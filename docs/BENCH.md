@@ -228,6 +228,8 @@ Each change is two atomic operations (D74).
 | 16,400 | 72.7 µs | 69.0 µs | 58.2 µs |
 | 65,491 | 267 µs | 254 µs | 213 µs |
 
+With the hand-written CBOR reader and writer (D81), short runs (2 s measuring) merge 645 ns, 4.41 µs, 58.8 µs, 218 µs; incr 623 ns, 4.17 µs, 55.5 µs, 206 µs; set 326 ns, 3.16 µs, 45.9 µs, 173 µs, by the same doc sizes. That is 18–37% faster than the table, measured on the same machine in one session, though the table's run was longer.
+
 Rechecked after the fixes on top of `1fd96cd` (D65, D66, D76, D77), load average about 2. `state_apply` is within 3% of this table in every cell, and the no-disk `write_path` runs are within 6% except 1 core with 100 records, 15% faster, which is noise under the caveats below. The real-disk runs weren't repeated. A merge or an `incr` on an existing number doesn't re-parse its result. An `incr` that adds a key does, which isn't in this table: parsing every result was measured at about 78% slower at 64 KB, and is why only that case does it (D76).
 
 Reading these:

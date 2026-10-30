@@ -148,3 +148,30 @@ async fn every_accepted_depth_stays_readable() {
     assert!(accepted_count < 40, "every depth in the range was accepted");
     harness.finish();
 }
+
+/// The whole path of D76's re-parse: refused, with state and version unchanged.
+#[tokio::test]
+async fn a_deep_map_as_a_path_key_is_refused_with_nothing_changed() {
+    let harness = Harness::new(manual_config(1));
+    let mut client = harness.node().client(0).await;
+    client
+        .state_op(request("s", 1, StateOp::Set, &map(&[])))
+        .await
+        .unwrap();
+    expect_reply(&mut client).await;
+    let before = client.snapshot("s").await.unwrap();
+    let mut deep_key = int(1);
+    for _ in 0..250 {
+        deep_key = Value::Map(vec![(int(1), deep_key)]);
+    }
+    let mut path: Vec<Value> = (0..100).map(|_| int(2)).collect();
+    path.push(deep_key);
+    let doc = map(&[("path", Value::Array(path)), ("n", int(1))]);
+    client
+        .state_op(request("s", 2, StateOp::Incr, &doc))
+        .await
+        .unwrap();
+    expect_malformed(&mut client, 2).await;
+    assert_eq!(client.snapshot("s").await.unwrap(), before);
+    harness.finish();
+}
