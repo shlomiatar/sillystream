@@ -3,7 +3,8 @@
 //! Each core hands over one sorted section per seal. When every core's section for
 //! a seal has arrived, they become one segment and one PUT, without sorting or copying
 //! data. A failed PUT is retried with the references still held, so nothing is lost
-//! and memory stays pinned while the store is down (Q9).
+//! and memory stays pinned while the store is down (Q9). An upload that no retry can
+//! help fails on its own, so one object can't stop the ones behind it (D59).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -20,7 +21,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cache::SegmentCache;
-use crate::object::{dedicated_path, seal_path};
+use crate::object::{dedicated_path, path_fits_stores, seal_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
 
@@ -68,7 +69,8 @@ pub enum UploadEvent {
         error: String,
     },
     /// This upload can't succeed, and its references are returned at exit: the
-    /// records were invalid, or another object already holds its path (D55).
+    /// records were invalid, another object already holds its path (D55), or the
+    /// store can't take this object (D59).
     Failed { key: UploadKey, error: String },
 }
 
@@ -298,6 +300,8 @@ enum PutError {
     Retryable(object_store::Error),
     /// Another object holds the path, with different bytes.
     Collision,
+    /// The store says that another try can't change the answer.
+    Permanent(object_store::Error),
 }
 
 impl fmt::Display for PutError {
@@ -305,6 +309,7 @@ impl fmt::Display for PutError {
         match self {
             PutError::Retryable(error) => write!(f, "{error}"),
             PutError::Collision => f.write_str("another object already holds this path"),
+            PutError::Permanent(error) => write!(f, "{error}"),
         }
     }
 }
@@ -477,20 +482,27 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     /// Retries until the PUT succeeds or the uploader is stopped. Returns whether the
     /// object is in the store.
     async fn upload(&mut self, key: UploadKey, path: Path, built: BuiltSegment) -> bool {
+        if !path_fits_stores(&path) {
+            self.emit(UploadEvent::Failed {
+                key,
+                error: format!("{path} has a part too long for an object path"),
+            });
+            return false;
+        }
         let mut backoff_ms = self.config.retry_initial_ms;
         let mut attempt = 0;
         loop {
             attempt += 1;
             match put_once(self.config.store.as_ref(), &path, &built.parts).await {
                 Ok(()) => break,
-                Err(PutError::Collision) => {
+                Err(error @ (PutError::Collision | PutError::Permanent(_))) => {
                     self.emit(UploadEvent::Failed {
                         key,
-                        error: PutError::Collision.to_string(),
+                        error: error.to_string(),
                     });
                     return false;
                 }
-                Err(error) => {
+                Err(error @ PutError::Retryable(_)) => {
                     self.emit(UploadEvent::Retrying {
                         key: key.clone(),
                         attempt,
@@ -580,6 +592,11 @@ async fn put_once(store: &dyn ObjectStore, path: &Path, parts: &[Bytes]) -> Resu
                 Err(PutError::Collision)
             }
         }
+        Err(
+            error @ (object_store::Error::InvalidPath { .. }
+            | object_store::Error::NotSupported { .. }
+            | object_store::Error::NotImplemented),
+        ) => Err(PutError::Permanent(error)),
         Err(error) => Err(PutError::Retryable(error)),
     }
 }

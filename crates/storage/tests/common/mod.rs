@@ -37,6 +37,8 @@ pub struct CountingStore {
     pub put_count: AtomicU64,
     pub put_attempt_count: AtomicU64,
     pub fail_next_puts: AtomicU64,
+    /// Refuses PUTs with an error that says retrying can't help.
+    pub reject_next_puts: AtomicU64,
 }
 
 impl CountingStore {
@@ -47,6 +49,7 @@ impl CountingStore {
             put_count: AtomicU64::new(0),
             put_attempt_count: AtomicU64::new(0),
             fail_next_puts: AtomicU64::new(0),
+            reject_next_puts: AtomicU64::new(0),
         }
     }
 
@@ -78,6 +81,15 @@ impl ObjectStore for CountingStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.put_attempt_count.fetch_add(1, Ordering::SeqCst);
+        let reject = self
+            .reject_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if reject {
+            return Err(object_store::Error::NotImplemented);
+        }
         let fail = self
             .fail_next_puts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {

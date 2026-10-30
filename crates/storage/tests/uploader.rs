@@ -15,6 +15,7 @@ use object_store::path::Path;
 use storage::{
     Section, SectionExtent, SegmentCache, SegmentReader, UnfinishedUpload, UploadEvent, UploadKey,
     UploadSendError, Uploader, UploaderConfig, dedicated_path, seal_path,
+    stream_fits_dedicated_path,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -478,4 +479,144 @@ async fn a_second_section_from_one_core_keeps_both_and_does_not_fire_the_seal() 
         })
         .sum();
     assert_eq!(held, 3, "every section comes back");
+}
+
+/// Events until `wanted` is `Uploaded`, failing if that takes longer than 5 s. A
+/// wedged uploader never gets there.
+async fn events_until_uploaded(
+    events: &mut UnboundedReceiver<UploadEvent>,
+    wanted: &UploadKey,
+) -> Vec<UploadEvent> {
+    let mut seen = Vec::new();
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.expect("the uploader stopped");
+            let done = matches!(&event, UploadEvent::Uploaded { key, .. } if key == wanted);
+            seen.push(event);
+            if done {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        waited.is_ok(),
+        "{wanted:?} was not uploaded: {} events, the first {:?}",
+        seen.len(),
+        seen.first()
+    );
+    seen
+}
+
+fn one_stream_section(stream: &str, bytes: &Bytes) -> Section<Bytes> {
+    Section {
+        extents: vec![SectionExtent {
+            stream: Arc::from(stream),
+            records: vec![bytes.clone()],
+        }],
+    }
+}
+
+async fn a_stream_id_too_long_for_a_path_fails_alone(store: Arc<dyn ObjectStore>) {
+    let (config, mut events) = config(store, 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    // Over the limit as encoded in a path, including ids short enough as raw bytes.
+    let long_ids = [
+        "x".repeat(300),
+        "x".repeat(256),
+        "#".repeat(100),
+        "é".repeat(60),
+    ];
+    for (number, id) in long_ids.iter().enumerate() {
+        assert!(!stream_fits_dedicated_path(id));
+        sender
+            .try_send_dedicated(Arc::from(id.as_str()), number as u64, vec![bytes.clone()])
+            .unwrap();
+    }
+    // The longest id that fits, and a long id in a seal, which puts it in no path.
+    assert!(stream_fits_dedicated_path(&"x".repeat(255)));
+    sender
+        .try_send_dedicated(Arc::from("x".repeat(255)), 100, vec![bytes.clone()])
+        .unwrap();
+    sender
+        .try_send_section(1, 0, one_stream_section(&"y".repeat(300), &bytes))
+        .unwrap();
+    let seen = events_until_uploaded(&mut events, &UploadKey::Seal(1)).await;
+    let mut failed = Vec::new();
+    for event in seen {
+        match event {
+            UploadEvent::Failed {
+                key: UploadKey::Dedicated { number, .. },
+                ..
+            } => failed.push(number),
+            UploadEvent::Uploaded {
+                key: UploadKey::Dedicated { number, .. },
+                ..
+            } => assert_eq!(number, 100),
+            UploadEvent::Uploaded { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(failed, [0, 1, 2, 3]);
+    let exit = uploader.shutdown();
+    assert_eq!(exit.unfinished.len(), 4, "their references come back");
+    for unfinished in exit.unfinished {
+        assert!(matches!(
+            unfinished,
+            UnfinishedUpload::Dedicated { records, .. } if records.len() == 1
+        ));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_id_too_long_for_a_path_fails_alone_on_the_local_file_system() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    a_stream_id_too_long_for_a_path_fails_alone(store).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_id_too_long_for_a_path_fails_alone_in_memory() {
+    // The same result on every store, whatever that store would have accepted.
+    a_stream_id_too_long_for_a_path_fails_alone(Arc::new(InMemory::new())).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_name_too_long_for_a_path_fails_each_seal_without_retrying() {
+    let (mut config, mut events) = config(Arc::new(InMemory::new()), 1);
+    config.node = "n".repeat(300);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_section(1, 0, one_stream_section("a", &bytes))
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Failed {
+            key: UploadKey::Seal(1),
+            ..
+        })
+    ));
+    assert_eq!(uploader.shutdown().unfinished.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_error_that_retrying_cannot_change_fails_alone() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.reject_next_puts.store(1, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, mut events) = config(store, 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_dedicated(Arc::from("rejected"), 1, vec![bytes.clone()])
+        .unwrap();
+    sender
+        .try_send_section(1, 0, one_stream_section("healthy", &bytes))
+        .unwrap();
+    let seen = events_until_uploaded(&mut events, &UploadKey::Seal(1)).await;
+    assert!(matches!(seen[0], UploadEvent::Failed { .. }), "{seen:?}");
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(uploader.shutdown().unfinished.len(), 1);
 }

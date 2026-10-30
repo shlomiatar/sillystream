@@ -14,7 +14,10 @@ mod wal_writer;
 
 pub use cache::{CacheError, SegmentCache};
 pub use metadata::{MetadataEntry, MetadataError, MetadataStore};
-pub use object::{ObjectStoreConfig, S3Config, build_store, dedicated_path, seal_path};
+pub use object::{
+    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, build_store, dedicated_path, seal_path,
+    stream_fits_dedicated_path,
+};
 pub use segment_builder::{BuiltSegment, SegmentBuilder};
 pub use segment_format::{
     BLOCK_ENTRY_BYTES, BlockEntry, BlockTable, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES,

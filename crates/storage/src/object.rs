@@ -85,6 +85,23 @@ fn sealed_path(owner: &str, generation: u64, first_id: u64) -> Path {
     ])
 }
 
+/// The longest path part any store here takes, as encoded in the path. It is the file
+/// name limit of common local file systems. With a part this long, a whole key stays
+/// well under S3's 1,024 bytes, so one limit gives the same result on every store (D59).
+pub const MAX_PATH_PART_BYTES: usize = 255;
+
+/// Whether a path has a part no store could hold, which no retry can change.
+pub(crate) fn path_fits_stores(path: &Path) -> bool {
+    path.parts()
+        .all(|part| part.as_ref().len() <= MAX_PATH_PART_BYTES)
+}
+
+/// Whether a stream can have a dedicated object. A stream whose id can't be a path part
+/// stays in the node's shared seals, where the id appears only in the footer (D59).
+pub fn stream_fits_dedicated_path(stream: &str) -> bool {
+    PathPart::from(stream).as_ref().len() <= MAX_PATH_PART_BYTES
+}
+
 /// The path of a node's shared object for one seal.
 pub fn seal_path(node: &str, generation: u64, first_id: u64) -> Path {
     sealed_path(node, generation, first_id)
