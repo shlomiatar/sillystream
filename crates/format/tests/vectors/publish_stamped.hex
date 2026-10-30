@@ -1,0 +1,13 @@
+# publish_unstamped.hex after stamping with first_id 0x0000019000000010 and author 0xAB.
+# record 0 gets first_id; only id and author differ.
+10 00 00 00 90 01 00 00
+10 00 00 00 00 00 00 00
+AB 00 00 00 00 00 00 00
+03 00 00 00 | 02 00 | 00 00
+41 42 43 | 00 00 00 00 00
+# record 1 gets first_id + 2.
+12 00 00 00 90 01 00 00
+20 00 00 00 00 00 00 00
+AB 00 00 00 00 00 00 00
+08 00 00 00 | 01 00 | 00 00
+44 45 46 47 48 49 4A 4B

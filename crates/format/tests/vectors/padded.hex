@@ -1,0 +1,11 @@
+# len = 5, so 3 padding bytes follow the data.
+# id 2
+02 00 00 00 00 00 00 00
+# options 0x0102030405060708
+08 07 06 05 04 03 02 01
+# author 9
+09 00 00 00 00 00 00 00
+# len 5 | count 1 | codec 0
+05 00 00 00 | 01 00 | 00 00
+# data "hello" | padding
+68 65 6C 6C 6F | 00 00 00

@@ -1,0 +1,13 @@
+# author = 0, options = entry type 1 (state set), data = actor u64 | doc.
+# id 0x0000019000000100
+00 01 00 00 90 01 00 00
+# options 1
+01 00 00 00 00 00 00 00
+# author 0
+00 00 00 00 00 00 00 00
+# len 12 | count 1 | codec 0
+0C 00 00 00 | 01 00 | 00 00
+# actor 42
+2A 00 00 00 00 00 00 00
+# doc: CBOR {"a": 1} | padding
+A1 61 61 01 | 00 00 00 00

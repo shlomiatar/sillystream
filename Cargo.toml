@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/format",
+    "crates/proto",
+    "crates/auth",
+    "crates/storage",
+    "crates/server",
+    "crates/sdk",
+    "crates/cli",
+    "crates/e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+format = { path = "crates/format" }
+proto = { path = "crates/proto" }
+auth = { path = "crates/auth" }
+storage = { path = "crates/storage" }
+server = { path = "crates/server" }
+sdk = { path = "crates/sdk" }
+crc32c = "0.6"
+criterion = { version = "0.5", default-features = false }
+proptest = "1"

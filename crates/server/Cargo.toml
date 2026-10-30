@@ -1,0 +1,11 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+format.workspace = true
+proto.workspace = true
+auth.workspace = true
+storage.workspace = true

@@ -15,6 +15,8 @@ Each has a working assumption so the build can continue.
 - **Q7. Lost records at levels 0–1 and id reuse.** A record delivered at level 0–1 and lost in a crash leaves no trace, so "ids are never reused" cannot be proven for it. A restart normally moves past it because ids follow the clock; a backward clock or borrowed ms could collide. Assumption: the no-reuse guarantee is tested for WAL-durable records only.
 - **Q8. Checkpoint lookup and cleanup.** Section 7.6 puts checkpoints in shared files per seal, but does not say how a long-idle stream finds its latest one, or whether old files may be deleted ("nothing else deletes data" is about records). Assumption: D18.
 - **Q9. Upload outage.** The spec doesn't bound memory and WAL while S3 is down. Assumption: slabs and the WAL stay pinned, and when a configured cap is reached it becomes publisher backpressure (D7). Level 3 acks wait.
+- **Q11. `eq` value bits outside the mask.** Section 4 defines `eq` as `(options & mask) == value`, which is never true if `value` has bits outside `mask`, but the formula in section 4.1 uses `need1 = mask & value` and would report "all match" for such a clause. Assumption: section 4's definition wins (D33).
+- **Q12. `ACK.count` is a u32.** A maximum-size frame can hold about 500,000 empty records of 65,535 items, around 3.4 × 10^10 items, which `ACK.count` can't express. Section 3's rejection list doesn't cover it. Assumption: D34.
 - **Q10. Conditional update on the ownership record.** "One ownership record" with a conditional increment needs compare-and-swap, which `object_store`'s `LocalFileSystem` doesn't implement (`PutMode::Update` returns `NotImplemented`; checked in 0.11.2). Assumption: D14.
 
 ## Decisions
@@ -32,6 +34,12 @@ Each has a working assumption so the build can continue.
 - **D6c.** Merge is RFC 7396 semantics on CBOR maps. Incr's doc is CBOR `{"path": [keys], "n": int}`. Incr on a non-numeric value is error 8. Reason: the spec names the ops but not incr's doc.
 - **D6d.** Defaults: `max_frame` 16 MiB, subscriptions per connection 1,024, subscriber queue 8 MiB, `PROGRESS` every 5 s, slab 4 MiB, block 64 KiB, footer page 64 KiB. Reason: plain starting values; all are constants or node config.
 - **D6e.** Dedupe's 28 bytes are `producer_id, producer_seq, first_id, count`, and idle age comes from `first_id`'s timestamp. Reason: the id already holds the time, so no field is added.
+- **D33.** An `eq` clause with `value & !mask != 0` matches nothing, and its block decision is "none match". Reason: keeps sections 4 and 4.1 consistent (Q11).
+- **D34.** A publish with more than `u32::MAX` items is rejected with error 8. Reason: `ACK.count` couldn't report it (Q12).
+- **D35.** A block summary's `count` is items, and `bytes` is whole records including headers and padding. The summary's on-disk layout is left to M3 (D10). Reason: the spec names the fields only; items match the id range, and whole-record bytes are what a reader fetches.
+- **D36.** The allocator never issues `u64::MAX` and refuses an allocation that would need it. Id 0 is never issued either. A clock above 48 bits is clamped. Reason: section 5.1 gives both values cursor meanings, and `first_id = 0` means "already committed" in an `ACK`.
+- **D37.** A record overlapping a filter's id range matches whole, and the decoder rejects non-zero padding as well as validation does. Reason: section 5.2 sends whole records; padding isn't data, and nothing valid has non-zero padding.
+- **D38.** `validate_forward` requires a non-zero `author`, and `id = 0`, for records from a forward sink. Reason: section 3 lets forward sinks set `author`, and D28 keeps system records out.
 
 ### Storage
 

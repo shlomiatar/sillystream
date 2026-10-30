@@ -1,0 +1,13 @@
+# A publish of two records as a producer sends it: id and author are 0.
+# record 0: options 0x10, count 2, len 3
+00 00 00 00 00 00 00 00
+10 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+03 00 00 00 | 02 00 | 00 00
+41 42 43 | 00 00 00 00 00
+# record 1: options 0x20, count 1, len 8
+00 00 00 00 00 00 00 00
+20 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+08 00 00 00 | 01 00 | 00 00
+44 45 46 47 48 49 4A 4B

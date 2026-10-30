@@ -1,0 +1,9 @@
+# count = 65,535, the maximum, and len = 0: a record may carry no data bytes.
+# id 0x0000019000010000
+00 00 01 00 90 01 00 00
+# options 0
+00 00 00 00 00 00 00 00
+# author 1
+01 00 00 00 00 00 00 00
+# len 0 | count 65535 | codec 0
+00 00 00 00 | FF FF | 00 00

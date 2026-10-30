@@ -1,0 +1,11 @@
+# count = 1, data fills whole 8-byte words, so no padding.
+# id 0x0123456789ABCDEF
+EF CD AB 89 67 45 23 01
+# options 0x8000000000000001
+01 00 00 00 00 00 00 80
+# author 0x1122334455667788
+88 77 66 55 44 33 22 11
+# len 8 | count 1 | codec 0
+08 00 00 00 | 01 00 | 00 00
+# data "sillystr"
+73 69 6C 6C 79 73 74 72

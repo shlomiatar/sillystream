@@ -1,0 +1,12 @@
+# count = 3, codec = 1 (zstd, opaque here). Data is client-owned.
+# id 0x0000019000000005
+05 00 00 00 90 01 00 00
+# options 0x00000000DEADBEEF
+EF BE AD DE 00 00 00 00
+# author 7
+07 00 00 00 00 00 00 00
+# len 16 | count 3 | codec 1
+10 00 00 00 | 03 00 | 01 00
+# data 00..0F
+00 01 02 03 04 05 06 07
+08 09 0A 0B 0C 0D 0E 0F
