@@ -395,10 +395,24 @@ fn summary_fields() {
     assert_eq!(summary.author, BlockAuthor::Single(7));
 }
 
+/// An empty summary reads as `Single(0)`, the same as a block of system records,
+/// so a system reader is the case that needs the empty check.
 #[test]
 fn an_empty_block_matches_nothing() {
-    assert_eq!(
-        Filter::new(&[]).unwrap().decide_block(&BlockSummary::new()),
-        Decision::None
-    );
+    let empty = BlockSummary::new();
+    let clause = Clause::Any { mask: 1 };
+    for clauses in [&[][..], &[clause][..]] {
+        for author in [None, Some(0), Some(7)] {
+            for include_system in [false, true] {
+                let mut filter = Filter::new(clauses).unwrap();
+                filter.author = author;
+                filter.include_system = include_system;
+                assert_eq!(
+                    filter.decide_block(&empty),
+                    Decision::None,
+                    "{clauses:?} author {author:?} include_system {include_system}"
+                );
+            }
+        }
+    }
 }
