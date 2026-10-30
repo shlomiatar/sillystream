@@ -180,6 +180,62 @@ Reading these:
 - **These reads hit the page cache,** since the object was just written. They count reads, and don't measure a disk or S3.
 - **The 2.93 s `PUT` has about 2M small parts,** two per stream. It wasn't profiled, and S3 wasn't run.
 
+## M4: `write_path` and `state_apply`
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p server --bench write_path
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p server --bench state_apply
+```
+
+Commit: the working tree on top of `fa77830`, committed together with this file. Load average about 2 during the runs.
+
+`write_path` runs real cores, the real WAL writer and the real client messages, with one client thread per core publishing to one stream on it. Each publish is one record of 256 data bytes (288 on the wire) unless stated, and producer ids dedupe as in production. Numbers are wall time per publish on each core, so the node's rate is `cores / time`. Runs are capped in size to bound memory, and criterion's count is scaled from the capped run. With 16 cores, the 16 client threads and the writer share the 16 hardware threads with the cores, so that column is pessimistic.
+
+**Publish to durable, on the real disk with `sync_data`, level 2:**
+
+| cores | one outstanding: per publish | node rate | 256 outstanding: per publish | node rate |
+|---|---|---|---|---|
+| 1 | 4.24 ms | 236 /s | 36.1 µs | 27,700 /s |
+| 4 | 8.68 ms | 461 /s | 34.0 µs | 117,500 /s |
+| 16 | 10.3 ms | 1,559 /s | 41.9 µs | 382,000 /s |
+
+**The same with no disk** (a WAL file that discards writes and syncs at once), which is what cores and channels cost, 256 outstanding:
+
+| cores | 1 record | 100 records | 10,000 records |
+|---|---|---|---|
+| 1 | 915 ns | 1.63 µs (16.5 GiB/s) | 129 µs (20.9 GiB/s) |
+| 4 | 1.06 µs | 4.73 µs (22.7 GiB/s) | 500 µs (21.4 GiB/s) |
+| 16 | 3.64 µs | 25.0 µs (17.2 GiB/s) | 2.26 ms (19.0 GiB/s) |
+
+**Dedupe lookup**, by entries in the table: 3.1 ns at 1, 3.4 ns at 10, 5.5 ns at 100, 7.9 ns at 1,000.
+
+**Slab reference changes** for one level 3 publish, from arrival through upload, counted by the hook:
+
+| records in the publish | changes | per record |
+|---|---|---|
+| 1 | 8 | 8.0 |
+| 100 | 8 | 0.08 |
+| 10,000 | 8 | 0.0008 |
+
+Each change is two atomic operations (D74).
+
+**`state_apply`**, one op on an encoded document, by its size. The doc is a flat map of short strings with a counter at the front:
+
+| doc bytes | merge | incr | set |
+|---|---|---|---|
+| 80 | 999 ns | 1.02 µs | 500 ns |
+| 1,025 | 5.93 µs | 5.69 µs | 4.39 µs |
+| 16,400 | 72.7 µs | 69.0 µs | 58.2 µs |
+| 65,491 | 267 µs | 254 µs | 213 µs |
+
+Reading these:
+
+- **Level 2 with one outstanding is the fsync:** 4.2 ms is `F_FULLFSYNC` on this laptop, in line with the WAL's own numbers. It says nothing about EBS or Linux NVMe, and section 7.2's level 2 row stays unconfirmed.
+- **Group commit is what scales it:** with 256 outstanding, one core does 117 times the single-outstanding rate on the same fsyncs. Going from 1 to 16 cores multiplies the node's rate by 13.8, on one laptop with the clients on the same cores.
+- **Batches cost little beyond memcpy.** With no disk, a 10,000-record publish takes about 140 times a one-record one at 10,000 times the records. The rate is around 20 GiB/s, which is mostly the client's copy into a slab plus the validation and stamping walks. Nothing here is a socket: M6 adds those.
+- **`no disk` isn't an ingest figure.** Nothing is sealed or uploaded in that run, and a discarded write isn't a WAL.
+- **State ops cost a full decode and encode,** so about 4 µs per KiB: one core could do about 3,700 merges per second on a full 64 KB doc. Section 10 already says state isn't for high-frequency updates. `set` also decodes, to validate.
+
 ## Caveats
 
 - `LocalFileSystem` doesn't fsync objects, so its `PUT` isn't a durability figure, and neither it nor these numbers say anything about S3.
@@ -189,4 +245,4 @@ Reading these:
 
 ## Not run yet
 
-`write_path` and `state_apply` (M4), `fan_out` (M5), and all load generator numbers (M6, M10).
+`fan_out` (M5), and all load generator numbers (M6, M10).

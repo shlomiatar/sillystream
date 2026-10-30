@@ -1767,10 +1767,19 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "auth",
+ "bytes",
+ "ciborium",
+ "criterion",
  "format",
+ "futures",
+ "object_store",
+ "proptest",
  "proto",
  "storage",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

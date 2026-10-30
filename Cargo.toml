@@ -23,6 +23,7 @@ auth = { path = "crates/auth" }
 storage = { path = "crates/storage" }
 server = { path = "crates/server" }
 sdk = { path = "crates/sdk" }
+ciborium = "0.2"
 crc32c = "0.6"
 hmac = "0.12"
 sha2 = "0.10"
