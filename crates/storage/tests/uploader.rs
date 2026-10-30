@@ -695,3 +695,74 @@ fn a_sender_that_never_pauses_cannot_hold_up_shutdown() {
     assert!(returned_in_time, "shutdown didn't return within 10 s");
     assert_eq!(shut_down.unfinished.len(), accepted);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_touches_cannot_take_the_room_sections_need() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (mut config, mut events) = config(store, 1);
+    config.channel_capacity = 8;
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_section(1, 0, one_stream_section("s", &bytes))
+        .unwrap();
+    // It is now stuck on seal 1, reading nothing, as during a long PUT or an outage.
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Retrying { .. })
+    ));
+    let mut touch_count = 0;
+    while sender.try_cache_touch(Path::from("sealed/1/node/a.seg")) {
+        touch_count += 1;
+        assert!(touch_count <= 1000, "touches have no bound");
+    }
+    assert!(touch_count >= 1, "a touch is accepted when there is room");
+    for seal in 2..10 {
+        sender
+            .try_send_section(seal, 0, one_stream_section("s", &bytes))
+            .unwrap_or_else(|error| panic!("seal {seal} refused: {error:?}"));
+    }
+    assert_eq!(uploader.shutdown().unfinished.len(), 9);
+}
+
+/// A touch sent before an upload counts before that upload's eviction, so a read
+/// protects what it read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cache_touch_still_reaches_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    // One record's object is well under 1 KiB. Measured below, then the cap fits two.
+    let probe = {
+        let mut builder = storage::SegmentBuilder::new();
+        let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+        builder.add_extent("s", [bytes]).unwrap();
+        builder.finish().unwrap().len_bytes
+    };
+    let cache = SegmentCache::open(dir.path(), probe * 2).unwrap();
+    let local = cache.store();
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (mut config, mut events) = config(inner, 1);
+    config.cache = Some(cache);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let mut paths = Vec::new();
+    for number in 0..2u64 {
+        // One ms apart in ids, so the objects have different paths and the same size.
+        let id = FIRST_ID + (number << 16);
+        let bytes = Bytes::from(record(id, 1, 7, b"x"));
+        sender
+            .try_send_dedicated(Arc::from("s"), number, vec![bytes])
+            .unwrap();
+        paths.push(next_uploaded(&mut events).await.1);
+    }
+    assert!(sender.try_cache_touch(paths[0].clone()));
+    let bytes = Bytes::from(record(FIRST_ID + (2 << 16), 1, 7, b"x"));
+    sender
+        .try_send_dedicated(Arc::from("s"), 2, vec![bytes])
+        .unwrap();
+    next_uploaded(&mut events).await;
+    assert!(local.head(&paths[0]).await.is_ok(), "the touched one stays");
+    assert!(local.head(&paths[1]).await.is_err(), "the other goes");
+    drop(sender);
+    uploader.finish();
+}

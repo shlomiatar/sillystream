@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::UnboundedSender;
@@ -121,7 +121,6 @@ enum UploadCommand<R> {
         number: u64,
         records: Vec<R>,
     },
-    CacheTouch(Path),
     /// Gets the thread out of `recv` so it sees the stop flag.
     Wake,
 }
@@ -135,6 +134,8 @@ pub enum UploadSendError<T> {
 
 pub struct UploaderSender<R> {
     tx: Sender<UploadCommand<R>>,
+    /// Separate from `tx`, so reads can't use up the room sections need (D54).
+    touch_tx: Sender<Path>,
     stop: Arc<AtomicBool>,
     /// Sends that have passed the stop check and may not have reached the channel. See
     /// `send`.
@@ -145,6 +146,7 @@ impl<R> Clone for UploaderSender<R> {
     fn clone(&self) -> Self {
         UploaderSender {
             tx: self.tx.clone(),
+            touch_tx: self.touch_tx.clone(),
             stop: Arc::clone(&self.stop),
             sending_count: Arc::clone(&self.sending_count),
         }
@@ -223,9 +225,10 @@ impl<R> UploaderSender<R> {
     }
 
     /// Tells the local cache an object was read. Losing this on a full queue costs
-    /// only a slightly worse eviction choice.
+    /// only a slightly worse eviction choice, and it has its own queue, so a burst of
+    /// reads can't make a section or dedicated object come back `Full`.
     pub fn try_cache_touch(&self, path: Path) -> bool {
-        self.send(UploadCommand::CacheTouch(path)).is_ok()
+        !self.stop.load(Ordering::SeqCst) && self.touch_tx.try_send(path).is_ok()
     }
 }
 
@@ -242,6 +245,7 @@ where
 {
     pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender<R>, Uploader<R>)> {
         let (tx, rx) = bounded(config.channel_capacity);
+        let (touch_tx, touch_rx) = bounded(config.channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
         let sending_count = Arc::new(AtomicUsize::new(0));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -259,11 +263,12 @@ where
                     pending: BTreeMap::new(),
                     unfinished: Vec::new(),
                 };
-                runtime.block_on(worker.run(rx))
+                runtime.block_on(worker.run(rx, touch_rx))
             })?;
         Ok((
             UploaderSender {
                 tx: tx.clone(),
+                touch_tx,
                 stop: Arc::clone(&stop),
                 sending_count,
             },
@@ -344,10 +349,40 @@ impl fmt::Display for PutError {
 }
 
 impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
-    async fn run(mut self, rx: Receiver<UploadCommand<R>>) -> UploaderExit<R> {
-        // `recv` blocks this thread, which runs nothing else: the runtime is here only
-        // for `object_store` calls (D12).
-        while let Ok(command) = rx.recv() {
+    async fn run(
+        mut self,
+        rx: Receiver<UploadCommand<R>>,
+        mut touch_rx: Receiver<Path>,
+    ) -> UploaderExit<R> {
+        loop {
+            // `select!` blocks this thread, which runs nothing else: the runtime is here
+            // only for `object_store` calls (D12).
+            let command = select! {
+                recv(rx) -> command => match command {
+                    Ok(command) => command,
+                    Err(_) => break,
+                },
+                recv(touch_rx) -> path => {
+                    match path {
+                        Ok(path) => self.touch_cache(&path),
+                        // Every sender is gone, and `rx` will say so next.
+                        Err(_) => touch_rx = never(),
+                    }
+                    if self.stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                },
+            };
+            // Reads that came before this upload count before its eviction. The bound
+            // keeps a fast reader from holding the upload up.
+            for path in touch_rx
+                .try_iter()
+                .take(self.config.channel_capacity)
+                .collect::<Vec<_>>()
+            {
+                self.touch_cache(&path);
+            }
             if self.stop.load(Ordering::SeqCst) {
                 self.keep_unfinished(command);
                 break;
@@ -366,12 +401,6 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     records,
                 } => self.upload_dedicated(stream, number, records).await,
                 UploadCommand::Wake => {}
-                UploadCommand::CacheTouch(path) => {
-                    if let Some(cache) = &mut self.config.cache {
-                        // A cache problem never affects the upload path.
-                        let _ = cache.touch(&path);
-                    }
-                }
             }
         }
         // The flag is set or every sender is gone, so nothing can arrive after these
@@ -389,6 +418,13 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
         UploaderExit {
             unfinished: self.unfinished,
+        }
+    }
+
+    fn touch_cache(&mut self, path: &Path) {
+        if let Some(cache) = &mut self.config.cache {
+            // A cache problem never affects the upload path.
+            let _ = cache.touch(path);
         }
     }
 
@@ -439,7 +475,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                 number,
                 records,
             }),
-            UploadCommand::CacheTouch(_) | UploadCommand::Wake => {}
+            UploadCommand::Wake => {}
         }
     }
 
