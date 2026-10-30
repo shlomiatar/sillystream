@@ -766,3 +766,115 @@ async fn a_cache_touch_still_reaches_the_cache() {
     drop(sender);
     uploader.finish();
 }
+
+fn seal_sections_held(unfinished: &[UnfinishedUpload<Bytes>]) -> Vec<(u64, usize)> {
+    let mut held: Vec<(u64, usize)> = unfinished
+        .iter()
+        .filter_map(|upload| match upload {
+            UnfinishedUpload::Seal { seal, sections } => Some((*seal, sections.len())),
+            UnfinishedUpload::Dedicated { .. } => None,
+        })
+        .collect();
+    held.sort();
+    held
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_section_for_an_uploaded_seal_does_not_put_again() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, mut events) = config(store, 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let first = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    let second = Bytes::from(record(FIRST_ID + 5, 1, 7, b"y"));
+    sender
+        .try_send_section(1, 0, one_stream_section("s", &first))
+        .unwrap();
+    assert_eq!(next_uploaded(&mut events).await.0, UploadKey::Seal(1));
+    sender
+        .try_send_section(1, 0, one_stream_section("s", &second))
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Failed {
+            key: UploadKey::Seal(1),
+            ..
+        })
+    ));
+    drop(sender);
+    let exit = uploader.finish();
+    assert_eq!(counting.puts(), 1, "one PUT per seal");
+    assert_eq!(seal_sections_held(&exit.unfinished), [(1, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_section_with_more_cores_fails_at_once_and_does_not_sit_pending() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, mut events) = config(store, 2);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    for core in 0..2 {
+        sender
+            .try_send_section(1, core, one_stream_section(&format!("s{core}"), &bytes))
+            .unwrap();
+    }
+    assert_eq!(next_uploaded(&mut events).await.0, UploadKey::Seal(1));
+    sender
+        .try_send_section(1, 1, one_stream_section("s", &bytes))
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await;
+    assert!(
+        matches!(event, Ok(Some(UploadEvent::Failed { .. }))),
+        "{event:?}"
+    );
+    drop(sender);
+    assert_eq!(seal_sections_held(&uploader.finish().unfinished), [(1, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_core_going_back_to_an_earlier_seal_is_refused() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, mut events) = config(store, 2);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_section(5, 0, one_stream_section("s", &bytes))
+        .unwrap();
+    sender
+        .try_send_section(4, 0, one_stream_section("s", &bytes))
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Failed {
+            key: UploadKey::Seal(4),
+            ..
+        })
+    ));
+    // Another core's numbers are its own, so seal 4 from it is still accepted.
+    sender
+        .try_send_section(4, 1, one_stream_section("s", &bytes))
+        .unwrap();
+    drop(sender);
+    assert_eq!(
+        seal_sections_held(&uploader.finish().unfinished),
+        [(4, 1), (4, 1), (5, 1)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_section_from_a_core_out_of_range_leaves_no_empty_seal_behind() {
+    let (config, mut events) = config(Arc::new(InMemory::new()), 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_section(9, 5, one_stream_section("s", &bytes))
+        .unwrap();
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Failed { .. })
+    ));
+    drop(sender);
+    assert_eq!(seal_sections_held(&uploader.finish().unfinished), [(9, 1)]);
+}

@@ -256,11 +256,13 @@ where
         let thread = std::thread::Builder::new()
             .name("uploader".to_owned())
             .spawn(move || {
+                let section_count = config.section_count;
                 let worker = Worker {
                     config,
                     stop: thread_stop,
                     sending_count: thread_sending_count,
                     pending: BTreeMap::new(),
+                    last_seal_by_core: vec![None; section_count],
                     unfinished: Vec::new(),
                 };
                 runtime.block_on(worker.run(rx, touch_rx))
@@ -325,6 +327,9 @@ struct Worker<R> {
     stop: Arc<AtomicBool>,
     sending_count: Arc<AtomicUsize>,
     pending: BTreeMap<u64, BTreeMap<usize, Section<R>>>,
+    /// The highest seal each core has handed over. A core's seals only go up, so this
+    /// recognises a repeat even after its seal has uploaded and left `pending`.
+    last_seal_by_core: Vec<Option<u64>>,
     unfinished: Vec<UnfinishedUpload<R>>,
 }
 
@@ -429,10 +434,13 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     }
 
     async fn receive_section(&mut self, seal: u64, core: usize, section: Section<R>) {
-        let sections = self.pending.entry(seal).or_default();
         // Counting sections is what fires the upload, so a wrong one must not count,
         // and replacing one would drop its references.
-        if core >= self.config.section_count || sections.contains_key(&core) {
+        let in_order = self
+            .last_seal_by_core
+            .get_mut(core)
+            .filter(|last| last.is_none_or(|last| seal > last));
+        let Some(last) = in_order else {
             self.unfinished.push(UnfinishedUpload::Seal {
                 seal,
                 sections: BTreeMap::from([(core, section)]),
@@ -442,7 +450,9 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                 error: format!("unexpected section from core {core}"),
             });
             return;
-        }
+        };
+        *last = Some(seal);
+        let sections = self.pending.entry(seal).or_default();
         sections.insert(core, section);
         if sections.len() == self.config.section_count
             && let Some(sections) = self.pending.remove(&seal)
