@@ -334,3 +334,192 @@ async fn publishers_racing_many_moves_lose_nothing() {
     }
     harness.finish();
 }
+
+/// A stream whose hashed shard starts on `core`, as placement is `shard % core_count`.
+fn name_on_core(core: usize, node: &server::Node, prefix: &str) -> String {
+    (0..)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|name| {
+            shard_of(name, node.virtual_shard_count()) as usize % node.core_count() == core
+        })
+        .expect("names go on for ever")
+}
+
+/// Publishes to `stream` until `core` has a stamped entry it can't get into the WAL
+/// channel, so that it stops reading writes. The WAL has to be held.
+async fn park_outbound(node: &server::Node, core: usize, stream: &str, records: &[u8]) {
+    let mut client = node.client(core).await;
+    let mut seq = 1;
+    while node.stats(core).await.unwrap().outbound_count == 0 {
+        assert!(seq < 100, "the channel should have filled by now");
+        client
+            .publish(publish(stream, records, seq, 1))
+            .await
+            .unwrap();
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn stalled_two_cores() -> server::NodeConfig {
+    let mut config = manual_config(2);
+    config.wal_channel_capacity = 2;
+    config
+}
+
+#[tokio::test]
+async fn a_publish_sent_while_the_barrier_is_out_cant_be_overtaken() {
+    let harness = Harness::new(stalled_two_cores());
+    let node = harness.node();
+    let name = name_on_core(0, node, "m");
+    let shard = shard_of(&name, node.virtual_shard_count());
+    let records = record_with(1, b"payload");
+    let mut client = node.client(0).await;
+
+    harness.wal.hold();
+    node.move_shard(shard, 1).await;
+    client
+        .publish(publish(&name, &records, 1, 1))
+        .await
+        .unwrap();
+    // This takes the `Moved` too, so the barrier goes down the old route.
+    assert_eq!(expect_ack(&mut client).await.0, 1);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    park_outbound(node, 0, &name_on_core(0, node, "other"), &records).await;
+
+    // Stuck in core 0's inbox, if it goes that way, until the WAL moves.
+    client
+        .publish(publish(&name, &records, 2, 1))
+        .await
+        .unwrap();
+    let mut acks = Vec::new();
+    if let Some(Reply::Ack {
+        producer_seq,
+        first_id,
+        count,
+        ..
+    }) = client.recv_within(30).await
+    {
+        acks.push((producer_seq, first_id, count));
+    }
+    assert_eq!(client.route_of(&name), 1);
+    client
+        .publish(publish(&name, &records, 3, 1))
+        .await
+        .unwrap();
+    while acks.len() < 2 {
+        if acks.len() == 1 && acks[0].0 == 3 {
+            harness.wal.release();
+        }
+        match client.recv_within(100).await {
+            Some(Reply::Ack {
+                producer_seq,
+                first_id,
+                count,
+                ..
+            }) => acks.push((producer_seq, first_id, count)),
+            Some(other) => panic!("{other:?}"),
+            None => harness.wal.release(),
+        }
+    }
+    harness.wal.release();
+    assert!(acks.iter().all(|ack| ack.1 > 0), "{acks:?}");
+    client
+        .publish(publish(&name, &records, 4, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut client).await;
+    let seqs: Vec<u64> = harness
+        .wal
+        .stream_entries(&name)
+        .iter()
+        .map(|entry| entry.producer_seq)
+        .collect();
+    assert_eq!(seqs, [1, 2, 3, 4]);
+    harness.finish();
+}
+
+#[tokio::test]
+async fn a_write_waits_for_a_barrier_still_on_its_way() {
+    let harness = Harness::new(stalled_two_cores());
+    let node = harness.node();
+    let name = name_on_core(0, node, "m");
+    let shard = shard_of(&name, node.virtual_shard_count());
+    let records = record_with(1, b"payload");
+    let mut client = node.client(0).await;
+
+    harness.wal.hold();
+    node.move_shard(shard, 1).await;
+    client
+        .publish(publish(&name, &records, 1, 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    park_outbound(node, 0, &name_on_core(0, node, "other"), &records).await;
+    // The barrier goes out only now, into an inbox that isn't being read.
+    assert_eq!(expect_ack(&mut client).await.0, 1);
+
+    // Sent down the old route, it wouldn't be covered by that barrier.
+    let waited = tokio::time::timeout(
+        Duration::from_millis(50),
+        client.publish(publish(&name, &records, 2, 1)),
+    )
+    .await;
+    assert!(waited.is_err(), "the publish went ahead: {waited:?}");
+    assert_eq!(
+        client.try_publish(publish(&name, &records, 2, 1)),
+        Err(server::ClientError::Full)
+    );
+    let state_op = tokio::time::timeout(
+        Duration::from_millis(50),
+        client.state_op(server::StateOpRequest {
+            stream: &name,
+            req: 1,
+            author: AUTHOR,
+            expect_ver: 0,
+            op: server::StateOp::Set,
+            doc: cbor(&int(1)),
+        }),
+    )
+    .await;
+    assert!(state_op.is_err(), "the state op went ahead");
+
+    harness.wal.release();
+    client
+        .publish(publish(&name, &records, 2, 1))
+        .await
+        .unwrap();
+    assert_eq!(client.route_of(&name), 1);
+    let (seq, first_id, _) = expect_ack(&mut client).await;
+    assert_eq!(seq, 2);
+    assert!(first_id > 0);
+    harness.finish();
+}
+
+#[tokio::test]
+async fn a_write_waiting_for_a_barrier_ends_when_the_node_stops() {
+    let harness = Harness::new(stalled_two_cores());
+    let node = harness.node();
+    let name = name_on_core(0, node, "m");
+    let shard = shard_of(&name, node.virtual_shard_count());
+    let records = record_with(1, b"payload");
+    let mut client = node.client(0).await;
+
+    harness.wal.hold();
+    node.move_shard(shard, 1).await;
+    client
+        .publish(publish(&name, &records, 1, 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    park_outbound(node, 0, &name_on_core(0, node, "other"), &records).await;
+    assert_eq!(expect_ack(&mut client).await.0, 1);
+
+    harness.finish();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.publish(publish(&name, &records, 2, 1)),
+    )
+    .await;
+    assert_eq!(ended, Ok(Err(server::ClientError::NodeStopped)));
+}

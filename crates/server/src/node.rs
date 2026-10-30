@@ -2,7 +2,7 @@
 //! is node-wide: the seal window (section 7.1), rebalancing (section 6.1), and the
 //! in-process API that later milestones put sockets in front of.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -583,6 +583,7 @@ impl Node {
             routes: HashMap::new(),
             reply_tx,
             reply_rx,
+            received: VecDeque::new(),
             pool: SlabPool::new(
                 self.config.slab_bytes,
                 self.accounts[home_core].clone(),
@@ -739,9 +740,10 @@ struct ClientRoute {
 /// One connection's view of the node: a slab pool to read frames into, and where each
 /// stream's messages go. Used from one task. Replies come back on `recv`.
 ///
-/// Order across this client's messages for a stream holds through moves. The route only
-/// changes after a barrier sent down the old route comes back, so everything sent before
-/// has been handled by then, and nothing can overtake it (D65).
+/// Order across this client's messages for a stream holds through moves. While a barrier
+/// is out, writes to that stream wait. The route only changes when the barrier comes back,
+/// so everything sent down the old route has been handled by then, and nothing can
+/// overtake it (D65).
 pub struct Client {
     links: Links,
     virtual_shard_count: u32,
@@ -749,6 +751,8 @@ pub struct Client {
     routes: HashMap<Arc<str>, ClientRoute>,
     reply_tx: mpsc::UnboundedSender<Reply>,
     reply_rx: mpsc::UnboundedReceiver<Reply>,
+    /// Replies that arrived while a write waited for a barrier, for `recv` to return.
+    received: VecDeque<Reply>,
     pool: SlabPool,
     memory_cap_bytes: u64,
 }
@@ -770,6 +774,45 @@ impl Client {
             },
         );
         (name, core)
+    }
+
+    /// Waits for a barrier out on this stream's route, so that a write can't be sent behind
+    /// it. Safe to cancel: what has arrived is kept.
+    async fn wait_for_barrier(&mut self, stream: &str) -> Result<(), ClientError> {
+        while let Some(route) = self
+            .routes
+            .get(stream)
+            .filter(|route| route.barrier_pending)
+        {
+            let core = route.core;
+            tokio::select! {
+                biased;
+                reply = self.reply_rx.recv() => {
+                    if let Some(reply) = reply.and_then(|reply| self.on_internal(reply)) {
+                        self.received.push_back(reply);
+                    }
+                }
+                _ = self.links.direct[core].closed() => return Err(ClientError::NodeStopped),
+            }
+        }
+        Ok(())
+    }
+
+    /// `wait_for_barrier`, with only what has already arrived. True if none is out.
+    fn barrier_is_back(&mut self, stream: &str) -> bool {
+        while self
+            .routes
+            .get(stream)
+            .is_some_and(|route| route.barrier_pending)
+        {
+            let Ok(reply) = self.reply_rx.try_recv() else {
+                return false;
+            };
+            if let Some(reply) = self.on_internal(reply) {
+                self.received.push_back(reply);
+            }
+        }
+        true
     }
 
     fn publish_msg(&mut self, publish: Publish<'_>) -> (usize, WriteMsg) {
@@ -797,6 +840,7 @@ impl Client {
         while self.pool.account().pinned_bytes() >= self.memory_cap_bytes {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        self.wait_for_barrier(publish.stream).await?;
         let (core, message) = self.publish_msg(publish);
         self.links.direct[core]
             .send(message)
@@ -809,6 +853,9 @@ impl Client {
         if self.pool.account().pinned_bytes() >= self.memory_cap_bytes {
             return Err(ClientError::Full);
         }
+        if !self.barrier_is_back(publish.stream) {
+            return Err(ClientError::Full);
+        }
         let (core, message) = self.publish_msg(publish);
         self.links.direct[core]
             .try_send(message)
@@ -819,6 +866,7 @@ impl Client {
     }
 
     pub async fn state_op(&mut self, request: StateOpRequest<'_>) -> Result<(), ClientError> {
+        self.wait_for_barrier(request.stream).await?;
         let (stream, core) = self.route(request.stream);
         let message = WriteMsg::StateOp(Box::new(StateOpMsg {
             stream,
@@ -890,6 +938,9 @@ impl Client {
 
     /// The next reply. `None` if the node has gone and no more can come.
     pub async fn recv(&mut self) -> Option<Reply> {
+        if let Some(reply) = self.received.pop_front() {
+            return Some(reply);
+        }
         loop {
             let reply = self.reply_rx.recv().await?;
             if let Some(reply) = self.on_internal(reply) {
