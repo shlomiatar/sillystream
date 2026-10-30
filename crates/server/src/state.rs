@@ -181,9 +181,11 @@ fn int_value(n: i128) -> Result<Value, StateError> {
         .map_err(|_| StateError::IncrOverflow)
 }
 
-fn incr_at(slot: &mut Value, path: &[Value], n: i128) -> Result<(), StateError> {
+/// True if it made a new key, which is the only way an `incr` can nest a doc deeper.
+fn incr_at(slot: &mut Value, path: &[Value], n: i128) -> Result<bool, StateError> {
     let Some((key, rest)) = path.split_first() else {
-        return add(slot, n);
+        add(slot, n)?;
+        return Ok(false);
     };
     let Value::Map(map) = slot else {
         return Err(StateError::NotNumeric);
@@ -197,17 +199,18 @@ fn incr_at(slot: &mut Value, path: &[Value], n: i128) -> Result<(), StateError> 
         created = Value::Map(vec![(key.clone(), created)]);
     }
     map.push((key.clone(), created));
-    Ok(())
+    Ok(true)
 }
 
-fn incr(current: Option<Value>, path: &[Value], n: i128) -> Result<Value, StateError> {
+/// The result, and whether it needs checking for depth.
+fn incr(current: Option<Value>, path: &[Value], n: i128) -> Result<(Value, bool), StateError> {
     let mut root = match current {
         Some(value) => value,
-        None if path.is_empty() => return int_value(n),
+        None if path.is_empty() => return Ok((int_value(n)?, false)),
         None => Value::Map(Vec::new()),
     };
-    incr_at(&mut root, path, n)?;
-    Ok(root)
+    let added_key = incr_at(&mut root, path, n)?;
+    Ok((root, added_key))
 }
 
 /// The document after `op`, or an error with nothing changed. `current` is empty if the
@@ -225,8 +228,10 @@ pub fn apply_op(current: &[u8], op: StateOp, doc: &[u8]) -> Result<Bytes, StateE
     } else {
         Some(parse(current)?)
     };
-    let result = match op {
-        StateOp::Merge => merge(current, patch),
+    // A merge can't go deeper than the deeper of two docs that both parsed: at every level,
+    // what it keeps comes from that level of one of them.
+    let (result, may_be_too_deep) = match op {
+        StateOp::Merge => (merge(current, patch), false),
         _ => {
             let (path, n) = parse_incr(patch)?;
             if path.len() > MAX_INCR_PATH_KEYS {
@@ -237,7 +242,9 @@ pub fn apply_op(current: &[u8], op: StateOp, doc: &[u8]) -> Result<Bytes, StateE
     };
     let bytes = encode(&result)?;
     // A doc that can't be parsed would refuse every later merge and incr, and replay.
-    parse(&bytes).map_err(|_| StateError::ResultTooDeep)?;
+    if may_be_too_deep {
+        parse(&bytes).map_err(|_| StateError::ResultTooDeep)?;
+    }
     Ok(Bytes::from(bytes))
 }
 
@@ -320,6 +327,17 @@ mod tests {
             // A merge patch as deep as what it lands on, under a key of its own.
             let patch = Value::Map(vec![(int(9), nested(depth))]);
             if let Ok(result) = apply_op(&current, StateOp::Merge, &cbor(&patch)) {
+                accepted_count += 1;
+                parse(&result).unwrap();
+            }
+            // And along the same keys, with a deep key at the far end.
+            let mut along = Value::Map(vec![(nested(depth / 2), int(1))]);
+            for _ in 0..depth / 2 {
+                along = Value::Map(vec![(int(1), along)]);
+            }
+            let patch = cbor(&along);
+            if parse(&patch).is_ok() {
+                let result = apply_op(&current, StateOp::Merge, &patch).unwrap();
                 accepted_count += 1;
                 parse(&result).unwrap();
             }
