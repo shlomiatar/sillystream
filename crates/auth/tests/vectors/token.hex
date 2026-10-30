@@ -1,0 +1,7 @@
+# secret 'test-secret'. Text form of the token: these bytes in lowercase hex.
+# expiry_ms 1800000000000 | author 7 | n 2
+00 50 5C 18 A3 01 00 00 07 00 00 00 00 00 00 00 02 00
+# 'logs.*' read | 'inbox.reviewer' publish + state
+06 00 6C 6F 67 73 2E 2A 01 0E 00 69 6E 62 6F 78 2E 72 65 76 69 65 77 65 72 06
+# hmac_sha256(secret, body)
+66 BB 54 6B 3E 9F 1C 4C 44 59 AA 62 6A D2 63 06 83 47 28 AB 79 F2 AE E3 89 E1 C8 FD 37 96 1B 3D
