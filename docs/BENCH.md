@@ -106,11 +106,87 @@ Reading these:
 - **Encode is a `memcpy`:** about 80–110 GiB/s, or 12 µs per MiB. `data_prefix` avoids that cost on the delivery path. Whether the delivery path gets the bytes to the socket without a copy is M5's to show.
 - **`SUBSCRIBE`:** clauses add about 3 ns to decode, and a 1 KiB stream id adds about 46 ns over a 15 B one. It is a per-subscription frame, so none of this is on the record path.
 
+## M3: `wal_throughput`
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p storage --bench wal_throughput
+```
+
+Commit: the working tree on top of `58c6402`, committed together with this file. Same machine, load average about 3. The real writer thread, real `sync_data` and the internal SSD (APFS, in the system temp dir). Each run starts a writer on a new 64 MiB `set_len` file, with a channel of 4,096 commands. Senders are real threads retrying `try_append` with `yield_now` on a full channel, and the clock stops when every entry is durable and the writer has exited. Each cell is the total over all of that bench's runs.
+
+| record bytes | senders | entries/s | MiB/s | fsyncs/s | mean group | largest group |
+|---|---|---|---|---|---|---|
+| 256 | 1 | 752,710 | 183.8 | 187 | 4,035 | 4,097 |
+| 256 | 4 | 725,936 | 177.2 | 186 | 3,913 | 4,097 |
+| 256 | 16 | 734,334 | 179.3 | 187 | 3,917 | 4,097 |
+| 4,096 | 1 | 456,268 | 1,782 | 115 | 3,979 | 4,097 |
+| 4,096 | 4 | 443,592 | 1,733 | 118 | 3,756 | 4,097 |
+| 4,096 | 16 | 400,657 | 1,565 | 106 | 3,780 | 4,097 |
+| 65,536 | 1 | 62,636 | 3,915 | 18 | 3,414 | 4,097 |
+| 65,536 | 4 | 61,591 | 3,850 | 23 | 2,672 | 4,097 |
+| 65,536 | 16 | 60,920 | 3,808 | 23 | 2,648 | 4,097 |
+
+`wal_durable_wait`, one entry at a time with one sender: `try_append` to the core's `watch` firing, so one group of one per sync. Mean of the criterion estimate.
+
+| record bytes | time per entry |
+|---|---|
+| 256 | 4.13 ms |
+| 4,096 | 4.30 ms |
+| 65,536 | 4.87 ms |
+
+Reading these:
+
+- **Group commit is what scales:** the group fills to the channel's capacity in every case, because senders refill it during each sync. A lone entry costs about 4 ms, and in a group costs about 1.3 µs.
+- **At 256 B the limit is the channel, not the disk.** About 187 syncs per second × 4,096 entries matches the 750,000 entries/s measured, so a bigger channel might raise it. Sender count makes little difference, since one thread writes.
+- **At 64 KiB the limit is the disk,** about 3.9 GiB/s, with groups of about 170–210 MiB.
+- **Section 7.2's level 2 row:** `wal_durable_wait` is 4–5 ms, against its estimates of 1–4 ms on EBS and 0.1–2 ms on NVMe. That is `F_FULLFSYNC` on this SSD, not either of those, so it confirms or refutes neither. Both rows stay unmeasured estimates.
+
+## M3: `segment`
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p storage --bench segment
+```
+
+Same commit and machine. Each stream has one record with 64 data bytes.
+
+Build, in memory, with no I/O: walking headers, block CRCs, the summary table and the footer. Record bytes aren't copied.
+
+| streams | time | rate |
+|---|---|---|
+| 1 | 232 ns | 4.3 M streams/s |
+| 1,000 | 112 µs | 9.0 M streams/s |
+| 1,000,000 | 164 ms | 6.1 M streams/s |
+| 1 stream, 32 MiB of 4 KiB records | 1.24 ms | 25 GiB/s (CRC speed) |
+
+Reads per lookup, counted through the wrapper store, and one measured `PUT` through `LocalFileSystem`:
+
+| streams | object | pages | top index reads | page reads | data reads | one `PUT` |
+|---|---|---|---|---|---|---|
+| 1 | under 1 MiB | 1 | 1 | 1 | 2 | 333 µs |
+| 1,000 | under 1 MiB | 1 | 1 | 1 | 2 | 2.8 ms |
+| 1,000,000 | 221 MiB | 977 | 1 | 1 | 2 | 2.93 s |
+
+Lookup time on `LocalFileSystem`, on a rotating set of streams, reading the record back with all CRCs checked:
+
+| streams | full lookup | cached top index | stored extent |
+|---|---|---|---|
+| 1 | 104 µs | 78 µs | 52 µs |
+| 1,000 | 115 µs | 81 µs | 52 µs |
+| 1,000,000 | 115 µs | 82 µs | 52 µs |
+
+Reading these:
+
+- **Lookup doesn't depend on stream count:** 1K to 1M streams changes nothing measurable. Each read costs about 26 µs. Where that time goes wasn't profiled.
+- **These reads hit the page cache,** since the object was just written. They count reads, and don't measure a disk or S3.
+- **The 2.93 s `PUT` has about 2M small parts,** two per stream. It wasn't profiled, and S3 wasn't run.
+
 ## Caveats
 
+- `LocalFileSystem` doesn't fsync objects, so its `PUT` isn't a durability figure, and neither it nor these numbers say anything about S3.
+- `sync_data` on macOS is `F_FULLFSYNC`, which behaves differently from `fdatasync` on Linux NVMe or EBS.
 - One laptop, under whatever else it was running. Treat differences under about 2× as noise.
-- These are single-threaded CPU measurements with no I/O, so no latency figure in SPEC.md section 7.2 is confirmed or refuted by them.
+- M1 and M2 are single-threaded CPU measurements with no I/O, and no latency figure in SPEC.md section 7.2 is confirmed or refuted by any number here.
 
 ## Not run yet
 
-`wal_throughput` and `segment` (M3), `write_path` and `state_apply` (M4), `fan_out` (M5), and all load generator numbers (M6, M10).
+`write_path` and `state_apply` (M4), `fan_out` (M5), and all load generator numbers (M6, M10).
