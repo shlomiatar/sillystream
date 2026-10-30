@@ -104,7 +104,7 @@ Benchmarks are a deliverable, not an afterthought. SPEC.md says its latency figu
 
 ### M4. Cores, write path and state
 
-**Scope.** Cores (one tokio current-thread runtime per thread), stream → shard → core placement with override table, per-shard counters, periodic rebalancing through message handoff (section 6.1). Slabs with per-slab reference counts (section 6.5). Write path (section 6.2), dedupe (section 3), ack levels 0–3 (section 7.2), backpressure (D7), seal and handoff to the uploader. State: set, merge and incr, `expect_ver`, atomic publish, system records, and snapshot with head (section 10).
+**Scope.** Cores (one tokio current-thread runtime per thread), stream → shard → core placement with override table, per-shard counters, periodic rebalancing through message handoff (section 6.1). Slabs with per-slab reference counts (section 6.5). Write path (section 6.2), dedupe (section 3), ack levels 0–3 (section 7.2), backpressure (D7), seal and handoff to the uploader, and who enforces the segment size cap of section 7.3 (Q18). State: set, merge and incr, `expect_ver`, atomic publish, system records, and snapshot with head (section 10).
 
 Tested through in-process message APIs, without sockets. Shard moves and crash-related cases get deterministic tests with an injected clock and scripted WAL and store.
 
