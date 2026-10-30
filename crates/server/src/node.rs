@@ -528,6 +528,7 @@ impl Node {
             forwarded: Vec::new(),
             direct: Vec::new(),
             delivery: Vec::new(),
+            reads: Vec::new(),
         };
         let mut inboxes = Vec::new();
         for (durable, uploads) in durable.into_iter().zip(upload_rxs) {
@@ -539,11 +540,14 @@ impl Node {
             links.direct.push(direct_tx);
             let (delivery_tx, delivery) = mpsc::unbounded_channel();
             links.delivery.push(delivery_tx);
+            let (reads_tx, reads) = mpsc::unbounded_channel();
+            links.reads.push(reads_tx);
             inboxes.push(CoreInbox {
                 control,
                 forwarded,
                 direct,
                 delivery,
+                reads,
                 durable,
                 uploads,
             });
@@ -560,6 +564,7 @@ impl Node {
             share_bytes: config.fair_share_bytes,
             window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
             read_bytes: config.catch_up_read_bytes,
+            memory_cap_bytes: config.memory_cap_bytes,
         };
         let mut threads = Vec::with_capacity(core_count + 1);
         for (id, inbox) in inboxes.into_iter().enumerate() {
@@ -587,6 +592,7 @@ impl Node {
                 ),
                 settings,
                 stores: stores.clone(),
+                accounts: accounts.clone(),
             });
             let runtime = runtime()?;
             threads.push(

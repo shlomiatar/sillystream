@@ -8,7 +8,7 @@ use format::IdAllocator;
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::{Event, ExtentRead};
+use crate::connection::{Event, ExtentRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
 use crate::delivery::{ExtentRef, FanOut, StreamDelivery};
@@ -202,6 +202,8 @@ pub struct CoreStats {
     /// One per record per distinct filter (section 5.2).
     pub filter_check_count: u64,
     pub behind_count: u64,
+    /// Stalled connections whose unread frames were taken back under memory pressure (D99).
+    pub stalled_release_count: u64,
     pub progress_count: u64,
     /// Blocks catch-ups on this home core read, and those summaries let them skip.
     pub catch_up_blocks_read_count: u64,
@@ -293,13 +295,8 @@ pub(crate) enum ControlMsg {
     },
     Conn(ConnCmd),
     Attach(Box<AttachMsg>),
-    ReadStep(Box<ReadStepMsg>),
-    ReadChain(Box<ReadChain>),
-    /// A read task on this core has finished.
-    ReadDone {
-        sub: SubRef,
-        done: Box<ReadDone>,
-    },
+    /// An explicit id's retention check, asking a stream's earlier owners (D100).
+    AttachWalk(Box<AttachMsg>),
     Detach {
         stream: Arc<str>,
         filter_id: u32,
@@ -309,8 +306,8 @@ pub(crate) enum ControlMsg {
         stream: Arc<str>,
         name: Arc<str>,
         op: CursorOp,
-        /// Where an error goes: the connection's frames, and the reference to use.
-        report: Option<(mpsc::UnboundedSender<Event>, u32)>,
+        /// Where an error goes.
+        report: Option<CursorReport>,
     },
     /// An upload's extents for a stream whose owner is elsewhere. Goes back to `origin`
     /// when noted, which is what lets it drop its batches (D83).
@@ -341,6 +338,27 @@ pub(crate) enum ControlMsg {
     Stop,
 }
 
+/// A connection on its home core, and the reference an error about a cursor should use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorReport {
+    pub home: usize,
+    pub conn: usize,
+    pub conn_uid: u64,
+    pub reference: u32,
+}
+
+/// Work for catch-ups, which a core does below writes and a little per turn (D101).
+#[derive(Debug)]
+pub(crate) enum ReadMsg {
+    Step(Box<ReadStepMsg>),
+    Chain(Box<ReadChain>),
+    /// A read task on this core has finished.
+    Done {
+        sub: SubRef,
+        done: Box<ReadDone>,
+    },
+}
+
 /// A subscription on its home core.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SubRef {
@@ -353,7 +371,7 @@ pub(crate) struct SubRef {
 #[derive(Debug)]
 pub(crate) enum ConnCmd {
     Open {
-        out: mpsc::UnboundedSender<Event>,
+        out: Arc<Outbox>,
         reply: oneshot::Sender<usize>,
     },
     Subscribe {
@@ -393,6 +411,11 @@ pub(crate) enum ConnCmd {
         conn: usize,
         bytes: u64,
     },
+    /// The client has read a `BEHIND`, so it is reading again.
+    BehindRead {
+        conn: usize,
+        sub: u32,
+    },
     Closed {
         conn: usize,
     },
@@ -414,6 +437,19 @@ pub(crate) struct AttachMsg {
     pub name: Option<Arc<str>>,
     pub with_state: bool,
     pub state_only: bool,
+    /// Set while the check of an explicit id is asking earlier owners (D100).
+    pub walk: Option<AttachWalk>,
+}
+
+/// Which of a stream's earlier owners still have to say what they hold above `cursor`.
+#[derive(Debug)]
+pub(crate) struct AttachWalk {
+    pub owner: usize,
+    pub cursor: u64,
+    /// `(last_id, core)`, oldest first.
+    pub hops: std::collections::VecDeque<(u64, usize)>,
+    /// The lowest id found.
+    pub found_id: Option<u64>,
 }
 
 /// "What comes after `after`?", from a catching-up subscriber to the stream's owner.
@@ -499,5 +535,9 @@ pub(crate) enum DeliveryMsg {
     Catch {
         sub: SubRef,
         reply: CatchReply,
+    },
+    Report {
+        report: CursorReport,
+        event: Event,
     },
 }

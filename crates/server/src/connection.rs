@@ -6,7 +6,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,7 +14,7 @@ use format::{Clause, Decision, Filter};
 use object_store::ObjectStore;
 use proto::ErrorCode;
 use storage::{BlockTable, SegmentError, SegmentReader, UploaderSender};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::core::Links;
@@ -23,9 +23,10 @@ use crate::delivery::{
     cursor_name_is_allowed, walk_records,
 };
 use crate::message::{
-    AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, ReadDone, ReadStepMsg, StreamBody, SubRef,
+    AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
+    ReadStepMsg, StreamBody, SubRef,
 };
-use crate::slab::SlabBytes;
+use crate::slab::{SlabAccount, SlabBytes};
 
 /// `type u8 | flags u8 | sub u32 | len u32` of a `DATA` frame.
 const DATA_FRAME_HEAD_BYTES: u64 = 10;
@@ -33,6 +34,11 @@ const DATA_FRAME_HEAD_BYTES: u64 = 10;
 const READ_RETRY_MS: u64 = 100;
 /// A newly held allocation costs at most this share of a connection's window (D96).
 const HELD_WINDOW_SHARE: u64 = 8;
+/// `type u8 | sub u32 | id u64`: what an unread `PROGRESS` takes from the window (D102).
+const PROGRESS_FRAME_BYTES: u64 = 13;
+/// How often a home core looks at memory pressure, and so how long a client has to take one
+/// frame before it counts as stalled (D99).
+const PRESSURE_CHECK_MS: u64 = 50;
 
 /// One matching stretch of a `DATA` frame: shared bytes, not a copy.
 #[derive(Debug, Clone)]
@@ -55,6 +61,10 @@ pub struct DataFrame {
     len_bytes: u64,
     /// What this frame took from the connection's window, and returns once read (D96).
     window_cost_bytes: u64,
+    /// The subscription it was for, and the id given before it, which is where that
+    /// subscription carries on if this frame is taken back (D99).
+    sub_serial: u64,
+    before_id: u64,
 }
 
 impl DataFrame {
@@ -141,11 +151,108 @@ impl<'a> Subscription<'a> {
     }
 }
 
+#[derive(Debug, Default)]
+struct OutFrames {
+    queue: VecDeque<Event>,
+    taken_count: u64,
+    closed: bool,
+}
+
+/// A connection's frames not yet taken, as a socket's writer would hold them. Its home core
+/// can take frames back, which a channel can't do, so that a client not reading doesn't keep
+/// memory (D99). The lock is between one core and one connection's reader, never two cores.
+#[derive(Debug, Default)]
+pub(crate) struct Outbox {
+    frames: Mutex<OutFrames>,
+    wake: Notify,
+}
+
+impl Outbox {
+    fn lock(&self) -> MutexGuard<'_, OutFrames> {
+        self.frames.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, event: Event) {
+        let mut frames = self.lock();
+        let was_empty = frames.queue.is_empty();
+        frames.queue.push_back(event);
+        drop(frames);
+        if was_empty {
+            self.wake.notify_one();
+        }
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.wake.notify_one();
+    }
+
+    /// The next frame, then `None` once the core has gone and nothing is left.
+    async fn next(&self) -> Option<Event> {
+        loop {
+            {
+                let mut frames = self.lock();
+                if let Some(event) = frames.queue.pop_front() {
+                    frames.taken_count += 1;
+                    return Some(event);
+                }
+                if frames.closed {
+                    return None;
+                }
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    /// `(frames taken so far, whether any wait)`.
+    fn reading_state(&self) -> (u64, bool) {
+        let frames = self.lock();
+        (frames.taken_count, !frames.queue.is_empty())
+    }
+
+    /// Removes the unread `DATA`, and the `PROGRESS` behind it, which would claim past what
+    /// was removed. A `BEHIND` behind it moves back to match. What is left goes on being
+    /// delivered in order, and what the client took before this is untouched.
+    fn take_back(&self) -> TakenBack {
+        let mut taken = TakenBack::default();
+        let mut frames = self.lock();
+        frames.queue.retain_mut(|event| match event {
+            Event::Data { sub, records } => {
+                taken.window_cost_bytes += records.window_cost_bytes;
+                taken
+                    .first_by_sub
+                    .entry(*sub)
+                    .or_insert((records.sub_serial, records.before_id));
+                false
+            }
+            Event::Progress { sub, .. } if taken.first_by_sub.contains_key(sub) => {
+                taken.window_cost_bytes += PROGRESS_FRAME_BYTES;
+                false
+            }
+            Event::Behind { sub, resume_from } => {
+                if let Some((_, before_id)) = taken.first_by_sub.get(sub) {
+                    *resume_from = *before_id;
+                }
+                true
+            }
+            _ => true,
+        });
+        taken
+    }
+}
+
+#[derive(Debug, Default)]
+struct TakenBack {
+    window_cost_bytes: u64,
+    /// `sub → (serial, id given before its first frame taken)`.
+    first_by_sub: HashMap<u32, (u64, u64)>,
+}
+
 /// One connection's handle on its home core.
 pub struct Connection {
     control: mpsc::UnboundedSender<ControlMsg>,
     conn: usize,
-    rx: mpsc::UnboundedReceiver<Event>,
+    out: Arc<Outbox>,
     credit_owed_bytes: u64,
     credit_step_bytes: u64,
 }
@@ -155,16 +262,19 @@ impl Connection {
         control: mpsc::UnboundedSender<ControlMsg>,
         window_bytes: u64,
     ) -> Option<Connection> {
-        let (out, rx) = mpsc::unbounded_channel();
+        let out = Arc::new(Outbox::default());
         let (reply, answer) = oneshot::channel();
         control
-            .send(ControlMsg::Conn(ConnCmd::Open { out, reply }))
+            .send(ControlMsg::Conn(ConnCmd::Open {
+                out: Arc::clone(&out),
+                reply,
+            }))
             .ok()?;
         let conn = answer.await.ok()?;
         Some(Connection {
             control,
             conn,
-            rx,
+            out,
             credit_owed_bytes: 0,
             credit_step_bytes: (window_bytes / 4).max(1),
         })
@@ -231,11 +341,19 @@ impl Connection {
         answer.await.ok().flatten()
     }
 
-    /// Returns what a frame took from the window, which only `DATA` and `STATE` do.
+    /// Returns what a frame took from the window, which `DATA`, `STATE` and `PROGRESS` do.
     fn took(&mut self, event: &Event) {
         self.credit_owed_bytes += match event {
             Event::Data { records, .. } => records.window_cost_bytes,
             Event::State { doc, .. } => doc.len() as u64,
+            Event::Progress { .. } => PROGRESS_FRAME_BYTES,
+            Event::Behind { sub, .. } => {
+                self.send(ConnCmd::BehindRead {
+                    conn: self.conn,
+                    sub: *sub,
+                });
+                return;
+            }
             _ => return,
         };
         if self.credit_owed_bytes >= self.credit_step_bytes {
@@ -249,14 +367,14 @@ impl Connection {
 
     /// The next frame, as a socket taking it. `None` once the node has gone.
     pub async fn recv(&mut self) -> Option<Event> {
-        let event = self.rx.recv().await?;
+        let event = self.out.next().await?;
         self.took(&event);
         Some(event)
     }
 
     /// The next frame within `wait_ms`.
     pub async fn recv_within(&mut self, wait_ms: u64) -> Option<Event> {
-        let waited = tokio::time::timeout(Duration::from_millis(wait_ms), self.rx.recv()).await;
+        let waited = tokio::time::timeout(Duration::from_millis(wait_ms), self.out.next()).await;
         let event = waited.ok().flatten()?;
         self.took(&event);
         Some(event)
@@ -279,6 +397,7 @@ pub(crate) struct DeliverySettings {
     pub share_bytes: u64,
     pub window_bytes: u64,
     pub read_bytes: u64,
+    pub memory_cap_bytes: u64,
 }
 
 /// Which stores a catch-up reads, nearest first.
@@ -292,6 +411,7 @@ pub(crate) struct Stores {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HomeStats {
     pub behind_count: u64,
+    pub stalled_release_count: u64,
     pub progress_count: u64,
     pub blocks_read_count: u64,
     pub blocks_skipped_count: u64,
@@ -323,7 +443,10 @@ struct ExtentProgress {
 }
 
 struct Sub {
+    /// Changes when it falls behind, so that a read in flight is ignored.
     uid: u64,
+    /// Stays for the subscription's life.
+    serial: u64,
     conn: usize,
     id: u32,
     stream: Arc<str>,
@@ -349,6 +472,8 @@ struct Sub {
     last_progress: Option<Instant>,
     head_progress_owed: bool,
     read_out: bool,
+    /// A `BEHIND` is on its way. Catching up waits until the client has read it (D86, D99).
+    behind_unread: bool,
     extent: Option<ExtentProgress>,
     read_bytes_since: u64,
     state_ver: u64,
@@ -413,7 +538,11 @@ impl Sub {
         held_charge_bytes: u64,
         spans: &mut Vec<RecordSpan>,
     ) -> DataFrame {
-        let mut frame = DataFrame::default();
+        let mut frame = DataFrame {
+            sub_serial: self.serial,
+            before_id: self.handed_through,
+            ..DataFrame::default()
+        };
         let mut left_bytes = budget_bytes as usize;
         while left_bytes > 0 {
             let Some(item) = self.queue.front_mut() else {
@@ -516,12 +645,21 @@ impl Sub {
 }
 
 struct Conn {
-    out: mpsc::UnboundedSender<Event>,
+    uid: u64,
+    out: Arc<Outbox>,
+    /// `taken_count` at the last pressure check, if frames were waiting then.
+    stall_seen: Option<u64>,
     window_left_bytes: i64,
     /// Subscriptions with something due, taking turns: this is the fair share.
     turns: VecDeque<usize>,
     subs: HashMap<u32, usize>,
     in_ready: bool,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.out.close();
+    }
 }
 
 #[derive(Default)]
@@ -548,6 +686,9 @@ pub(crate) struct Home {
     settings: DeliverySettings,
     stores: Stores,
     uploader: UploaderSender<SlabBytes>,
+    /// Every core's slab account: a subscriber here can pin a publisher's slabs anywhere.
+    accounts: Vec<SlabAccount>,
+    next_pressure_check: Instant,
     conns: Vec<Option<Conn>>,
     free_conns: Vec<usize>,
     subs: Vec<Option<Sub>>,
@@ -571,6 +712,7 @@ impl Home {
         settings: DeliverySettings,
         stores: Stores,
         uploader: UploaderSender<SlabBytes>,
+        accounts: Vec<SlabAccount>,
     ) -> Home {
         Home {
             me,
@@ -578,6 +720,8 @@ impl Home {
             settings,
             stores,
             uploader,
+            accounts,
+            next_pressure_check: Instant::now(),
             conns: Vec::new(),
             free_conns: Vec::new(),
             subs: Vec::new(),
@@ -609,7 +753,7 @@ impl Home {
 
     fn send_event(&self, conn: usize, event: Event) {
         if let Some(Some(conn)) = self.conns.get(conn) {
-            let _ = conn.out.send(event);
+            conn.out.push(event);
         }
     }
 
@@ -625,8 +769,12 @@ impl Home {
     pub fn on_command(&mut self, command: ConnCmd) {
         match command {
             ConnCmd::Open { out, reply } => {
+                let uid = self.next_uid;
+                self.next_uid += 1;
                 let conn = Conn {
+                    uid,
                     out,
+                    stall_seen: None,
                     window_left_bytes: self.settings.window_bytes as i64,
                     turns: VecDeque::new(),
                     subs: HashMap::new(),
@@ -691,7 +839,7 @@ impl Home {
                     );
                     return;
                 }
-                let report = self.conns[conn].as_ref().map(|c| (c.out.clone(), 0));
+                let report = self.cursor_report(conn, 0);
                 self.post_cursor(stream, name, CursorOp::Reset(id), report);
             }
             ConnCmd::ReadCursor {
@@ -700,7 +848,36 @@ impl Home {
                 reply,
             } => self.post_cursor(stream, name, CursorOp::Read(reply), None),
             ConnCmd::Credit { conn, bytes } => self.on_credit(conn, bytes),
+            ConnCmd::BehindRead { conn, sub } => {
+                let key = self.conns[conn]
+                    .as_ref()
+                    .and_then(|c| c.subs.get(&sub).copied());
+                if let Some(key) = key {
+                    if let Some(Some(sub)) = self.subs.get_mut(key) {
+                        sub.behind_unread = false;
+                    }
+                    self.pump_catch_up(key);
+                }
+            }
             ConnCmd::Closed { conn } => self.close(conn),
+        }
+    }
+
+    fn cursor_report(&self, conn: usize, reference: u32) -> Option<CursorReport> {
+        self.conns[conn].as_ref().map(|c| CursorReport {
+            home: self.me,
+            conn,
+            conn_uid: c.uid,
+            reference,
+        })
+    }
+
+    /// An owner's error about a cursor, for a connection that may have gone since.
+    pub fn on_report(&mut self, report: CursorReport, event: Event) {
+        if let Some(Some(conn)) = self.conns.get(report.conn)
+            && conn.uid == report.conn_uid
+        {
+            conn.out.push(event);
         }
     }
 
@@ -709,7 +886,7 @@ impl Home {
         stream: Arc<str>,
         name: Arc<str>,
         op: CursorOp,
-        report: Option<(mpsc::UnboundedSender<Event>, u32)>,
+        report: Option<CursorReport>,
     ) {
         let _ = self.links.control[self.me].send(ControlMsg::Cursor {
             stream,
@@ -737,7 +914,7 @@ impl Home {
             );
             return;
         };
-        let report = self.conns[conn].as_ref().map(|c| (c.out.clone(), sub));
+        let report = self.cursor_report(conn, sub);
         self.post_cursor(stream, name, CursorOp::Commit(id), report);
     }
 
@@ -787,6 +964,7 @@ impl Home {
         self.next_uid += 1;
         let sub = Sub {
             uid,
+            serial: uid,
             conn,
             id,
             stream: Arc::clone(&stream),
@@ -807,6 +985,7 @@ impl Home {
             last_progress: None,
             head_progress_owed: false,
             read_out: false,
+            behind_unread: false,
             extent: None,
             read_bytes_since: 0,
             state_ver: 0,
@@ -834,6 +1013,7 @@ impl Home {
             name,
             with_state,
             state_only,
+            walk: None,
         })));
     }
 
@@ -974,7 +1154,7 @@ impl Home {
                 let frame = sub.take_frame(share_bytes, held_charge_bytes, &mut spans);
                 if frame.len_bytes > 0 {
                     connection.window_left_bytes -= frame.window_cost_bytes as i64;
-                    let _ = connection.out.send(Event::Data {
+                    connection.out.push(Event::Data {
                         sub: sub.id,
                         records: frame,
                     });
@@ -1027,7 +1207,7 @@ impl Home {
         if !sub.queue.is_empty() {
             return false;
         }
-        let Some(Some(connection)) = self.conns.get(sub.conn) else {
+        let Some(Some(connection)) = self.conns.get_mut(sub.conn) else {
             return true;
         };
         if connection.window_left_bytes <= 0 {
@@ -1040,7 +1220,8 @@ impl Home {
         sub.last_progress = Some(now);
         sub.handed_through = id;
         sub.position = id;
-        let _ = connection.out.send(Event::Progress { sub: sub.id, id });
+        connection.window_left_bytes -= PROGRESS_FRAME_BYTES as i64;
+        connection.out.push(Event::Progress { sub: sub.id, id });
         self.stats.progress_count += 1;
         true
     }
@@ -1049,10 +1230,75 @@ impl Home {
     pub fn next_deadline(&self) -> Option<Instant> {
         let linger = self.linger.peek().map(|Reverse((at, _, _))| *at);
         let progress = (!self.skipping.is_empty()).then_some(self.next_progress_check);
-        match (linger, progress) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
+        let pressure =
+            (self.conns.len() > self.free_conns.len()).then_some(self.next_pressure_check);
+        [linger, progress, pressure].into_iter().flatten().min()
+    }
+
+    fn is_under_pressure(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|account| account.pinned_bytes() / 3 >= self.settings.memory_cap_bytes / 4)
+    }
+
+    /// Nothing else lets go of what a stalled client holds once publishers have stopped, as
+    /// overflow only happens when a record arrives. A connection whose frames waited through
+    /// a whole check, with none taken, is stalled (D99).
+    fn check_pressure(&mut self) {
+        if !self.is_under_pressure() {
+            return;
         }
+        for conn in 0..self.conns.len() {
+            let Some(Some(connection)) = self.conns.get_mut(conn) else {
+                continue;
+            };
+            let (taken_count, waiting) = connection.out.reading_state();
+            let stalled = waiting && connection.stall_seen == Some(taken_count);
+            connection.stall_seen = waiting.then_some(taken_count);
+            if stalled {
+                self.release_stalled(conn);
+            }
+        }
+    }
+
+    /// Takes back all a stalled connection's records, queued or sent and unread. Each of its
+    /// subscriptions that lost any goes back to what the client has really seen.
+    fn release_stalled(&mut self, conn: usize) {
+        let Some(Some(connection)) = self.conns.get_mut(conn) else {
+            return;
+        };
+        let taken = connection.out.take_back();
+        connection.window_left_bytes += taken.window_cost_bytes as i64;
+        let keys: Vec<usize> = connection.subs.values().copied().collect();
+        let mut released = false;
+        for key in keys {
+            let Some(Some(sub)) = self.subs.get_mut(key) else {
+                continue;
+            };
+            let lost_frames = match taken.first_by_sub.get(&sub.id) {
+                Some((serial, before_id)) if *serial == sub.serial => {
+                    sub.handed_through = *before_id;
+                    sub.frame_held = None;
+                    true
+                }
+                _ => false,
+            };
+            if !lost_frames && sub.queue.is_empty() {
+                continue;
+            }
+            released = true;
+            if sub.behind_unread {
+                // The `BEHIND` it has yet to read has been moved back to this.
+                sub.position = sub.handed_through;
+            } else if matches!(sub.mode, Mode::Live { .. } | Mode::CatchUp) {
+                self.fall_behind(key);
+            }
+        }
+        if released {
+            self.stats.stalled_release_count += 1;
+        }
+        // The window has opened, and turns left over from when it closed need taking.
+        self.make_ready(conn);
     }
 
     pub fn on_timer(&mut self) {
@@ -1074,6 +1320,10 @@ impl Home {
             self.next_progress_check =
                 now + Duration::from_millis((self.settings.progress_interval_ms / 4).max(1));
             self.check_progress();
+        }
+        if self.next_pressure_check <= now {
+            self.next_pressure_check = now + Duration::from_millis(PRESSURE_CHECK_MS);
+            self.check_pressure();
         }
     }
 
@@ -1278,7 +1528,7 @@ impl Home {
         if let Some((ver, doc)) = sub.latest_state.take() {
             sub.state_ver = ver;
             connection.window_left_bytes -= doc.len() as i64;
-            let _ = connection.out.send(Event::State {
+            connection.out.push(Event::State {
                 sub: sub.id,
                 ver,
                 doc,
@@ -1290,6 +1540,8 @@ impl Home {
     /// carries on from what it was last given, by catching up (D86).
     fn fall_behind(&mut self, key: usize) {
         self.leave_group(key);
+        let uid = self.next_uid;
+        self.next_uid += 1;
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
@@ -1297,7 +1549,12 @@ impl Home {
         sub.due = false;
         sub.mode = Mode::CatchUp;
         sub.position = sub.handed_through;
+        // What a read in flight brings back starts from a position this one has left.
+        sub.uid = uid;
         sub.read_out = false;
+        sub.timer_armed = false;
+        sub.head_progress_owed = false;
+        sub.behind_unread = true;
         sub.extent = None;
         let (conn, id, resume_from) = (sub.conn, sub.id, sub.handed_through);
         self.stats.behind_count += 1;
@@ -1318,7 +1575,11 @@ impl Home {
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
-        if sub.mode != Mode::CatchUp || sub.read_out || sub.queue_cost_bytes() > queue_low_bytes {
+        if sub.mode != Mode::CatchUp
+            || sub.read_out
+            || sub.behind_unread
+            || sub.queue_cost_bytes() > queue_low_bytes
+        {
             return;
         }
         let window_open = self
@@ -1340,7 +1601,7 @@ impl Home {
                 filter: range_filter(&sub.filter, sub.position, extent.limit),
                 position: sub.position,
                 budget_bytes: read_bytes,
-                back: self.links.control[self.me].clone(),
+                back: self.links.reads[self.me].clone(),
                 sub: SubRef {
                     home: self.me,
                     key,
@@ -1362,7 +1623,7 @@ impl Home {
             after: sub.position,
             read_bytes: std::mem::take(&mut sub.read_bytes_since),
         };
-        let _ = self.links.control[self.me].send(ControlMsg::ReadStep(Box::new(message)));
+        let _ = self.links.reads[self.me].send(ReadMsg::Step(Box::new(message)));
     }
 
     fn enqueue_read(&mut self, key: usize, matched: Option<Arc<Matched>>) {
@@ -1418,7 +1679,7 @@ impl Home {
                     if let Some(last) = spans.last() {
                         position = position.max(last.header.last_id());
                     }
-                    matched.extend(Matched::select(&bytes, &spans, &filter));
+                    matched.extend(Matched::select(&bytes, &spans, &filter, &mut 0));
                 }
                 self.spans = spans;
                 for one in matched {
@@ -1507,7 +1768,7 @@ impl Home {
                     let bytes = SharedBytes::Plain(bytes);
                     let mut spans = std::mem::take(&mut self.spans);
                     walk_records(&bytes, &mut spans);
-                    let matched = Matched::select(&bytes, &spans, &filter);
+                    let matched = Matched::select(&bytes, &spans, &filter, &mut 0);
                     self.spans = spans;
                     self.enqueue_read(key, matched);
                 }
@@ -1537,7 +1798,7 @@ struct ExtentJob {
     filter: Filter,
     position: u64,
     budget_bytes: u64,
-    back: mpsc::UnboundedSender<ControlMsg>,
+    back: mpsc::UnboundedSender<ReadMsg>,
     sub: SubRef,
 }
 
@@ -1646,7 +1907,7 @@ async fn run_extent_job(job: ExtentJob) {
             },
         },
     };
-    let _ = job.back.send(ControlMsg::ReadDone {
+    let _ = job.back.send(ReadMsg::Done {
         sub: job.sub,
         done: Box::new(done),
     });

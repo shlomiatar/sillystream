@@ -92,15 +92,18 @@ pub struct Matched {
 }
 
 impl Matched {
-    /// The records `filter` picks. `None` if none.
+    /// The records `filter` picks. `None` if none. Each record looked at adds one to
+    /// `check_count`, which is what makes that counter a count (section 5.2).
     pub(crate) fn select(
         bytes: &SharedBytes,
         spans: &[RecordSpan],
         filter: &Filter,
+        check_count: &mut u64,
     ) -> Option<Arc<Matched>> {
         let mut runs: Vec<Run> = Vec::new();
         let mut total_bytes = 0;
         for span in spans {
+            *check_count += 1;
             if !filter.matches(&span.header) {
                 continue;
             }
@@ -235,15 +238,15 @@ impl FilterTable {
     ) -> (Vec<(u32, Arc<Matched>)>, u64, u64) {
         let mut matches = Vec::with_capacity(self.entries.len());
         let mut fan_out_bytes = 0;
+        let mut check_count = 0;
         for entry in &self.entries {
-            if let Some(matched) = Matched::select(bytes, spans, &entry.filter) {
+            if let Some(matched) = Matched::select(bytes, spans, &entry.filter, &mut check_count) {
                 let sub_count: u64 = entry.subs_by_core.iter().map(|n| u64::from(*n)).sum();
                 fan_out_bytes += matched.total_bytes * sub_count;
                 matches.push((entry.id, matched));
             }
         }
-        let checks = spans.len() as u64 * self.entries.len() as u64;
-        (matches, checks, fan_out_bytes)
+        (matches, check_count, fan_out_bytes)
     }
 }
 
@@ -331,6 +334,19 @@ impl StreamDelivery {
         );
     }
 
+    /// An id known to be above `after` in the extents, and the lowest one if the extent
+    /// starts above it. An extent holding `after` shows only its own last id: what comes
+    /// next inside it isn't known without reading it (D89).
+    pub fn sealed_id_above(&self, after: u64) -> Option<u64> {
+        self.first_extent_after(after).map(|known| {
+            if known.extent.id_first > after {
+                known.extent.id_first
+            } else {
+                known.extent.id_last
+            }
+        })
+    }
+
     /// The first extent holding any id above `after`.
     pub fn first_extent_after(&self, after: u64) -> Option<&ExtentRef> {
         let at = self
@@ -348,4 +364,51 @@ pub(crate) fn retention_start_id(now_ms: u64, retention_ms: u64) -> u64 {
 /// A cursor name for clients. `sink:` names belong to sinks (D27).
 pub(crate) fn cursor_name_is_allowed(name: &str) -> bool {
     !name.starts_with("sink:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use format::Clause;
+
+    fn filter(value: u64) -> Filter {
+        Filter::new(&[Clause::Eq { mask: 1, value }]).unwrap()
+    }
+
+    /// Thousands of subscribers under each filter change nothing: the count comes from where
+    /// a filter is evaluated, so another evaluation anywhere in `check` shows here.
+    #[test]
+    fn a_check_counts_one_evaluation_per_record_per_filter() {
+        let mut table = FilterTable::new(2);
+        let mut stored = Vec::new();
+        for (id, options) in [(10, 0), (11, 1), (12, 1), (13, 0), (14, 1)] {
+            let header = RecordHeader {
+                id,
+                options,
+                author: 5,
+                len: 4,
+                count: 1,
+                codec: 0,
+            };
+            format::encode_record(&mut stored, &header, b"data").unwrap();
+        }
+        for at in 0..3_000 {
+            table.attach(filter(at % 2), at as usize % 2);
+        }
+        let mut other_author = filter(0);
+        other_author.author = Some(7);
+        table.attach(other_author, 0);
+
+        let bytes = SharedBytes::Plain(Bytes::from(stored));
+        let mut spans = Vec::new();
+        walk_records(&bytes, &mut spans);
+        assert_eq!(spans.len(), 5);
+        let (matches, check_count, _) = table.check(&bytes, &spans);
+        assert_eq!(check_count, 5 * 3);
+        assert_eq!(
+            matches.len(),
+            2,
+            "filter 0, filter 1, and the author matches none"
+        );
+    }
 }

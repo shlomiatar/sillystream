@@ -27,12 +27,13 @@ use crate::delivery::{
     retention_start_id, walk_records,
 };
 use crate::message::{
-    AttachMsg, CatchReply, ControlMsg, CoreStats, CursorOp, DeliveryMsg, ProbeTarget, PublishMsg,
-    ReadChain, ReadStepMsg, Reply, ReplyTx, ShardHandoff, SnapshotReply, StateChange, StateOpMsg,
-    StreamBody, StreamConfig, StreamHandoff, SubRef, WriteMsg,
+    AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
+    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, ShardHandoff,
+    SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff, SubRef,
+    WriteMsg,
 };
 use crate::placement::{ShardCounters, shard_of};
-use crate::slab::{SlabBytes, SlabPool};
+use crate::slab::{SlabAccount, SlabBytes, SlabPool};
 use crate::state::{StreamState, apply_op, check_doc};
 
 /// How often a core retries what didn't fit in a full channel. Crossbeam gives nothing
@@ -45,6 +46,9 @@ const WAL_STOPPED_MSG: &str = "the WAL writer has stopped, so nothing can be mad
 /// How many delivery messages a core takes per turn of its loop, whatever else is waiting,
 /// so that neither writes nor fan-out can starve the other (D85).
 const DELIVERY_PER_TURN_COUNT: usize = 16;
+/// How many more steps of catching up a core does on a turn that had nothing above reads to
+/// do. On any other turn it does one, so reads can't starve either (D101).
+const READS_PER_IDLE_TURN_COUNT: usize = 4;
 
 #[derive(Clone)]
 pub(crate) struct Links {
@@ -58,6 +62,8 @@ pub(crate) struct Links {
     /// From owners to home cores. Unbounded, since an owner never waits for a subscriber:
     /// each home core drops what is over its own bounds.
     pub delivery: Vec<mpsc::UnboundedSender<DeliveryMsg>>,
+    /// Catch-up's reads, which have their own channel so that nothing waits on them (D101).
+    pub reads: Vec<mpsc::UnboundedSender<ReadMsg>>,
 }
 
 /// What a core tells the node's control thread.
@@ -82,6 +88,7 @@ pub(crate) struct CoreInbox {
     pub forwarded: mpsc::UnboundedReceiver<WriteMsg>,
     pub direct: mpsc::Receiver<WriteMsg>,
     pub delivery: mpsc::UnboundedReceiver<DeliveryMsg>,
+    pub reads: mpsc::UnboundedReceiver<ReadMsg>,
     pub durable: watch::Receiver<u64>,
     pub uploads: mpsc::UnboundedReceiver<UploadEvent>,
 }
@@ -390,6 +397,7 @@ pub(crate) struct CoreParts {
     pub pool: SlabPool,
     pub settings: DeliverySettings,
     pub stores: Stores,
+    pub accounts: Vec<SlabAccount>,
 }
 
 impl Core {
@@ -412,6 +420,7 @@ impl Core {
             parts.settings,
             parts.stores,
             parts.uploader.clone(),
+            parts.accounts,
         );
         Core {
             config,
@@ -468,6 +477,7 @@ impl Core {
             let need_retry = (!self.outbound.is_empty() && !self.wal_stopped)
                 || (!self.uploads_out.is_empty() && !self.upload_stopped);
             let home_deadline = self.home.next_deadline();
+            let mut reads_this_turn = 1;
             tokio::select! {
                 biased;
                 message = self.inbox.control.recv() => match message {
@@ -502,12 +512,24 @@ impl Core {
                         self.on_delivery(message);
                     }
                 },
+                message = self.inbox.reads.recv() => {
+                    if let Some(message) = message {
+                        self.on_read(message);
+                    }
+                    reads_this_turn = READS_PER_IDLE_TURN_COUNT;
+                },
             }
             for _ in 0..DELIVERY_PER_TURN_COUNT {
                 let Ok(message) = self.inbox.delivery.try_recv() else {
                     break;
                 };
                 self.on_delivery(message);
+            }
+            for _ in 0..reads_this_turn {
+                let Ok(message) = self.inbox.reads.try_recv() else {
+                    break;
+                };
+                self.on_read(message);
             }
             if self
                 .home
@@ -527,6 +549,15 @@ impl Core {
         match message {
             DeliveryMsg::Stream { stream, seq, body } => self.home.on_stream(stream, seq, body),
             DeliveryMsg::Catch { sub, reply } => self.home.on_catch(sub, reply),
+            DeliveryMsg::Report { report, event } => self.home.on_report(report, event),
+        }
+    }
+
+    fn on_read(&mut self, message: ReadMsg) {
+        match message {
+            ReadMsg::Step(message) => self.on_read_step(*message),
+            ReadMsg::Chain(chain) => self.on_read_chain(chain),
+            ReadMsg::Done { sub, done } => self.home.on_read_done(sub, *done),
         }
     }
 
@@ -1381,8 +1412,10 @@ impl Core {
     }
 
     /// Where a subscriber starts (section 5.1), then live or catching up.
-    fn on_attach(&mut self, message: AttachMsg) {
+    fn on_attach(&mut self, mut message: AttachMsg) {
         if let Route::Forward(to) = self.route(&message.stream) {
+            // Whatever a walk found, a move since means another core to ask.
+            message.walk = None;
             let _ = self.links.control[to].send(ControlMsg::Attach(Box::new(message)));
             return;
         }
@@ -1412,20 +1445,41 @@ impl Core {
             id => id,
         };
         if from != 0 && from != u64::MAX {
-            let next_id = [
-                stream
-                    .delivery
-                    .first_extent_after(cursor)
-                    .map(|known| known.extent.id_first),
-                self.logs
-                    .get(&*message.stream)
-                    .and_then(|log| log.read_after(cursor, u64::MAX, 1).first().map(first_id)),
+            // Only a record below the start can be missed, and only earlier owners may
+            // hold one in memory, so most subscribers ask nobody (D100).
+            if message.walk.is_none() && cursor.saturating_add(1) < retention_start {
+                let me = self.config.id;
+                let hops: VecDeque<(u64, usize)> = stream
+                    .owners
+                    .iter()
+                    .filter(|(end, core)| *end > cursor && *core != me)
+                    .copied()
+                    .collect();
+                if !hops.is_empty() {
+                    message.walk = Some(AttachWalk {
+                        owner: me,
+                        cursor,
+                        hops,
+                        found_id: None,
+                    });
+                    self.on_attach_walk(Box::new(message));
+                    return;
+                }
+            }
+            let own_id = self
+                .logs
+                .get(&*message.stream)
+                .and_then(|log| next_id_in_log(log, cursor, u64::MAX));
+            let lowest_id = [
+                stream.delivery.sealed_id_above(cursor),
+                own_id,
+                message.walk.as_ref().and_then(|walk| walk.found_id),
             ]
             .into_iter()
             .flatten()
             .min()
             .unwrap_or(head);
-            if cursor < head && next_id < retention_start {
+            if cursor < head && lowest_id < retention_start {
                 self.send_catch(
                     sub,
                     CatchReply::Fail {
@@ -1482,6 +1536,30 @@ impl Core {
                 },
             );
         }
+    }
+
+    /// One earlier owner says what it holds above the cursor, oldest stretch first, and the
+    /// answer goes back to the owner, who decides.
+    fn on_attach_walk(&mut self, mut message: Box<AttachMsg>) {
+        let me = self.config.id;
+        let walk = message.walk.as_mut().expect("only a walk gets here");
+        while let Some((end, core)) = walk.hops.pop_front() {
+            if core != me {
+                walk.hops.push_front((end, core));
+                let _ = self.links.control[core].send(ControlMsg::AttachWalk(message));
+                return;
+            }
+            let found = self
+                .logs
+                .get(&*message.stream)
+                .and_then(|log| next_id_in_log(log, walk.cursor, end));
+            if found.is_some() {
+                walk.found_id = found;
+                walk.hops.clear();
+            }
+        }
+        let owner = walk.owner;
+        let _ = self.links.control[owner].send(ControlMsg::Attach(message));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1562,7 +1640,7 @@ impl Core {
     /// in one step here, so nothing falls between the read and live (section 5.1).
     fn on_read_step(&mut self, message: ReadStepMsg) {
         if let Route::Forward(to) = self.route(&message.stream) {
-            let _ = self.links.control[to].send(ControlMsg::ReadStep(Box::new(message)));
+            let _ = self.links.reads[to].send(ReadMsg::Step(Box::new(message)));
             return;
         }
         let me = self.config.id;
@@ -1618,7 +1696,7 @@ impl Core {
         while let Some((end, core)) = chain.hops.pop_front() {
             if core != self.config.id {
                 chain.hops.push_front((end, core));
-                let _ = self.links.control[core].send(ControlMsg::ReadChain(chain));
+                let _ = self.links.reads[core].send(ReadMsg::Chain(chain));
                 return;
             }
             if let Some(log) = self.logs.get(&*chain.stream) {
@@ -1631,7 +1709,7 @@ impl Core {
             }
         }
         if let Route::Forward(to) = self.route(&chain.stream) {
-            let _ = self.links.control[to].send(ControlMsg::ReadChain(chain));
+            let _ = self.links.reads[to].send(ReadMsg::Chain(chain));
             return;
         }
         let extent = self
@@ -1662,7 +1740,7 @@ impl Core {
         name: Arc<str>,
         cursor: Arc<str>,
         op: CursorOp,
-        report: Option<(mpsc::UnboundedSender<crate::connection::Event>, u32)>,
+        report: Option<CursorReport>,
     ) {
         if let Route::Forward(to) = self.route(&name) {
             let _ = self.links.control[to].send(ControlMsg::Cursor {
@@ -1674,11 +1752,14 @@ impl Core {
             return;
         }
         let fail = |code, msg: &str| {
-            if let Some((out, reference)) = &report {
-                let _ = out.send(crate::connection::Event::Error {
-                    reference: *reference,
-                    code,
-                    msg: msg.to_owned(),
+            if let Some(report) = report {
+                let _ = self.links.delivery[report.home].send(DeliveryMsg::Report {
+                    report,
+                    event: crate::connection::Event::Error {
+                        reference: report.reference,
+                        code,
+                        msg: msg.to_owned(),
+                    },
                 });
             }
         };
@@ -1988,6 +2069,7 @@ impl Core {
                     forwarded_count: self.forwarded_count,
                     filter_check_count: self.filter_check_count,
                     behind_count: self.home.stats.behind_count,
+                    stalled_release_count: self.home.stats.stalled_release_count,
                     progress_count: self.home.stats.progress_count,
                     catch_up_blocks_read_count: self.home.stats.blocks_read_count,
                     catch_up_blocks_skipped_count: self.home.stats.blocks_skipped_count,
@@ -2005,9 +2087,7 @@ impl Core {
             } => self.ack_local(&stream, last_id, level, ack, reply),
             ControlMsg::Conn(command) => self.home.on_command(command),
             ControlMsg::Attach(message) => self.on_attach(*message),
-            ControlMsg::ReadStep(message) => self.on_read_step(*message),
-            ControlMsg::ReadChain(chain) => self.on_read_chain(chain),
-            ControlMsg::ReadDone { sub, done } => self.home.on_read_done(sub, *done),
+            ControlMsg::AttachWalk(message) => self.on_attach_walk(message),
             ControlMsg::Detach {
                 stream,
                 filter_id,
@@ -2275,6 +2355,14 @@ async fn sleep_until_some(at: Option<tokio::time::Instant>) {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
+}
+
+/// The lowest id this core holds above `after`, in batches ending by `through`. Ids within a
+/// batch run without gaps.
+fn next_id_in_log(log: &StreamLog, after: u64, through: u64) -> Option<u64> {
+    log.read_after(after, through, 1)
+        .first()
+        .map(|batch| first_id(batch).max(after + 1))
 }
 
 fn first_id(batch: &SlabBytes) -> u64 {
