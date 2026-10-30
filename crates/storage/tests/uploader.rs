@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use common::{CountingStore, concat, record};
@@ -14,7 +14,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use storage::{
     Section, SectionExtent, SegmentCache, SegmentReader, UnfinishedUpload, UploadEvent, UploadKey,
-    UploadSendError, Uploader, UploaderConfig, dedicated_path, seal_path,
+    UploadSendError, Uploader, UploaderConfig, UploaderSender, dedicated_path, seal_path,
     stream_fits_dedicated_path,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -619,4 +619,79 @@ async fn a_store_error_that_retrying_cannot_change_fails_alone() {
     assert!(matches!(seen[0], UploadEvent::Failed { .. }), "{seen:?}");
     assert_eq!(seen.len(), 2, "{seen:?}");
     assert_eq!(uploader.shutdown().unfinished.len(), 1);
+}
+
+/// Sends a new seal's section until told to stop or until the uploader has stopped.
+/// With `section_count = 2` each stays pending, so an accepted one has to come back.
+fn send_until_stopped(
+    sender: &UploaderSender<Bytes>,
+    give_up: &AtomicBool,
+    spins_between_sends: u32,
+) -> usize {
+    let mut accepted = 0;
+    let mut seal = 0;
+    while !give_up.load(Ordering::Relaxed) {
+        let section = Section {
+            extents: Vec::new(),
+        };
+        match sender.try_send_section(seal, 0, section) {
+            Ok(()) => {
+                accepted += 1;
+                seal += 1;
+            }
+            Err(UploadSendError::Full(_)) => {}
+            Err(UploadSendError::Stopped(_)) => break,
+        }
+        for _ in 0..spins_between_sends {
+            std::hint::spin_loop();
+        }
+    }
+    accepted
+}
+
+#[test]
+fn every_section_accepted_around_shutdown_comes_back() {
+    for run in 0..500 {
+        let (mut config, _events) = config(Arc::new(InMemory::new()), 2);
+        config.channel_capacity = 1024;
+        let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+        let give_up = AtomicBool::new(false);
+        let (accepted, returned) = std::thread::scope(|scope| {
+            let sending = scope.spawn(|| send_until_stopped(&sender, &give_up, 200));
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            let exit = uploader.shutdown();
+            (sending.join().unwrap(), exit.unfinished.len())
+        });
+        assert_eq!(accepted, returned, "run {run}");
+    }
+}
+
+#[test]
+fn a_sender_that_never_pauses_cannot_hold_up_shutdown() {
+    let (mut config, _events) = config(Arc::new(InMemory::new()), 2);
+    config.channel_capacity = 1024;
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let give_up = AtomicBool::new(false);
+    let (shut_down, returned_in_time, accepted) = std::thread::scope(|scope| {
+        let sending = scope.spawn(|| send_until_stopped(&sender, &give_up, 0));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutting_down = scope.spawn(move || {
+            let exit = uploader.shutdown();
+            let _ = done_tx.send(());
+            exit
+        });
+        let returned_in_time = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+        // Lets a stuck shutdown finish, so a failure here is a failure and not a hang.
+        give_up.store(true, Ordering::Relaxed);
+        (
+            shutting_down.join().unwrap(),
+            returned_in_time,
+            sending.join().unwrap(),
+        )
+    });
+    assert!(returned_in_time, "shutdown didn't return within 10 s");
+    assert_eq!(shut_down.unfinished.len(), accepted);
 }

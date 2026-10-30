@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -135,12 +135,18 @@ pub enum UploadSendError<T> {
 
 pub struct UploaderSender<R> {
     tx: Sender<UploadCommand<R>>,
+    stop: Arc<AtomicBool>,
+    /// Sends that have passed the stop check and may not have reached the channel. See
+    /// `send`.
+    sending_count: Arc<AtomicUsize>,
 }
 
 impl<R> Clone for UploaderSender<R> {
     fn clone(&self) -> Self {
         UploaderSender {
             tx: self.tx.clone(),
+            stop: Arc::clone(&self.stop),
+            sending_count: Arc::clone(&self.sending_count),
         }
     }
 }
@@ -156,6 +162,23 @@ fn unwrap_send<R, T>(
 }
 
 impl<R> UploaderSender<R> {
+    /// A command the channel accepts must come back from `run` if it isn't uploaded,
+    /// and `run` can only know it has them all if no more can arrive. So a sender
+    /// announces itself and then checks the flag, and `run` sets the flag and then waits
+    /// out the announced ones: with sequential consistency, either this sender sees the
+    /// flag, or `run` sees this sender and drains after it. No sender ever waits, and
+    /// the drain has an end however fast they send.
+    fn send(&self, command: UploadCommand<R>) -> Result<(), TrySendError<UploadCommand<R>>> {
+        self.sending_count.fetch_add(1, Ordering::SeqCst);
+        let result = if self.stop.load(Ordering::SeqCst) {
+            Err(TrySendError::Disconnected(command))
+        } else {
+            self.tx.try_send(command)
+        };
+        self.sending_count.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
     /// Hands over a core's section for a seal.
     #[allow(clippy::result_large_err)]
     pub fn try_send_section(
@@ -164,18 +187,17 @@ impl<R> UploaderSender<R> {
         core: usize,
         section: Section<R>,
     ) -> Result<(), UploadSendError<Section<R>>> {
-        self.tx
-            .try_send(UploadCommand::Section {
-                seal,
-                core,
-                section,
+        self.send(UploadCommand::Section {
+            seal,
+            core,
+            section,
+        })
+        .map_err(|error| {
+            unwrap_send(error, |command| match command {
+                UploadCommand::Section { section, .. } => section,
+                _ => unreachable!("try_send returns the command it was given"),
             })
-            .map_err(|error| {
-                unwrap_send(error, |command| match command {
-                    UploadCommand::Section { section, .. } => section,
-                    _ => unreachable!("try_send returns the command it was given"),
-                })
-            })
+        })
     }
 
     /// Uploads a stream that filled its own buffer as its own object (section 7.3).
@@ -187,24 +209,23 @@ impl<R> UploaderSender<R> {
         number: u64,
         records: Vec<R>,
     ) -> Result<(), UploadSendError<Vec<R>>> {
-        self.tx
-            .try_send(UploadCommand::Dedicated {
-                stream,
-                number,
-                records,
+        self.send(UploadCommand::Dedicated {
+            stream,
+            number,
+            records,
+        })
+        .map_err(|error| {
+            unwrap_send(error, |command| match command {
+                UploadCommand::Dedicated { records, .. } => records,
+                _ => unreachable!("try_send returns the command it was given"),
             })
-            .map_err(|error| {
-                unwrap_send(error, |command| match command {
-                    UploadCommand::Dedicated { records, .. } => records,
-                    _ => unreachable!("try_send returns the command it was given"),
-                })
-            })
+        })
     }
 
     /// Tells the local cache an object was read. Losing this on a full queue costs
     /// only a slightly worse eviction choice.
     pub fn try_cache_touch(&self, path: Path) -> bool {
-        self.tx.try_send(UploadCommand::CacheTouch(path)).is_ok()
+        self.send(UploadCommand::CacheTouch(path)).is_ok()
     }
 }
 
@@ -222,23 +243,30 @@ where
     pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender<R>, Uploader<R>)> {
         let (tx, rx) = bounded(config.channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
+        let sending_count = Arc::new(AtomicUsize::new(0));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let thread_stop = Arc::clone(&stop);
+        let thread_sending_count = Arc::clone(&sending_count);
         let thread = std::thread::Builder::new()
             .name("uploader".to_owned())
             .spawn(move || {
                 let worker = Worker {
                     config,
                     stop: thread_stop,
+                    sending_count: thread_sending_count,
                     pending: BTreeMap::new(),
                     unfinished: Vec::new(),
                 };
                 runtime.block_on(worker.run(rx))
             })?;
         Ok((
-            UploaderSender { tx: tx.clone() },
+            UploaderSender {
+                tx: tx.clone(),
+                stop: Arc::clone(&stop),
+                sending_count,
+            },
             Uploader {
                 wake: Some(tx),
                 thread: Some(thread),
@@ -272,7 +300,7 @@ where
 impl<R> Uploader<R> {
     /// If the channel is full, the thread has commands to wake it anyway.
     fn request_stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(wake) = self.wake.take() {
             let _ = wake.try_send(UploadCommand::Wake);
         }
@@ -290,6 +318,7 @@ impl<R> Drop for Uploader<R> {
 struct Worker<R> {
     config: UploaderConfig,
     stop: Arc<AtomicBool>,
+    sending_count: Arc<AtomicUsize>,
     pending: BTreeMap<u64, BTreeMap<usize, Section<R>>>,
     unfinished: Vec<UnfinishedUpload<R>>,
 }
@@ -319,7 +348,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         // `recv` blocks this thread, which runs nothing else: the runtime is here only
         // for `object_store` calls (D12).
         while let Ok(command) = rx.recv() {
-            if self.stop.load(Ordering::Acquire) {
+            if self.stop.load(Ordering::SeqCst) {
                 self.keep_unfinished(command);
                 break;
             }
@@ -344,6 +373,11 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     }
                 }
             }
+        }
+        // The flag is set or every sender is gone, so nothing can arrive after these
+        // sends (see `UploaderSender::send`). They take a moment, so this is a short wait.
+        while self.sending_count.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
         }
         // Whatever is left: stopped early, or a seal that never got all its sections.
         while let Ok(command) = rx.try_recv() {
@@ -533,7 +567,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         const STEP_MS: u64 = 20;
         let mut left_ms = wait_ms;
         loop {
-            if self.stop.load(Ordering::Acquire) {
+            if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
             if left_ms == 0 {
