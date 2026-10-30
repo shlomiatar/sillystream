@@ -1,0 +1,69 @@
+# Build notes
+
+Choices made where `docs/SPEC.md` is silent or ambiguous, and questions for the user. SPEC.md stays the source of truth: nothing here changes its meaning, and any item can be reversed. Each entry is one choice and its reason. Later milestones append here.
+
+## Questions for the user
+
+Each has a working assumption so the build can continue.
+
+- **Q1. No `to` on subscribe.** Section 4 says an id range "from any point to any point", but `SUBSCRIBE` and HTTP `read` carry only a start (`from`, plus `limit`). Assumption: no new field; the client stops at its end id.
+- **Q2. No admin API.** Sections 9, 12 and 13 require stream create, config, delete and the sink lifecycle under `admin`, but section 11 has no route for them. Assumption: the smallest HTTP additions, listed in D21.
+- **Q3. Manifest record type.** Section 7.5 publishes seal manifests to a system stream, and only `author = 0` data may be read by the server, but section 2.2 defines entry types 1–3 only. Assumption: manifests are system records with entry type 4 in a stream named `_sys.manifests`.
+- **Q4. Manifest stream's special rule.** Section 7.5 says one is needed but not what it is. Assumption: manifest stream segments are never listed in a manifest and never compacted; they stay in `sealed/`, and the delete job's compaction check covers them.
+- **Q5. "One preallocated file" versus recycling.** Section 6.3 has one file, but entries covering a sealed-but-not-yet-uploaded window must survive while new ones arrive, and old entries in a recycled file still have valid CRCs. Assumption: D8.
+- **Q6. One "last valid id" with per-stream ids.** Section 8.1 keeps a single id, but ids are per stream. It works because ids are time-based: it is the highest id seen at takeover, and every new id on every stream is above it (D15). An old generation's object at or below that id is accepted. Please confirm.
+- **Q7. Lost records at levels 0–1 and id reuse.** A record delivered at level 0–1 and lost in a crash leaves no trace, so "ids are never reused" cannot be proven for it. A restart normally moves past it because ids follow the clock; a backward clock or borrowed ms could collide. Assumption: the no-reuse guarantee is tested for WAL-durable records only.
+- **Q8. Checkpoint lookup and cleanup.** Section 7.6 puts checkpoints in shared files per seal, but does not say how a long-idle stream finds its latest one, or whether old files may be deleted ("nothing else deletes data" is about records). Assumption: D18.
+- **Q9. Upload outage.** The spec doesn't bound memory and WAL while S3 is down. Assumption: slabs and the WAL stay pinned, and when a configured cap is reached it becomes publisher backpressure (D7). Level 3 acks wait.
+- **Q10. Conditional update on the ownership record.** "One ownership record" with a conditional increment needs compare-and-swap, which `object_store`'s `LocalFileSystem` doesn't implement (`PutMode::Update` returns `NotImplemented`; checked in 0.11.2). Assumption: D14.
+
+## Decisions
+
+### Format and frames
+
+- **D1.** `op` in filter clauses: 0 = `eq`, 1 = `any`. Reason: the spec gives the field but no codes.
+- **D2.** `nfilt = 0` matches every record; `nfilt > 4` is error 8. Reason: follows "up to 4 clauses".
+- **D3.** App filters (`options`, `author`) don't apply to system records; `INCLUDE_SYSTEM` delivers them all. Block skipping for such a reader is allowed only when the block's `author` is a non-zero value. Reason: on system records `options` is the entry type, so a block could otherwise be skipped while holding one.
+- **D4.** `SDK from`: the client sends `from = head` after a snapshot. Reason: section 10 says "read from `head + 1`", and section 5.1 defines `from` as "after this id", so they agree only this way.
+- **D5.** A publish with `HAS_STATE` places the system record last. `ACK.first_id` is the first id of the publish and `ACK.count` counts all its items, including the system record. Reason: `first_id + i` then still maps to the producer's items.
+- **D6.** `producer_id = 0` means no idempotency: it is what `STATE_OP` and HTTP publishes without the headers use, and it creates no dedupe entry. Reason: the WAL entry always has the field, and `expect_ver` covers state retries.
+- **D6a.** Level 0 sends no `ACK`, but a rejection still gets a `NACK`. A publish below a stream's minimum ack level is raised to it. A publish with neither records nor state is error 8. A state result over 64 KB is error 8. Reason: smallest reading of sections 3 and 13.
+- **D6b.** `STATE_RESULT` carries `ok = 0` only for a version conflict; other failures send `ERROR` with `ref = req`. Reason: `STATE_RESULT` has no code field.
+- **D6c.** Merge is RFC 7396 semantics on CBOR maps. Incr's doc is CBOR `{"path": [keys], "n": int}`. Incr on a non-numeric value is error 8. Reason: the spec names the ops but not incr's doc.
+- **D6d.** Defaults: `max_frame` 16 MiB, subscriptions per connection 1,024, subscriber queue 8 MiB, `PROGRESS` every 5 s, slab 4 MiB, block 64 KiB, footer page 64 KiB. Reason: plain starting values; all are constants or node config.
+- **D6e.** Dedupe's 28 bytes are `producer_id, producer_seq, first_id, count`, and idle age comes from `first_id`'s timestamp. Reason: the id already holds the time, so no field is added.
+
+### Storage
+
+- **D7.** A core keeps a bounded outbound queue for when `try_send` fails and stops reading publish frames while it is non-empty or the memory cap is reached. Reason: backpressure without blocking a core or dropping a stamped record.
+- **D8.** The WAL is a sequence of preallocated files, `wal-<seq>.log`, with one active at a time, rotated at seal, and renamed for reuse once its segment and checkpoint are durable. The first 16 bytes of each file are a magic and `seq`, and the entry CRC is seeded with `seq`. Reason: stale entries in a reused file fail the CRC, with no added entry field.
+- **D9.** WAL entry: `stream_len u16 | stream | producer_id u64 | producer_seq u64 | len u32 | crc32c u32`, then the record bytes padded to 8. One publish is one entry, so an atomic publish can't be torn apart. State ops are found by reading `author = 0` records during replay. Reason: the spec's fields in its order.
+- **D10.** Segment layout: sections of stream extents, then footer pages sorted by `xxh3_64(stream)`, then the top index and a fixed trailer (`magic, top_offset, top_len, crc32c`). Each extent starts with a block summary table followed by blocks of whole records. Stream index entries hold the full name to resolve hash collisions. Reason: follows section 7.3; a reader's data step may take one read for the table and one for the blocks.
+- **D11.** Unsealed records are served from memory, since slabs are pinned until upload. The local tier is a copy of the uploaded segment, under a byte cap. Reason: the WAL is read only during recovery.
+- **D12.** The uploader is one thread with its own current-thread tokio runtime, used only for `object_store` calls. Reason: `object_store` is async, and the thread pattern is the spec's.
+- **D13.** Extra node config beyond section 13: listen address, TLS cert and key, token secret, object store URL and credentials source, node name, `data_dir` (KV and local cache), local cache cap, memory cap, and `sink_allow_private_addresses` (default false). Reason: required to run; none changes behaviour the spec defines.
+
+### Recovery
+
+- **D14.** Ownership is stored as `ownership/<generation>` created with `PutMode::Create`; the highest generation is current. Each holds the previous generation's last valid id. Reason: the same conditional write works on S3 and `LocalFileSystem`, and a losing process sees a clean failure.
+- **D15.** Id assignment is `max(last_id + 1, now_ms << 16, last_valid_id + 1)`. Reason: new ids stay above everything a former owner could have issued.
+- **D16.** The WAL is recycled only after both the segment and its checkpoint are durable, and replay skips ids at or below the stream's sealed extent. An uploaded object with no extent is ignored and ages out. Reason: a crash between steps neither loses nor doubles records.
+- **D17.** Compaction applies the last valid id too, and drops an older generation's records above it. Reason: compaction must not resurrect what readers would ignore.
+- **D18.** Checkpoint files are `checkpoints/<generation>-<seq>.ckpt`, in the same paged footer format. A lookup walks newest to oldest using cached top indexes, and a periodic full checkpoint removes the need for older files, which are then deleted. Reason: the simplest way to bound the walk (Q8).
+- **D19.** Fjall with default features off. Reason: pure Rust, and its default `lz4` feature would break the no-codec rule.
+- **D20.** Deleting a stream writes a tombstone to the local store and checkpoint, and its old records stop being reachable and age out with their prefixes. Reason: rebuild must not resurrect it, and "nothing else deletes data".
+
+### API, auth and sinks
+
+- **D21.** Admin routes, all under `admin` (Q2): `PUT` and `DELETE /v1/stream/<id>` (create or config, delete); `PUT`, `DELETE /v1/stream/<id>/sink/<sink_id>`; `POST .../sink/<sink_id>/pause`, `/resume`, and `/reset`. Bodies are JSON. Reason: the smallest set that reaches what the spec already requires.
+- **D22.** WebSocket and HTTP share one TLS 1.3 port, with the upgrade at `/v1/ws`. Reason: one listener.
+- **D23.** The server has its own small RFC 6455 frame reader, tested against `tokio-tungstenite`. Reason: existing libraries read into their own buffers, and section 6.5 needs frames read into slabs and unmasked in place.
+- **D24.** Connections are accepted once and handed to cores round robin. Bytes read on a non-owner core reach the owner as an exclusive slab region in a message, and are stamped there. Reason: a connection can use streams on several cores, and `SO_REUSEPORT` balancing isn't portable to macOS.
+- **D25.** Tokens are `body | hmac_sha256(secret, body)`, with a little-endian binary body: `expiry_ms u64 | author u64 | n u16 | n × (pattern str | perms u8)`. Patterns match exactly or by a trailing `*`. A token with `author = 0` is invalid. Expiry is rechecked on every operation. Reason: verification needs no lookup, and HMAC is also what webhooks need.
+- **D26.** HTTP: binary publish uses `Content-Type: application/x-sillystream-records`; any other type is the simple form. `filter=` is comma-separated `eq:<mask>:<value>`, `any:<mask>`, `author:<n>`. `PATCH state` takes the op in `X-State-Op`. Results for publish and state are small JSON objects; reads are binary. Reason: the spec names these but gives no encoding.
+- **D27.** `sink_id` is a `u64`, and clients may not create cursors named `sink:*` (error 8). Reason: `forward` uses it as `producer_id`.
+- **D28.** Sinks never forward or deliver system records. Reason: forwarding `author = 0` would inject state ops into the target.
+- **D29.** `webhook.deliver` posts the record bytes unchanged, with `X-Sink-Id`, `X-First-Id`, `X-Last-Id` and `X-Signature` (HMAC-SHA256 over the body). The resolved address is what gets checked against private ranges. Reason: fixes the spec's fields to a form, and blocks DNS tricks.
+- **D30.** A sink's skip gap is logged and shown in the stream info. Reason: the spec says "records the gap" without a place.
+- **D31.** A stream's retention is read at compaction time; changing class affects data from that point on. Reason: compaction copies forward and nothing rewrites old prefixes.
+- **D32.** Test hooks are behind a `test-hooks` cargo feature of the server binary: a clock offset and named crash points. Reason: retention and crash windows can't otherwise be reached end to end, and release builds must not contain them.
