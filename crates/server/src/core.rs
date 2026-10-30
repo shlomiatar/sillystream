@@ -865,8 +865,8 @@ impl Core {
                 return;
             }
         };
-        // A result has to go back, so a stream whose default is level 0 acts as level 1.
-        let level = effective_level(None, &stream.config).max(1);
+        // STATE_OP can't ask for less, and section 10 acks after the WAL (D70).
+        let level = effective_level(None, &stream.config).max(2);
         stream.state.install(doc, ver);
         let bytes = self.bytes_with_system_record(&[], ver, msg.author, &msg.change);
         self.commit(

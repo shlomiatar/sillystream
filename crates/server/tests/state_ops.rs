@@ -477,3 +477,41 @@ proptest! {
             .block_on(live_against_replay(ops));
     }
 }
+
+/// `STATE_OP` has no ack field, so nobody asked for less than section 10's "then acked".
+#[tokio::test]
+async fn a_state_op_waits_for_the_wal_whatever_the_streams_default_level() {
+    for default_ack_level in [0, 1, 2] {
+        let harness = Harness::new(manual_config(1));
+        let mut client = harness.node().client(0).await;
+        client
+            .configure(
+                "s",
+                server::StreamConfig {
+                    default_ack_level,
+                    min_ack_level: 0,
+                },
+            )
+            .await;
+        harness.wal.hold();
+        client
+            .state_op(StateOpRequest {
+                stream: "s",
+                req: 1,
+                author: AUTHOR,
+                expect_ver: 0,
+                op: StateOp::Set,
+                doc: cbor(&int(1)),
+            })
+            .await
+            .unwrap();
+        expect_quiet(&mut client).await;
+        harness.wal.release();
+        assert!(matches!(
+            expect_reply(&mut client).await,
+            Reply::StateResult { ok: true, .. }
+        ));
+        assert_eq!(harness.wal.stream_entries("s").len(), 1);
+        harness.finish();
+    }
+}
