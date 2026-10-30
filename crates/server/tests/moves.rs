@@ -752,3 +752,249 @@ async fn parked_streams_swapping_cores_all_get_through() {
     assert_wal_in_id_order(&harness, &on_one);
     harness.finish();
 }
+
+fn one_slot_wal() -> server::NodeConfig {
+    let mut config = manual_config(2);
+    config.wal_channel_capacity = 1;
+    config
+}
+
+/// Moves the stream to core 1 and leaves core 1 unable to read writes, with the WAL held.
+async fn own_on_stalled_core_1(harness: &Harness, name: &str) {
+    let node = harness.node();
+    node.move_shard(shard_of(name, node.virtual_shard_count()), 1)
+        .await;
+    harness.wal.hold();
+    let filler = record_with(1, b"filler");
+    park_outbound(node, 1, &name_on_core(1, node, "filler"), &filler).await;
+}
+
+/// Waits for core 0 to pass something on, then hands the stream back to it.
+async fn move_back_behind_the_forward(harness: &Harness, name: &str, forwarded_before: u64) {
+    let node = harness.node();
+    let deadline = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+    while node.stats(0).await.unwrap().forwarded_count == forwarded_before {
+        assert!(std::time::Instant::now() < deadline, "nothing forwarded");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    node.move_shard(shard_of(name, node.virtual_shard_count()), 0)
+        .await;
+}
+
+async fn a_forward_stays_ahead_after_its_stream_moves_back(hear_moved_first: bool) {
+    let harness = Harness::new(one_slot_wal());
+    let node = harness.node();
+    let name = name_on_core(0, node, "back");
+    let records = record_with(1, b"payload");
+    let mut client = node.client(0).await;
+    client
+        .publish(publish(&name, &records, 1, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut client).await;
+
+    own_on_stalled_core_1(&harness, &name).await;
+    let forwarded = node.stats(0).await.unwrap().forwarded_count;
+    client
+        .publish(publish(&name, &records, 2, 1))
+        .await
+        .unwrap();
+    move_back_behind_the_forward(&harness, &name, forwarded).await;
+    assert_eq!(client.route_of(&name), 0);
+
+    let mut acks = Vec::new();
+    if hear_moved_first
+        && let Some(Reply::Ack {
+            producer_seq,
+            first_id,
+            count,
+            ..
+        }) = client.recv_within(100).await
+    {
+        acks.push((producer_seq, first_id, count));
+    }
+    // A barrier that went out waits on a core with a full queue, and seq 3 waits for it.
+    if hear_moved_first {
+        harness.wal.release();
+    }
+    client
+        .publish(publish(&name, &records, 3, 1))
+        .await
+        .unwrap();
+    harness.wal.release();
+    while acks.len() < 2 {
+        acks.push(expect_ack(&mut client).await);
+    }
+    assert!(acks.iter().all(|ack| ack.1 > 0), "{acks:?}");
+    acks.sort();
+    assert!(acks[0].1 < acks[1].1, "{acks:?}");
+
+    client
+        .publish(publish(&name, &records, 4, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut client).await;
+    let seqs: Vec<u64> = harness
+        .wal
+        .stream_entries(&name)
+        .iter()
+        .map(|entry| entry.producer_seq)
+        .collect();
+    assert_eq!(seqs, [1, 2, 3, 4]);
+    assert_wal_in_id_order(&harness, &name);
+    harness.finish();
+}
+
+#[tokio::test]
+async fn a_forward_stays_ahead_after_a_move_back_with_no_barrier_out() {
+    a_forward_stays_ahead_after_its_stream_moves_back(false).await;
+}
+
+#[tokio::test]
+async fn a_forward_stays_ahead_after_a_move_back_with_a_barrier_answered() {
+    a_forward_stays_ahead_after_its_stream_moves_back(true).await;
+}
+
+/// With no producer id there is no dedupe to drop it, so this would commit out of order.
+#[tokio::test]
+async fn publishes_with_no_producer_id_keep_their_order_across_a_move_back() {
+    let harness = Harness::new(one_slot_wal());
+    let node = harness.node();
+    let name = name_on_core(0, node, "back");
+    let first = record_with(1, b"first");
+    let second = record_with(1, b"second");
+    let mut client = node.client(0).await;
+    own_on_stalled_core_1(&harness, &name).await;
+    let forwarded = node.stats(0).await.unwrap().forwarded_count;
+    let mut request = publish(&name, &first, 0, 2);
+    request.producer_id = 0;
+    client.publish(request).await.unwrap();
+    move_back_behind_the_forward(&harness, &name, forwarded).await;
+    let mut request = publish(&name, &second, 0, 2);
+    request.producer_id = 0;
+    client.publish(request).await.unwrap();
+    harness.wal.release();
+    expect_ack(&mut client).await;
+    expect_ack(&mut client).await;
+    let datas: Vec<Vec<u8>> = harness
+        .wal
+        .stream_entries(&name)
+        .iter()
+        .map(|entry| parse_records(&entry.records)[0].3.clone())
+        .collect();
+    assert!(datas[0].starts_with(b"first"), "{datas:?}");
+    assert!(datas[1].starts_with(b"second"), "{datas:?}");
+    assert_wal_in_id_order(&harness, &name);
+    harness.finish();
+}
+
+#[tokio::test]
+async fn state_ops_keep_their_order_across_a_move_back() {
+    let harness = Harness::new(one_slot_wal());
+    let node = harness.node();
+    let name = name_on_core(0, node, "back");
+    let mut client = node.client(0).await;
+    own_on_stalled_core_1(&harness, &name).await;
+    let forwarded = node.stats(0).await.unwrap().forwarded_count;
+    client.state_op(set_op(&name, 1, 10)).await.unwrap();
+    move_back_behind_the_forward(&harness, &name, forwarded).await;
+    client.state_op(set_op(&name, 2, 20)).await.unwrap();
+    harness.wal.release();
+    for _ in 0..2 {
+        assert!(matches!(
+            expect_reply(&mut client).await,
+            Reply::StateResult { ok: true, .. }
+        ));
+    }
+    let snapshot = client.snapshot(&name).await.unwrap();
+    assert_eq!(from_cbor(&snapshot.state), int(20));
+    assert_eq!(replay_state(&harness, &name), {
+        let mut live = server::StreamState::new();
+        live.install(snapshot.state.clone(), snapshot.state_ver);
+        live
+    });
+    harness.finish();
+}
+
+/// A shard going back and forth under load, with the WAL stalling on and off: what each
+/// client sent commits once, in the order it was sent, however the routes changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shard_bouncing_under_stalls_keeps_every_client_in_order() {
+    let mut config = manual_config(3);
+    config.wal_channel_capacity = 1;
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let name = name_on_core(0, node, "bounce");
+    let shard = shard_of(&name, node.virtual_shard_count());
+    let records = record_with(1, b"payload");
+    let mut clients = Vec::new();
+    for home in 0..3 {
+        clients.push(node.client(home).await);
+    }
+    let send_count = 120u64;
+    for seq in 1..=send_count {
+        for (index, client) in clients.iter_mut().enumerate() {
+            let mut request = publish(&name, &records, seq, 1);
+            request.producer_id = index as u64 + 1;
+            // A full inbox waits for a stalled core, which only the release can end.
+            while client.try_publish(request.clone()) == Err(server::ClientError::Full) {
+                harness.wal.release();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        if seq % 7 == 0 {
+            harness.wal.hold();
+        } else if seq % 7 == 4 {
+            harness.wal.release();
+        }
+        if seq % 3 == 0 {
+            node.move_shard(shard, (seq as usize / 3) % 3).await;
+        }
+        if seq % 5 == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    harness.wal.release();
+    for (index, client) in clients.iter_mut().enumerate() {
+        let mut acks = 0;
+        while acks < send_count {
+            match expect_reply(client).await {
+                Reply::Ack {
+                    first_id,
+                    producer_seq,
+                    ..
+                } => {
+                    assert!(
+                        first_id > 0,
+                        "client {index} seq {producer_seq} was acked as committed unwritten, {:?}",
+                        harness
+                            .wal
+                            .stream_entries(&name)
+                            .iter()
+                            .filter(|entry| entry.producer_id == index as u64 + 1)
+                            .map(|entry| entry.producer_seq)
+                            .collect::<Vec<_>>()
+                    );
+                    acks += 1;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut request = publish(&name, &records, send_count + 1, 2);
+        request.producer_id = index as u64 + 1;
+        client.publish(request).await.unwrap();
+        expect_ack(client).await;
+    }
+    let entries = harness.wal.stream_entries(&name);
+    for producer_id in 1..=3 {
+        let seqs: Vec<u64> = entries
+            .iter()
+            .filter(|entry| entry.producer_id == producer_id)
+            .map(|entry| entry.producer_seq)
+            .collect();
+        assert_eq!(seqs, (1..=send_count + 1).collect::<Vec<_>>());
+    }
+    assert_wal_in_id_order(&harness, &name);
+    harness.finish();
+}

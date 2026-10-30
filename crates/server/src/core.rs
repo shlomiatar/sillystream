@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::clock::Clock;
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::message::{
-    ControlMsg, CoreStats, PublishMsg, Reply, ReplyTx, ShardHandoff, SnapshotReply, StateChange,
-    StateOpMsg, StreamConfig, StreamHandoff, WriteMsg,
+    ControlMsg, CoreStats, ProbeTarget, PublishMsg, Reply, ReplyTx, ShardHandoff, SnapshotReply,
+    StateChange, StateOpMsg, StreamConfig, StreamHandoff, WriteMsg,
 };
 use crate::placement::{ShardCounters, shard_of};
 use crate::slab::{SlabBytes, SlabPool};
@@ -40,6 +40,7 @@ pub(crate) struct Links {
     pub control: Vec<mpsc::UnboundedSender<ControlMsg>>,
     /// Writes passed on by another core. Unbounded, so that two cores forwarding to each
     /// other can't wait on each other. What is in here was read from a bounded inbox.
+    /// Always read: what can't be stamped yet waits on the core (D78).
     pub forwarded: Vec<mpsc::UnboundedSender<WriteMsg>>,
     /// Writes from clients. Bounded: a full inbox is backpressure on the publisher.
     pub direct: Vec<mpsc::Sender<WriteMsg>>,
@@ -78,6 +79,23 @@ struct WalWait {
     ticket: u64,
     /// This core's last ticket when the stream arrived. Earlier ones don't wait.
     stamped_through: u64,
+}
+
+/// Writes for a shard this core just adopted, waiting for what it had forwarded for that
+/// shard to arrive first (D78). Control runs one move at a time and `done` goes out only
+/// when this ends, so a node has at most one, and only the new owner has it.
+struct Hold {
+    shard: u32,
+    /// Streams whose route changed here because the handoff told this core of their own
+    /// shard, whichever shard they were on.
+    streams: Vec<Arc<str>>,
+    probes_out_count: usize,
+    /// This core's own forwards coming back, with when it first forwarded each. A stale
+    /// read can send one round twice, so arrival order isn't enough. Everything else was
+    /// read later than these.
+    returned: Vec<(u64, WriteMsg)>,
+    later: VecDeque<WriteMsg>,
+    done: oneshot::Sender<()>,
 }
 
 struct Waiter {
@@ -259,6 +277,10 @@ pub(crate) struct Core {
     shards: HashMap<u32, Shard>,
     /// Stream → its own shard. Kept for good, so that the chain above stays whole.
     overrides: HashMap<Arc<str>, u32>,
+    hold: Option<Hold>,
+    /// Writes read from the forwarded inbox, for streams on this core, that can't be stamped
+    /// until the outbound queue empties (D78).
+    deferred: VecDeque<WriteMsg>,
 
     logs: HashMap<Arc<str>, StreamLog>,
     dirty: Vec<Arc<str>>,
@@ -324,6 +346,8 @@ impl Core {
             streams: HashMap::new(),
             shards: HashMap::new(),
             overrides: HashMap::new(),
+            hold: None,
+            deferred: VecDeque::new(),
             logs: HashMap::new(),
             dirty: Vec::new(),
             next_ticket: 0,
@@ -370,34 +394,125 @@ impl Core {
                     None => uploads_open = false,
                 },
                 _ = tokio::time::sleep(Duration::from_millis(RETRY_FULL_MS)), if need_retry => {}
-                message = self.inbox.forwarded.recv(), if can_write => {
+                message = self.inbox.forwarded.recv() => {
                     if let Some(message) = message {
-                        stopping = self.drain_control();
-                        self.on_write(message);
+                        self.read_write(message);
                     }
                 },
                 message = self.inbox.direct.recv(), if can_write => {
                     if let Some(message) = message {
-                        stopping = self.drain_control();
-                        self.on_write(message);
+                        self.read_write(message);
                     }
                 },
             }
             self.flush_outbound();
             self.flush_uploads();
+            self.run_deferred();
         }
     }
 
-    /// A write that got here may have been sent after an `Adopt` it depends on, and a
-    /// message sent earlier by that core is already in this inbox. So read it first.
-    fn drain_control(&mut self) -> bool {
-        while let Ok(message) = self.inbox.control.try_recv() {
-            if matches!(message, ControlMsg::Stop) {
-                return true;
+    /// A write just read from an inbox. Order across a client's writes depends on this
+    /// path: see D78.
+    fn read_write(&mut self, mut message: WriteMsg) {
+        let Some(name) = message.stream() else {
+            self.on_write(message);
+            return;
+        };
+        if self.is_held(name) {
+            let first_pass = message.first_pass(self.config.id);
+            let hold = self.hold.as_mut().expect("is_held found it");
+            match first_pass {
+                Some(count) => hold.returned.push((count, message)),
+                None => hold.later.push_back(message),
             }
-            self.on_control(message);
+            return;
         }
-        false
+        self.accept(message);
+    }
+
+    fn is_held(&self, name: &str) -> bool {
+        let Some(hold) = &self.hold else {
+            return false;
+        };
+        let shard = self
+            .overrides
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| shard_of(name, self.config.virtual_shard_count));
+        shard == hold.shard || hold.streams.iter().any(|stream| &**stream == name)
+    }
+
+    /// Passing a write on needs no room here, so that a stalled core still does it.
+    fn accept(&mut self, message: WriteMsg) {
+        let waits_here = !self.deferred.is_empty() || !self.outbound.is_empty();
+        if waits_here
+            && let Some(name) = message.stream()
+            && matches!(self.route(name), Route::Here(_))
+        {
+            self.deferred.push_back(message);
+        } else {
+            self.on_write(message);
+        }
+    }
+
+    fn run_deferred(&mut self) {
+        while self.outbound.is_empty()
+            && let Some(message) = self.deferred.pop_front()
+        {
+            self.on_write(message);
+        }
+    }
+
+    /// After giving a stream away: what was waiting for it goes after it, in order. So
+    /// `deferred` only ever holds writes for streams on this core.
+    fn pass_on_deferred(&mut self) {
+        for message in std::mem::take(&mut self.deferred) {
+            let here = message
+                .stream()
+                .is_some_and(|name| matches!(self.route(name), Route::Here(_)));
+            if here {
+                self.deferred.push_back(message);
+            } else {
+                self.on_write(message);
+            }
+        }
+    }
+
+    fn on_probe(&mut self, target: ProbeTarget, origin: usize) {
+        let at = match &target {
+            ProbeTarget::Shard(shard) => match self.location[*shard as usize] {
+                u16::MAX => self.config.id,
+                at => at as usize,
+            },
+            ProbeTarget::Stream(name) => match self.route(name) {
+                Route::Here(_) => self.config.id,
+                Route::Forward(to) => to,
+            },
+        };
+        if at != self.config.id {
+            let _ = self.links.forwarded[at].send(WriteMsg::Probe { target, origin });
+        } else if origin == self.config.id {
+            self.on_probe_back();
+        } else {
+            let _ = self.links.control[origin].send(ControlMsg::ProbeBack);
+        }
+    }
+
+    fn on_probe_back(&mut self) {
+        let Some(hold) = &mut self.hold else {
+            return;
+        };
+        hold.probes_out_count -= 1;
+        if hold.probes_out_count > 0 {
+            return;
+        }
+        let mut hold = self.hold.take().expect("just looked at it");
+        hold.returned.sort_by_key(|(count, _)| *count);
+        let returned = hold.returned.into_iter().map(|(_, message)| message);
+        for message in returned.chain(hold.later) {
+            self.accept(message);
+        }
+        let _ = hold.done.send(());
     }
 
     fn route(&self, name: &str) -> Route {
@@ -443,7 +558,11 @@ impl Core {
                     self.forward_write(to, WriteMsg::StateOp(op));
                 }
             },
-            WriteMsg::Barrier { stream, reply } => match self.route(&stream) {
+            WriteMsg::Barrier {
+                stream,
+                reply,
+                passed,
+            } => match self.route(&stream) {
                 Route::Here(_) => send_reply(
                     &reply,
                     Reply::RouteDone {
@@ -452,14 +571,21 @@ impl Core {
                     },
                 ),
                 Route::Forward(to) => {
-                    self.forward_write(to, WriteMsg::Barrier { stream, reply });
+                    let barrier = WriteMsg::Barrier {
+                        stream,
+                        reply,
+                        passed,
+                    };
+                    self.forward_write(to, barrier);
                 }
             },
+            WriteMsg::Probe { target, origin } => self.on_probe(target, origin),
         }
     }
 
-    fn forward_write(&mut self, to: usize, message: WriteMsg) {
+    fn forward_write(&mut self, to: usize, mut message: WriteMsg) {
         self.forwarded_count += 1;
+        message.mark_passed(self.config.id, self.forwarded_count);
         let _ = self.links.forwarded[to].send(message);
     }
 
@@ -1214,6 +1340,7 @@ impl Core {
                 ack,
                 reply,
             } => self.ack_local(&stream, last_id, level, ack, reply),
+            ControlMsg::ProbeBack => self.on_probe_back(),
             ControlMsg::WalSent { core, ticket } => {
                 self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
             }
@@ -1276,6 +1403,7 @@ impl Core {
             overrides,
             done,
         })));
+        self.pass_on_deferred();
     }
 
     fn on_split_stream(
@@ -1319,11 +1447,27 @@ impl Core {
             overrides: vec![(name, new_shard, to as u16)],
             done,
         })));
+        self.pass_on_deferred();
     }
 
     fn on_adopt(&mut self, handoff: ShardHandoff) {
         let me = self.config.id as u16;
         let shard_id = handoff.shard;
+        // Where this core has been forwarding, read before anything here changes it.
+        let mut probes = Vec::new();
+        let mut rerouted = Vec::new();
+        let old_hop = self.location[shard_id as usize];
+        if old_hop != u16::MAX && old_hop != me {
+            probes.push((old_hop as usize, ProbeTarget::Shard(shard_id)));
+        }
+        for (name, _, _) in &handoff.overrides {
+            if !self.overrides.contains_key(name)
+                && let Route::Forward(hop) = self.route(name)
+            {
+                rerouted.push(Arc::clone(name));
+                probes.push((hop, ProbeTarget::Stream(Arc::clone(name))));
+            }
+        }
         self.location[shard_id as usize] = me;
         for (name, own_shard, at) in handoff.overrides {
             self.overrides.insert(name, own_shard);
@@ -1363,7 +1507,28 @@ impl Core {
                 },
             );
         }
-        let _ = handoff.done.send(());
+        let mut probes_out_count = 0;
+        for (hop, target) in probes {
+            let origin = self.config.id;
+            if self.links.forwarded[hop]
+                .send(WriteMsg::Probe { target, origin })
+                .is_ok()
+            {
+                probes_out_count += 1;
+            }
+        }
+        if probes_out_count == 0 {
+            let _ = handoff.done.send(());
+            return;
+        }
+        self.hold = Some(Hold {
+            shard: shard_id,
+            streams: rerouted,
+            probes_out_count,
+            returned: Vec::new(),
+            later: VecDeque::new(),
+            done: handoff.done,
+        });
     }
 }
 

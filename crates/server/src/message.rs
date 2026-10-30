@@ -88,6 +88,9 @@ pub(crate) struct PublishMsg {
     pub state: Option<StateChange>,
     pub records: SlabRegion,
     pub reply: ReplyTx,
+    /// `(core, its forward count)` the first time each core forwarded this, so that a core
+    /// can put its own forwards back in the order it first read them (D78).
+    pub passed: Vec<(u16, u64)>,
 }
 
 #[derive(Debug)]
@@ -97,6 +100,8 @@ pub(crate) struct StateOpMsg {
     pub author: NonZeroU64,
     pub change: StateChange,
     pub reply: ReplyTx,
+    /// As on `PublishMsg`.
+    pub passed: Vec<(u16, u64)>,
 }
 
 /// Messages that make records, read only while the core has room for them (D7).
@@ -108,7 +113,61 @@ pub(crate) enum WriteMsg {
     Barrier {
         stream: Arc<str>,
         reply: ReplyTx,
+        /// As on `PublishMsg`.
+        passed: Vec<(u16, u64)>,
     },
+    /// From a core that has just adopted a shard, down the route it was forwarding on. What
+    /// it forwarded is ahead of this at every hop, so its return means all of that has
+    /// reached the owner (D78). Read even by a core that isn't reading writes.
+    Probe {
+        target: ProbeTarget,
+        origin: usize,
+    },
+}
+
+/// What a probe follows: the chain of a shard, or of one stream that has its own shard.
+#[derive(Debug)]
+pub(crate) enum ProbeTarget {
+    Shard(u32),
+    Stream(Arc<str>),
+}
+
+impl WriteMsg {
+    /// The stream it is for. A probe isn't for one in this sense.
+    pub(crate) fn stream(&self) -> Option<&str> {
+        match self {
+            WriteMsg::Publish(publish) => Some(&publish.stream),
+            WriteMsg::StateOp(op) => Some(&op.stream),
+            WriteMsg::Barrier { stream, .. } => Some(stream),
+            WriteMsg::Probe { .. } => None,
+        }
+    }
+
+    fn passed_mut(&mut self) -> Option<&mut Vec<(u16, u64)>> {
+        match self {
+            WriteMsg::Publish(publish) => Some(&mut publish.passed),
+            WriteMsg::StateOp(op) => Some(&mut op.passed),
+            WriteMsg::Barrier { passed, .. } => Some(passed),
+            WriteMsg::Probe { .. } => None,
+        }
+    }
+
+    /// Where this core first forwarded it, if it has.
+    pub(crate) fn first_pass(&mut self, core: usize) -> Option<u64> {
+        let passed = self.passed_mut()?;
+        passed
+            .iter()
+            .find(|(by, _)| usize::from(*by) == core)
+            .map(|(_, count)| *count)
+    }
+
+    pub(crate) fn mark_passed(&mut self, core: usize, count: u64) {
+        if self.first_pass(core).is_none()
+            && let Some(passed) = self.passed_mut()
+        {
+            passed.push((core as u16, count));
+        }
+    }
 }
 
 /// The reply to a snapshot: state and head as one consistent step (section 10).
@@ -214,6 +273,8 @@ pub(crate) enum ControlMsg {
         ack: Reply,
         reply: ReplyTx,
     },
+    /// A probe this core sent has reached the owner (D78).
+    ProbeBack,
     /// The WAL channel has taken `core`'s entries up to `ticket` (D77).
     WalSent {
         core: usize,

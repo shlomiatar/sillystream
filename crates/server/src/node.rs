@@ -830,6 +830,7 @@ impl Client {
                 state: publish.state,
                 records,
                 reply: self.reply_tx.clone(),
+                passed: Vec::new(),
             })),
         )
     }
@@ -878,6 +879,7 @@ impl Client {
                 doc: request.doc,
             },
             reply: self.reply_tx.clone(),
+            passed: Vec::new(),
         }));
         self.links.direct[core]
             .send(message)
@@ -920,6 +922,7 @@ impl Client {
                     let barrier = WriteMsg::Barrier {
                         stream,
                         reply: self.reply_tx.clone(),
+                        passed: Vec::new(),
                     };
                     route.barrier_pending = self.links.direct[route.core].try_send(barrier).is_ok();
                 }
