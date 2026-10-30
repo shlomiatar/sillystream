@@ -1,8 +1,11 @@
 use format::{
-    FormatError, RecordHeader, Records, SystemRecord, decode_record, encode_record,
+    COUNT_OFFSET, FormatError, RecordHeader, Records, SystemRecord, decode_record, encode_record,
     encode_system_record, padded_data_bytes, validate_forward, validate_publish,
 };
 use proptest::prelude::*;
+use std::num::NonZeroU64;
+
+const AUTHOR: NonZeroU64 = NonZeroU64::new(77).unwrap();
 
 fn arb_record() -> impl Strategy<Value = (RecordHeader, Vec<u8>)> {
     (
@@ -79,40 +82,190 @@ proptest! {
     }
 }
 
+/// A valid frame: `id` and `author` zero or not, sometimes a system record.
+fn arb_valid_frame() -> impl Strategy<Value = Vec<u8>> {
+    let record = (
+        any::<u64>(),
+        prop_oneof![9 => Just(0u64), 1 => any::<u64>()],
+        1u64..9,
+        1..=u16::MAX,
+        proptest::collection::vec(any::<u8>(), 0..40),
+    );
+    (proptest::collection::vec(record, 1..5), any::<bool>()).prop_map(|(records, zero_author)| {
+        let mut bytes = Vec::new();
+        for (options, id, author, count, data) in records {
+            let author = if zero_author { 0 } else { author };
+            let header = RecordHeader {
+                id,
+                options,
+                author,
+                len: data.len() as u32,
+                count,
+                codec: 0,
+            };
+            encode_record(&mut bytes, &header, &data).unwrap();
+        }
+        bytes
+    })
+}
+
+/// Uniform bytes reject at the first `len`, so most inputs are valid frames with
+/// a few byte changes and sometimes a cut, which get further before going wrong.
+fn arb_frame() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        1 => proptest::collection::vec(any::<u8>(), 0..400),
+        3 => arb_valid_frame(),
+        6 => (
+            arb_valid_frame(),
+            proptest::collection::vec((any::<usize>(), any::<u8>()), 1..5),
+            prop_oneof![3 => Just(1.0f64), 1 => 0.0f64..1.0],
+            prop::bool::weighted(0.1),
+        )
+            .prop_map(|(mut bytes, changes, keep_fraction, zero_count)| {
+                for (at, value) in changes {
+                    let at = at % bytes.len();
+                    bytes[at] = value;
+                }
+                // Two bytes must both be 0, which random changes rarely do.
+                if zero_count {
+                    bytes[COUNT_OFFSET..COUNT_OFFSET + 2].fill(0);
+                }
+                bytes.truncate((bytes.len() as f64 * keep_fraction) as usize);
+                bytes
+            }),
+    ]
+}
+
+/// A `len` that fits the body or nearly does, or one that can't possibly fit.
+fn arb_hostile_len() -> impl Strategy<Value = Vec<u8>> {
+    (
+        prop_oneof![
+            3 => 0u32..=72,
+            1 => any::<u32>(),
+            1 => (0u32..16).prop_map(|below| u32::MAX - below),
+        ],
+        1..=u16::MAX,
+        prop_oneof![
+            1 => proptest::collection::vec(any::<u8>(), 0..64),
+            // Bodies of zeros, so that padding checks pass and `Ok` is reached.
+            2 => (0usize..64).prop_map(|len| vec![0u8; len]),
+        ],
+    )
+        .prop_map(|(len, count, body)| {
+            let header = RecordHeader {
+                id: 0,
+                options: 0,
+                author: 0,
+                len,
+                count,
+                codec: 0,
+            };
+            let mut bytes = header.to_bytes().to_vec();
+            bytes.extend_from_slice(&body);
+            bytes
+        })
+}
+
+/// Which paths one input reached.
+#[derive(Debug, Default)]
+struct Reached {
+    decode_ok: u32,
+    system_ok: u32,
+    second_record: u32,
+    publish_ok: u32,
+    forward_ok: u32,
+    non_zero_padding: u32,
+    zero_count: u32,
+    truncated_data: u32,
+    truncated_header: u32,
+}
+
+/// Runs every entry point on `bytes`, and checks what each one says it did.
+fn exercise(bytes: &[u8], reached: &mut Reached) {
+    let _ = RecordHeader::read(bytes);
+    match decode_record(bytes) {
+        Ok((view, total_bytes)) => {
+            reached.decode_ok += 1;
+            assert!(total_bytes <= bytes.len());
+            assert_eq!(total_bytes, view.header.total_bytes());
+            assert_eq!(view.data.len(), view.header.len as usize);
+            if SystemRecord::parse(&view).is_ok() {
+                reached.system_ok += 1;
+            }
+        }
+        Err(FormatError::NonZeroPadding) => reached.non_zero_padding += 1,
+        Err(FormatError::ZeroCount) => reached.zero_count += 1,
+        Err(FormatError::TruncatedData) => reached.truncated_data += 1,
+        Err(FormatError::TruncatedHeader) => reached.truncated_header += 1,
+        Err(error) => panic!("decode_record returned {error:?}"),
+    }
+    let mut walked = 0;
+    let mut walked_ok = true;
+    for record in Records::new(bytes) {
+        walked += 1;
+        walked_ok &= record.is_ok();
+    }
+    if walked >= 2 {
+        reached.second_record += 1;
+    }
+
+    let mut publish = bytes.to_vec();
+    if let Ok(mut validated) = validate_publish(&mut publish) {
+        assert!(walked_ok);
+        assert_eq!(validated.record_count(), walked);
+        let item_count = validated.item_count();
+        if walked > 0 {
+            reached.publish_ok += 1;
+        }
+        validated.stamp(1000, AUTHOR);
+        check_stamped(&publish, walked, item_count, AUTHOR.get());
+    }
+    let mut forward = bytes.to_vec();
+    if let Ok(mut validated) = validate_forward(&mut forward) {
+        assert!(walked_ok);
+        let item_count = validated.item_count();
+        if walked > 0 {
+            reached.forward_ok += 1;
+        }
+        validated.stamp(1000);
+        let mut next_id = 1000;
+        for record in Records::new(&forward) {
+            let view = record.unwrap();
+            assert_eq!(view.header.id, next_id);
+            assert_ne!(view.header.author, 0);
+            next_id += u64::from(view.header.count);
+        }
+        assert_eq!(next_id, 1000 + item_count);
+    }
+}
+
+fn check_stamped(bytes: &[u8], record_count: u32, item_count: u64, author: u64) {
+    let mut seen = 0;
+    let mut next_id = 1000;
+    for record in Records::new(bytes) {
+        let view = record.unwrap();
+        assert_eq!(view.header.id, next_id);
+        assert_eq!(view.header.author, author);
+        next_id += u64::from(view.header.count);
+        seen += 1;
+    }
+    assert_eq!(seen, record_count);
+    assert_eq!(next_id, 1000 + item_count);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(5000))]
 
-    /// Every entry point returns normally on arbitrary bytes.
+    /// Every entry point returns normally on arbitrary frames.
     #[test]
-    fn random_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..400)) {
-        let _ = RecordHeader::read(&bytes);
-        if let Ok((view, total_bytes)) = decode_record(&bytes) {
-            prop_assert!(total_bytes <= bytes.len());
-            prop_assert_eq!(total_bytes, view.header.total_bytes());
-            let _ = SystemRecord::parse(&view);
-        }
-        for record in Records::new(&bytes) {
-            let _ = record;
-        }
-        let _ = validate_publish(&mut bytes.clone()).map(|publish| publish.item_count());
-        let _ = validate_forward(&mut bytes.clone()).map(|forward| forward.item_count());
+    fn random_bytes_never_panic(bytes in arb_frame()) {
+        exercise(&bytes, &mut Reached::default());
     }
 
-    /// Headers with huge `len` values and small bodies, which random bytes rarely hit.
+    /// Headers with hostile `len` values and small bodies.
     #[test]
-    fn hostile_len_never_panics(
-        len: u32,
-        count: u16,
-        body in proptest::collection::vec(any::<u8>(), 0..64),
-    ) {
-        let header = RecordHeader { id: 0, options: 0, author: 0, len, count, codec: 0 };
-        let mut bytes = header.to_bytes().to_vec();
-        bytes.extend_from_slice(&body);
-        if let Ok((view, total_bytes)) = decode_record(&bytes) {
-            prop_assert_eq!(view.data.len(), len as usize);
-            prop_assert!(total_bytes <= bytes.len());
-        }
-        let _ = validate_publish(&mut bytes).map(|publish| publish.item_count());
+    fn hostile_len_never_panics(bytes in arb_hostile_len()) {
+        exercise(&bytes, &mut Reached::default());
     }
 
     /// Any truncation of valid bytes yields the whole records before the cut, then an error.
@@ -135,6 +288,43 @@ proptest! {
         let on_boundary = cut == 0 || ends.contains(&cut);
         prop_assert_eq!(decoded.len(), if on_boundary { ok_count } else { ok_count + 1 });
     }
+}
+
+fn reached_by(strategy: impl Strategy<Value = Vec<u8>>) -> Reached {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+
+    let mut runner = TestRunner::deterministic();
+    let mut reached = Reached::default();
+    for _ in 0..5_000 {
+        let bytes = strategy.new_tree(&mut runner).unwrap().current();
+        exercise(&bytes, &mut reached);
+    }
+    reached
+}
+
+/// The no-panic tests prove nothing about paths their inputs never reach, so
+/// count them: past the first header check, across records, and through to stamp.
+#[test]
+fn the_no_panic_inputs_reach_every_path() {
+    let reached = reached_by(arb_frame());
+    assert!(reached.decode_ok > 500, "{reached:?}");
+    assert!(reached.system_ok > 50, "{reached:?}");
+    assert!(reached.second_record > 500, "{reached:?}");
+    assert!(reached.publish_ok > 100, "{reached:?}");
+    assert!(reached.forward_ok > 100, "{reached:?}");
+    assert!(reached.non_zero_padding > 50, "{reached:?}");
+    assert!(reached.zero_count > 50, "{reached:?}");
+    assert!(reached.truncated_data > 50, "{reached:?}");
+    assert!(reached.truncated_header > 50, "{reached:?}");
+}
+
+#[test]
+fn the_hostile_len_inputs_get_past_the_length_check() {
+    let reached = reached_by(arb_hostile_len());
+    assert!(reached.decode_ok > 500, "{reached:?}");
+    assert!(reached.non_zero_padding > 50, "{reached:?}");
+    assert!(reached.truncated_data > 500, "{reached:?}");
 }
 
 #[test]
