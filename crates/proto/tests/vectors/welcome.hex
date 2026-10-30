@@ -1,0 +1,8 @@
+# type 0x81 | flags 0x00
+81 00
+# session
+08 07 06 05 04 03 02 01
+# max_frame 16 MiB
+00 00 00 01
+# server_ms
+00 50 5C 18 A3 01 00 00

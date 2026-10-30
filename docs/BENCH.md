@@ -75,6 +75,37 @@ Reading these:
 - **Uniform lengths are a best case.** Each record's offset depends on the previous header's `len`, and this CPU appears to predict repeated values. With `mixed` lengths the cost is 2 ns per record at 100 records and about 8 ns at 10,000. Use the `mixed` rows for real publishes.
 - **Run-to-run variance:** an earlier run of the same code had `stamp` at 10,000 records with 256 B and 4,096 B at 6.8 µs and 7.0 µs, against about 14 µs here, so large publishes can differ by about 2× between runs. Criterion's narrow intervals don't capture this.
 
+## M2: `frame_codec`
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p proto --bench frame_codec
+```
+
+Commit: the working tree on top of `bc0ddcb`, committed together with this file. Same machine, load average about 3.7. Time per frame; the record bytes are a fill pattern, which is fine because the codec doesn't read them.
+
+`PUBLISH` has no state. `encode` appends to a reused, already sized `Vec`, so it measures no allocation. `data_prefix` builds only the 10 bytes before the records, which is what a sender passing the original bytes to the socket pays.
+
+| records | `PUBLISH` decode | `PUBLISH` encode | `DATA` decode | `DATA` encode | `data_prefix` |
+|---|---|---|---|---|---|
+| 64 B | 8.2 ns | 5.4 ns | 3.1 ns | 4.1 ns | 1.4 ns |
+| 4 KiB | 8.3 ns | 40.5 ns | 3.1 ns | 37.9 ns | 1.4 ns |
+| 64 KiB | 8.3 ns | 545 ns | 3.1 ns | 554 ns | 1.4 ns |
+| 1 MiB | 8.4 ns | 12.1 µs | 3.1 ns | 11.9 µs | 1.5 ns |
+
+`SUBSCRIBE`, time per frame:
+
+| clauses and stream id | decode | encode |
+|---|---|---|
+| 0 clauses, 15 B | 35.8 ns | 11.1 ns |
+| 4 clauses, 15 B | 38.7 ns | 13.7 ns |
+| 4 clauses, 1 KiB | 84.7 ns | 45.2 ns |
+
+Reading these:
+
+- **Decode doesn't depend on record size:** 64 B to 1 MiB stays within about 3% for `PUBLISH` and 2% for `DATA`, since it only slices. Criterion also prints GiB/s for these rows, and those numbers mean nothing because no record byte is touched.
+- **Encode is a `memcpy`:** about 80–110 GiB/s, or 12 µs per MiB. `data_prefix` avoids that cost on the delivery path. Whether the delivery path gets the bytes to the socket without a copy is M5's to show.
+- **`SUBSCRIBE`:** clauses add about 3 ns to decode, and a 1 KiB stream id adds about 46 ns over a 15 B one. It is a per-subscription frame, so none of this is on the record path.
+
 ## Caveats
 
 - One laptop, under whatever else it was running. Treat differences under about 2× as noise.
@@ -82,4 +113,4 @@ Reading these:
 
 ## Not run yet
 
-`frame_codec` (M2), `wal_throughput` and `segment` (M3), `write_path` and `state_apply` (M4), `fan_out` (M5), and all load generator numbers (M6, M10).
+`wal_throughput` and `segment` (M3), `write_path` and `state_apply` (M4), `fan_out` (M5), and all load generator numbers (M6, M10).

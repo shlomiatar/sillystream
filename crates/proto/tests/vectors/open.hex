@@ -1,0 +1,6 @@
+# type 0x04 | flags 0x00
+04 00
+# handle
+09 00 00 00
+# stream 'inbox.reviewer'
+0E 00 69 6E 62 6F 78 2E 72 65 76 69 65 77 65 72

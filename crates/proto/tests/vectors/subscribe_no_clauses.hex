@@ -1,0 +1,12 @@
+# type 0x02 | flags 0x00
+02 00
+# sub
+04 03 02 01
+# from
+18 17 16 15 14 13 12 11
+# linger_ms
+22 21
+# nfilt
+00
+# stream 'logs.a'
+06 00 6C 6F 67 73 2E 61

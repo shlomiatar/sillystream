@@ -1,0 +1,16 @@
+# type 0x02 | flags 0x19
+02 19
+# sub
+04 03 02 01
+# from
+18 17 16 15 14 13 12 11
+# linger_ms
+22 21
+# author (HAS_AUTHOR)
+38 37 36 35 34 33 32 31
+# nfilt
+01
+# mask | value | op
+48 47 46 45 44 43 42 41 58 57 56 55 54 53 52 51 00
+# stream 'logs.a'
+06 00 6C 6F 67 73 2E 61

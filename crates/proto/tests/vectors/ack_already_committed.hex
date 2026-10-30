@@ -1,0 +1,10 @@
+# type 0x84 | flags 0x00
+84 00
+# handle
+05 00 00 00
+# producer_seq
+29 00 00 00 00 00 00 00
+# first_id 0
+00 00 00 00 00 00 00 00
+# count 0
+00 00 00 00

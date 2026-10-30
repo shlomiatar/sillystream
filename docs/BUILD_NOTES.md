@@ -41,6 +41,15 @@ Each has a working assumption so the build can continue.
 - **D36.** The allocator never issues `u64::MAX` and refuses an allocation that would need it. Id 0 is never issued either. A clock above 48 bits is clamped. Reason: section 5.1 gives both values cursor meanings, and `first_id = 0` means "already committed" in an `ACK`.
 - **D37.** A record overlapping a filter's id range matches whole, and the decoder rejects non-zero padding as well as validation does. Reason: section 5.2 sends whole records; padding isn't data, and nothing valid has non-zero padding.
 - **D38.** `validate_forward` requires a non-zero `author`, and `id = 0`, for records from a forward sink. Reason: section 3 lets forward sinks set `author`, and D28 keeps system records out.
+- **D39.** Frame decoders are strict: unknown types, undefined flag bits (flags must be 0 on frames that define none), trailing bytes, `ack` above 3, a state `op` outside 1–3, `ok` above 1 and error codes outside 1–8 are errors. Reason: each frame then has one encoding, and section 3 and 11.1 define no other values.
+- **D40.** A token's text form is the lowercase hex of D25's bytes. Reason: `HELLO` carries `token str`, which must be UTF-8, and a Bearer header must be text, but D25's bytes are binary; hex needs no dependency, and one case means one text form.
+- **D41.** `HELLO.ver` is 1 for now, and the codec doesn't check it. Reason: the spec gives the field but no value, and what to do on a mismatch belongs to the connection (M6).
+- **D42.** A stream id in a frame must be non-empty as well as free of `/`, and the codec checks both. Reason: section 1 calls them names; a bad id fails as error 8 before reaching a core.
+- **D43.** `max_frame` covers the whole frame, including `type` and `flags`. A frame above it is error 6, and every other decode failure is error 8. Reason: the WebSocket message length is what a reader can check first.
+- **D44.** The codec accepts all 32 `SUBSCRIBE` flag combinations, including `WITH_STATE` with `STATE_ONLY`, and leaves their meaning to the subscribe handler (M5). It also doesn't check `sink:*` cursor names (D27), state doc size or CBOR, or record validity, which belong to the owner. Reason: these need context or are section 3's validation, and the codec never reads inside `records`.
+- **D45.** Permission bits: `read` 0x01, `publish` 0x02, `state` 0x04, `admin` 0x08, and other bits make a token invalid. Reason: D25 gives `perms u8` but no bits.
+- **D46.** A token is expired once `now_ms >= expiry_ms`. `*` is a wildcard only as a pattern's last character, and it matches an empty remainder, so `logs.*` matches `logs.` but neither `logs` nor `logsx`. A `*` elsewhere is an ordinary character. The signature is checked before the body is parsed. Reason: smallest reading of D25; unauthenticated bytes never reach the parser.
+- **D47.** `Token::sign` and `verify` accept any secret length, including empty. Rejecting a weak secret is for node config, when it is added (M6). Reason: the token code has no policy on keys, and HMAC accepts any length.
 
 ### Storage
 

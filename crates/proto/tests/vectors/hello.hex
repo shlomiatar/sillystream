@@ -1,0 +1,6 @@
+# type 0x01 | flags 0x00
+01 00
+# ver 1
+01 00
+# token 'tok'
+03 00 74 6F 6B

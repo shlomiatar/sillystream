@@ -1,0 +1,10 @@
+# type 0x8A | flags 0x00
+8A 00
+# handle
+05 00 00 00
+# producer_seq
+2A 00 00 00 00 00 00 00
+# code 3 version conflict
+03 00
+# msg 'conflict'
+08 00 63 6F 6E 66 6C 69 63 74
