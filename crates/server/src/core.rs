@@ -242,7 +242,8 @@ pub(crate) struct Core {
     pool: SlabPool,
 
     /// Where each shard is, as far as this core knows. Following it always ends at the
-    /// owner, because each core that gives a shard away remembers where it went.
+    /// owner, because each core that gives a shard away remembers where it went, and an
+    /// entry is never overwritten by what another core says (D66).
     location: Vec<u16>,
     streams: HashMap<Arc<str>, Stream>,
     shards: HashMap<u32, Shard>,
@@ -1232,10 +1233,13 @@ impl Core {
         self.location[shard_id as usize] = me;
         for (name, own_shard, at) in handoff.overrides {
             self.overrides.insert(name, own_shard);
-            self.location[own_shard as usize] = at;
+            // The sender's view may be old, and this core may since have had the shard. What
+            // a core learned by holding a shard is newer than anything it can be told (D66).
+            let known = &mut self.location[own_shard as usize];
+            if *known == u16::MAX {
+                *known = at;
+            }
         }
-        // An entry just above may say where the shard was when it left.
-        self.location[shard_id as usize] = me;
         let shard = self.shards.entry(shard_id).or_default();
         shard.counters = handoff.counters;
         for stream in handoff.streams {
