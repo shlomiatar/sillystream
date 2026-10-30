@@ -177,30 +177,23 @@ fn arb_defect() -> impl Strategy<Value = Defect> {
     ]
 }
 
-/// Builds a publish whose data comes from `fill`. The lengths and the defect are
-/// the same whatever `fill` returns, so two calls differ in data bytes only.
-fn build(
-    lens: &[(u8, u16)],
-    defect: Defect,
-    mut fill: impl FnMut() -> u8,
-) -> (Vec<u8>, Vec<usize>) {
+/// A record's data and `count`.
+type PublishRecord = (Vec<u8>, u16);
+
+/// Builds a publish. The lengths and the defect depend only on the shape of
+/// `records`, so two calls with equally long data differ in data bytes only.
+fn build(records: &[PublishRecord], defect: Defect) -> (Vec<u8>, Vec<usize>) {
     let mut bytes = Vec::new();
     let mut data_offsets = Vec::new();
-    for (len, count) in lens {
-        let data: Vec<u8> = (0..*len).map(|_| fill()).collect();
+    let mut last_start = 0;
+    for (data, count) in records {
+        last_start = bytes.len();
         for at in 0..data.len() {
             data_offsets.push(bytes.len() + 32 + at);
         }
-        bytes.extend(unstamped(9, *count, &data));
+        bytes.extend(unstamped(9, *count, data));
     }
-    let last_start = {
-        let mut offset = 0;
-        for (len, _) in &lens[..lens.len() - 1] {
-            offset += 32 + ((*len as usize + 7) & !7);
-        }
-        offset
-    };
-    let last_len = lens[lens.len() - 1].0 as usize;
+    let last_len = records[records.len() - 1].0.len();
     match defect {
         Defect::None => {}
         Defect::Id => bytes[last_start] = 1,
@@ -222,26 +215,57 @@ fn build(
     (bytes, data_offsets)
 }
 
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Random bytes, often starting with what a codec sniffer would look for.
+fn arb_data(len: usize) -> impl Strategy<Value = Vec<u8>> {
+    (proptest::collection::vec(any::<u8>(), len), any::<bool>()).prop_map(|(mut data, magic)| {
+        if magic {
+            let prefix = data.len().min(ZSTD_MAGIC.len());
+            data[..prefix].copy_from_slice(&ZSTD_MAGIC[..prefix]);
+        }
+        data
+    })
+}
+
+/// Two publishes of the same shape with independent random data.
+fn arb_publish_pair() -> impl Strategy<Value = (Vec<PublishRecord>, Vec<PublishRecord>)> {
+    proptest::collection::vec((0usize..64, 1u16..=u16::MAX), 1..8).prop_flat_map(|shape| {
+        let side = |shape: &[(usize, u16)]| {
+            shape
+                .iter()
+                .map(|(len, count)| (arb_data(*len), Just(*count)))
+                .collect::<Vec<_>>()
+        };
+        (side(&shape), side(&shape))
+    })
+}
+
+/// A publish whose data is the zstd magic is an ordinary publish: the rules don't
+/// look at data, whatever it holds.
+#[test]
+fn data_that_looks_compressed_is_accepted() {
+    assert_eq!(check(unstamped(1, 1, &ZSTD_MAGIC)), Ok((1, 1)));
+    for first in 0..=u8::MAX {
+        for second in 0..=u8::MAX {
+            assert_eq!(check(unstamped(1, 1, &[first, second])), Ok((1, 1)));
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
     /// The result is a function of headers and padding alone: changing every data
     /// byte, to anything, never changes it, and validation leaves the bytes alone.
+    /// That no read happens at all is shown by the probe tests in `publish.rs`.
     #[test]
     fn validation_does_not_depend_on_data(
-        lens in proptest::collection::vec((0u8..64, 1u16..=u16::MAX), 1..8),
+        (records_a, records_b) in arb_publish_pair(),
         defect in arb_defect(),
-        seed_a: u8,
-        seed_b: u8,
-        hostile: bool,
     ) {
-        let mut a = seed_a;
-        let (bytes_a, offsets) = build(&lens, defect, || { a = a.wrapping_mul(31).wrapping_add(7); a });
-        let mut b = seed_b;
-        let (mut bytes_b, _) = build(&lens, defect, || {
-            b = b.wrapping_mul(17).wrapping_add(3);
-            if hostile { 0xFF } else { b }
-        });
+        let (bytes_a, offsets) = build(&records_a, defect);
+        let (mut bytes_b, _) = build(&records_b, defect);
         // Only data bytes may differ between the two.
         let data_offsets: std::collections::HashSet<usize> = offsets.into_iter().collect();
         for (at, (x, y)) in bytes_a.iter().zip(&bytes_b).enumerate() {

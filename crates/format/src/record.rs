@@ -88,20 +88,29 @@ pub struct RecordView<'a> {
     pub data: &'a [u8],
 }
 
+/// Where the data ends and the whole record ends, relative to the record's start,
+/// given `available_bytes` from there. Rejects `count = 0` and a `len` that overruns.
+pub(crate) fn record_bounds(
+    header: &RecordHeader,
+    available_bytes: usize,
+) -> Result<(usize, usize), FormatError> {
+    if header.count == 0 {
+        return Err(FormatError::ZeroCount);
+    }
+    let total_bytes = header.total_bytes();
+    if total_bytes > available_bytes {
+        return Err(FormatError::TruncatedData);
+    }
+    Ok((DATA_OFFSET + header.len as usize, total_bytes))
+}
+
 /// Decodes the record at the start of `bytes`, returning it and its total size.
 ///
 /// Rejects `count = 0`, a `len` past the end of `bytes`, and non-zero padding.
 /// It slices the data without reading it.
 pub fn decode_record(bytes: &[u8]) -> Result<(RecordView<'_>, usize), FormatError> {
     let header = RecordHeader::read(bytes)?;
-    if header.count == 0 {
-        return Err(FormatError::ZeroCount);
-    }
-    let total_bytes = header.total_bytes();
-    if total_bytes > bytes.len() {
-        return Err(FormatError::TruncatedData);
-    }
-    let data_end = DATA_OFFSET + header.len as usize;
+    let (data_end, total_bytes) = record_bounds(&header, bytes.len())?;
     if bytes[data_end..total_bytes].iter().any(|byte| *byte != 0) {
         return Err(FormatError::NonZeroPadding);
     }
