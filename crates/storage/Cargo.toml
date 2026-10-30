@@ -27,3 +27,7 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time",
 [[bench]]
 name = "wal_throughput"
 harness = false
+
+[[bench]]
+name = "segment"
+harness = false
