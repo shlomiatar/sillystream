@@ -7,6 +7,9 @@ use ciborium::value::{Integer, Value};
 use format::{ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, RecordView, SystemRecord};
 
 pub const MAX_STATE_BYTES: usize = 64 * 1024;
+/// What `incr` will walk or build. The parser refuses to nest deeper than this, so a longer
+/// path could never be read back, and building it would risk the core's stack (D76).
+const MAX_INCR_PATH_KEYS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateOp {
@@ -41,6 +44,8 @@ pub enum StateError {
     DocTooLarge,
     InvalidCbor,
     ResultTooLarge,
+    /// The result is nested too deeply to be parsed again (D76).
+    ResultTooDeep,
     /// `incr` found something other than a number, or a non-map on its path.
     NotNumeric,
     /// `incr`'s doc isn't `{"path": [keys], "n": int}`.
@@ -57,6 +62,7 @@ impl std::fmt::Display for StateError {
             StateError::DocTooLarge => "state doc is over 64 KB",
             StateError::InvalidCbor => "state doc is not valid CBOR",
             StateError::ResultTooLarge => "state would be over 64 KB",
+            StateError::ResultTooDeep => "state would be nested too deeply",
             StateError::NotNumeric => "incr path does not lead to a number",
             StateError::BadIncrDoc => "incr doc is not {path, n}",
             StateError::IncrOverflow => "incr result does not fit a CBOR integer",
@@ -223,10 +229,16 @@ pub fn apply_op(current: &[u8], op: StateOp, doc: &[u8]) -> Result<Bytes, StateE
         StateOp::Merge => merge(current, patch),
         _ => {
             let (path, n) = parse_incr(patch)?;
+            if path.len() > MAX_INCR_PATH_KEYS {
+                return Err(StateError::ResultTooDeep);
+            }
             incr(current, &path, n)?
         }
     };
-    encode(&result).map(Bytes::from)
+    let bytes = encode(&result)?;
+    // A doc that can't be parsed would refuse every later merge and incr, and replay.
+    parse(&bytes).map_err(|_| StateError::ResultTooDeep)?;
+    Ok(Bytes::from(bytes))
 }
 
 /// A stream's state and its version, which is the id of the system record that made it.
@@ -272,6 +284,61 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn whatever_an_incr_or_merge_returns_can_be_applied_to_again() {
+        let nested = |depth: usize| {
+            let mut value = int(1);
+            for _ in 0..depth {
+                value = Value::Map(vec![(int(1), value)]);
+            }
+            value
+        };
+        let incr_keys =
+            |keys: usize| incr_doc_values((0..keys).map(|_| int(2)).collect::<Vec<_>>(), 1);
+        let next = cbor(&map(&[("a", int(1))]));
+        let mut accepted_count = 0;
+        // State already near the limit, with an op that would take it past.
+        for depth in 200..270 {
+            let current = cbor(&nested(depth));
+            if parse(&current).is_err() {
+                continue;
+            }
+            for keys in [1, 2, 60, 300] {
+                match apply_op(&current, StateOp::Incr, &cbor(&incr_keys(keys))) {
+                    Ok(result) => {
+                        accepted_count += 1;
+                        parse(&result).unwrap();
+                        apply_op(&result, StateOp::Merge, &next).unwrap();
+                    }
+                    Err(error) => assert!(
+                        matches!(error, StateError::ResultTooDeep | StateError::NotNumeric),
+                        "{error:?}"
+                    ),
+                }
+            }
+            // A merge patch as deep as what it lands on, under a key of its own.
+            let patch = Value::Map(vec![(int(9), nested(depth))]);
+            if let Ok(result) = apply_op(&current, StateOp::Merge, &cbor(&patch)) {
+                accepted_count += 1;
+                parse(&result).unwrap();
+            }
+        }
+        assert!(accepted_count > 0);
+    }
+
+    #[test]
+    fn a_path_of_any_length_is_refused_before_anything_is_built() {
+        let doc = incr_doc_values((0..60_000).map(|_| int(1)).collect::<Vec<_>>(), 1);
+        assert_eq!(
+            apply_op(&[], StateOp::Incr, &cbor(&doc)),
+            Err(StateError::ResultTooDeep)
+        );
+    }
+
+    fn incr_doc_values(path: Vec<Value>, n: i64) -> Value {
+        map(&[("path", Value::Array(path)), ("n", int(n))])
+    }
 
     fn cbor(value: &Value) -> Vec<u8> {
         let mut out = Vec::new();
