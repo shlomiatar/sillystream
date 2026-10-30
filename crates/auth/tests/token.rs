@@ -193,6 +193,83 @@ fn sign_refuses_what_verify_would_refuse() {
     let mut long_pattern = token();
     long_pattern.grants[0].pattern = "x".repeat(65_536);
     assert_eq!(long_pattern.sign(SECRET), Err(AuthError::TooLong));
+    let mut many_grants = token();
+    many_grants.grants = vec![
+        Grant {
+            pattern: String::new(),
+            perms: PERM_READ,
+        };
+        65_536
+    ];
+    assert_eq!(many_grants.sign(SECRET), Err(AuthError::TooLong));
+}
+
+/// A token whose text is exactly `text_bytes` long, which must be even: 18 bytes of
+/// header, 3 of grant framing and 32 of signature, each doubled by hex.
+fn token_with_text_bytes(text_bytes: usize) -> Token {
+    Token {
+        grants: vec![Grant {
+            pattern: "x".repeat(text_bytes / 2 - 53),
+            perms: PERM_READ,
+        }],
+        ..token()
+    }
+}
+
+/// `HELLO` carries the token as a `str` (section 11.1), so the longest token text is
+/// the longest `str`, and hex text is even: 65,534 bytes.
+#[test]
+fn the_longest_token_sign_issues_fits_in_hello() {
+    let longest = token_with_text_bytes(65_534);
+    let text = longest.sign(SECRET).unwrap();
+    assert_eq!(text.len(), 65_534);
+    assert_eq!(verify(SECRET, &text, NOW_MS), Ok(longest));
+    let hello = proto::ClientFrame::Hello {
+        ver: 1,
+        token: &text,
+    };
+    let mut out = Vec::new();
+    hello.encode(&mut out).unwrap();
+    let decoded = proto::decode_client(&out, 1 << 20).unwrap();
+    assert_eq!(decoded, hello);
+}
+
+#[test]
+fn sign_refuses_a_token_that_does_not_fit_in_hello() {
+    assert_eq!(
+        token_with_text_bytes(65_536).sign(SECRET),
+        Err(AuthError::TooLong)
+    );
+    // A stream id may be 65,535 bytes, but an exact grant on one this long can't fit.
+    let mut long_exact_grant = token();
+    long_exact_grant.grants[0].pattern = "x".repeat(40_000);
+    assert_eq!(long_exact_grant.sign(SECRET), Err(AuthError::TooLong));
+}
+
+/// One limit on both paths, so a token can't work on HTTP and fail on WebSocket.
+#[test]
+fn verify_refuses_a_token_that_does_not_fit_in_hello() {
+    let body_bytes = 65_536 / 2 - 32;
+    let mut body = Vec::with_capacity(body_bytes);
+    body.extend_from_slice(&EXPIRY_MS.to_le_bytes());
+    body.extend_from_slice(&7u64.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    let pattern_bytes = body_bytes - body.len() - 3;
+    body.extend_from_slice(&(pattern_bytes as u16).to_le_bytes());
+    body.resize(body.len() + pattern_bytes, b'x');
+    body.push(PERM_READ);
+    let text = sign_raw(SECRET, &body);
+    assert_eq!(text.len(), 65_536);
+    assert_eq!(verify(SECRET, &text, NOW_MS), Err(AuthError::TooLong));
+    // The limit comes first: text this long isn't decoded at all.
+    assert_eq!(
+        verify(SECRET, &"z".repeat(65_536), NOW_MS),
+        Err(AuthError::TooLong)
+    );
+    assert_eq!(
+        verify(SECRET, &"z".repeat(65_534), NOW_MS),
+        Err(AuthError::Malformed)
+    );
 }
 
 #[test]
@@ -237,6 +314,50 @@ fn check_needs_both_the_stream_and_the_permission() {
     }
 }
 
+/// Section 12's check, and `Token::check`'s rule for several bits: one grant must
+/// allow them all. Holding some of them is not enough, and neither is holding them
+/// across two grants.
+#[test]
+fn several_permission_bits_must_all_be_allowed_by_one_grant() {
+    let token = token();
+    assert_eq!(
+        token.check("inbox.reviewer", PERM_PUBLISH | PERM_STATE, NOW_MS),
+        Ok(())
+    );
+    for (stream, perm) in [
+        ("logs.a", PERM_READ | PERM_ADMIN),
+        ("logs.a", PERM_READ | PERM_PUBLISH),
+        ("inbox.reviewer", PERM_PUBLISH | PERM_ADMIN),
+        ("inbox.reviewer", PERM_PUBLISH | PERM_STATE | PERM_READ),
+    ] {
+        assert_eq!(
+            token.check(stream, perm, NOW_MS),
+            Err(AuthError::Forbidden),
+            "{stream} {perm:#x}"
+        );
+    }
+
+    let split = Token {
+        grants: vec![
+            Grant {
+                pattern: "a".to_string(),
+                perms: PERM_READ,
+            },
+            Grant {
+                pattern: "a".to_string(),
+                perms: PERM_ADMIN,
+            },
+        ],
+        ..token
+    };
+    assert_eq!(split.check("a", PERM_READ, NOW_MS), Ok(()));
+    assert_eq!(split.check("a", PERM_ADMIN, NOW_MS), Ok(()));
+    assert_eq!(
+        split.check("a", PERM_READ | PERM_ADMIN, NOW_MS),
+        Err(AuthError::Forbidden)
+    );
+}
+
 #[test]
 fn a_token_with_no_grants_verifies_and_allows_nothing() {
     let token = Token {
@@ -250,25 +371,28 @@ fn a_token_with_no_grants_verifies_and_allows_nothing() {
     );
 }
 
-/// Verification does no I/O. The signature makes that checkable from outside: it
-/// takes the clock as an argument, and the crate's source names no I/O, clock or
-/// environment API, and depends only on the two hash crates.
+/// Verification does no I/O. The crate is `no_std`, so the compiler refuses any path
+/// to files, sockets, clocks, threads or the environment, including nested imports
+/// and printing. What that leaves open is opting back in to `std`, which this test
+/// refuses in every source file, and new dependencies, which it refuses too. The two
+/// hash crates themselves are trusted here, not inspected.
 #[test]
-fn verification_source_uses_no_io() {
-    let source = include_str!("../src/lib.rs");
-    for banned in [
-        "std::fs",
-        "std::net",
-        "std::io",
-        "std::env",
-        "std::time",
-        "std::process",
-        "std::thread",
-        "tokio",
-        "SystemTime",
-        "Instant",
-    ] {
-        assert!(!source.contains(banned), "auth uses {banned}");
+fn the_crate_can_not_reach_io() {
+    let lib = include_str!("../src/lib.rs");
+    assert!(
+        lib.lines().any(|line| line.trim() == "#![no_std]"),
+        "auth must be unconditionally no_std"
+    );
+    let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    for entry in std::fs::read_dir(src_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            opt_in_to_std(&source),
+            None,
+            "{} opts back in to std",
+            path.display()
+        );
     }
     let manifest = include_str!("../Cargo.toml");
     let dependencies = manifest
@@ -284,6 +408,33 @@ fn verification_source_uses_no_io() {
         .map(|line| line.split(['.', ' ']).next().unwrap())
         .collect();
     assert_eq!(names, ["hmac", "sha2"]);
+}
+
+/// The first word outside comments that could bring `std` or foreign code into a
+/// `no_std` crate. Only `extern crate alloc;` is allowed.
+fn opt_in_to_std(source: &str) -> Option<String> {
+    source
+        .lines()
+        .map(|line| line.split("//").next().unwrap().trim())
+        .filter(|line| *line != "extern crate alloc;")
+        .flat_map(|line| line.split(|c: char| !c.is_alphanumeric() && c != '_'))
+        .find(|word| matches!(*word, "std" | "extern"))
+        .map(str::to_string)
+}
+
+#[test]
+fn the_io_check_sees_every_way_back_to_std() {
+    for source in [
+        "extern crate std;",
+        "use std::{fs, net::TcpStream};",
+        "fn f() { ::std::fs::read(\"x\"); }",
+        "extern crate alloc as std;",
+        "extern crate alloc; extern crate core as other;",
+    ] {
+        assert!(opt_in_to_std(source).is_some(), "{source}");
+    }
+    let allowed = "// std is not used\nextern crate alloc;\nuse core::fmt;";
+    assert_eq!(opt_in_to_std(allowed), None);
 }
 
 fn arb_grant() -> impl Strategy<Value = Grant> {

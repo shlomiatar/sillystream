@@ -5,11 +5,17 @@
 //! little-endian, where `str` is a u16 length and UTF-8.
 //!
 //! Verification is a pure function of the secret, the token and the caller's clock
-//! reading: no lookup, no I/O, and no clock of its own.
+//! reading: no lookup, no I/O, and no clock of its own. The crate is `no_std`, so the
+//! compiler holds it to that.
+#![no_std]
 #![forbid(unsafe_code)]
 
-use std::fmt;
-use std::num::NonZeroU64;
+extern crate alloc;
+
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
+use core::num::NonZeroU64;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -22,6 +28,12 @@ const PERM_ALL: u8 = PERM_READ | PERM_PUBLISH | PERM_STATE | PERM_ADMIN;
 
 const SIGNATURE_BYTES: usize = 32;
 
+/// The longest token text. `HELLO` carries a token as a `str`, which has a u16 length,
+/// and HTTP takes the same limit so a token works on both or on neither. Hex text has
+/// even length, so the longest real token is 65,534 bytes, a 32,767-byte
+/// `body | signature`.
+pub const MAX_TOKEN_TEXT_BYTES: usize = 65_535;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthError {
     /// Not lowercase hex, or too short to hold a signature.
@@ -32,7 +44,8 @@ pub enum AuthError {
     MalformedBody,
     /// `author = 0` is reserved for the server (section 2.2).
     ZeroAuthor,
-    /// A pattern is over 65,535 bytes, or there are over 65,535 grants.
+    /// A pattern is over 65,535 bytes, there are over 65,535 grants, or the token text
+    /// is over `MAX_TOKEN_TEXT_BYTES`.
     TooLong,
     /// A grant has permission bits section 12 doesn't define.
     UnknownPermission,
@@ -58,7 +71,7 @@ impl fmt::Display for AuthError {
     }
 }
 
-impl std::error::Error for AuthError {}
+impl core::error::Error for AuthError {}
 
 /// `true` if a stream id matches a pattern: exactly, or by prefix when the pattern
 /// ends in `*`. A `*` anywhere else is an ordinary character.
@@ -103,7 +116,8 @@ impl Token {
         }
     }
 
-    /// Signs this token into its text form. Only the issuer does this.
+    /// Signs this token into its text form. Only the issuer does this. A token whose
+    /// text wouldn't fit in `HELLO` is refused here rather than failing at connect time.
     pub fn sign(&self, secret: &[u8]) -> Result<String, AuthError> {
         let mut body = Vec::new();
         body.extend_from_slice(&self.expiry_ms.to_le_bytes());
@@ -121,13 +135,19 @@ impl Token {
         }
         let signature = new_mac(secret).chain_update(&body).finalize().into_bytes();
         body.extend_from_slice(&signature);
+        if body.len() * 2 > MAX_TOKEN_TEXT_BYTES {
+            return Err(AuthError::TooLong);
+        }
         Ok(to_hex(&body))
     }
 }
 
-/// Verifies a token's text form. The signature is checked, in constant time, before
-/// anything in the body is parsed.
+/// Verifies a token's text form. The length is checked first, then the signature, in
+/// constant time, before anything in the body is parsed.
 pub fn verify(secret: &[u8], token: &str, now_ms: u64) -> Result<Token, AuthError> {
+    if token.len() > MAX_TOKEN_TEXT_BYTES {
+        return Err(AuthError::TooLong);
+    }
     let bytes = from_hex(token).ok_or(AuthError::Malformed)?;
     if bytes.len() < SIGNATURE_BYTES {
         return Err(AuthError::Malformed);
@@ -163,7 +183,7 @@ fn parse_body(body: &[u8]) -> Result<Token, AuthError> {
         }
         let (pattern, after) = rest.split_at(pattern_len);
         rest = after;
-        let pattern = std::str::from_utf8(pattern).map_err(|_| AuthError::MalformedBody)?;
+        let pattern = core::str::from_utf8(pattern).map_err(|_| AuthError::MalformedBody)?;
         let [perms] = take_array(&mut rest)?;
         if perms & !PERM_ALL != 0 {
             return Err(AuthError::UnknownPermission);

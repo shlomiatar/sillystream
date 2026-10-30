@@ -50,6 +50,8 @@ Each has a working assumption so the build can continue.
 - **D45.** Permission bits: `read` 0x01, `publish` 0x02, `state` 0x04, `admin` 0x08, and other bits make a token invalid. Reason: D25 gives `perms u8` but no bits.
 - **D46.** A token is expired once `now_ms >= expiry_ms`. `*` is a wildcard only as a pattern's last character, and it matches an empty remainder, so `logs.*` matches `logs.` but neither `logs` nor `logsx`. A `*` elsewhere is an ordinary character. The signature is checked before the body is parsed. Reason: smallest reading of D25; unauthenticated bytes never reach the parser.
 - **D47.** `Token::sign` and `verify` accept any secret length, including empty. Rejecting a weak secret is for node config, when it is added (M6). Reason: the token code has no policy on keys, and HMAC accepts any length.
+- **D48.** Token text is at most 65,535 bytes, so 65,534 in practice because hex is even, and `body | signature` at most 32,767 bytes. `sign` and `verify` both return `TooLong` above it, on HTTP as well. An exact grant on a stream id over about 32.7 KB can't be issued, though such an id is valid (section 11), and has to use a shorter `*` pattern. Reason: `HELLO` carries the token as a `str`, and one limit means a token can't work on HTTP and always fail on WebSocket.
+- **D49.** The `auth` crate is `no_std` plus `alloc`, and a test refuses any opt back in to `std`. Reason: it makes "verification does no I/O" a compile error instead of a source search that a nested import gets past.
 
 ### Storage
 

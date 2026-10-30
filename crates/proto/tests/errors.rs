@@ -5,8 +5,8 @@ mod common;
 use common::{MAX, load, one_clause, subscribe_with_flags};
 use format::Clause;
 use proto::{
-    AckLevel, ClientFrame, ErrorCode, ProtoError, Publish, ServerFrame, StateOp, WireClause,
-    WireClauses, decode_client, decode_server,
+    AckLevel, ClientFrame, ErrorCode, ProtoError, Publish, ServerFrame, StateOp, Subscribe,
+    WireClause, WireClauses, decode_client, decode_server,
 };
 
 const SUBSCRIBE_NFILT_OFFSET: usize = 16;
@@ -167,6 +167,15 @@ fn stream_ids_can_not_be_empty_or_contain_a_slash() {
         host: "h",
     };
     assert_eq!(redirect.encode(&mut out), Err(ProtoError::InvalidStreamId));
+
+    // Each encoder that writes a stream id has to refuse what its decoder refuses.
+    for stream in ["", "a/b"] {
+        let subscribe = ClientFrame::Subscribe(Subscribe {
+            stream,
+            ..subscribe_with_flags(0, WireClauses::default())
+        });
+        assert_eq!(subscribe.encode(&mut out), Err(ProtoError::InvalidStreamId));
+    }
 }
 
 #[test]
