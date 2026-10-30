@@ -464,6 +464,11 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// A delivery bound past the memory cap stops nothing, because publishers stop first (D96).
+fn delivery_bound_bytes(config: &NodeConfig, bound_bytes: u64) -> u64 {
+    bound_bytes.min(config.memory_cap_bytes / 4)
+}
+
 impl Node {
     /// Starts the WAL writer on `volume`, the uploader on `store`, and every core.
     pub fn start<V: WalVolume + 'static>(
@@ -548,12 +553,12 @@ impl Node {
         let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let accounts: Vec<SlabAccount> = (0..core_count).map(|_| SlabAccount::new()).collect();
         let settings = DeliverySettings {
-            queue_bytes: config.subscriber_queue_bytes,
+            queue_bytes: delivery_bound_bytes(&config, config.subscriber_queue_bytes),
             progress_interval_ms: config.progress_interval_ms,
             max_frame_bytes: config.max_frame_bytes,
             max_subscriptions: config.max_subscriptions_per_connection,
             share_bytes: config.fair_share_bytes,
-            window_bytes: config.connection_window_bytes,
+            window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
             read_bytes: config.catch_up_read_bytes,
         };
         let mut threads = Vec::with_capacity(core_count + 1);
@@ -679,7 +684,7 @@ impl Node {
     pub async fn connection(&self, home_core: usize) -> Option<Connection> {
         Connection::open(
             self.links.control[home_core].clone(),
-            self.config.connection_window_bytes,
+            delivery_bound_bytes(&self.config, self.config.connection_window_bytes),
         )
         .await
     }

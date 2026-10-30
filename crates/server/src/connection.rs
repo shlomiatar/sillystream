@@ -31,6 +31,8 @@ use crate::slab::SlabBytes;
 const DATA_FRAME_HEAD_BYTES: u64 = 10;
 /// How long a failed store read waits before the next try (D87).
 const READ_RETRY_MS: u64 = 100;
+/// A newly held allocation costs at most this share of a connection's window (D96).
+const HELD_WINDOW_SHARE: u64 = 8;
 
 /// One matching stretch of a `DATA` frame: shared bytes, not a copy.
 #[derive(Debug, Clone)]
@@ -51,6 +53,8 @@ impl DataPart {
 pub struct DataFrame {
     parts: Vec<DataPart>,
     len_bytes: u64,
+    /// What this frame took from the connection's window, and returns once read (D96).
+    window_cost_bytes: u64,
 }
 
 impl DataFrame {
@@ -227,16 +231,19 @@ impl Connection {
         answer.await.ok().flatten()
     }
 
+    /// Returns what a frame took from the window, which only `DATA` and `STATE` do.
     fn took(&mut self, event: &Event) {
-        if let Event::Data { records, .. } = event {
-            self.credit_owed_bytes += records.len_bytes();
-            if self.credit_owed_bytes >= self.credit_step_bytes {
-                self.send(ConnCmd::Credit {
-                    conn: self.conn,
-                    bytes: self.credit_owed_bytes,
-                });
-                self.credit_owed_bytes = 0;
-            }
+        self.credit_owed_bytes += match event {
+            Event::Data { records, .. } => records.window_cost_bytes,
+            Event::State { doc, .. } => doc.len() as u64,
+            _ => return,
+        };
+        if self.credit_owed_bytes >= self.credit_step_bytes {
+            self.send(ConnCmd::Credit {
+                conn: self.conn,
+                bytes: self.credit_owed_bytes,
+            });
+            self.credit_owed_bytes = 0;
         }
     }
 
@@ -327,6 +334,11 @@ struct Sub {
     subscribed_sent: bool,
     queue: VecDeque<QueueItem>,
     queued_bytes: u64,
+    /// The size of the allocations the queue keeps alive: each run of neighbours in one
+    /// allocation counts once (D96).
+    held_bytes: u64,
+    /// The allocation this subscription's last frame was charged for.
+    frame_held: Option<usize>,
     /// The highest id looked at: everything at or below it matching is queued or sent.
     position: u64,
     /// The highest id this subscriber has been told about.
@@ -344,8 +356,63 @@ struct Sub {
 }
 
 impl Sub {
-    /// Whole records up to `budget_bytes`, and at least one. Bytes aren't copied.
-    fn take_frame(&mut self, budget_bytes: u64, spans: &mut Vec<RecordSpan>) -> DataFrame {
+    /// What the queue costs against its bound: its bytes or the memory they keep, whichever
+    /// is more.
+    fn queue_cost_bytes(&self) -> u64 {
+        self.queued_bytes.max(self.held_bytes)
+    }
+
+    /// `queue_cost_bytes` with `matched` added.
+    fn queue_cost_with(&self, matched: &Matched, bytes: u64) -> u64 {
+        let (held, size_bytes) = matched.bytes.held();
+        let new_held_bytes = match self.queue.back() {
+            Some(last) if last.matched.bytes.held().0 == held => 0,
+            _ => size_bytes,
+        };
+        (self.queued_bytes + bytes).max(self.held_bytes + new_held_bytes)
+    }
+
+    fn push_item(&mut self, item: QueueItem, bytes: u64) {
+        let (held, size_bytes) = item.matched.bytes.held();
+        if self
+            .queue
+            .back()
+            .is_none_or(|last| last.matched.bytes.held().0 != held)
+        {
+            self.held_bytes += size_bytes;
+        }
+        self.queued_bytes += bytes;
+        self.queue.push_back(item);
+    }
+
+    fn pop_item(&mut self) {
+        let Some(item) = self.queue.pop_front() else {
+            return;
+        };
+        let (held, size_bytes) = item.matched.bytes.held();
+        if self
+            .queue
+            .front()
+            .is_none_or(|next| next.matched.bytes.held().0 != held)
+        {
+            self.held_bytes -= size_bytes;
+        }
+    }
+
+    fn clear_queue(&mut self) {
+        self.queue.clear();
+        self.queued_bytes = 0;
+        self.held_bytes = 0;
+    }
+
+    /// Whole records up to `budget_bytes`. Only a record over the budget by itself goes past
+    /// it, and then it goes alone (D91). Bytes aren't copied.
+    fn take_frame(
+        &mut self,
+        budget_bytes: u64,
+        held_charge_bytes: u64,
+        spans: &mut Vec<RecordSpan>,
+    ) -> DataFrame {
         let mut frame = DataFrame::default();
         let mut left_bytes = budget_bytes as usize;
         while left_bytes > 0 {
@@ -360,20 +427,31 @@ impl Sub {
                 // Only an oversized stretch needs its headers walked.
                 walk_records(&item.matched.bytes[start..run.end], spans);
                 let mut taken = 0;
+                let frame_is_empty = frame.parts.is_empty();
                 for span in spans.iter() {
-                    if span.end > left_bytes && taken > 0 {
+                    if span.end > left_bytes && (taken > 0 || !frame_is_empty) {
                         break;
                     }
                     taken = span.end;
                     last_id = span.header.last_id();
                 }
                 if taken == 0 {
+                    if !frame_is_empty {
+                        break;
+                    }
                     // Bytes that don't walk can't be whole records. Nothing valid gets here.
                     taken = end - start;
                 }
                 end = start + taken;
             }
             let part_bytes = end - start;
+            let (held, size_bytes) = item.matched.bytes.held();
+            frame.window_cost_bytes += if self.frame_held == Some(held) {
+                part_bytes as u64
+            } else {
+                self.frame_held = Some(held);
+                size_bytes.min(held_charge_bytes).max(part_bytes as u64)
+            };
             frame.parts.push(DataPart {
                 matched: Arc::clone(&item.matched),
                 start,
@@ -387,7 +465,7 @@ impl Sub {
                 item.run += 1;
                 item.offset = 0;
                 if item.run == item.matched.runs.len() {
-                    self.queue.pop_front();
+                    self.pop_item();
                 }
             } else {
                 item.offset = end;
@@ -719,6 +797,8 @@ impl Home {
             subscribed_sent: false,
             queue: VecDeque::new(),
             queued_bytes: 0,
+            held_bytes: 0,
+            frame_held: None,
             position: 0,
             handed_through: 0,
             due: false,
@@ -852,13 +932,15 @@ impl Home {
     }
 
     /// Records joined a queue. They go out now, or when the timer fires or the queue has
-    /// reached a frame, whichever is first (section 5.2).
+    /// reached a frame, whichever is first (section 5.2). A queue bound below a frame would
+    /// come first, so half the bound counts as full too (D97).
     fn after_enqueue(&mut self, key: usize) {
-        let max_data_bytes = self.max_data_bytes();
+        let queue_bytes = self.settings.queue_bytes;
+        let full_bytes = self.max_data_bytes().min(queue_bytes / 2);
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
-        if sub.linger_ms == 0 || sub.queued_bytes >= max_data_bytes {
+        if sub.linger_ms == 0 || sub.queued_bytes >= full_bytes || sub.held_bytes >= queue_bytes {
             sub.due = true;
         } else if !sub.due && !sub.timer_armed {
             sub.timer_armed = true;
@@ -874,6 +956,7 @@ impl Home {
             return;
         }
         let share_bytes = self.settings.share_bytes.min(self.max_data_bytes()).max(1);
+        let held_charge_bytes = self.settings.window_bytes / HELD_WINDOW_SHARE;
         let mut spans = std::mem::take(&mut self.spans);
         for conn in std::mem::take(&mut self.ready) {
             let Some(Some(connection)) = self.conns.get_mut(conn) else {
@@ -888,9 +971,9 @@ impl Home {
                     continue;
                 };
                 sub.in_turn = false;
-                let frame = sub.take_frame(share_bytes, &mut spans);
+                let frame = sub.take_frame(share_bytes, held_charge_bytes, &mut spans);
                 if frame.len_bytes > 0 {
-                    connection.window_left_bytes -= frame.len_bytes as i64;
+                    connection.window_left_bytes -= frame.window_cost_bytes as i64;
                     let _ = connection.out.send(Event::Data {
                         sub: sub.id,
                         records: frame,
@@ -1135,12 +1218,18 @@ impl Home {
                 let Some((item, bytes)) = sub.item_after_position(matched) else {
                     continue;
                 };
-                if sub.queued_bytes + bytes > self.settings.queue_bytes && !sub.queue.is_empty() {
+                // With the window open, the end of this event sends the queue, so going
+                // over is no sign of a slow client (D97).
+                if sub.queue_cost_with(matched, bytes) > self.settings.queue_bytes
+                    && !sub.queue.is_empty()
+                    && self.conns[sub.conn]
+                        .as_ref()
+                        .is_none_or(|conn| conn.window_left_bytes <= 0)
+                {
                     overflowed.push(*key);
                     continue;
                 }
-                sub.queue.push_back(item);
-                sub.queued_bytes += bytes;
+                sub.push_item(item, bytes);
                 sub.position = matched.last_id;
                 enqueued.push(*key);
             }
@@ -1204,8 +1293,7 @@ impl Home {
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
-        sub.queue.clear();
-        sub.queued_bytes = 0;
+        sub.clear_queue();
         sub.due = false;
         sub.mode = Mode::CatchUp;
         sub.position = sub.handed_through;
@@ -1230,7 +1318,7 @@ impl Home {
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
-        if sub.mode != Mode::CatchUp || sub.read_out || sub.queued_bytes > queue_low_bytes {
+        if sub.mode != Mode::CatchUp || sub.read_out || sub.queue_cost_bytes() > queue_low_bytes {
             return;
         }
         let window_open = self
@@ -1282,12 +1370,15 @@ impl Home {
             return;
         };
         if let Some(matched) = matched {
-            sub.queued_bytes += matched.total_bytes;
-            sub.queue.push_back(QueueItem {
-                matched,
-                run: 0,
-                offset: 0,
-            });
+            let bytes = matched.total_bytes;
+            sub.push_item(
+                QueueItem {
+                    matched,
+                    run: 0,
+                    offset: 0,
+                },
+                bytes,
+            );
             // A read isn't waiting for more, so it doesn't linger.
             sub.due = true;
         }

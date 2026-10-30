@@ -1353,6 +1353,9 @@ impl Core {
                 return;
             };
             stream.delivery.visible_through = entry.last_id;
+            if let Some(state) = &entry.state {
+                stream.delivery.visible_state = state.clone();
+            }
             let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
             fan_out(
                 stream,
@@ -1395,7 +1398,8 @@ impl Core {
             );
             return;
         };
-        let head = stream.ids.last_id();
+        // What is stamped and not yet visible may never have happened (D98).
+        let head = stream.delivery.visible_head(stream.ids.last_id());
         let retention_start = retention_start_id(now_ms, stream.config.retention_ms);
         let stored = message
             .name
@@ -1439,9 +1443,10 @@ impl Core {
                 .entry(Arc::clone(name))
                 .or_insert(cursor);
         }
-        let state_ver = stream.state.ver();
+        let (state_ver, visible_doc) = &stream.delivery.visible_state;
+        let state_ver = *state_ver;
         let state = if message.with_state || message.state_only {
-            stream.state.doc().clone()
+            visible_doc.clone()
         } else {
             Bytes::new()
         };
@@ -1576,7 +1581,8 @@ impl Core {
         }
         let limit = stream.delivery.visible_through;
         if message.after >= limit {
-            let (head, state_ver) = (stream.ids.last_id(), stream.state.ver());
+            let head = stream.delivery.visible_head(stream.ids.last_id());
+            let state_ver = stream.delivery.visible_state.0;
             self.attach_live(
                 &message.stream,
                 message.sub,
@@ -1919,9 +1925,9 @@ impl Core {
                         .streams
                         .get(&*stream)
                         .map(|stream| SnapshotReply {
-                            head: stream.ids.last_id(),
-                            state_ver: stream.state.ver(),
-                            state: stream.state.doc().clone(),
+                            head: stream.delivery.visible_head(stream.ids.last_id()),
+                            state_ver: stream.delivery.visible_state.0,
+                            state: stream.delivery.visible_state.1.clone(),
                         })
                         .ok_or(ErrorCode::NotFound);
                     let _ = reply.send(result);

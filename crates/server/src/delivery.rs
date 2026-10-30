@@ -34,6 +34,17 @@ impl Deref for SharedBytes {
     }
 }
 
+impl SharedBytes {
+    /// The allocation these bytes keep alive, as `(identity, size)`: the whole slab, or the
+    /// whole read, however little of it matched (D96).
+    pub(crate) fn held(&self) -> (usize, u64) {
+        match self {
+            SharedBytes::Slab(bytes) => bytes.held(),
+            SharedBytes::Plain(bytes) => (bytes.as_ptr() as usize, bytes.len() as u64),
+        }
+    }
+}
+
 /// Where a record is in some bytes, read from its header alone.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordSpan {
@@ -263,6 +274,9 @@ pub(crate) struct StreamDelivery {
     pub pending: VecDeque<PendingVisible>,
     /// The id of the last visible record.
     pub visible_through: u64,
+    /// `(version, doc)` as of the last visible change, which is all a reader may see. The
+    /// stream's own state runs ahead of it, by what is stamped and waiting for the WAL (D98).
+    pub visible_state: (u64, Bytes),
     pub table: FilterTable,
     /// The next message number for each home core. Continuous across moves, so that a home
     /// core can put two owners' messages back in order (D85).
@@ -278,10 +292,21 @@ impl StreamDelivery {
         StreamDelivery {
             pending: VecDeque::new(),
             visible_through: 0,
+            visible_state: (0, Bytes::new()),
             table: FilterTable::new(core_count),
             seq_by_home: vec![0; core_count],
             cursors: HashMap::new(),
             extents: Vec::new(),
+        }
+    }
+
+    /// The head a reader may be told: the last id, except while some are stamped and not
+    /// yet visible (D98).
+    pub fn visible_head(&self, last_id: u64) -> u64 {
+        if self.pending.is_empty() {
+            last_id
+        } else {
+            self.visible_through
         }
     }
 

@@ -108,6 +108,15 @@ impl SlabBytes {
     pub fn slab_id(&self) -> u64 {
         self.tracker.slab_id
     }
+
+    /// Which allocation this keeps alive, and how big it is. Unlike `slab_id`, the identity
+    /// holds across pools.
+    pub(crate) fn held(&self) -> (usize, u64) {
+        (
+            Arc::as_ptr(&self.tracker) as usize,
+            self.tracker.capacity_bytes,
+        )
+    }
 }
 
 impl Clone for SlabBytes {
