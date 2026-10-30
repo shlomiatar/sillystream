@@ -147,6 +147,9 @@ pub(crate) struct StreamHandoff {
     pub config: StreamConfig,
     /// `(last_id, core)`: the core that stamped ids up to `last_id`, above the entry before.
     pub owners: Vec<(u64, usize)>,
+    /// `(core, ticket)`: stamped entries still to reach the WAL channel. Nothing the new
+    /// owner stamps can go in ahead of them (D77).
+    pub wal_waits: Vec<(usize, u64)>,
 }
 
 #[derive(Debug)]
@@ -210,6 +213,11 @@ pub(crate) enum ControlMsg {
         level: u8,
         ack: Reply,
         reply: ReplyTx,
+    },
+    /// The WAL channel has taken `core`'s entries up to `ticket` (D77).
+    WalSent {
+        core: usize,
+        ticket: u64,
     },
     Stop,
 }

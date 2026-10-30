@@ -523,3 +523,232 @@ async fn a_write_waiting_for_a_barrier_ends_when_the_node_stops() {
     .await;
     assert_eq!(ended, Ok(Err(server::ClientError::NodeStopped)));
 }
+
+/// Sleeps once, on one thread, the next time that thread changes a slab's count. So
+/// `read_memory` can make a core miss its retries for as long as a test needs.
+struct StallOnce {
+    thread_name: String,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl server::SlabHook for StallOnce {
+    fn ref_changed(&self, _slab_id: u64, _delta: i32) {
+        if std::thread::current().name() == Some(self.thread_name.as_str())
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    fn slab_freed(&self, _slab_id: u64) {}
+}
+
+async fn wait_for_parked(node: &server::Node, core: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+    while node.stats(core).await.unwrap().outbound_count == 0 {
+        assert!(std::time::Instant::now() < deadline, "nothing parked");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// `first_id` of each WAL entry for the stream, which have to go up.
+fn assert_wal_in_id_order(harness: &Harness, stream: &str) -> Vec<u64> {
+    let ids: Vec<u64> = harness
+        .wal
+        .stream_entries(stream)
+        .iter()
+        .map(|entry| parse_records(&entry.records)[0].0)
+        .collect();
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "WAL is out of id order: {ids:?}"
+    );
+    ids
+}
+
+fn set_op<'a>(stream: &'a str, req: u32, value: i64) -> server::StateOpRequest<'a> {
+    server::StateOpRequest {
+        stream,
+        req,
+        author: AUTHOR,
+        expect_ver: 0,
+        op: server::StateOp::Set,
+        doc: cbor(&int(value)),
+    }
+}
+
+fn replay_state(harness: &Harness, stream: &str) -> server::StreamState {
+    let mut replayed = server::StreamState::new();
+    for entry in harness.wal.stream_entries(stream) {
+        for view in format::Records::new(&entry.records) {
+            let view = view.unwrap();
+            if view.header.is_system() {
+                replayed.replay(&view).unwrap();
+            }
+        }
+    }
+    replayed
+}
+
+/// The old core misses the slot the WAL frees, and the new core is there to take it.
+#[tokio::test]
+async fn a_move_with_a_parked_entry_keeps_the_wal_in_id_order_and_replay_equal_to_live() {
+    let hook = Arc::new(StallOnce {
+        thread_name: "core-0".to_owned(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut config = manual_config(2);
+    config.wal_channel_capacity = 1;
+    config.slab_hook = Some(hook.clone());
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let name = name_on_core(0, node, "m");
+    let shard = shard_of(&name, node.virtual_shard_count());
+    let records = record_with(1, b"payload");
+    let mut client = node.client(0).await;
+
+    harness.wal.hold();
+    for seq in [1, 2] {
+        client
+            .publish(publish(&name, &records, seq, 2))
+            .await
+            .unwrap();
+    }
+    let mut last = publish(&name, &records, 3, 2);
+    last.state = Some(server::StateChange {
+        expect_ver: 0,
+        op: server::StateOp::Set,
+        doc: cbor(&int(1)),
+    });
+    client.publish(last).await.unwrap();
+    wait_for_parked(node, 0).await;
+
+    node.move_shard(shard, 1).await;
+    let mut moved = node.client(1).await;
+    moved.state_op(set_op(&name, 1, 2)).await.unwrap();
+    // Core 1's own wake-up comes from another of its entries becoming durable.
+    let mut neighbour = node.client(1).await;
+    neighbour
+        .publish(publish(&name_on_core(1, node, "n"), &records, 1, 2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    hook.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    node.read_memory(0, &name).await;
+    harness.wal.release();
+
+    let ver = match expect_reply(&mut moved).await {
+        Reply::StateResult { ok: true, ver, .. } => ver,
+        other => panic!("{other:?}"),
+    };
+    for _ in 0..3 {
+        expect_ack(&mut client).await;
+    }
+    let ids = assert_wal_in_id_order(&harness, &name);
+    assert_eq!(ids.len(), 4);
+    let live = client.snapshot(&name).await.unwrap();
+    assert_eq!(live.state_ver, ver);
+    let replayed = replay_state(&harness, &name);
+    assert_eq!(replayed.doc(), &live.state);
+    assert_eq!(replayed.ver(), live.state_ver);
+    harness.finish();
+}
+
+#[tokio::test]
+async fn a_parked_entry_keeps_its_place_across_many_moves() {
+    for (cores, path) in [(3, vec![1, 2]), (2, vec![1, 0]), (3, vec![1, 0, 2])] {
+        let mut config = manual_config(cores);
+        config.wal_channel_capacity = 1;
+        let harness = Harness::new(config);
+        let node = harness.node();
+        let name = name_on_core(0, node, "m");
+        let shard = shard_of(&name, node.virtual_shard_count());
+        let records = record_with(1, b"payload");
+        let mut client = node.client(0).await;
+
+        harness.wal.hold();
+        let mut seq = 1;
+        while node.stats(0).await.unwrap().outbound_count == 0 {
+            client
+                .publish(publish(&name, &records, seq, 1))
+                .await
+                .unwrap();
+            seq += 1;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for to in &path {
+            node.move_shard(shard, *to).await;
+            // At the first stop, a write that is stamped there and has to wait its turn.
+            if *to == path[0] {
+                let mut there = node.client(*to).await;
+                there
+                    .publish(publish(&name, &records, seq, 1))
+                    .await
+                    .unwrap();
+                seq += 1;
+                expect_ack(&mut there).await;
+            }
+        }
+        let mut last = node.client(*path.last().unwrap()).await;
+        harness.wal.release();
+        last.publish(publish(&name, &records, seq, 2))
+            .await
+            .unwrap();
+        expect_ack(&mut last).await;
+        assert_wal_in_id_order(&harness, &name);
+        assert_eq!(harness.wal.stream_entries(&name).len() as u64, seq);
+        harness.finish();
+    }
+}
+
+/// Two cores each waiting on the other's stream mustn't wait for ever.
+#[tokio::test]
+async fn parked_streams_swapping_cores_all_get_through() {
+    let mut config = manual_config(2);
+    config.wal_channel_capacity = 1;
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let on_zero = name_on_core(0, node, "x");
+    let on_one = name_on_core(1, node, "y");
+    let records = record_with(1, b"payload");
+    let mut zero = node.client(0).await;
+    let mut one = node.client(1).await;
+
+    harness.wal.hold();
+    let mut seq = 1;
+    while node.stats(0).await.unwrap().outbound_count == 0
+        || node.stats(1).await.unwrap().outbound_count == 0
+    {
+        assert!(seq < 100, "both should have parked by now");
+        zero.publish(publish(&on_zero, &records, seq, 1))
+            .await
+            .unwrap();
+        one.publish(publish(&on_one, &records, seq, 1))
+            .await
+            .unwrap();
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    node.move_shard(shard_of(&on_zero, node.virtual_shard_count()), 1)
+        .await;
+    node.move_shard(shard_of(&on_one, node.virtual_shard_count()), 0)
+        .await;
+    harness.wal.release();
+
+    let mut after_zero = node.client(1).await;
+    let mut after_one = node.client(0).await;
+    after_zero
+        .publish(publish(&on_zero, &records, 1000, 2))
+        .await
+        .unwrap();
+    after_one
+        .publish(publish(&on_one, &records, 1000, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut after_zero).await;
+    expect_ack(&mut after_one).await;
+    assert_wal_in_id_order(&harness, &on_zero);
+    assert_wal_in_id_order(&harness, &on_one);
+    harness.finish();
+}

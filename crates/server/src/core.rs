@@ -70,6 +70,16 @@ pub(crate) struct CoreInbox {
     pub uploads: mpsc::UnboundedReceiver<UploadEvent>,
 }
 
+/// An entry another core stamped for `stream`, not yet in the WAL channel. What this core
+/// stamps after it took the stream over goes in behind it (D77).
+struct WalWait {
+    stream: Arc<str>,
+    core: usize,
+    ticket: u64,
+    /// This core's last ticket when the stream arrived. Earlier ones don't wait.
+    stamped_through: u64,
+}
+
 struct Waiter {
     reply: Reply,
     tx: ReplyTx,
@@ -257,6 +267,11 @@ pub(crate) struct Core {
     sent_ticket: u64,
     outbound: VecDeque<WalEntry<SlabBytes>>,
     wal_stopped: bool,
+    wal_waits: Vec<WalWait>,
+    /// How far the WAL channel has taken each other core's entries, as far as it has said.
+    wal_sent_by_core: Vec<u64>,
+    /// The ticket other cores are waiting to hear about, or 0.
+    wal_sent_owed: u64,
     durable_waiters: VecDeque<(u64, Waiter)>,
 
     uploads_out: VecDeque<UploadOut>,
@@ -285,6 +300,7 @@ pub(crate) struct CoreParts {
 impl Core {
     pub(crate) fn new(parts: CoreParts) -> Core {
         let config = parts.config;
+        let core_count = config.core_count;
         let total = config.virtual_shard_count + config.override_shard_count;
         let location = (0..total)
             .map(|shard| {
@@ -314,6 +330,9 @@ impl Core {
             sent_ticket: 0,
             outbound: VecDeque::new(),
             wal_stopped: false,
+            wal_waits: Vec::new(),
+            wal_sent_by_core: vec![0; core_count],
+            wal_sent_owed: 0,
             durable_waiters: VecDeque::new(),
             uploads_out: VecDeque::new(),
             upload_stopped: false,
@@ -808,24 +827,94 @@ impl Core {
         }
     }
 
-    /// In order, so a full channel keeps a stream's entries in id order.
+    /// In order, so a full channel keeps a stream's entries in id order, and behind what
+    /// earlier owners of its stream have yet to send (D77).
     fn flush_outbound(&mut self) {
         while let Some(entry) = self.outbound.pop_front() {
             let ticket = entry.ticket_for_core();
+            if !self.wal_waits.is_empty() {
+                self.clear_wal_waits();
+                if self
+                    .wal_waits
+                    .iter()
+                    .any(|wait| wait.stamped_through < ticket)
+                {
+                    self.outbound.push_front(entry);
+                    return;
+                }
+            }
             match self.wal.try_append(entry) {
-                Ok(()) => self.sent_ticket = ticket,
+                Ok(()) => {
+                    self.sent_ticket = ticket;
+                    if self.wal_sent_owed != 0 && ticket >= self.wal_sent_owed {
+                        self.wal_sent_owed = 0;
+                        self.tell_wal_sent(ticket);
+                    }
+                }
                 Err(WalSendError::Full(entry)) => {
                     self.outbound.push_front(entry);
                     return;
                 }
                 Err(WalSendError::Stopped(entry)) => {
-                    // Nothing more can become durable, so writes stay unread (D7).
-                    self.wal_stopped = true;
+                    // Nothing more can become durable, so writes stay unread (D7), and no
+                    // other core should wait on what this one holds.
                     self.outbound.push_front(entry);
+                    if !self.wal_stopped {
+                        self.wal_stopped = true;
+                        self.tell_wal_sent(u64::MAX);
+                    }
                     return;
                 }
             }
         }
+    }
+
+    fn tell_wal_sent(&self, ticket: u64) {
+        for (core, control) in self.links.control.iter().enumerate() {
+            if core != self.config.id {
+                let _ = control.send(ControlMsg::WalSent {
+                    core: self.config.id,
+                    ticket,
+                });
+            }
+        }
+    }
+
+    fn clear_wal_waits(&mut self) {
+        let (me, own_sent) = (self.config.id, self.sent_ticket);
+        let sent = &self.wal_sent_by_core;
+        self.wal_waits.retain(|wait| {
+            let through = if wait.core == me {
+                own_sent
+            } else {
+                sent[wait.core]
+            };
+            through < wait.ticket
+        });
+    }
+
+    /// A stream's waits as it leaves: those it arrived with, and its own entry if one is
+    /// still queued here. This core keeps its copies, since entries it stamped wait on them.
+    fn wal_waits_for_handoff(&mut self, name: &str) -> Vec<(usize, u64)> {
+        let mut waits: Vec<(usize, u64)> = self
+            .wal_waits
+            .iter()
+            .filter(|wait| &*wait.stream == name)
+            .map(|wait| (wait.core, wait.ticket))
+            .collect();
+        let parked = self
+            .outbound
+            .iter()
+            .rev()
+            .find(|entry| entry.stream() == name)
+            .map(|entry| entry.ticket_for_core());
+        if let Some(ticket) = parked
+            && !self.wal_stopped
+        {
+            waits.push((self.config.id, ticket));
+            self.wal_sent_owed = self.wal_sent_owed.max(ticket);
+        }
+        waits
     }
 
     fn flush_uploads(&mut self) {
@@ -1125,6 +1214,9 @@ impl Core {
                 ack,
                 reply,
             } => self.ack_local(&stream, last_id, level, ack, reply),
+            ControlMsg::WalSent { core, ticket } => {
+                self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
+            }
             ControlMsg::Stop => {}
         }
     }
@@ -1135,6 +1227,7 @@ impl Core {
         if last_id > 0 {
             stream.owners.push((last_id, self.config.id));
         }
+        let wal_waits = self.wal_waits_for_handoff(name);
         Some(StreamHandoff {
             name: stream.name,
             ids: stream.ids,
@@ -1142,6 +1235,7 @@ impl Core {
             dedupe: stream.dedupe,
             config: stream.config,
             owners: stream.owners,
+            wal_waits,
         })
     }
 
@@ -1246,6 +1340,15 @@ impl Core {
             shard.streams.insert(Arc::clone(&stream.name));
             if let Some(log) = self.logs.get_mut(&*stream.name) {
                 log.residency += 1;
+            }
+            // Anything already sent is dropped by the next `clear_wal_waits`.
+            for (core, ticket) in stream.wal_waits {
+                self.wal_waits.push(WalWait {
+                    stream: Arc::clone(&stream.name),
+                    core,
+                    ticket,
+                    stamped_through: self.next_ticket,
+                });
             }
             self.streams.insert(
                 Arc::clone(&stream.name),

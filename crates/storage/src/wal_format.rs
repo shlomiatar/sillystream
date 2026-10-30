@@ -89,6 +89,10 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         })
     }
 
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+
     /// What the writer will report as durable once this entry is synced.
     pub fn ticket_for_core(&self) -> u64 {
         self.ticket
