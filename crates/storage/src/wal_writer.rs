@@ -29,8 +29,9 @@ pub trait WalFile: Send {
 pub trait WalVolume: Send {
     type File: WalFile;
     fn create(&mut self, seq: u64) -> io::Result<Self::File>;
-    /// Renames a closed file to `new_seq` and rewrites its header, so that its old
-    /// entries fail their CRC (D8).
+    /// Makes a closed file the file `new_seq`, with nothing of its old contents left.
+    /// Record data is the publisher's, so old bytes could hold an entry that is valid
+    /// under `new_seq`, and a CRC can't tell it apart (D60).
     fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<Self::File>;
 }
 
@@ -115,9 +116,16 @@ impl WalVolume for DirVolume {
     }
 
     fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<File> {
+        let old_path = self.path(old_seq);
+        let mut file = OpenOptions::new().read(true).write(true).open(&old_path)?;
+        let size_bytes = file.metadata()?.len();
+        // Durably empty before it has the new name, so that a crash at any point
+        // here leaves no old bytes under it. Its entries are already uploaded (D16).
+        file.set_len(0)?;
+        file.sync_all()?;
         let path = self.path(new_seq);
-        std::fs::rename(self.path(old_seq), &path)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        std::fs::rename(old_path, &path)?;
+        file.set_len(size_bytes)?;
         DirVolume::write_header(&mut file, new_seq)?;
         self.sync_dir()?;
         Ok(file)

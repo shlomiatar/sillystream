@@ -1,11 +1,14 @@
 //! The WAL writer's ordering, group commit and backpressure, with injected files, and
 //! on the real disk.
 
+mod common;
+
 use std::io::{self, IoSlice};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::record;
 use storage::{
     DirVolume, DurableNotify, WalConfig, WalEntry, WalError, WalFile, WalRotated, WalSendError,
     WalVolume, durable_watches, encode_file_header, encode_wal_entry, replay_dir, start_wal_writer,
@@ -489,7 +492,7 @@ fn a_real_reused_file_returns_none_of_its_stale_entries() {
     }
     sender.try_rotate().unwrap().blocking_recv().unwrap();
     sender.try_recycle(1).unwrap();
-    // File 3 is file 1 renamed, with its 20 old entries still in place after the first.
+    // File 3 is file 1 renamed, with none of its 20 old entries left in it.
     sender.try_rotate().unwrap().blocking_recv().unwrap();
     sender.try_append(entry(0, 21)).unwrap();
     drop(sender);
@@ -502,9 +505,8 @@ fn a_real_reused_file_returns_none_of_its_stale_entries() {
     assert_eq!(names, [2, 3]);
     let raw = std::fs::read(dir.path().join(storage::wal_file_name(3))).unwrap();
     assert_eq!(&raw[..16], encode_file_header(3));
-    // The stale bytes really are there, past the new entry.
     let stale = encode_wal_entry(1, "stream", 7, 2, &[2; 40]).unwrap();
-    assert!(raw.windows(stale.len()).any(|window| window == stale));
+    assert!(!raw.windows(stale.len()).any(|window| window == stale));
     let entries = replay_dir(dir.path()).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].producer_seq, 21);
@@ -527,4 +529,74 @@ fn entries_that_the_format_cannot_hold_are_refused() {
         WalEntry::new(Arc::from("s"), 0, 0, Bytes::new(), 0, 0).unwrap_err(),
         WalEntryError::EmptyRecords
     );
+}
+
+/// Record data is the publisher's, and is written verbatim into the file, so it can
+/// hold a fully valid entry seeded with a `seq` the file will have later.
+#[test]
+fn record_data_in_a_reused_file_cannot_be_replayed_as_an_entry() {
+    const AUTHOR: u64 = 7;
+    const FORGED_AT_BYTES: usize = 88;
+    let dir = tempfile::tempdir().unwrap();
+    let (notify, _receivers) = durable_watches(1);
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _>(DirVolume::new(dir.path(), 1 << 16), notify, config(64))
+            .unwrap();
+    let forged_record = record(u64::MAX >> 1, 0, 0, b"forged system record, author 0");
+    let forged = encode_wal_entry(3, "victim", 999, 1, &forged_record).unwrap();
+    // The entry's head is 34 bytes and the record's 32, so 6 zeros reach the offset.
+    let mut data = vec![0; 6];
+    data.extend_from_slice(&forged);
+    let planted = Bytes::from(record(1 << 16, 0, AUTHOR, &data));
+    sender
+        .try_append(WalEntry::new(Arc::from("attacker"), 1, 1, planted, 0, 1).unwrap())
+        .unwrap();
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    let raw = std::fs::read(dir.path().join(storage::wal_file_name(1))).unwrap();
+    assert_eq!(
+        raw[FORGED_AT_BYTES..]
+            .windows(forged.len())
+            .position(|window| window == forged),
+        Some(0),
+        "the forged entry is where the test means to land"
+    );
+    sender.try_recycle(1).unwrap();
+    // File 3 is file 1 renamed, and the forged entry's CRC is seeded with 3.
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    let innocent = Bytes::from(record(2 << 16, 0, AUTHOR, &[1]));
+    let new_entry = WalEntry::new(Arc::from("other"), 2, 1, innocent.clone(), 0, 2).unwrap();
+    assert_eq!(
+        encode_wal_entry(3, "other", 2, 1, &innocent).unwrap().len(),
+        FORGED_AT_BYTES - storage::WAL_FILE_HEADER_BYTES,
+        "the new entry ends exactly where the forged one starts"
+    );
+    sender.try_append(new_entry).unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let replayed: Vec<String> = replay_dir(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.stream)
+        .collect();
+    assert_eq!(replayed, ["other"]);
+}
+
+#[test]
+fn reuse_keeps_the_size_and_nothing_of_the_old_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut volume = DirVolume::new(dir.path(), 4096);
+    let mut file = volume.create(1).unwrap();
+    // Past the preallocated size, as a busy window does (D51).
+    std::io::Write::write_all(&mut file, &[0xAB; 8192]).unwrap();
+    drop(file);
+    let size_bytes = std::fs::metadata(dir.path().join(storage::wal_file_name(1)))
+        .unwrap()
+        .len();
+    assert!(size_bytes > 4096);
+    drop(volume.reuse(1, 2).unwrap());
+    let raw = std::fs::read(dir.path().join(storage::wal_file_name(2))).unwrap();
+    assert_eq!(raw.len() as u64, size_bytes);
+    assert_eq!(&raw[..16], encode_file_header(2));
+    assert!(raw[16..].iter().all(|byte| *byte == 0));
+    assert!(!dir.path().join(storage::wal_file_name(1)).exists());
 }

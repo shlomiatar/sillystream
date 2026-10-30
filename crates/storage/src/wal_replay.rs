@@ -39,8 +39,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 /// Parses the entry at `offset`, returning it and the next entry's offset. `None`
 /// for anything other than one whole valid entry, which is where the prefix ends:
-/// the zeros of a preallocated tail have `stream_len = 0`, and the stale entries
-/// of a reused file fail their CRC, because it was seeded with another `seq`.
+/// the zeros of a preallocated tail have `stream_len = 0`. A CRC can't reject bytes
+/// a publisher chose, so stale bytes must not be in the file at all (D60); the `seq`
+/// seed is what still rejects an old file's entries if they are found.
 fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, usize)> {
     let bytes = &file[offset..];
     if bytes.len() < ENTRY_FIXED_BYTES {
