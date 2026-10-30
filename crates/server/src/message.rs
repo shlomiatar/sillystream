@@ -74,6 +74,69 @@ impl Default for StreamConfig {
     }
 }
 
+/// What a config change sets. `None` keeps what the stream has (D21).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamConfigPatch {
+    pub default_ack_level: Option<u8>,
+    pub min_ack_level: Option<u8>,
+    pub retention_ms: Option<u64>,
+}
+
+/// One sink as it is registered. Its runtime is M9, so nothing here delivers yet (BUILD_NOTES).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkSpec {
+    pub kind: String,
+    /// `webhook.*`: where it goes.
+    pub url: Option<String>,
+    /// `forward`: the stream it writes into.
+    pub target: Option<String>,
+    /// `D26`'s filter text, already checked.
+    pub filter: Option<String>,
+    pub on_expire: String,
+    pub concurrency: u32,
+    pub paused: bool,
+}
+
+/// `GET /v1/stream/<id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub head: u64,
+    pub state_ver: u64,
+    pub config: StreamConfig,
+    /// `(sink id, spec, cursor)`, in id order.
+    pub sinks: Vec<(u64, SinkSpec, Option<u64>)>,
+}
+
+/// A change to a stream's sinks (section 9's lifecycle, without its runtime).
+#[derive(Debug, Clone)]
+pub enum SinkOp {
+    /// Creates at `start`, or updates a sink that exists and keeps its cursor and pause.
+    Put {
+        sink_id: u64,
+        spec: SinkSpec,
+        start: SinkStart,
+    },
+    Delete {
+        sink_id: u64,
+    },
+    SetPaused {
+        sink_id: u64,
+        paused: bool,
+    },
+    Reset {
+        sink_id: u64,
+        start: SinkStart,
+    },
+}
+
+/// Where a sink's cursor starts, or goes on reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkStart {
+    Now,
+    Earliest,
+    Id(u64),
+}
+
 /// The state change a publish carries. It commits with the records or not at all.
 #[derive(Debug, Clone)]
 pub struct StateChange {
@@ -238,12 +301,42 @@ pub(crate) struct ShardHandoff {
     pub counters: ShardCounters,
     /// Override entries that this shard's owner answers for, with where each one was.
     pub overrides: Vec<(Arc<str>, u32, u16)>,
+    /// Deleted streams in this shard, with the id a new one must stay above.
+    pub tombstones: Vec<(Arc<str>, u64)>,
     pub done: oneshot::Sender<()>,
+}
+
+/// Work to start on a core, which is how a socket reaches its home core (D24).
+pub(crate) struct RunOnCore(pub Box<dyn FnOnce() + Send>);
+
+impl std::fmt::Debug for RunOnCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunOnCore")
+    }
 }
 
 /// Everything else. Always read, however backed up the write path is.
 #[derive(Debug)]
 pub(crate) enum ControlMsg {
+    Run(RunOnCore),
+    StreamInfo {
+        stream: Arc<str>,
+        reply: oneshot::Sender<Result<StreamInfo, ErrorCode>>,
+    },
+    ConfigurePatch {
+        stream: Arc<str>,
+        patch: StreamConfigPatch,
+        reply: oneshot::Sender<StreamConfig>,
+    },
+    DeleteStream {
+        stream: Arc<str>,
+        reply: oneshot::Sender<bool>,
+    },
+    Sink {
+        stream: Arc<str>,
+        op: SinkOp,
+        reply: oneshot::Sender<Result<(), ErrorCode>>,
+    },
     Ping {
         reply: oneshot::Sender<usize>,
     },
@@ -426,6 +519,12 @@ pub(crate) enum CursorOp {
     Commit(u64),
     Reset(u64),
     Read(oneshot::Sender<Option<u64>>),
+    /// `PUT .../cursor/<name>`: commit or reset, answered with where it ended up.
+    Put {
+        id: u64,
+        reset: bool,
+        reply: oneshot::Sender<Result<u64, ErrorCode>>,
+    },
 }
 
 #[derive(Debug)]
@@ -522,6 +621,8 @@ pub(crate) enum StreamBody {
         state: Bytes,
     },
     Fan(Arc<FanOut>),
+    /// The stream is gone: its subscriptions end, and the next message is number 0.
+    Deleted,
 }
 
 /// What goes from owners to home cores.

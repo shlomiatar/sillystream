@@ -288,6 +288,9 @@ pub(crate) struct StreamDelivery {
     pub cursors: HashMap<Arc<str>, u64>,
     /// In id order, and not overlapping (D68).
     pub extents: Vec<ExtentRef>,
+    /// The last id of a deleted stream of this name. Nothing at or below it is readable.
+    pub floor_id: u64,
+    pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
 }
 
 impl StreamDelivery {
@@ -300,6 +303,8 @@ impl StreamDelivery {
             seq_by_home: vec![0; core_count],
             cursors: HashMap::new(),
             extents: Vec::new(),
+            floor_id: 0,
+            sinks: std::collections::BTreeMap::new(),
         }
     }
 

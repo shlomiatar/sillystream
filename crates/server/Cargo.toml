@@ -7,6 +7,11 @@ publish.workspace = true
 [lib]
 bench = false
 
+[[bin]]
+name = "sillystream-server"
+path = "src/bin/sillystream-server.rs"
+bench = false
+
 [dependencies]
 format.workspace = true
 proto.workspace = true
@@ -15,9 +20,17 @@ storage.workspace = true
 bytes.workspace = true
 ciborium.workspace = true
 object_store.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+rustls = { workspace = true }
+rustls-pemfile = "2"
+sha1 = "0.10"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true, features = ["tls12"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

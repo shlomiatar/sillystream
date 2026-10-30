@@ -204,6 +204,13 @@ impl Outbox {
         }
     }
 
+    fn try_next(&self) -> Option<Event> {
+        let mut frames = self.lock();
+        let event = frames.queue.pop_front()?;
+        frames.taken_count += 1;
+        Some(event)
+    }
+
     /// `(frames taken so far, whether any wait)`.
     fn reading_state(&self) -> (u64, bool) {
         let frames = self.lock();
@@ -363,6 +370,13 @@ impl Connection {
             });
             self.credit_owed_bytes = 0;
         }
+    }
+
+    /// The next frame if one is here already.
+    pub(crate) fn try_recv(&mut self) -> Option<Event> {
+        let event = self.out.try_next()?;
+        self.took(&event);
+        Some(event)
     }
 
     /// The next frame, as a socket taking it. `None` once the node has gone.
@@ -1383,6 +1397,37 @@ impl Home {
                 state,
             } => self.on_attached(stream, sub, filter_id, head, cursor, state_ver, state),
             StreamBody::Fan(fan) => self.on_fan(stream, &fan),
+            StreamBody::Deleted => self.on_deleted(stream),
+        }
+    }
+
+    /// Every subscription on the stream ends with error 2, and the owner's numbering starts
+    /// over. What is in `reorder` overtook this, so it belongs to a new stream of this name.
+    fn on_deleted(&mut self, stream: &Arc<str>) {
+        let keys: Vec<(usize, usize, u32)> = self
+            .subs
+            .iter()
+            .enumerate()
+            .filter_map(|(key, sub)| {
+                let sub = sub.as_ref()?;
+                (sub.stream == *stream).then_some((key, sub.conn, sub.id))
+            })
+            .collect();
+        for (key, conn, id) in keys {
+            self.send_event(
+                conn,
+                Event::Error {
+                    reference: id,
+                    code: ErrorCode::NotFound,
+                    msg: "the stream was deleted".to_owned(),
+                },
+            );
+            self.remove_sub(key);
+        }
+        if let Some(home_stream) = self.streams.get_mut(stream) {
+            home_stream.next_seq = 0;
+            home_stream.groups.clear();
+            home_stream.state_subs.clear();
         }
     }
 

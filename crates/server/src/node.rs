@@ -27,11 +27,11 @@ use crate::clock::Clock;
 use crate::connection::{Connection, DeliverySettings, Stores};
 use crate::core::{Core, CoreConfig, CoreInbox, CoreParts, CoreToNode, Links};
 use crate::message::{
-    ControlMsg, CoreStats, PublishMsg, Reply, SnapshotReply, StateChange, StateOpMsg, StreamConfig,
-    WriteMsg,
+    ControlMsg, CoreStats, CursorOp, PublishMsg, Reply, RunOnCore, SinkOp, SnapshotReply,
+    StateChange, StateOpMsg, StreamConfig, StreamConfigPatch, StreamInfo, WriteMsg,
 };
 use crate::placement::{ShardMove, plan_moves, shard_of};
-use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool};
+use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 use crate::state::StateOp;
 
 /// The local tier of section 6.2: copies of uploaded segments.
@@ -447,13 +447,81 @@ pub struct NodeExit {
     pub unfinished_upload_count: usize,
 }
 
+/// What a socket task needs to reach the node. A connection holds a cheap copy of it, so
+/// that idle connections cost little (section 6.5).
+#[derive(Clone)]
+pub(crate) struct NodeHandle {
+    links: Arc<Links>,
+    virtual_shard_count: u32,
+    location_hint: Arc<Vec<u16>>,
+    accounts: Vec<SlabAccount>,
+    slab_bytes: usize,
+    slab_hook: Option<Arc<dyn SlabHook>>,
+    memory_cap_bytes: u64,
+    window_bytes: u64,
+    core_count: usize,
+    client_count: Arc<AtomicU64>,
+}
+
+impl NodeHandle {
+    pub(crate) fn core_count(&self) -> usize {
+        self.core_count
+    }
+
+    pub(crate) fn account(&self, core: usize) -> &SlabAccount {
+        &self.accounts[core]
+    }
+
+    /// A client whose frames are already in slabs. It never fills a slab of its own.
+    pub(crate) fn client(&self, home_core: usize) -> Client {
+        let client_number = self.client_count.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+        Client {
+            links: Arc::clone(&self.links),
+            virtual_shard_count: self.virtual_shard_count,
+            location_hint: Arc::clone(&self.location_hint),
+            routes: HashMap::new(),
+            reply_tx,
+            reply_rx,
+            received: VecDeque::new(),
+            pool: SlabPool::new(
+                self.slab_bytes,
+                self.accounts[home_core].clone(),
+                self.slab_hook.clone(),
+                (self.core_count as u64 + 1 + client_number) << 40,
+            ),
+            memory_cap_bytes: self.memory_cap_bytes,
+        }
+    }
+
+    pub(crate) fn read_pool(&self, home_core: usize) -> SlabPool {
+        SlabPool::new(
+            self.slab_bytes,
+            self.accounts[home_core].clone(),
+            self.slab_hook.clone(),
+            (self.core_count as u64 + 1 + self.client_count.fetch_add(1, Ordering::Relaxed)) << 40,
+        )
+    }
+
+    pub(crate) async fn connection(&self, home_core: usize) -> Option<Connection> {
+        Connection::open(self.links.control[home_core].clone(), self.window_bytes).await
+    }
+
+    /// Runs `work` on a core's thread, inside its runtime. False if the core has stopped.
+    pub(crate) fn run_on_core(&self, core: usize, work: Box<dyn FnOnce() + Send>) -> bool {
+        self.links.control[core]
+            .send(ControlMsg::Run(RunOnCore(work)))
+            .is_ok()
+    }
+}
+
 pub struct Node {
     config: NodeConfig,
     links: Links,
     to_control: mpsc::UnboundedSender<NodeMsg>,
     accounts: Vec<SlabAccount>,
     threads: Vec<JoinHandle<()>>,
-    client_count: AtomicU64,
+    client_count: Arc<AtomicU64>,
     uploader: Option<Uploader<SlabBytes>>,
     wal: Option<WalHandle>,
 }
@@ -647,7 +715,7 @@ impl Node {
             to_control,
             accounts,
             threads,
-            client_count: AtomicU64::new(0),
+            client_count: Arc::new(AtomicU64::new(0)),
             uploader: Some(uploader),
             wal: Some(wal_handle),
         })
@@ -661,13 +729,34 @@ impl Node {
         self.config.virtual_shard_count
     }
 
+    pub(crate) fn handle(&self) -> NodeHandle {
+        let shards = self.config.virtual_shard_count + self.config.override_shard_count;
+        NodeHandle {
+            links: Arc::new(self.links.clone()),
+            virtual_shard_count: self.config.virtual_shard_count,
+            // The start's placement. A hint that has aged just gets forwarded (D65).
+            location_hint: Arc::new(
+                (0..shards)
+                    .map(|shard| (shard as usize % self.config.core_count) as u16)
+                    .collect(),
+            ),
+            accounts: self.accounts.clone(),
+            slab_bytes: self.config.slab_bytes,
+            slab_hook: self.config.slab_hook.clone(),
+            memory_cap_bytes: self.config.memory_cap_bytes,
+            window_bytes: delivery_bound_bytes(&self.config, self.config.connection_window_bytes),
+            core_count: self.config.core_count,
+            client_count: Arc::clone(&self.client_count),
+        }
+    }
+
     /// A client living on `home_core`, as a connection would (D24).
     pub async fn client(&self, home_core: usize) -> Client {
-        let location_hint = self.placement().await;
+        let location_hint = Arc::new(self.placement().await);
         let client_number = self.client_count.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         Client {
-            links: self.links.clone(),
+            links: Arc::new(self.links.clone()),
             virtual_shard_count: self.config.virtual_shard_count,
             location_hint,
             routes: HashMap::new(),
@@ -826,6 +915,28 @@ pub struct StateOpRequest<'a> {
     pub doc: Bytes,
 }
 
+/// A `PUBLISH` read off a socket. Its records are already in a slab, so nothing is copied.
+#[derive(Debug)]
+pub(crate) struct RegionPublish {
+    pub stream: Arc<str>,
+    pub handle: u32,
+    pub producer_id: u64,
+    pub producer_seq: u64,
+    pub ack_level: Option<u8>,
+    pub author: NonZeroU64,
+    pub state: Option<StateChange>,
+    pub records: SlabRegion,
+}
+
+/// A `STATE_OP` read off a socket.
+#[derive(Debug)]
+pub(crate) struct OwnedStateOp {
+    pub stream: Arc<str>,
+    pub req: u32,
+    pub author: NonZeroU64,
+    pub change: StateChange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientError {
     /// The core's inbox is full, or the memory cap is reached. Only from `try_publish`.
@@ -847,9 +958,9 @@ struct ClientRoute {
 /// so everything sent down the old route has been handled by then, and nothing can
 /// overtake it (D65).
 pub struct Client {
-    links: Links,
+    links: Arc<Links>,
     virtual_shard_count: u32,
-    location_hint: Vec<u16>,
+    location_hint: Arc<Vec<u16>>,
     routes: HashMap<Arc<str>, ClientRoute>,
     reply_tx: mpsc::UnboundedSender<Reply>,
     reply_rx: mpsc::UnboundedReceiver<Reply>,
@@ -966,6 +1077,150 @@ impl Client {
                 mpsc::error::TrySendError::Full(_) => ClientError::Full,
                 mpsc::error::TrySendError::Closed(_) => ClientError::NodeStopped,
             })
+    }
+
+    /// A permit to send on this stream's route, or nothing if a write has to wait: at the
+    /// memory cap, while a barrier is out, or with the core's inbox full.
+    fn write_permit(
+        &mut self,
+        stream: &str,
+    ) -> Result<(Arc<str>, mpsc::Permit<'_, WriteMsg>), ClientError> {
+        if self.pool.account().pinned_bytes() >= self.memory_cap_bytes {
+            return Err(ClientError::Full);
+        }
+        if !self.barrier_is_back(stream) {
+            return Err(ClientError::Full);
+        }
+        let (name, core) = self.route(stream);
+        let permit = self.links.direct[core]
+            .try_reserve()
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(()) => ClientError::Full,
+                mpsc::error::TrySendError::Closed(()) => ClientError::NodeStopped,
+            })?;
+        Ok((name, permit))
+    }
+
+    /// Hands a publish to its owner, or gives it back if that has to wait (D7). A socket
+    /// task must go on writing meanwhile, so it can't await this.
+    // The large `Err` is the publish coming back, moved once, on a path that waits anyway.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_publish_region(
+        &mut self,
+        publish: RegionPublish,
+    ) -> Result<(), (ClientError, RegionPublish)> {
+        let reply = self.reply_tx.clone();
+        match self.write_permit(&publish.stream) {
+            Err(error) => Err((error, publish)),
+            Ok((stream, permit)) => {
+                permit.send(WriteMsg::Publish(Box::new(PublishMsg {
+                    stream,
+                    handle: publish.handle,
+                    producer_id: publish.producer_id,
+                    producer_seq: publish.producer_seq,
+                    ack_level: publish.ack_level,
+                    author: publish.author,
+                    state: publish.state,
+                    records: publish.records,
+                    reply,
+                    passed: Vec::new(),
+                })));
+                Ok(())
+            }
+        }
+    }
+
+    /// As `try_publish_region`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn try_state_op(
+        &mut self,
+        op: OwnedStateOp,
+    ) -> Result<(), (ClientError, OwnedStateOp)> {
+        let reply = self.reply_tx.clone();
+        match self.write_permit(&op.stream) {
+            Err(error) => Err((error, op)),
+            Ok((stream, permit)) => {
+                permit.send(WriteMsg::StateOp(Box::new(StateOpMsg {
+                    stream,
+                    req: op.req,
+                    author: op.author,
+                    change: op.change,
+                    reply,
+                    passed: Vec::new(),
+                })));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn stream_info(&mut self, stream: &str) -> Result<StreamInfo, ErrorCode> {
+        let (stream, core) = self.route(stream);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::StreamInfo { stream, reply });
+        answer.await.unwrap_or(Err(ErrorCode::NotFound))
+    }
+
+    /// Creates the stream if needed, and changes what the patch sets.
+    pub(crate) async fn configure_patch(
+        &mut self,
+        stream: &str,
+        patch: StreamConfigPatch,
+    ) -> Option<StreamConfig> {
+        let (stream, core) = self.route(stream);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::ConfigurePatch {
+            stream,
+            patch,
+            reply,
+        });
+        answer.await.ok()
+    }
+
+    /// False if there was no such stream.
+    pub(crate) async fn delete_stream(&mut self, stream: &str) -> bool {
+        let (stream, core) = self.route(stream);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::DeleteStream { stream, reply });
+        answer.await.unwrap_or(false)
+    }
+
+    pub(crate) async fn sink_op(&mut self, stream: &str, op: SinkOp) -> Result<(), ErrorCode> {
+        let (stream, core) = self.route(stream);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::Sink { stream, op, reply });
+        answer.await.unwrap_or(Err(ErrorCode::NotFound))
+    }
+
+    /// `PUT .../cursor/<name>`: forward only unless `reset`. Answers with where it ended up.
+    pub(crate) async fn put_cursor(
+        &mut self,
+        stream: &str,
+        name: &str,
+        id: u64,
+        reset: bool,
+    ) -> Result<u64, ErrorCode> {
+        let (stream, core) = self.route(stream);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::Cursor {
+            stream,
+            name: Arc::from(name),
+            op: CursorOp::Put { id, reset, reply },
+            report: None,
+        });
+        answer.await.unwrap_or(Err(ErrorCode::NotFound))
+    }
+
+    /// A reply if one is here already.
+    pub(crate) fn try_recv(&mut self) -> Option<Reply> {
+        if let Some(reply) = self.received.pop_front() {
+            return Some(reply);
+        }
+        while let Ok(reply) = self.reply_rx.try_recv() {
+            if let Some(reply) = self.on_internal(reply) {
+                return Some(reply);
+            }
+        }
+        None
     }
 
     pub async fn state_op(&mut self, request: StateOpRequest<'_>) -> Result<(), ClientError> {

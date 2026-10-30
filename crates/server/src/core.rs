@@ -28,9 +28,9 @@ use crate::delivery::{
 };
 use crate::message::{
     AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
-    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, ShardHandoff,
-    SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff, SubRef,
-    WriteMsg,
+    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, ShardHandoff, SinkOp,
+    SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff,
+    StreamInfo, SubRef, WriteMsg,
 };
 use crate::placement::{ShardCounters, shard_of};
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
@@ -347,6 +347,8 @@ pub(crate) struct Core {
     /// until the outbound queue empties (D78).
     deferred: VecDeque<WriteMsg>,
 
+    /// Deleted streams this core answers for, with their last id (D20).
+    tombstones: HashMap<Arc<str>, u64>,
     logs: HashMap<Arc<str>, StreamLog>,
     dirty: Vec<Arc<str>>,
     next_ticket: u64,
@@ -437,6 +439,7 @@ impl Core {
             overrides: HashMap::new(),
             hold: None,
             deferred: VecDeque::new(),
+            tombstones: HashMap::new(),
             logs: HashMap::new(),
             dirty: Vec::new(),
             next_ticket: 0,
@@ -769,17 +772,20 @@ impl Core {
                 .or_default()
                 .streams
                 .insert(Arc::clone(name));
+            let floor_id = self.tombstones.remove(&**name).unwrap_or(0);
+            let mut delivery = StreamDelivery::new(self.config.core_count);
+            delivery.floor_id = floor_id;
             self.streams.insert(
                 Arc::clone(name),
                 Stream {
                     name: Arc::clone(name),
                     shard,
-                    ids: IdAllocator::new(0, self.config.last_valid_id),
+                    ids: IdAllocator::new(floor_id, self.config.last_valid_id),
                     state: StreamState::new(),
                     dedupe: DedupeTable::new(),
                     config: StreamConfig::default(),
                     owners: Vec::new(),
-                    delivery: StreamDelivery::new(self.config.core_count),
+                    delivery,
                 },
             );
         }
@@ -1443,7 +1449,8 @@ impl Core {
             0 => retention_start.saturating_sub(1),
             u64::MAX => head,
             id => id,
-        };
+        }
+        .max(stream.delivery.floor_id);
         if from != 0 && from != u64::MAX {
             // Only a record below the start can be missed, and only earlier owners may
             // hold one in memory, so most subscribers ask nobody (D100).
@@ -1768,6 +1775,9 @@ impl Core {
                 CursorOp::Read(reply) => {
                     let _ = reply.send(None);
                 }
+                CursorOp::Put { reply, .. } => {
+                    let _ = reply.send(Err(ErrorCode::NotFound));
+                }
                 _ => fail(ErrorCode::NotFound, "no such stream"),
             }
             return;
@@ -1787,6 +1797,15 @@ impl Core {
             }
             CursorOp::Read(reply) => {
                 let _ = reply.send(stream.delivery.cursors.get(&cursor).copied());
+            }
+            CursorOp::Put { id, reset, reply } => {
+                if !reset && id > head {
+                    let _ = reply.send(Err(ErrorCode::Malformed));
+                    return;
+                }
+                let at = stream.delivery.cursors.entry(cursor).or_insert(id);
+                *at = if reset { id } else { (*at).max(id) };
+                let _ = reply.send(Ok(*at));
             }
         }
     }
@@ -1994,6 +2013,79 @@ impl Core {
 
     fn on_control(&mut self, message: ControlMsg) {
         match message {
+            ControlMsg::Run(work) => (work.0)(),
+            ControlMsg::StreamInfo { stream, reply } => match self.route(&stream) {
+                Route::Forward(to) => {
+                    let _ = self.links.control[to].send(ControlMsg::StreamInfo { stream, reply });
+                }
+                Route::Here(_) => {
+                    let result = self
+                        .streams
+                        .get(&*stream)
+                        .map(|stream| StreamInfo {
+                            head: stream.delivery.visible_head(stream.ids.last_id()),
+                            state_ver: stream.delivery.visible_state.0,
+                            config: stream.config,
+                            sinks: stream
+                                .delivery
+                                .sinks
+                                .iter()
+                                .map(|(id, spec)| {
+                                    let cursor = stream
+                                        .delivery
+                                        .cursors
+                                        .get(sink_cursor_name(*id).as_str())
+                                        .copied();
+                                    (*id, spec.clone(), cursor)
+                                })
+                                .collect(),
+                        })
+                        .ok_or(ErrorCode::NotFound);
+                    let _ = reply.send(result);
+                }
+            },
+            ControlMsg::ConfigurePatch {
+                stream,
+                patch,
+                reply,
+            } => match self.route(&stream) {
+                Route::Forward(to) => {
+                    let _ = self.links.control[to].send(ControlMsg::ConfigurePatch {
+                        stream,
+                        patch,
+                        reply,
+                    });
+                }
+                Route::Here(shard) => {
+                    let config = &mut self.stream_entry(&stream, shard).config;
+                    if let Some(level) = patch.default_ack_level {
+                        config.default_ack_level = level;
+                    }
+                    if let Some(level) = patch.min_ack_level {
+                        config.min_ack_level = level;
+                    }
+                    if let Some(retention_ms) = patch.retention_ms {
+                        config.retention_ms = retention_ms;
+                    }
+                    let _ = reply.send(*config);
+                }
+            },
+            ControlMsg::DeleteStream { stream, reply } => match self.route(&stream) {
+                Route::Forward(to) => {
+                    let _ = self.links.control[to].send(ControlMsg::DeleteStream { stream, reply });
+                }
+                Route::Here(shard) => {
+                    let _ = reply.send(self.on_delete_stream(&stream, shard));
+                }
+            },
+            ControlMsg::Sink { stream, op, reply } => match self.route(&stream) {
+                Route::Forward(to) => {
+                    let _ = self.links.control[to].send(ControlMsg::Sink { stream, op, reply });
+                }
+                Route::Here(_) => {
+                    let _ = reply.send(self.on_sink(&stream, op));
+                }
+            },
             ControlMsg::Ping { reply } => {
                 let _ = reply.send(self.config.id);
             }
@@ -2170,6 +2262,80 @@ impl Core {
         })
     }
 
+    /// Its records stop being reachable and age out with their prefixes (D20), and a stream
+    /// made under this name later has higher ids and can't read them.
+    fn on_delete_stream(&mut self, name: &Arc<str>, shard: u32) -> bool {
+        let Some(mut stream) = self.streams.remove(&**name) else {
+            return false;
+        };
+        if let Some(shard) = self.shards.get_mut(&shard) {
+            shard.streams.remove(&**name);
+        }
+        self.tombstones
+            .insert(Arc::clone(name), stream.ids.last_id());
+        for home in 0..self.config.core_count {
+            let seq = next_seq(&mut stream.delivery, home);
+            if home == self.config.id {
+                self.home
+                    .on_stream(Arc::clone(name), seq, StreamBody::Deleted);
+            } else {
+                let _ = self.links.delivery[home].send(DeliveryMsg::Stream {
+                    stream: Arc::clone(name),
+                    seq,
+                    body: StreamBody::Deleted,
+                });
+            }
+        }
+        true
+    }
+
+    fn on_sink(&mut self, name: &str, op: SinkOp) -> Result<(), ErrorCode> {
+        let stream = self.streams.get_mut(name).ok_or(ErrorCode::NotFound)?;
+        let head = stream.delivery.visible_head(stream.ids.last_id());
+        let cursor_at = |start: SinkStart| match start {
+            SinkStart::Now => head,
+            SinkStart::Earliest => 0,
+            SinkStart::Id(id) => id,
+        };
+        let delivery = &mut stream.delivery;
+        match op {
+            SinkOp::Put {
+                sink_id,
+                mut spec,
+                start,
+            } => {
+                if let Some(existing) = delivery.sinks.get(&sink_id) {
+                    spec.paused = existing.paused;
+                } else {
+                    delivery
+                        .cursors
+                        .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
+                }
+                delivery.sinks.insert(sink_id, spec);
+            }
+            SinkOp::Delete { sink_id } => {
+                delivery.sinks.remove(&sink_id).ok_or(ErrorCode::NotFound)?;
+                delivery.cursors.remove(sink_cursor_name(sink_id).as_str());
+            }
+            SinkOp::SetPaused { sink_id, paused } => {
+                delivery
+                    .sinks
+                    .get_mut(&sink_id)
+                    .ok_or(ErrorCode::NotFound)?
+                    .paused = paused;
+            }
+            SinkOp::Reset { sink_id, start } => {
+                if !delivery.sinks.contains_key(&sink_id) {
+                    return Err(ErrorCode::NotFound);
+                }
+                delivery
+                    .cursors
+                    .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
+            }
+        }
+        Ok(())
+    }
+
     /// The move's handoff: everything goes in one message, the shard is someone else's
     /// from here, and later writes follow it. Batches and acks waiting on them stay.
     fn on_move_shard(&mut self, shard: u32, to: usize, done: oneshot::Sender<()>) {
@@ -2200,11 +2366,27 @@ impl Core {
                 )
             })
             .collect();
+        let tombstones: Vec<(Arc<str>, u64)> = self
+            .tombstones
+            .iter()
+            .filter(|(name, _)| {
+                self.overrides
+                    .get(&***name)
+                    .copied()
+                    .unwrap_or_else(|| shard_of(name, self.config.virtual_shard_count))
+                    == shard
+            })
+            .map(|(name, last_id)| (Arc::clone(name), *last_id))
+            .collect();
+        for (name, _) in &tombstones {
+            self.tombstones.remove(&**name);
+        }
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard,
             streams,
             counters: state.counters,
             overrides,
+            tombstones,
             done,
         })));
         self.pass_on_deferred();
@@ -2244,11 +2426,13 @@ impl Core {
             return;
         }
         let streams = self.package_stream(&name).into_iter().collect();
+        let tombstones = self.tombstones.remove_entry(&*name).into_iter().collect();
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard: new_shard,
             streams,
             counters: ShardCounters::default(),
             overrides: vec![(name, new_shard, to as u16)],
+            tombstones,
             done,
         })));
         self.pass_on_deferred();
@@ -2282,6 +2466,7 @@ impl Core {
                 *known = at;
             }
         }
+        self.tombstones.extend(handoff.tombstones);
         let shard = self.shards.entry(shard_id).or_default();
         shard.counters = handoff.counters;
         for stream in handoff.streams {
@@ -2363,6 +2548,11 @@ fn next_id_in_log(log: &StreamLog, after: u64, through: u64) -> Option<u64> {
     log.read_after(after, through, 1)
         .first()
         .map(|batch| first_id(batch).max(after + 1))
+}
+
+/// The named cursor of section 9.
+fn sink_cursor_name(sink_id: u64) -> String {
+    format!("sink:{sink_id}")
 }
 
 fn first_id(batch: &SlabBytes) -> u64 {

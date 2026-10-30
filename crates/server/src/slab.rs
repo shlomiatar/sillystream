@@ -97,6 +97,24 @@ impl std::fmt::Debug for SlabRegion {
     }
 }
 
+impl SlabRegion {
+    /// The first `at` bytes as a region of their own. Both stay exclusive.
+    pub(crate) fn split_to(&mut self, at: usize) -> SlabRegion {
+        SlabRegion {
+            bytes: self.bytes.split_to(at),
+            tracker: Arc::clone(&self.tracker),
+        }
+    }
+
+    /// The bytes from `at` on as a region of their own. Both stay exclusive.
+    pub(crate) fn split_off(&mut self, at: usize) -> SlabRegion {
+        SlabRegion {
+            bytes: self.bytes.split_off(at),
+            tracker: Arc::clone(&self.tracker),
+        }
+    }
+}
+
 /// `(slab, offset, len)` of frozen bytes. Cloning changes the slab's count, and is done
 /// per batch.
 pub struct SlabBytes {
@@ -250,6 +268,38 @@ impl SlabPool {
         region
     }
 
+    /// A region to read a socket into, from the slab being filled, of at most `max_bytes` and
+    /// at least `min_bytes`. What isn't filled goes back through `give_back`, so that reading
+    /// costs a slab only what it reads.
+    pub(crate) fn borrow_chunk(&mut self, min_bytes: usize, max_bytes: usize) -> SlabRegion {
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|slab| slab.rest.len() < min_bytes)
+        {
+            self.current = Some(self.new_slab(self.slab_bytes.max(min_bytes)));
+        }
+        let Some(slab) = self.current.as_mut() else {
+            unreachable!("a slab was just made");
+        };
+        let take_bytes = slab.rest.len().min(max_bytes);
+        SlabRegion {
+            bytes: slab.rest.split_to(take_bytes),
+            tracker: Arc::clone(&slab.tracker),
+        }
+    }
+
+    /// Returns the unfilled end of the last `borrow_chunk`. Nothing may have been taken from
+    /// this pool since, which holds because a socket read doesn't wait.
+    pub(crate) fn give_back(&mut self, mut region: SlabRegion) {
+        if let Some(slab) = self.current.as_mut()
+            && Arc::ptr_eq(&slab.tracker, &region.tracker)
+        {
+            region.bytes.unsplit(std::mem::take(&mut slab.rest));
+            slab.rest = region.bytes;
+        }
+    }
+
     /// Lets go of the slab being filled, so it can be freed once its references go.
     pub fn retire_current(&mut self) {
         self.current = None;
@@ -358,6 +408,30 @@ mod tests {
         pool.retire_current();
         drop(region);
         assert_eq!(*hook.freed.lock().unwrap(), [0]);
+    }
+
+    #[test]
+    fn a_chunk_given_back_is_handed_out_again_in_the_same_place() {
+        let (mut pool, _hook) = pool(1024);
+        let mut chunk = pool.borrow_chunk(64, 256);
+        assert_eq!(chunk.len(), 256);
+        let start = chunk.as_ptr() as usize;
+        let tail = chunk.split_off(10);
+        pool.give_back(tail);
+        let next = pool.borrow_chunk(64, 2048);
+        // Right behind what was kept, with all the rest of the slab.
+        assert_eq!(next.as_ptr() as usize, start + 10);
+        assert_eq!(next.len(), 1014);
+        assert_eq!(pool.account().pinned_bytes(), 1024);
+    }
+
+    #[test]
+    fn a_chunk_too_small_moves_to_a_new_slab() {
+        let (mut pool, _hook) = pool(128);
+        let a = pool.borrow_chunk(64, 100);
+        let b = pool.borrow_chunk(64, 100);
+        assert_ne!(a.tracker.slab_id, b.tracker.slab_id);
+        assert_eq!(pool.account().pinned_bytes(), 256);
     }
 
     #[test]

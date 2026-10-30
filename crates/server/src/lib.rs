@@ -1,5 +1,5 @@
-//! Cores, the write path, state and delivery (SPEC sections 3, 5, 6, 7.2, 10). APIs and
-//! recovery come in later milestones.
+//! Cores, the write path, state, delivery and the socket APIs (SPEC sections 3, 5, 6, 7.2,
+//! 10, 11, 12). Recovery comes in a later milestone.
 //!
 //! Each core is one thread with one current-thread tokio runtime, and owns its streams
 //! outright. Everything between cores, and between cores and the WAL writer or uploader,
@@ -13,6 +13,7 @@ mod core;
 mod dedupe;
 mod delivery;
 mod message;
+pub mod net;
 mod node;
 mod placement;
 mod slab;
@@ -24,7 +25,10 @@ pub use dedupe::{
     DEDUPE_CAP_COUNT, DEDUPE_ENTRY_BYTES, DEDUPE_IDLE_MS, DedupeCheck, DedupeEntry, DedupeTable,
 };
 pub use delivery::Matched;
-pub use message::{CoreStats, Reply, SnapshotReply, StateChange, StreamConfig};
+pub use message::{
+    CoreStats, Reply, SinkOp, SinkSpec, SinkStart, SnapshotReply, StateChange, StreamConfig,
+    StreamConfigPatch, StreamInfo,
+};
 pub use node::{
     Client, ClientError, LocalCacheConfig, Node, NodeConfig, NodeExit, Publish, SealOutcome,
     StateOpRequest,
