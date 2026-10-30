@@ -1,6 +1,10 @@
 //! Id assignment (SPEC section 2, BUILD_NOTES D15).
 
-use format::{FormatError, IdAllocator, MAX_ID_MS, id_counter, id_ms, make_id};
+use std::num::NonZeroU64;
+
+use format::{
+    FormatError, IdAllocator, MAX_ID_MS, RecordHeader, id_counter, id_ms, make_id, validate_publish,
+};
 use proptest::prelude::*;
 
 const ALLOCATIONS: u64 = 1_000_000;
@@ -141,6 +145,53 @@ fn a_clock_past_48_bits_does_not_wrap() {
 }
 
 #[test]
+fn a_clock_just_past_48_bits_is_clamped() {
+    // `u64::MAX` can't tell clamping from plain shifting, because its high bits
+    // shift out to the same value. These can: unclamped, they lose the top bits.
+    for now_ms in [MAX_ID_MS + 1, MAX_ID_MS + 6, 1 << 50] {
+        let mut allocator = IdAllocator::new(0, 0);
+        let id = allocator.allocate(now_ms, 1).unwrap();
+        assert_eq!(id, make_id(MAX_ID_MS, 0), "clock {now_ms}");
+    }
+}
+
+/// Pins today's behaviour for BUILD_NOTES Q13, which is the user's to decide.
+/// This is not an endorsement: the spec doesn't bound borrowing, so the allocator
+/// doesn't either. When Q13 is decided, this test changes with it.
+#[test]
+fn q13_empty_max_count_records_move_ids_ahead_of_the_clock_without_bound() {
+    let header = RecordHeader {
+        id: 0,
+        options: 0,
+        author: 0,
+        len: 0,
+        count: u16::MAX,
+        codec: 0,
+    };
+    // The largest publish D34 allows: 65,537 × 65,535 = u32::MAX items.
+    let mut frame = header.to_bytes().to_vec().repeat(65_537);
+    assert_eq!(frame.len(), 2_097_184);
+    let mut publish = validate_publish(&mut frame).unwrap();
+    assert_eq!(publish.item_count(), u64::from(u32::MAX));
+
+    // One publish moves the stream about 65 s ahead.
+    let mut allocator = IdAllocator::new(0, 0);
+    let first_id = allocator.allocate(START_MS, publish.item_count()).unwrap();
+    publish.stamp(first_id, NonZeroU64::new(7).unwrap());
+    let honest_id = allocator.allocate(START_MS + 1, 1).unwrap();
+    assert_eq!(id_ms(honest_id) - (START_MS + 1), 65_534);
+
+    // Nothing stops it from adding up. 1,000 of them is about 18.2 hours.
+    let mut allocator = IdAllocator::new(0, 0);
+    for _ in 0..1_000 {
+        allocator.allocate(START_MS, u64::from(u32::MAX)).unwrap();
+    }
+    assert_eq!(id_ms(allocator.last_id()) - START_MS, 65_535_999);
+    let honest_id = allocator.allocate(START_MS, 1).unwrap();
+    assert_eq!(id_ms(honest_id) - START_MS, 65_535_999);
+}
+
+#[test]
 fn id_parts_round_trip() {
     let id = make_id(START_MS, 0xABCD);
     assert_eq!(id_ms(id), START_MS);
@@ -161,5 +212,12 @@ proptest! {
             prop_assert!(first_id >= now_ms << 16);
             last_id = first_id + item_count - 1;
         }
+    }
+
+    /// Any clock too large for 48 bits gives the highest ms.
+    #[test]
+    fn a_clock_past_48_bits_gives_the_highest_ms(now_ms in (MAX_ID_MS + 1)..=u64::MAX) {
+        let id = IdAllocator::new(0, 0).allocate(now_ms, 1).unwrap();
+        prop_assert_eq!(id, make_id(MAX_ID_MS, 0));
     }
 }
