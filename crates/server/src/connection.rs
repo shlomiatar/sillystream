@@ -1,0 +1,1562 @@
+//! The connection's side of delivery (SPEC section 5.2), on its home core (D24): each
+//! subscription's bounded queue, linger, `PROGRESS`, `BEHIND`, fair sharing and catch-up.
+//!
+//! `Connection` is what M6 puts a socket behind. `recv` stands in for the socket, and bytes
+//! it hasn't taken count against a window, which is how a slow client is seen here.
+
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use format::{Clause, Decision, Filter};
+use object_store::ObjectStore;
+use proto::ErrorCode;
+use storage::{BlockTable, SegmentError, SegmentReader, UploaderSender};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
+
+use crate::core::Links;
+use crate::delivery::{
+    ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
+    cursor_name_is_allowed, walk_records,
+};
+use crate::message::{
+    AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, ReadDone, ReadStepMsg, StreamBody, SubRef,
+};
+use crate::slab::SlabBytes;
+
+/// `type u8 | flags u8 | sub u32 | len u32` of a `DATA` frame.
+const DATA_FRAME_HEAD_BYTES: u64 = 10;
+/// How long a failed store read waits before the next try (D87).
+const READ_RETRY_MS: u64 = 100;
+
+/// One matching stretch of a `DATA` frame: shared bytes, not a copy.
+#[derive(Debug, Clone)]
+pub struct DataPart {
+    matched: Arc<Matched>,
+    start: usize,
+    end: usize,
+}
+
+impl DataPart {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.matched.bytes[self.start..self.end]
+    }
+}
+
+/// The `records` of a `DATA` frame: whole records, in id order.
+#[derive(Debug, Clone, Default)]
+pub struct DataFrame {
+    parts: Vec<DataPart>,
+    len_bytes: u64,
+}
+
+impl DataFrame {
+    pub fn parts(&self) -> &[DataPart] {
+        &self.parts
+    }
+
+    pub fn len_bytes(&self) -> u64 {
+        self.len_bytes
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len_bytes as usize);
+        for part in &self.parts {
+            out.extend_from_slice(part.as_bytes());
+        }
+        out
+    }
+}
+
+/// What a connection hears. Each is one server frame of section 11.1.
+#[derive(Debug, Clone)]
+pub enum Event {
+    Subscribed {
+        sub: u32,
+        head: u64,
+        state_ver: u64,
+        state: Bytes,
+    },
+    Data {
+        sub: u32,
+        records: DataFrame,
+    },
+    State {
+        sub: u32,
+        ver: u64,
+        doc: Bytes,
+    },
+    Behind {
+        sub: u32,
+        resume_from: u64,
+    },
+    Progress {
+        sub: u32,
+        id: u64,
+    },
+    Error {
+        reference: u32,
+        code: ErrorCode,
+        msg: String,
+    },
+}
+
+/// What a `SUBSCRIBE` frame carries.
+#[derive(Debug, Clone, Copy)]
+pub struct Subscription<'a> {
+    pub sub: u32,
+    pub stream: &'a str,
+    pub from: u64,
+    pub linger_ms: u16,
+    pub author: Option<u64>,
+    pub clauses: &'a [Clause],
+    pub name: Option<&'a str>,
+    pub with_state: bool,
+    pub state_only: bool,
+    pub include_system: bool,
+}
+
+impl<'a> Subscription<'a> {
+    /// Everything but system records, from `from`, with no linger.
+    pub fn new(sub: u32, stream: &'a str, from: u64) -> Subscription<'a> {
+        Subscription {
+            sub,
+            stream,
+            from,
+            linger_ms: 0,
+            author: None,
+            clauses: &[],
+            name: None,
+            with_state: false,
+            state_only: false,
+            include_system: false,
+        }
+    }
+}
+
+/// One connection's handle on its home core.
+pub struct Connection {
+    control: mpsc::UnboundedSender<ControlMsg>,
+    conn: usize,
+    rx: mpsc::UnboundedReceiver<Event>,
+    credit_owed_bytes: u64,
+    credit_step_bytes: u64,
+}
+
+impl Connection {
+    pub(crate) async fn open(
+        control: mpsc::UnboundedSender<ControlMsg>,
+        window_bytes: u64,
+    ) -> Option<Connection> {
+        let (out, rx) = mpsc::unbounded_channel();
+        let (reply, answer) = oneshot::channel();
+        control
+            .send(ControlMsg::Conn(ConnCmd::Open { out, reply }))
+            .ok()?;
+        let conn = answer.await.ok()?;
+        Some(Connection {
+            control,
+            conn,
+            rx,
+            credit_owed_bytes: 0,
+            credit_step_bytes: (window_bytes / 4).max(1),
+        })
+    }
+
+    fn send(&self, command: ConnCmd) {
+        let _ = self.control.send(ControlMsg::Conn(command));
+    }
+
+    /// `SUBSCRIBE`. The answer is `Event::Subscribed` or `Event::Error`.
+    pub fn subscribe(&self, subscription: Subscription<'_>) {
+        let filter = Filter::new(subscription.clauses).map(|mut filter| {
+            filter.author = subscription.author;
+            filter.include_system = subscription.include_system;
+            filter
+        });
+        self.send(ConnCmd::Subscribe {
+            conn: self.conn,
+            sub: subscription.sub,
+            stream: Arc::from(subscription.stream),
+            from: subscription.from,
+            linger_ms: subscription.linger_ms,
+            filter: filter.ok(),
+            name: subscription.name.map(Arc::from),
+            with_state: subscription.with_state,
+            state_only: subscription.state_only,
+        });
+    }
+
+    pub fn unsubscribe(&self, sub: u32) {
+        self.send(ConnCmd::Unsubscribe {
+            conn: self.conn,
+            sub,
+        });
+    }
+
+    /// `COMMIT`: moves the subscription's named cursor forward.
+    pub fn commit(&self, sub: u32, id: u64) {
+        self.send(ConnCmd::Commit {
+            conn: self.conn,
+            sub,
+            id,
+        });
+    }
+
+    /// The explicit reset of section 5.1, which alone can move a cursor back.
+    pub fn reset_cursor(&self, stream: &str, name: &str, id: u64) {
+        self.send(ConnCmd::ResetCursor {
+            conn: self.conn,
+            stream: Arc::from(stream),
+            name: Arc::from(name),
+            id,
+        });
+    }
+
+    /// Where a named cursor is. In order with this connection's commits and resets.
+    pub async fn read_cursor(&self, stream: &str, name: &str) -> Option<u64> {
+        let (reply, answer) = oneshot::channel();
+        self.send(ConnCmd::ReadCursor {
+            stream: Arc::from(stream),
+            name: Arc::from(name),
+            reply,
+        });
+        answer.await.ok().flatten()
+    }
+
+    fn took(&mut self, event: &Event) {
+        if let Event::Data { records, .. } = event {
+            self.credit_owed_bytes += records.len_bytes();
+            if self.credit_owed_bytes >= self.credit_step_bytes {
+                self.send(ConnCmd::Credit {
+                    conn: self.conn,
+                    bytes: self.credit_owed_bytes,
+                });
+                self.credit_owed_bytes = 0;
+            }
+        }
+    }
+
+    /// The next frame, as a socket taking it. `None` once the node has gone.
+    pub async fn recv(&mut self) -> Option<Event> {
+        let event = self.rx.recv().await?;
+        self.took(&event);
+        Some(event)
+    }
+
+    /// The next frame within `wait_ms`.
+    pub async fn recv_within(&mut self, wait_ms: u64) -> Option<Event> {
+        let waited = tokio::time::timeout(Duration::from_millis(wait_ms), self.rx.recv()).await;
+        let event = waited.ok().flatten()?;
+        self.took(&event);
+        Some(event)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.send(ConnCmd::Closed { conn: self.conn });
+    }
+}
+
+/// Delivery settings of a node (D6d).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeliverySettings {
+    pub queue_bytes: u64,
+    pub progress_interval_ms: u64,
+    pub max_frame_bytes: u64,
+    pub max_subscriptions: usize,
+    pub share_bytes: u64,
+    pub window_bytes: u64,
+    pub read_bytes: u64,
+}
+
+/// Which stores a catch-up reads, nearest first.
+#[derive(Clone)]
+pub(crate) struct Stores {
+    pub local: Option<Arc<dyn ObjectStore>>,
+    pub object: Arc<dyn ObjectStore>,
+}
+
+/// What a home core counts.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HomeStats {
+    pub behind_count: u64,
+    pub progress_count: u64,
+    pub blocks_read_count: u64,
+    pub blocks_skipped_count: u64,
+    pub memory_bytes: u64,
+    pub local_bytes: u64,
+    pub object_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Attaching,
+    Live { filter_id: u32 },
+    StateOnly,
+    CatchUp,
+}
+
+struct QueueItem {
+    matched: Arc<Matched>,
+    run: usize,
+    offset: usize,
+}
+
+/// A catch-up partway through an extent, so its table is read once.
+struct ExtentProgress {
+    extent: ExtentRef,
+    table: Option<Arc<BlockTable>>,
+    next_block: usize,
+    limit: u64,
+}
+
+struct Sub {
+    uid: u64,
+    conn: usize,
+    id: u32,
+    stream: Arc<str>,
+    filter: Filter,
+    linger_ms: u16,
+    name: Option<Arc<str>>,
+    mode: Mode,
+    subscribed_sent: bool,
+    queue: VecDeque<QueueItem>,
+    queued_bytes: u64,
+    /// The highest id looked at: everything at or below it matching is queued or sent.
+    position: u64,
+    /// The highest id this subscriber has been told about.
+    handed_through: u64,
+    due: bool,
+    in_turn: bool,
+    timer_armed: bool,
+    last_progress: Option<Instant>,
+    head_progress_owed: bool,
+    read_out: bool,
+    extent: Option<ExtentProgress>,
+    read_bytes_since: u64,
+    state_ver: u64,
+    latest_state: Option<(u64, Bytes)>,
+}
+
+impl Sub {
+    /// Whole records up to `budget_bytes`, and at least one. Bytes aren't copied.
+    fn take_frame(&mut self, budget_bytes: u64, spans: &mut Vec<RecordSpan>) -> DataFrame {
+        let mut frame = DataFrame::default();
+        let mut left_bytes = budget_bytes as usize;
+        while left_bytes > 0 {
+            let Some(item) = self.queue.front_mut() else {
+                break;
+            };
+            let run = item.matched.runs[item.run];
+            let start = item.offset.max(run.start);
+            let mut end = run.end;
+            let mut last_id = run.last_id;
+            if end - start > left_bytes {
+                // Only an oversized stretch needs its headers walked.
+                walk_records(&item.matched.bytes[start..run.end], spans);
+                let mut taken = 0;
+                for span in spans.iter() {
+                    if span.end > left_bytes && taken > 0 {
+                        break;
+                    }
+                    taken = span.end;
+                    last_id = span.header.last_id();
+                }
+                if taken == 0 {
+                    // Bytes that don't walk can't be whole records. Nothing valid gets here.
+                    taken = end - start;
+                }
+                end = start + taken;
+            }
+            let part_bytes = end - start;
+            frame.parts.push(DataPart {
+                matched: Arc::clone(&item.matched),
+                start,
+                end,
+            });
+            frame.len_bytes += part_bytes as u64;
+            self.queued_bytes -= part_bytes as u64;
+            self.handed_through = self.handed_through.max(last_id);
+            left_bytes = left_bytes.saturating_sub(part_bytes);
+            if end == run.end {
+                item.run += 1;
+                item.offset = 0;
+                if item.run == item.matched.runs.len() {
+                    self.queue.pop_front();
+                }
+            } else {
+                item.offset = end;
+            }
+        }
+        frame
+    }
+
+    /// The parts of `matched` above this subscriber's position.
+    fn item_after_position(&self, matched: &Arc<Matched>) -> Option<(QueueItem, u64)> {
+        if matched.last_id <= self.position {
+            return None;
+        }
+        if matched.first_id > self.position {
+            let item = QueueItem {
+                matched: Arc::clone(matched),
+                run: 0,
+                offset: 0,
+            };
+            return Some((item, matched.total_bytes));
+        }
+        // A batch the position falls inside: only a subscriber just attached mid-way.
+        let run = matched
+            .runs
+            .partition_point(|run| run.last_id <= self.position);
+        let mut spans = Vec::new();
+        walk_records(
+            &matched.bytes[matched.runs[run].start..matched.runs[run].end],
+            &mut spans,
+        );
+        let base = matched.runs[run].start;
+        let offset = spans
+            .iter()
+            .find(|span| span.header.last_id() > self.position)
+            .map_or(base, |span| base + span.start);
+        let later_bytes: usize = matched.runs[run + 1..]
+            .iter()
+            .map(|run| run.end - run.start)
+            .sum();
+        let bytes = matched.runs[run].end - offset + later_bytes;
+        let item = QueueItem {
+            matched: Arc::clone(matched),
+            run,
+            offset,
+        };
+        Some((item, bytes as u64))
+    }
+}
+
+struct Conn {
+    out: mpsc::UnboundedSender<Event>,
+    window_left_bytes: i64,
+    /// Subscriptions with something due, taking turns: this is the fair share.
+    turns: VecDeque<usize>,
+    subs: HashMap<u32, usize>,
+    in_ready: bool,
+}
+
+#[derive(Default)]
+struct Group {
+    subs: Vec<usize>,
+    /// Nothing at or below this is still to come for these subscribers.
+    through_id: u64,
+}
+
+/// A stream as this core's subscribers see it.
+#[derive(Default)]
+struct HomeStream {
+    next_seq: u64,
+    /// Messages from a new owner that overtook its predecessor's (D85).
+    reorder: BTreeMap<u64, StreamBody>,
+    groups: HashMap<u32, Group>,
+    state_subs: Vec<usize>,
+}
+
+/// One core's connections and subscriptions.
+pub(crate) struct Home {
+    me: usize,
+    links: Links,
+    settings: DeliverySettings,
+    stores: Stores,
+    uploader: UploaderSender<SlabBytes>,
+    conns: Vec<Option<Conn>>,
+    free_conns: Vec<usize>,
+    subs: Vec<Option<Sub>>,
+    free_subs: Vec<usize>,
+    next_uid: u64,
+    streams: HashMap<Arc<str>, HomeStream>,
+    ready: Vec<usize>,
+    linger: BinaryHeap<Reverse<(Instant, usize, u64)>>,
+    /// Streams whose subscribers may owe a `PROGRESS`.
+    skipping: HashSet<Arc<str>>,
+    next_progress_check: Instant,
+    spans: Vec<RecordSpan>,
+    after_turn: Vec<usize>,
+    pub stats: HomeStats,
+}
+
+impl Home {
+    pub fn new(
+        me: usize,
+        links: Links,
+        settings: DeliverySettings,
+        stores: Stores,
+        uploader: UploaderSender<SlabBytes>,
+    ) -> Home {
+        Home {
+            me,
+            links,
+            settings,
+            stores,
+            uploader,
+            conns: Vec::new(),
+            free_conns: Vec::new(),
+            subs: Vec::new(),
+            free_subs: Vec::new(),
+            next_uid: 1,
+            streams: HashMap::new(),
+            ready: Vec::new(),
+            linger: BinaryHeap::new(),
+            skipping: HashSet::new(),
+            next_progress_check: Instant::now(),
+            spans: Vec::new(),
+            after_turn: Vec::new(),
+            stats: HomeStats::default(),
+        }
+    }
+
+    fn max_data_bytes(&self) -> u64 {
+        self.settings
+            .max_frame_bytes
+            .saturating_sub(DATA_FRAME_HEAD_BYTES)
+    }
+
+    fn sub_mut(&mut self, key: usize, uid: u64) -> Option<&mut Sub> {
+        self.subs
+            .get_mut(key)
+            .and_then(Option::as_mut)
+            .filter(|sub| sub.uid == uid)
+    }
+
+    fn send_event(&self, conn: usize, event: Event) {
+        if let Some(Some(conn)) = self.conns.get(conn) {
+            let _ = conn.out.send(event);
+        }
+    }
+
+    fn sub_ref(&self, key: usize, uid: u64) -> SubRef {
+        SubRef {
+            home: self.me,
+            key,
+            uid,
+        }
+    }
+
+    /// Connection commands, from the handle.
+    pub fn on_command(&mut self, command: ConnCmd) {
+        match command {
+            ConnCmd::Open { out, reply } => {
+                let conn = Conn {
+                    out,
+                    window_left_bytes: self.settings.window_bytes as i64,
+                    turns: VecDeque::new(),
+                    subs: HashMap::new(),
+                    in_ready: false,
+                };
+                let key = match self.free_conns.pop() {
+                    Some(key) => {
+                        self.conns[key] = Some(conn);
+                        key
+                    }
+                    None => {
+                        self.conns.push(Some(conn));
+                        self.conns.len() - 1
+                    }
+                };
+                let _ = reply.send(key);
+            }
+            ConnCmd::Subscribe {
+                conn,
+                sub,
+                stream,
+                from,
+                linger_ms,
+                filter,
+                name,
+                with_state,
+                state_only,
+            } => self.subscribe(
+                conn, sub, stream, from, linger_ms, filter, name, with_state, state_only,
+            ),
+            ConnCmd::Unsubscribe { conn, sub } => {
+                let key = self.conns[conn]
+                    .as_ref()
+                    .and_then(|c| c.subs.get(&sub).copied());
+                match key {
+                    Some(key) => self.remove_sub(key),
+                    None => self.send_event(
+                        conn,
+                        Event::Error {
+                            reference: sub,
+                            code: ErrorCode::NotFound,
+                            msg: "no such subscription".to_owned(),
+                        },
+                    ),
+                }
+            }
+            ConnCmd::Commit { conn, sub, id } => self.commit(conn, sub, id),
+            ConnCmd::ResetCursor {
+                conn,
+                stream,
+                name,
+                id,
+            } => {
+                if !cursor_name_is_allowed(&name) {
+                    self.send_event(
+                        conn,
+                        Event::Error {
+                            reference: 0,
+                            code: ErrorCode::Malformed,
+                            msg: "sink: cursors belong to sinks".to_owned(),
+                        },
+                    );
+                    return;
+                }
+                let report = self.conns[conn].as_ref().map(|c| (c.out.clone(), 0));
+                self.post_cursor(stream, name, CursorOp::Reset(id), report);
+            }
+            ConnCmd::ReadCursor {
+                stream,
+                name,
+                reply,
+            } => self.post_cursor(stream, name, CursorOp::Read(reply), None),
+            ConnCmd::Credit { conn, bytes } => self.on_credit(conn, bytes),
+            ConnCmd::Closed { conn } => self.close(conn),
+        }
+    }
+
+    fn post_cursor(
+        &self,
+        stream: Arc<str>,
+        name: Arc<str>,
+        op: CursorOp,
+        report: Option<(mpsc::UnboundedSender<Event>, u32)>,
+    ) {
+        let _ = self.links.control[self.me].send(ControlMsg::Cursor {
+            stream,
+            name,
+            op,
+            report,
+        });
+    }
+
+    fn commit(&mut self, conn: usize, sub: u32, id: u64) {
+        let key = self.conns[conn]
+            .as_ref()
+            .and_then(|c| c.subs.get(&sub).copied());
+        let target = key
+            .and_then(|key| self.subs[key].as_ref())
+            .and_then(|sub| sub.name.clone().map(|name| (Arc::clone(&sub.stream), name)));
+        let Some((stream, name)) = target else {
+            self.send_event(
+                conn,
+                Event::Error {
+                    reference: sub,
+                    code: ErrorCode::Malformed,
+                    msg: "COMMIT needs a subscription with a named cursor".to_owned(),
+                },
+            );
+            return;
+        };
+        let report = self.conns[conn].as_ref().map(|c| (c.out.clone(), sub));
+        self.post_cursor(stream, name, CursorOp::Commit(id), report);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn subscribe(
+        &mut self,
+        conn: usize,
+        id: u32,
+        stream: Arc<str>,
+        from: u64,
+        linger_ms: u16,
+        filter: Option<Filter>,
+        name: Option<Arc<str>>,
+        with_state: bool,
+        state_only: bool,
+    ) {
+        let error = |code, msg: &str| Event::Error {
+            reference: id,
+            code,
+            msg: msg.to_owned(),
+        };
+        let Some(connection) = self.conns.get(conn).and_then(Option::as_ref) else {
+            return;
+        };
+        let refused = if connection.subs.contains_key(&id) {
+            Some(error(ErrorCode::Malformed, "subscription id is in use"))
+        } else if connection.subs.len() >= self.settings.max_subscriptions {
+            Some(error(
+                ErrorCode::TooManySubscriptions,
+                "too many subscriptions",
+            ))
+        } else if filter.is_none() {
+            Some(error(ErrorCode::Malformed, "more than 4 clauses"))
+        } else if name
+            .as_deref()
+            .is_some_and(|name| !cursor_name_is_allowed(name))
+        {
+            Some(error(ErrorCode::Malformed, "sink: cursors belong to sinks"))
+        } else {
+            None
+        };
+        if let Some(event) = refused {
+            self.send_event(conn, event);
+            return;
+        }
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        let sub = Sub {
+            uid,
+            conn,
+            id,
+            stream: Arc::clone(&stream),
+            filter: filter.expect("checked above"),
+            linger_ms,
+            name: name.clone(),
+            mode: Mode::Attaching,
+            subscribed_sent: false,
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            position: 0,
+            handed_through: 0,
+            due: false,
+            in_turn: false,
+            timer_armed: false,
+            last_progress: None,
+            head_progress_owed: false,
+            read_out: false,
+            extent: None,
+            read_bytes_since: 0,
+            state_ver: 0,
+            latest_state: None,
+        };
+        let filter = sub.filter;
+        let key = match self.free_subs.pop() {
+            Some(key) => {
+                self.subs[key] = Some(sub);
+                key
+            }
+            None => {
+                self.subs.push(Some(sub));
+                self.subs.len() - 1
+            }
+        };
+        if let Some(Some(connection)) = self.conns.get_mut(conn) {
+            connection.subs.insert(id, key);
+        }
+        let _ = self.links.control[self.me].send(ControlMsg::Attach(Box::new(AttachMsg {
+            stream,
+            sub: self.sub_ref(key, uid),
+            filter,
+            from,
+            name,
+            with_state,
+            state_only,
+        })));
+    }
+
+    fn detach_from_owner(&self, stream: &Arc<str>, filter_id: u32) {
+        let _ = self.links.control[self.me].send(ControlMsg::Detach {
+            stream: Arc::clone(stream),
+            filter_id,
+            home: self.me,
+        });
+    }
+
+    /// Takes a subscriber off the stream's lists, and tells the owner.
+    fn leave_group(&mut self, key: usize) {
+        let Some(sub) = self.subs[key].as_ref() else {
+            return;
+        };
+        let stream = Arc::clone(&sub.stream);
+        let filter_id = match sub.mode {
+            Mode::Live { filter_id } => filter_id,
+            Mode::StateOnly => STATE_ONLY_FILTER_ID,
+            Mode::Attaching | Mode::CatchUp => return,
+        };
+        if let Some(home_stream) = self.streams.get_mut(&stream) {
+            if filter_id == STATE_ONLY_FILTER_ID {
+                home_stream.state_subs.retain(|other| *other != key);
+            } else if let Some(group) = home_stream.groups.get_mut(&filter_id) {
+                group.subs.retain(|other| *other != key);
+                if group.subs.is_empty() {
+                    home_stream.groups.remove(&filter_id);
+                }
+            }
+        }
+        self.detach_from_owner(&stream, filter_id);
+    }
+
+    fn remove_sub(&mut self, key: usize) {
+        self.leave_group(key);
+        let Some(sub) = self.subs[key].take() else {
+            return;
+        };
+        self.free_subs.push(key);
+        if let Some(Some(conn)) = self.conns.get_mut(sub.conn) {
+            conn.subs.remove(&sub.id);
+            if sub.in_turn {
+                conn.turns.retain(|other| *other != key);
+            }
+        }
+    }
+
+    fn close(&mut self, conn: usize) {
+        let Some(connection) = self.conns.get_mut(conn).and_then(Option::take) else {
+            return;
+        };
+        for key in connection.subs.values() {
+            self.remove_sub(*key);
+        }
+        self.free_conns.push(conn);
+    }
+
+    fn on_credit(&mut self, conn: usize, bytes: u64) {
+        let Some(Some(connection)) = self.conns.get_mut(conn) else {
+            return;
+        };
+        connection.window_left_bytes += bytes as i64;
+        let keys: Vec<usize> = connection.subs.values().copied().collect();
+        self.make_ready(conn);
+        for key in keys {
+            self.send_latest_state(key);
+            self.owed_after_frame(key);
+        }
+    }
+
+    fn make_ready(&mut self, conn: usize) {
+        if let Some(Some(connection)) = self.conns.get_mut(conn)
+            && !connection.in_ready
+        {
+            connection.in_ready = true;
+            self.ready.push(conn);
+        }
+    }
+
+    /// Puts a subscription in its connection's turns, if it has something due.
+    fn schedule(&mut self, key: usize) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if !sub.due || sub.in_turn || sub.queue.is_empty() {
+            return;
+        }
+        sub.in_turn = true;
+        let conn = sub.conn;
+        if let Some(Some(connection)) = self.conns.get_mut(conn) {
+            connection.turns.push_back(key);
+        }
+        self.make_ready(conn);
+    }
+
+    /// Records joined a queue. They go out now, or when the timer fires or the queue has
+    /// reached a frame, whichever is first (section 5.2).
+    fn after_enqueue(&mut self, key: usize) {
+        let max_data_bytes = self.max_data_bytes();
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if sub.linger_ms == 0 || sub.queued_bytes >= max_data_bytes {
+            sub.due = true;
+        } else if !sub.due && !sub.timer_armed {
+            sub.timer_armed = true;
+            let at = Instant::now() + Duration::from_millis(u64::from(sub.linger_ms));
+            self.linger.push(Reverse((at, key, sub.uid)));
+        }
+        self.schedule(key);
+    }
+
+    /// Sends what is due, connection by connection, one share per subscription per turn.
+    pub fn flush(&mut self) {
+        if self.ready.is_empty() {
+            return;
+        }
+        let share_bytes = self.settings.share_bytes.min(self.max_data_bytes()).max(1);
+        let mut spans = std::mem::take(&mut self.spans);
+        for conn in std::mem::take(&mut self.ready) {
+            let Some(Some(connection)) = self.conns.get_mut(conn) else {
+                continue;
+            };
+            connection.in_ready = false;
+            while connection.window_left_bytes > 0 {
+                let Some(key) = connection.turns.pop_front() else {
+                    break;
+                };
+                let Some(Some(sub)) = self.subs.get_mut(key) else {
+                    continue;
+                };
+                sub.in_turn = false;
+                let frame = sub.take_frame(share_bytes, &mut spans);
+                if frame.len_bytes > 0 {
+                    connection.window_left_bytes -= frame.len_bytes as i64;
+                    let _ = connection.out.send(Event::Data {
+                        sub: sub.id,
+                        records: frame,
+                    });
+                }
+                if sub.queue.is_empty() {
+                    sub.due = false;
+                } else if sub.due {
+                    sub.in_turn = true;
+                    connection.turns.push_back(key);
+                }
+                if sub.mode == Mode::CatchUp || (sub.head_progress_owed && sub.queue.is_empty()) {
+                    self.after_turn.push(key);
+                }
+            }
+        }
+        self.spans = spans;
+        for key in std::mem::take(&mut self.after_turn) {
+            self.owed_after_frame(key);
+        }
+    }
+
+    fn owed_after_frame(&mut self, key: usize) {
+        let owed = self.subs[key]
+            .as_ref()
+            .is_some_and(|sub| sub.head_progress_owed && sub.queue.is_empty());
+        if owed {
+            self.send_head_progress(key);
+        }
+        self.pump_catch_up(key);
+    }
+
+    fn send_head_progress(&mut self, key: usize) {
+        let still_owed = !self.progress(key, 0, true);
+        if let Some(Some(sub)) = self.subs.get_mut(key) {
+            sub.head_progress_owed = still_owed;
+        }
+    }
+
+    /// Sends `PROGRESS` if it means something and may go now. False if it is still owed.
+    fn progress(&mut self, key: usize, floor_id: u64, force: bool) -> bool {
+        let interval = Duration::from_millis(self.settings.progress_interval_ms);
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return true;
+        };
+        let id = sub.position.max(floor_id);
+        if id <= sub.handed_through {
+            return true;
+        }
+        // Everything matching at or below `id` has to be out ahead of it.
+        if !sub.queue.is_empty() {
+            return false;
+        }
+        let Some(Some(connection)) = self.conns.get(sub.conn) else {
+            return true;
+        };
+        if connection.window_left_bytes <= 0 {
+            return false;
+        }
+        let now = Instant::now();
+        if !force && sub.last_progress.is_some_and(|at| now - at < interval) {
+            return false;
+        }
+        sub.last_progress = Some(now);
+        sub.handed_through = id;
+        sub.position = id;
+        let _ = connection.out.send(Event::Progress { sub: sub.id, id });
+        self.stats.progress_count += 1;
+        true
+    }
+
+    /// The next time `on_timer` has something to do.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let linger = self.linger.peek().map(|Reverse((at, _, _))| *at);
+        let progress = (!self.skipping.is_empty()).then_some(self.next_progress_check);
+        match (linger, progress) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub fn on_timer(&mut self) {
+        let now = Instant::now();
+        while let Some(Reverse((at, key, uid))) = self.linger.peek().copied() {
+            if at > now {
+                break;
+            }
+            self.linger.pop();
+            if let Some(sub) = self.sub_mut(key, uid) {
+                sub.timer_armed = false;
+                if !sub.queue.is_empty() {
+                    sub.due = true;
+                }
+                self.schedule(key);
+            }
+        }
+        if !self.skipping.is_empty() && self.next_progress_check <= now {
+            self.next_progress_check =
+                now + Duration::from_millis((self.settings.progress_interval_ms / 4).max(1));
+            self.check_progress();
+        }
+    }
+
+    fn check_progress(&mut self) {
+        for stream in self.skipping.iter().cloned().collect::<Vec<_>>() {
+            let mut owed = false;
+            let groups: Vec<(u64, Vec<usize>)> = self
+                .streams
+                .get(&stream)
+                .map(|home_stream| {
+                    home_stream
+                        .groups
+                        .values()
+                        .map(|group| (group.through_id, group.subs.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (through_id, subs) in groups {
+                for key in subs {
+                    owed |= !self.progress(key, through_id, false);
+                }
+            }
+            if !owed {
+                self.skipping.remove(&stream);
+            }
+        }
+    }
+
+    /// From an owner: `seq` puts its messages in order, whichever owner sent each.
+    pub fn on_stream(&mut self, stream: Arc<str>, seq: u64, body: StreamBody) {
+        let home_stream = self.streams.entry(Arc::clone(&stream)).or_default();
+        if seq != home_stream.next_seq {
+            home_stream.reorder.insert(seq, body);
+            return;
+        }
+        home_stream.next_seq += 1;
+        self.apply(&stream, body);
+        loop {
+            let home_stream = self.streams.entry(Arc::clone(&stream)).or_default();
+            let next = home_stream.next_seq;
+            let Some(body) = home_stream.reorder.remove(&next) else {
+                return;
+            };
+            home_stream.next_seq += 1;
+            self.apply(&stream, body);
+        }
+    }
+
+    fn apply(&mut self, stream: &Arc<str>, body: StreamBody) {
+        match body {
+            StreamBody::Attached {
+                sub,
+                filter_id,
+                head,
+                cursor,
+                state_ver,
+                state,
+            } => self.on_attached(stream, sub, filter_id, head, cursor, state_ver, state),
+            StreamBody::Fan(fan) => self.on_fan(stream, &fan),
+        }
+    }
+
+    fn say_subscribed(&mut self, key: usize, head: u64, cursor: u64, state_ver: u64, state: Bytes) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if sub.subscribed_sent {
+            return;
+        }
+        sub.subscribed_sent = true;
+        sub.position = cursor;
+        sub.handed_through = cursor;
+        sub.state_ver = state_ver;
+        let (conn, id) = (sub.conn, sub.id);
+        self.send_event(
+            conn,
+            Event::Subscribed {
+                sub: id,
+                head,
+                state_ver,
+                state,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_attached(
+        &mut self,
+        stream: &Arc<str>,
+        sub_ref: SubRef,
+        filter_id: u32,
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+    ) {
+        if self.sub_mut(sub_ref.key, sub_ref.uid).is_none() {
+            self.detach_from_owner(stream, filter_id);
+            return;
+        }
+        let key = sub_ref.key;
+        self.say_subscribed(key, head, cursor, state_ver, state);
+        let home_stream = self.streams.entry(Arc::clone(stream)).or_default();
+        let sub = self.subs[key].as_mut().expect("checked above");
+        let was_catching_up = sub.mode == Mode::CatchUp;
+        if filter_id == STATE_ONLY_FILTER_ID {
+            sub.mode = Mode::StateOnly;
+            home_stream.state_subs.push(key);
+            return;
+        }
+        sub.mode = Mode::Live { filter_id };
+        sub.position = sub.position.max(cursor);
+        home_stream
+            .groups
+            .entry(filter_id)
+            .or_default()
+            .subs
+            .push(key);
+        if was_catching_up {
+            // Reaching head: section 5.2's other reason to send it.
+            sub.head_progress_owed = true;
+            if sub.queue.is_empty() {
+                self.send_head_progress(key);
+            }
+        }
+    }
+
+    fn on_fan(&mut self, stream: &Arc<str>, fan: &FanOut) {
+        let Some(home_stream) = self.streams.get_mut(stream) else {
+            return;
+        };
+        let mut overflowed = Vec::new();
+        let mut enqueued = Vec::new();
+        for (filter_id, matched) in &fan.matches {
+            let Some(group) = home_stream.groups.get(filter_id) else {
+                continue;
+            };
+            for key in &group.subs {
+                let Some(Some(sub)) = self.subs.get_mut(*key) else {
+                    continue;
+                };
+                let Some((item, bytes)) = sub.item_after_position(matched) else {
+                    continue;
+                };
+                if sub.queued_bytes + bytes > self.settings.queue_bytes && !sub.queue.is_empty() {
+                    overflowed.push(*key);
+                    continue;
+                }
+                sub.queue.push_back(item);
+                sub.queued_bytes += bytes;
+                sub.position = matched.last_id;
+                enqueued.push(*key);
+            }
+        }
+        let has_groups = !home_stream.groups.is_empty();
+        for group in home_stream.groups.values_mut() {
+            group.through_id = group.through_id.max(fan.through_id);
+        }
+        let state_subs = if fan.state.is_some() {
+            home_stream.state_subs.clone()
+        } else {
+            Vec::new()
+        };
+        if has_groups {
+            self.skipping.insert(Arc::clone(stream));
+        }
+        for key in enqueued {
+            self.after_enqueue(key);
+        }
+        for key in overflowed {
+            self.fall_behind(key);
+        }
+        if let Some((ver, doc)) = &fan.state {
+            for key in state_subs {
+                if let Some(Some(sub)) = self.subs.get_mut(key)
+                    && *ver > sub.state_ver
+                {
+                    sub.latest_state = Some((*ver, doc.clone()));
+                    self.send_latest_state(key);
+                }
+            }
+        }
+    }
+
+    /// State is how things stand now, so a slow client only needs the latest (D88).
+    fn send_latest_state(&mut self, key: usize) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        let Some(Some(connection)) = self.conns.get_mut(sub.conn) else {
+            return;
+        };
+        if connection.window_left_bytes <= 0 {
+            return;
+        }
+        if let Some((ver, doc)) = sub.latest_state.take() {
+            sub.state_ver = ver;
+            connection.window_left_bytes -= doc.len() as i64;
+            let _ = connection.out.send(Event::State {
+                sub: sub.id,
+                ver,
+                doc,
+            });
+        }
+    }
+
+    /// Section 5.2's overflow: what is queued goes, so the bound holds, and the subscription
+    /// carries on from what it was last given, by catching up (D86).
+    fn fall_behind(&mut self, key: usize) {
+        self.leave_group(key);
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        sub.queue.clear();
+        sub.queued_bytes = 0;
+        sub.due = false;
+        sub.mode = Mode::CatchUp;
+        sub.position = sub.handed_through;
+        sub.read_out = false;
+        sub.extent = None;
+        let (conn, id, resume_from) = (sub.conn, sub.id, sub.handed_through);
+        self.stats.behind_count += 1;
+        self.send_event(
+            conn,
+            Event::Behind {
+                sub: id,
+                resume_from,
+            },
+        );
+        self.pump_catch_up(key);
+    }
+
+    /// Asks for the next stretch, if the queue has room and the client is reading.
+    fn pump_catch_up(&mut self, key: usize) {
+        let queue_low_bytes = self.settings.queue_bytes / 2;
+        let read_bytes = self.settings.read_bytes;
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if sub.mode != Mode::CatchUp || sub.read_out || sub.queued_bytes > queue_low_bytes {
+            return;
+        }
+        let window_open = self
+            .conns
+            .get(sub.conn)
+            .and_then(Option::as_ref)
+            .is_some_and(|conn| conn.window_left_bytes > 0);
+        if !window_open {
+            return;
+        }
+        sub.read_out = true;
+        if let Some(extent) = &sub.extent {
+            let job = ExtentJob {
+                stores: self.stores.clone(),
+                extent: extent.extent.clone(),
+                table: extent.table.clone(),
+                next_block: extent.next_block,
+                limit: extent.limit,
+                filter: range_filter(&sub.filter, sub.position, extent.limit),
+                position: sub.position,
+                budget_bytes: read_bytes,
+                back: self.links.control[self.me].clone(),
+                sub: SubRef {
+                    home: self.me,
+                    key,
+                    uid: sub.uid,
+                },
+            };
+            let _ = self.uploader.try_cache_touch(extent.extent.path.clone());
+            tokio::spawn(run_extent_job(job));
+            return;
+        }
+        let message = ReadStepMsg {
+            stream: Arc::clone(&sub.stream),
+            sub: SubRef {
+                home: self.me,
+                key,
+                uid: sub.uid,
+            },
+            filter: sub.filter,
+            after: sub.position,
+            read_bytes: std::mem::take(&mut sub.read_bytes_since),
+        };
+        let _ = self.links.control[self.me].send(ControlMsg::ReadStep(Box::new(message)));
+    }
+
+    fn enqueue_read(&mut self, key: usize, matched: Option<Arc<Matched>>) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if let Some(matched) = matched {
+            sub.queued_bytes += matched.total_bytes;
+            sub.queue.push_back(QueueItem {
+                matched,
+                run: 0,
+                offset: 0,
+            });
+            // A read isn't waiting for more, so it doesn't linger.
+            sub.due = true;
+        }
+        self.schedule(key);
+    }
+
+    pub fn on_catch(&mut self, sub_ref: SubRef, reply: CatchReply) {
+        let key = sub_ref.key;
+        let Some(sub) = self.sub_mut(key, sub_ref.uid) else {
+            return;
+        };
+        sub.read_out = false;
+        match reply {
+            CatchReply::Start {
+                head,
+                cursor,
+                state_ver,
+                state,
+            } => {
+                sub.mode = Mode::CatchUp;
+                self.say_subscribed(key, head, cursor, state_ver, state);
+            }
+            CatchReply::Memory { batches, limit } => {
+                let filter = range_filter(&sub.filter, sub.position, limit);
+                // Nothing came, so nothing is left at or below the limit.
+                let mut position = if batches.is_empty() {
+                    limit
+                } else {
+                    sub.position
+                };
+                let mut matched = Vec::new();
+                let mut spans = std::mem::take(&mut self.spans);
+                for batch in batches {
+                    let bytes = SharedBytes::Slab(batch);
+                    walk_records(&bytes, &mut spans);
+                    self.stats.memory_bytes += bytes.len() as u64;
+                    if let Some(last) = spans.last() {
+                        position = position.max(last.header.last_id());
+                    }
+                    matched.extend(Matched::select(&bytes, &spans, &filter));
+                }
+                self.spans = spans;
+                for one in matched {
+                    self.account_read(key, one.total_bytes);
+                    self.enqueue_read(key, Some(one));
+                }
+                if let Some(Some(sub)) = self.subs.get_mut(key) {
+                    sub.position = position;
+                }
+            }
+            CatchReply::Extent { extent, limit } => {
+                sub.extent = Some(ExtentProgress {
+                    extent,
+                    table: None,
+                    next_block: 0,
+                    limit,
+                });
+            }
+            CatchReply::Fail { code, msg } => {
+                let (conn, id) = (sub.conn, sub.id);
+                self.send_event(
+                    conn,
+                    Event::Error {
+                        reference: id,
+                        code,
+                        msg,
+                    },
+                );
+                self.remove_sub(key);
+                return;
+            }
+        }
+        self.progress(key, 0, false);
+        self.pump_catch_up(key);
+    }
+
+    fn account_read(&mut self, key: usize, bytes: u64) {
+        if let Some(Some(sub)) = self.subs.get_mut(key) {
+            sub.read_bytes_since += bytes;
+        }
+    }
+
+    /// A read task's result.
+    pub fn on_read_done(&mut self, sub_ref: SubRef, done: ReadDone) {
+        let key = sub_ref.key;
+        let Some(sub) = self.sub_mut(key, sub_ref.uid) else {
+            return;
+        };
+        sub.read_out = false;
+        match done {
+            ReadDone::Retry => {}
+            ReadDone::Fail { code, msg } => {
+                let (conn, id) = (sub.conn, sub.id);
+                self.send_event(
+                    conn,
+                    Event::Error {
+                        reference: id,
+                        code,
+                        msg,
+                    },
+                );
+                self.remove_sub(key);
+                return;
+            }
+            ReadDone::Read(read) => {
+                let limit = sub.extent.as_ref().map_or(read.position, |e| e.limit);
+                let filter = range_filter(&sub.filter, sub.position, limit);
+                sub.position = sub.position.max(read.position);
+                if let Some(extent) = &mut sub.extent {
+                    extent.table = Some(read.table);
+                    extent.next_block = read.next_block;
+                }
+                if read.done {
+                    sub.extent = None;
+                }
+                let local = read.from_local;
+                self.stats.blocks_read_count += read.blocks_read_count;
+                self.stats.blocks_skipped_count += read.blocks_skipped_count;
+                if let Some(bytes) = read.bytes {
+                    if local {
+                        self.stats.local_bytes += bytes.len() as u64;
+                    } else {
+                        self.stats.object_bytes += bytes.len() as u64;
+                    }
+                    self.account_read(key, bytes.len() as u64);
+                    let bytes = SharedBytes::Plain(bytes);
+                    let mut spans = std::mem::take(&mut self.spans);
+                    walk_records(&bytes, &mut spans);
+                    let matched = Matched::select(&bytes, &spans, &filter);
+                    self.spans = spans;
+                    self.enqueue_read(key, matched);
+                }
+            }
+        }
+        self.progress(key, 0, false);
+        self.pump_catch_up(key);
+    }
+}
+
+/// The filter, narrowed to what a read may take: whole records above `position`, and
+/// nothing not yet visible.
+fn range_filter(filter: &Filter, position: u64, limit: u64) -> Filter {
+    let mut ranged = *filter;
+    ranged.id_first = position.saturating_add(1);
+    ranged.id_last = limit;
+    ranged
+}
+
+/// One read of an extent: its table if needed, then one run of blocks.
+struct ExtentJob {
+    stores: Stores,
+    extent: ExtentRef,
+    table: Option<Arc<BlockTable>>,
+    next_block: usize,
+    limit: u64,
+    filter: Filter,
+    position: u64,
+    budget_bytes: u64,
+    back: mpsc::UnboundedSender<ControlMsg>,
+    sub: SubRef,
+}
+
+/// What came back from one read of an extent.
+#[derive(Debug)]
+pub(crate) struct ExtentRead {
+    pub table: Arc<BlockTable>,
+    pub next_block: usize,
+    /// Everything at or below this id has been looked at.
+    pub position: u64,
+    pub done: bool,
+    pub bytes: Option<Bytes>,
+    pub blocks_read_count: u64,
+    pub blocks_skipped_count: u64,
+    pub from_local: bool,
+}
+
+async fn read_from(
+    store: Arc<dyn ObjectStore>,
+    job: &ExtentJob,
+) -> Result<ExtentRead, SegmentError> {
+    let reader = SegmentReader::new(store, job.extent.path.clone());
+    let table = match &job.table {
+        Some(table) => Arc::clone(table),
+        None => Arc::new(reader.read_table(&job.extent.extent).await?),
+    };
+    let blocks = &table.blocks;
+    let mut position = job.position;
+    let mut at = job.next_block;
+    let mut skipped = 0;
+    let mut done = false;
+    // Blocks the summaries rule out cost nothing beyond the table (section 4.1).
+    while let Some(block) = blocks.get(at) {
+        if block.summary.id_first > job.limit {
+            // Extents are in id order, so nothing at or below the limit is left anywhere.
+            position = position.max(job.limit);
+            done = true;
+            break;
+        }
+        if job.filter.decide_block(&block.summary) != Decision::None {
+            break;
+        }
+        skipped += 1;
+        position = position.max(block.summary.id_last.min(job.limit));
+        at += 1;
+    }
+    let start = at;
+    let mut bytes = 0;
+    while let Some(block) = blocks.get(at) {
+        if block.summary.id_first > job.limit
+            || bytes >= job.budget_bytes
+            || job.filter.decide_block(&block.summary) == Decision::None
+        {
+            break;
+        }
+        bytes += block.summary.bytes;
+        position = position.max(block.summary.id_last.min(job.limit));
+        at += 1;
+    }
+    let data = if start < at {
+        Some(
+            reader
+                .read_blocks(&job.extent.extent, &table, start..at)
+                .await?,
+        )
+    } else {
+        None
+    };
+    done |= at >= blocks.len();
+    Ok(ExtentRead {
+        next_block: at,
+        position,
+        done,
+        bytes: data,
+        blocks_read_count: (at - start) as u64,
+        blocks_skipped_count: skipped,
+        from_local: false,
+        table,
+    })
+}
+
+async fn run_extent_job(job: ExtentJob) {
+    // A miss or a bad copy in the local tier isn't an error: S3 has it (section 6.2).
+    let local_read = match &job.stores.local {
+        Some(local) => read_from(Arc::clone(local), &job).await.ok(),
+        None => None,
+    };
+    let done = match local_read {
+        Some(mut read) => {
+            read.from_local = true;
+            ReadDone::Read(read)
+        }
+        None => match read_from(Arc::clone(&job.stores.object), &job).await {
+            Ok(read) => ReadDone::Read(read),
+            Err(SegmentError::Store(object_store::Error::NotFound { .. })) => ReadDone::Fail {
+                code: ErrorCode::RetentionExpired,
+                msg: "the object holding these records is gone".to_owned(),
+            },
+            Err(SegmentError::Store(_)) => {
+                tokio::time::sleep(Duration::from_millis(READ_RETRY_MS)).await;
+                ReadDone::Retry
+            }
+            Err(error) => ReadDone::Fail {
+                code: ErrorCode::Malformed,
+                msg: error.to_string(),
+            },
+        },
+    };
+    let _ = job.back.send(ControlMsg::ReadDone {
+        sub: job.sub,
+        done: Box::new(done),
+    });
+}

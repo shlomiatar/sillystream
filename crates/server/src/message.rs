@@ -8,7 +8,10 @@ use format::IdAllocator;
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::connection::{Event, ExtentRead};
+use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
+use crate::delivery::{ExtentRef, FanOut, StreamDelivery};
 use crate::placement::ShardCounters;
 use crate::slab::{SlabBytes, SlabRegion};
 use crate::state::{StateOp, StreamState};
@@ -52,11 +55,13 @@ pub enum Reply {
 
 pub(crate) type ReplyTx = mpsc::UnboundedSender<Reply>;
 
-/// Per-stream config of section 13. Retention arrives with M8.
+/// Per-stream config of section 13.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamConfig {
     pub default_ack_level: u8,
     pub min_ack_level: u8,
+    /// Section 7.4's class, as a length of time. Only reads use it until M8 (D89).
+    pub retention_ms: u64,
 }
 
 impl Default for StreamConfig {
@@ -64,6 +69,7 @@ impl Default for StreamConfig {
         StreamConfig {
             default_ack_level: 2,
             min_ack_level: 0,
+            retention_ms: 24 * 60 * 60 * 1000,
         }
     }
 }
@@ -193,6 +199,17 @@ pub struct CoreStats {
     pub unsealed_bytes: u64,
     pub duplicate_count: u64,
     pub forwarded_count: u64,
+    /// One per record per distinct filter (section 5.2).
+    pub filter_check_count: u64,
+    pub behind_count: u64,
+    pub progress_count: u64,
+    /// Blocks catch-ups on this home core read, and those summaries let them skip.
+    pub catch_up_blocks_read_count: u64,
+    pub catch_up_blocks_skipped_count: u64,
+    /// Bytes catch-ups on this home core read from each tier.
+    pub catch_up_memory_bytes: u64,
+    pub catch_up_local_bytes: u64,
+    pub catch_up_object_bytes: u64,
 }
 
 /// A stream on its way to another core. Its records stay with the old core until they
@@ -209,6 +226,7 @@ pub(crate) struct StreamHandoff {
     /// `(core, ticket)`: stamped entries still to reach the WAL channel. Nothing the new
     /// owner stamps can go in ahead of them (D77).
     pub wal_waits: Vec<(usize, u64)>,
+    pub delivery: StreamDelivery,
 }
 
 #[derive(Debug)]
@@ -273,6 +291,46 @@ pub(crate) enum ControlMsg {
         ack: Reply,
         reply: ReplyTx,
     },
+    Conn(ConnCmd),
+    Attach(Box<AttachMsg>),
+    ReadStep(Box<ReadStepMsg>),
+    ReadChain(Box<ReadChain>),
+    /// A read task on this core has finished.
+    ReadDone {
+        sub: SubRef,
+        done: Box<ReadDone>,
+    },
+    Detach {
+        stream: Arc<str>,
+        filter_id: u32,
+        home: usize,
+    },
+    Cursor {
+        stream: Arc<str>,
+        name: Arc<str>,
+        op: CursorOp,
+        /// Where an error goes: the connection's frames, and the reference to use.
+        report: Option<(mpsc::UnboundedSender<Event>, u32)>,
+    },
+    /// An upload's extents for a stream whose owner is elsewhere. Goes back to `origin`
+    /// when noted, which is what lets it drop its batches (D83).
+    AddExtents {
+        stream: Arc<str>,
+        path: object_store::path::Path,
+        extents: Vec<storage::StreamExtent>,
+        origin: usize,
+        tag: UploadTag,
+    },
+    ExtentsNoted {
+        stream: Arc<str>,
+        tag: UploadTag,
+    },
+    /// `core`'s entries are durable up to `ticket`, for streams that moved away while an
+    /// entry waited (D84).
+    DurableSeen {
+        core: usize,
+        ticket: u64,
+    },
     /// A probe this core sent has reached the owner (D78).
     ProbeBack,
     /// The WAL channel has taken `core`'s entries up to `ticket` (D77).
@@ -281,4 +339,165 @@ pub(crate) enum ControlMsg {
         ticket: u64,
     },
     Stop,
+}
+
+/// A subscription on its home core.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SubRef {
+    pub home: usize,
+    pub key: usize,
+    pub uid: u64,
+}
+
+/// What a connection handle asks of its home core.
+#[derive(Debug)]
+pub(crate) enum ConnCmd {
+    Open {
+        out: mpsc::UnboundedSender<Event>,
+        reply: oneshot::Sender<usize>,
+    },
+    Subscribe {
+        conn: usize,
+        sub: u32,
+        stream: Arc<str>,
+        from: u64,
+        linger_ms: u16,
+        /// `None` if the clauses didn't make a filter.
+        filter: Option<format::Filter>,
+        name: Option<Arc<str>>,
+        with_state: bool,
+        state_only: bool,
+    },
+    Unsubscribe {
+        conn: usize,
+        sub: u32,
+    },
+    Commit {
+        conn: usize,
+        sub: u32,
+        id: u64,
+    },
+    ResetCursor {
+        conn: usize,
+        stream: Arc<str>,
+        name: Arc<str>,
+        id: u64,
+    },
+    ReadCursor {
+        stream: Arc<str>,
+        name: Arc<str>,
+        reply: oneshot::Sender<Option<u64>>,
+    },
+    /// The socket has taken this many bytes.
+    Credit {
+        conn: usize,
+        bytes: u64,
+    },
+    Closed {
+        conn: usize,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum CursorOp {
+    Commit(u64),
+    Reset(u64),
+    Read(oneshot::Sender<Option<u64>>),
+}
+
+#[derive(Debug)]
+pub(crate) struct AttachMsg {
+    pub stream: Arc<str>,
+    pub sub: SubRef,
+    pub filter: format::Filter,
+    pub from: u64,
+    pub name: Option<Arc<str>>,
+    pub with_state: bool,
+    pub state_only: bool,
+}
+
+/// "What comes after `after`?", from a catching-up subscriber to the stream's owner.
+#[derive(Debug)]
+pub(crate) struct ReadStepMsg {
+    pub stream: Arc<str>,
+    pub sub: SubRef,
+    pub filter: format::Filter,
+    pub after: u64,
+    /// Bytes read since the last step, for the shard's counters.
+    pub read_bytes: u64,
+}
+
+/// A read step's walk over the cores that stamped the ids in question, oldest first, which
+/// ends at the owner (D83).
+#[derive(Debug)]
+pub(crate) struct ReadChain {
+    pub stream: Arc<str>,
+    pub sub: SubRef,
+    pub after: u64,
+    pub limit: u64,
+    /// `(last_id, core)`.
+    pub hops: std::collections::VecDeque<(u64, usize)>,
+    pub batches: Vec<SlabBytes>,
+}
+
+/// An owner's answer to a subscriber. Not in `seq`: one is out at a time per subscriber.
+#[derive(Debug)]
+pub(crate) enum CatchReply {
+    Start {
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+    },
+    Memory {
+        batches: Vec<SlabBytes>,
+        limit: u64,
+    },
+    Extent {
+        extent: ExtentRef,
+        limit: u64,
+    },
+    Fail {
+        code: ErrorCode,
+        msg: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum ReadDone {
+    Read(ExtentRead),
+    /// The store failed. The next try is the subscriber's to start.
+    Retry,
+    Fail {
+        code: ErrorCode,
+        msg: String,
+    },
+}
+
+/// In order for each stream and home core, through `seq`.
+#[derive(Debug)]
+pub(crate) enum StreamBody {
+    Attached {
+        sub: SubRef,
+        filter_id: u32,
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+    },
+    Fan(Arc<FanOut>),
+}
+
+/// What goes from owners to home cores.
+#[derive(Debug)]
+pub(crate) enum DeliveryMsg {
+    Stream {
+        stream: Arc<str>,
+        seq: u64,
+        body: StreamBody,
+    },
+    Catch {
+        sub: SubRef,
+        reply: CatchReply,
+    },
 }

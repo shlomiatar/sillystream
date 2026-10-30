@@ -115,6 +115,7 @@ async fn a_publish_below_the_streams_minimum_is_raised_to_it() {
             StreamConfig {
                 default_ack_level: 2,
                 min_ack_level: 2,
+                ..Default::default()
             },
         )
         .await;
@@ -151,6 +152,7 @@ async fn no_ack_level_takes_the_streams_default() {
             StreamConfig {
                 default_ack_level: 1,
                 min_ack_level: 0,
+                ..Default::default()
             },
         )
         .await;

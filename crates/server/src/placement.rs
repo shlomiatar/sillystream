@@ -15,7 +15,7 @@ fn fold(average: &mut f64, sample: u64) {
 }
 
 /// Section 6.1's counters: totals since the last sample, and their moving averages per
-/// sample. Fan-out, subscriber and catch-up counts have no source until M5.
+/// sample.
 #[derive(Debug, Clone, Default)]
 pub struct ShardCounters {
     pub ingest_bytes: u64,

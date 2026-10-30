@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -15,14 +16,15 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    DurableWatch, StreamExtent, UploadEvent, UploadKey, Uploader, UploaderConfig, WalConfig,
-    WalError, WalHandle, WalSendError, WalSender, WalStats, WalVolume, durable_watches,
+    DurableWatch, SegmentCache, StreamExtent, UploadEvent, UploadKey, Uploader, UploaderConfig,
+    WalConfig, WalError, WalHandle, WalSendError, WalSender, WalStats, WalVolume, durable_watches,
     start_wal_writer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::clock::Clock;
+use crate::connection::{Connection, DeliverySettings, Stores};
 use crate::core::{Core, CoreConfig, CoreInbox, CoreParts, CoreToNode, Links};
 use crate::message::{
     ControlMsg, CoreStats, PublishMsg, Reply, SnapshotReply, StateChange, StateOpMsg, StreamConfig,
@@ -31,6 +33,13 @@ use crate::message::{
 use crate::placement::{ShardMove, plan_moves, shard_of};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool};
 use crate::state::StateOp;
+
+/// The local tier of section 6.2: copies of uploaded segments.
+#[derive(Debug, Clone)]
+pub struct LocalCacheConfig {
+    pub dir: PathBuf,
+    pub cap_bytes: u64,
+}
 
 #[derive(Clone)]
 pub struct NodeConfig {
@@ -61,6 +70,20 @@ pub struct NodeConfig {
     pub overload_ratio: f64,
     pub max_moves_per_check: usize,
     pub slab_hook: Option<Arc<dyn SlabHook>>,
+    /// `None` reads sealed records from the object store alone.
+    pub local_cache: Option<LocalCacheConfig>,
+    /// A subscription's queue bound (section 5.2).
+    pub subscriber_queue_bytes: u64,
+    /// `PROGRESS` goes at most this often (section 5.2).
+    pub progress_interval_ms: u64,
+    pub max_frame_bytes: u64,
+    pub max_subscriptions_per_connection: usize,
+    /// What a subscription sends per turn on its connection (section 5.2).
+    pub fair_share_bytes: u64,
+    /// Bytes a connection can have that its client hasn't taken. M6 has a socket for this.
+    pub connection_window_bytes: u64,
+    /// How much one catch-up read asks for.
+    pub catch_up_read_bytes: u64,
 }
 
 impl NodeConfig {
@@ -86,6 +109,14 @@ impl NodeConfig {
             overload_ratio: 1.25,
             max_moves_per_check: 16,
             slab_hook: None,
+            local_cache: None,
+            subscriber_queue_bytes: 8 * 1024 * 1024,
+            progress_interval_ms: 5_000,
+            max_frame_bytes: 16 * 1024 * 1024,
+            max_subscriptions_per_connection: 1_024,
+            fair_share_bytes: 256 * 1024,
+            connection_window_bytes: 4 * 1024 * 1024,
+            catch_up_read_bytes: 1024 * 1024,
         }
     }
 }
@@ -429,7 +460,7 @@ pub struct Node {
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+        .enable_all()
         .build()
 }
 
@@ -442,6 +473,19 @@ impl Node {
         clock: Arc<dyn Clock>,
     ) -> io::Result<Node> {
         let core_count = config.core_count;
+        let cache = match &config.local_cache {
+            Some(local) => {
+                Some(SegmentCache::open(&local.dir, local.cap_bytes).map_err(io::Error::other)?)
+            }
+            None => None,
+        };
+        let stores = Stores {
+            local: cache.as_ref().map(|cache| {
+                let store: Arc<dyn ObjectStore> = cache.store();
+                store
+            }),
+            object: Arc::clone(&store),
+        };
         let (notify, durable): (DurableWatch, _) = durable_watches(core_count);
         let (wal, wal_handle) = start_wal_writer::<SlabBytes, _, _>(
             volume,
@@ -470,7 +514,7 @@ impl Node {
             channel_capacity: config.upload_channel_capacity,
             retry_initial_ms: config.upload_retry_initial_ms,
             retry_max_ms: config.upload_retry_max_ms,
-            cache: None,
+            cache,
             events: upload_txs,
         })?;
 
@@ -478,6 +522,7 @@ impl Node {
             control: Vec::new(),
             forwarded: Vec::new(),
             direct: Vec::new(),
+            delivery: Vec::new(),
         };
         let mut inboxes = Vec::new();
         for (durable, uploads) in durable.into_iter().zip(upload_rxs) {
@@ -487,10 +532,13 @@ impl Node {
             links.control.push(control_tx);
             links.forwarded.push(forwarded_tx);
             links.direct.push(direct_tx);
+            let (delivery_tx, delivery) = mpsc::unbounded_channel();
+            links.delivery.push(delivery_tx);
             inboxes.push(CoreInbox {
                 control,
                 forwarded,
                 direct,
+                delivery,
                 durable,
                 uploads,
             });
@@ -499,6 +547,15 @@ impl Node {
         let (to_control, control_rx) = mpsc::unbounded_channel();
         let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let accounts: Vec<SlabAccount> = (0..core_count).map(|_| SlabAccount::new()).collect();
+        let settings = DeliverySettings {
+            queue_bytes: config.subscriber_queue_bytes,
+            progress_interval_ms: config.progress_interval_ms,
+            max_frame_bytes: config.max_frame_bytes,
+            max_subscriptions: config.max_subscriptions_per_connection,
+            share_bytes: config.fair_share_bytes,
+            window_bytes: config.connection_window_bytes,
+            read_bytes: config.catch_up_read_bytes,
+        };
         let mut threads = Vec::with_capacity(core_count + 1);
         for (id, inbox) in inboxes.into_iter().enumerate() {
             let core = Core::new(CoreParts {
@@ -523,12 +580,18 @@ impl Node {
                     config.slab_hook.clone(),
                     (id as u64 + 1) << 40,
                 ),
+                settings,
+                stores: stores.clone(),
             });
             let runtime = runtime()?;
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("core-{id}"))
-                    .spawn(move || runtime.block_on(core.run()))?,
+                    .spawn(move || {
+                        runtime.block_on(core.run());
+                        // A read in progress on a hung store mustn't hold up the stop.
+                        runtime.shutdown_background();
+                    })?,
             );
         }
         // Keeps its own copy of what a seal or rebalance needs.
@@ -611,6 +674,16 @@ impl Node {
         }
     }
 
+    /// A connection living on `home_core`, as a socket accepted there would (D24). `None`
+    /// if the node has stopped.
+    pub async fn connection(&self, home_core: usize) -> Option<Connection> {
+        Connection::open(
+            self.links.control[home_core].clone(),
+            self.config.connection_window_bytes,
+        )
+        .await
+    }
+
     pub async fn placement(&self) -> Vec<u16> {
         let (reply, answer) = oneshot::channel();
         let _ = self.to_control.send(NodeMsg::Placement { reply });
@@ -634,7 +707,7 @@ impl Node {
         answer.await.ok()
     }
 
-    /// Stamped batches `core` holds for a stream, in id order: what M5 reads from.
+    /// Stamped batches `core` holds for a stream, in id order.
     pub async fn read_memory(&self, core: usize, stream: &str) -> Vec<SlabBytes> {
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::ReadMemory {

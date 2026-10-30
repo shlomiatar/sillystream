@@ -20,10 +20,16 @@ use storage::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
+use crate::connection::{DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
+use crate::delivery::{
+    FanOut, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, StreamDelivery,
+    retention_start_id, walk_records,
+};
 use crate::message::{
-    ControlMsg, CoreStats, ProbeTarget, PublishMsg, Reply, ReplyTx, ShardHandoff, SnapshotReply,
-    StateChange, StateOpMsg, StreamConfig, StreamHandoff, WriteMsg,
+    AttachMsg, CatchReply, ControlMsg, CoreStats, CursorOp, DeliveryMsg, ProbeTarget, PublishMsg,
+    ReadChain, ReadStepMsg, Reply, ReplyTx, ShardHandoff, SnapshotReply, StateChange, StateOpMsg,
+    StreamBody, StreamConfig, StreamHandoff, SubRef, WriteMsg,
 };
 use crate::placement::{ShardCounters, shard_of};
 use crate::slab::{SlabBytes, SlabPool};
@@ -36,6 +42,9 @@ const RETRY_FULL_MS: u64 = 1;
 const ACTOR_BYTES: usize = 8;
 /// What a client hears once nothing more can be made durable (D79).
 const WAL_STOPPED_MSG: &str = "the WAL writer has stopped, so nothing can be made durable";
+/// How many delivery messages a core takes per turn of its loop, whatever else is waiting,
+/// so that neither writes nor fan-out can starve the other (D85).
+const DELIVERY_PER_TURN_COUNT: usize = 16;
 
 #[derive(Clone)]
 pub(crate) struct Links {
@@ -46,6 +55,9 @@ pub(crate) struct Links {
     pub forwarded: Vec<mpsc::UnboundedSender<WriteMsg>>,
     /// Writes from clients. Bounded: a full inbox is backpressure on the publisher.
     pub direct: Vec<mpsc::Sender<WriteMsg>>,
+    /// From owners to home cores. Unbounded, since an owner never waits for a subscriber:
+    /// each home core drops what is over its own bounds.
+    pub delivery: Vec<mpsc::UnboundedSender<DeliveryMsg>>,
 }
 
 /// What a core tells the node's control thread.
@@ -69,6 +81,7 @@ pub(crate) struct CoreInbox {
     pub control: mpsc::UnboundedReceiver<ControlMsg>,
     pub forwarded: mpsc::UnboundedReceiver<WriteMsg>,
     pub direct: mpsc::Receiver<WriteMsg>,
+    pub delivery: mpsc::UnboundedReceiver<DeliveryMsg>,
     pub durable: watch::Receiver<u64>,
     pub uploads: mpsc::UnboundedReceiver<UploadEvent>,
 }
@@ -128,7 +141,7 @@ impl Waiter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum UploadTag {
+pub(crate) enum UploadTag {
     Seal(u64),
     Dedicated(u64),
 }
@@ -137,7 +150,10 @@ enum UploadTag {
 enum BatchUpload {
     Unsealed,
     Pending(UploadTag),
-    Done,
+    /// In the store, so level 3 can ack. Stays readable here until the owner knows.
+    Done(UploadTag),
+    /// The owner has the extent, so nothing needs this copy (D83).
+    Noted,
 }
 
 /// One WAL entry's bytes: a publish, with one reference to its slab.
@@ -194,24 +210,48 @@ impl StreamLog {
         (records, taken_bytes)
     }
 
+    /// Batches above `after`, up to `through`, and about `budget_bytes` of them. In id order.
+    fn read_after(&self, after: u64, through: u64, budget_bytes: u64) -> Vec<SlabBytes> {
+        let start = self.batches.partition_point(|batch| batch.last_id <= after);
+        let mut out = Vec::new();
+        let mut taken_bytes = 0;
+        for batch in self.batches.iter().skip(start) {
+            if batch.last_id > through || taken_bytes >= budget_bytes {
+                break;
+            }
+            taken_bytes += batch.bytes.len() as u64;
+            out.push(batch.bytes.clone());
+        }
+        out
+    }
+
     fn has_unsealed(&self) -> bool {
         self.first_unsealed < self.batches.len()
     }
 
-    /// Level 3 acks go out, and the core's references to uploaded batches go away.
+    /// Level 3 acks go out.
     fn complete(&mut self, tag: UploadTag) {
         for batch in self.batches.iter_mut().take(self.first_unsealed) {
             if batch.upload == BatchUpload::Pending(tag) {
-                batch.upload = BatchUpload::Done;
+                batch.upload = BatchUpload::Done(tag);
                 for waiter in batch.waiters.drain(..) {
                     waiter.fire();
                 }
             }
         }
+    }
+
+    /// The owner has the extents, so a read can't miss these. The core's references go.
+    fn note(&mut self, tag: UploadTag) {
+        for batch in self.batches.iter_mut().take(self.first_unsealed) {
+            if batch.upload == BatchUpload::Done(tag) {
+                batch.upload = BatchUpload::Noted;
+            }
+        }
         while self
             .batches
             .front()
-            .is_some_and(|batch| batch.upload == BatchUpload::Done)
+            .is_some_and(|batch| batch.upload == BatchUpload::Noted)
         {
             self.batches.pop_front();
             self.first_unsealed -= 1;
@@ -227,6 +267,7 @@ struct Stream {
     dedupe: DedupeTable,
     config: StreamConfig,
     owners: Vec<(u64, usize)>,
+    delivery: StreamDelivery,
 }
 
 #[derive(Default)]
@@ -323,6 +364,19 @@ pub(crate) struct Core {
     upload_failed_count: u64,
     duplicate_count: u64,
     forwarded_count: u64,
+
+    home: Home,
+    settings: DeliverySettings,
+    /// Streams waiting on the WAL for a batch, in ticket order.
+    wal_visible: VecDeque<(u64, Arc<str>)>,
+    /// Streams holding batches another core stamped (D84).
+    foreign_visible: Vec<Arc<str>>,
+    /// How far other cores' entries are durable, as far as they have said.
+    durable_by_core: Vec<u64>,
+    /// The ticket other cores are waiting to hear is durable, or 0.
+    durable_owed: u64,
+    filter_check_count: u64,
+    spans: Vec<RecordSpan>,
 }
 
 pub(crate) struct CoreParts {
@@ -334,6 +388,8 @@ pub(crate) struct CoreParts {
     pub uploader: UploaderSender<SlabBytes>,
     pub to_node: mpsc::UnboundedSender<CoreToNode>,
     pub pool: SlabPool,
+    pub settings: DeliverySettings,
+    pub stores: Stores,
 }
 
 impl Core {
@@ -350,6 +406,13 @@ impl Core {
                 }
             })
             .collect();
+        let home = Home::new(
+            config.id,
+            parts.links.clone(),
+            parts.settings,
+            parts.stores,
+            parts.uploader.clone(),
+        );
         Core {
             config,
             clock: parts.clock,
@@ -384,6 +447,14 @@ impl Core {
             upload_failed_count: 0,
             duplicate_count: 0,
             forwarded_count: 0,
+            home,
+            settings: parts.settings,
+            wal_visible: VecDeque::new(),
+            foreign_visible: Vec::new(),
+            durable_by_core: vec![0; core_count],
+            durable_owed: 0,
+            filter_check_count: 0,
+            spans: Vec::new(),
         }
     }
 
@@ -396,6 +467,7 @@ impl Core {
             let can_write = !self.is_stalled();
             let need_retry = (!self.outbound.is_empty() && !self.wal_stopped)
                 || (!self.uploads_out.is_empty() && !self.upload_stopped);
+            let home_deadline = self.home.next_deadline();
             tokio::select! {
                 biased;
                 message = self.inbox.control.recv() => match message {
@@ -414,6 +486,7 @@ impl Core {
                     None => uploads_open = false,
                 },
                 _ = tokio::time::sleep(Duration::from_millis(RETRY_FULL_MS)), if need_retry => {}
+                _ = sleep_until_some(home_deadline), if home_deadline.is_some() => {}
                 message = self.inbox.forwarded.recv() => {
                     if let Some(message) = message {
                         self.read_write(message);
@@ -424,10 +497,36 @@ impl Core {
                         self.read_write(message);
                     }
                 },
+                message = self.inbox.delivery.recv() => {
+                    if let Some(message) = message {
+                        self.on_delivery(message);
+                    }
+                },
             }
+            for _ in 0..DELIVERY_PER_TURN_COUNT {
+                let Ok(message) = self.inbox.delivery.try_recv() else {
+                    break;
+                };
+                self.on_delivery(message);
+            }
+            if self
+                .home
+                .next_deadline()
+                .is_some_and(|at| at <= tokio::time::Instant::now())
+            {
+                self.home.on_timer();
+            }
+            self.home.flush();
             self.flush_outbound();
             self.flush_uploads();
             self.run_deferred();
+        }
+    }
+
+    fn on_delivery(&mut self, message: DeliveryMsg) {
+        match message {
+            DeliveryMsg::Stream { stream, seq, body } => self.home.on_stream(stream, seq, body),
+            DeliveryMsg::Catch { sub, reply } => self.home.on_catch(sub, reply),
         }
     }
 
@@ -649,6 +748,7 @@ impl Core {
                     dedupe: DedupeTable::new(),
                     config: StreamConfig::default(),
                     owners: Vec::new(),
+                    delivery: StreamDelivery::new(self.config.core_count),
                 },
             );
         }
@@ -774,9 +874,11 @@ impl Core {
         validated.stamp(first_id, msg.author);
         let record_count = u64::from(validated.record_count()) + u64::from(has_state);
 
+        let mut state_after = None;
         let bytes = match (&msg.state, new_state) {
             (Some(change), Some(doc)) => {
                 let bytes = self.bytes_with_system_record(&records, last_id, msg.author, change);
+                state_after = Some((last_id, doc.clone()));
                 self.streams
                     .get_mut(&*name)
                     .expect("the stream was made above")
@@ -800,6 +902,7 @@ impl Core {
                 first_id,
                 last_id,
                 record_count,
+                state_after,
             },
             bytes,
             level,
@@ -867,6 +970,7 @@ impl Core {
         };
         // STATE_OP can't ask for less, and section 10 acks after the WAL (D70).
         let level = effective_level(None, &stream.config).max(2);
+        let state_after = Some((ver, doc.clone()));
         stream.state.install(doc, ver);
         let bytes = self.bytes_with_system_record(&[], ver, msg.author, &msg.change);
         self.commit(
@@ -877,6 +981,7 @@ impl Core {
                 first_id: ver,
                 last_id: ver,
                 record_count: 1,
+                state_after,
             },
             bytes,
             level,
@@ -959,6 +1064,17 @@ impl Core {
             shard.counters.ingest_bytes += len_bytes;
             shard.counters.ingest_records += ids.record_count;
         }
+        let needs_wal = level >= 2;
+        if let Some(stream) = self.streams.get_mut(&**name) {
+            stream.delivery.pending.push_back(PendingVisible {
+                core: self.config.id,
+                ticket,
+                needs_wal,
+                last_id: ids.last_id,
+                bytes: bytes.clone(),
+                state: ids.state_after,
+            });
+        }
         let log = self.logs.entry(Arc::clone(name)).or_default();
         let mut batch = Batch {
             bytes,
@@ -986,6 +1102,11 @@ impl Core {
 
         self.outbound.push_back(entry);
         self.flush_outbound();
+
+        if needs_wal {
+            self.wal_visible.push_back((ticket, Arc::clone(name)));
+        }
+        self.drain_visible(name);
 
         if over_stream_buffer && stream_fits_dedicated_path(name) {
             self.send_dedicated(name);
@@ -1165,6 +1286,467 @@ impl Core {
                 waiter.fire();
             }
         }
+        while self
+            .wal_visible
+            .front()
+            .is_some_and(|(ticket, _)| *ticket <= durable_ticket)
+        {
+            if let Some((_, name)) = self.wal_visible.pop_front() {
+                self.drain_visible(&name);
+            }
+        }
+        self.drain_foreign_visible();
+        self.tell_durable_if_owed();
+    }
+
+    fn tell_durable_if_owed(&mut self) {
+        let durable_ticket = *self.inbox.durable.borrow();
+        if self.durable_owed == 0 || durable_ticket < self.durable_owed {
+            return;
+        }
+        self.durable_owed = 0;
+        for (core, control) in self.links.control.iter().enumerate() {
+            if core != self.config.id {
+                let _ = control.send(ControlMsg::DurableSeen {
+                    core: self.config.id,
+                    ticket: durable_ticket,
+                });
+            }
+        }
+    }
+
+    fn drain_foreign_visible(&mut self) {
+        if self.foreign_visible.is_empty() {
+            return;
+        }
+        for name in std::mem::take(&mut self.foreign_visible) {
+            self.drain_visible(&name);
+            let waiting = self
+                .streams
+                .get(&*name)
+                .is_some_and(|stream| !stream.delivery.pending.is_empty());
+            if waiting {
+                self.foreign_visible.push(name);
+            }
+        }
+    }
+
+    /// Delivery advances in id order: what is ready goes, up to the first that isn't. A
+    /// level 0 or 1 batch waits only behind an earlier one that needs the WAL (section 5.2).
+    fn drain_visible(&mut self, name: &str) {
+        let me = self.config.id;
+        let Some(stream) = self.streams.get_mut(name) else {
+            return;
+        };
+        while let Some(front) = stream.delivery.pending.front() {
+            if front.needs_wal {
+                let seen = if front.core == me {
+                    *self.inbox.durable.borrow()
+                } else {
+                    self.durable_by_core[front.core]
+                };
+                if front.ticket > seen {
+                    return;
+                }
+            }
+            let Some(entry) = stream.delivery.pending.pop_front() else {
+                return;
+            };
+            stream.delivery.visible_through = entry.last_id;
+            let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
+            fan_out(
+                stream,
+                entry,
+                FanOutParts {
+                    me,
+                    links: &self.links,
+                    home: &mut self.home,
+                    spans: &mut self.spans,
+                    filter_check_count: &mut self.filter_check_count,
+                    counters,
+                },
+            );
+        }
+    }
+
+    fn send_catch(&mut self, sub: SubRef, reply: CatchReply) {
+        if sub.home == self.config.id {
+            self.home.on_catch(sub, reply);
+        } else {
+            let _ = self.links.delivery[sub.home].send(DeliveryMsg::Catch { sub, reply });
+        }
+    }
+
+    /// Where a subscriber starts (section 5.1), then live or catching up.
+    fn on_attach(&mut self, message: AttachMsg) {
+        if let Route::Forward(to) = self.route(&message.stream) {
+            let _ = self.links.control[to].send(ControlMsg::Attach(Box::new(message)));
+            return;
+        }
+        let now_ms = self.clock.now_ms();
+        let sub = message.sub;
+        let Some(stream) = self.streams.get_mut(&*message.stream) else {
+            self.send_catch(
+                sub,
+                CatchReply::Fail {
+                    code: ErrorCode::NotFound,
+                    msg: "no such stream".to_owned(),
+                },
+            );
+            return;
+        };
+        let head = stream.ids.last_id();
+        let retention_start = retention_start_id(now_ms, stream.config.retention_ms);
+        let stored = message
+            .name
+            .as_ref()
+            .and_then(|name| stream.delivery.cursors.get(name).copied());
+        let from = stored.unwrap_or(message.from);
+        let cursor = match from {
+            0 => retention_start.saturating_sub(1),
+            u64::MAX => head,
+            id => id,
+        };
+        if from != 0 && from != u64::MAX {
+            let next_id = [
+                stream
+                    .delivery
+                    .first_extent_after(cursor)
+                    .map(|known| known.extent.id_first),
+                self.logs
+                    .get(&*message.stream)
+                    .and_then(|log| log.read_after(cursor, u64::MAX, 1).first().map(first_id)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(head);
+            if cursor < head && next_id < retention_start {
+                self.send_catch(
+                    sub,
+                    CatchReply::Fail {
+                        code: ErrorCode::RetentionExpired,
+                        msg: "that id is before the start of retention".to_owned(),
+                    },
+                );
+                return;
+            }
+        }
+        if let Some(name) = &message.name {
+            stream
+                .delivery
+                .cursors
+                .entry(Arc::clone(name))
+                .or_insert(cursor);
+        }
+        let state_ver = stream.state.ver();
+        let state = if message.with_state || message.state_only {
+            stream.state.doc().clone()
+        } else {
+            Bytes::new()
+        };
+        if message.state_only {
+            stream.delivery.table.attach_state_only(sub.home);
+            self.send_attached(
+                &message.stream,
+                sub,
+                STATE_ONLY_FILTER_ID,
+                head,
+                cursor,
+                state_ver,
+                state,
+            );
+        } else if cursor >= stream.delivery.visible_through {
+            self.attach_live(
+                &message.stream,
+                sub,
+                message.filter,
+                head,
+                cursor,
+                state_ver,
+                state,
+            );
+        } else {
+            self.send_catch(
+                sub,
+                CatchReply::Start {
+                    head,
+                    cursor,
+                    state_ver,
+                    state,
+                },
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_live(
+        &mut self,
+        name: &Arc<str>,
+        sub: SubRef,
+        filter: format::Filter,
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+    ) {
+        let Some(stream) = self.streams.get_mut(&**name) else {
+            return;
+        };
+        let filter_id = stream.delivery.table.attach(filter, sub.home);
+        if let Some(shard) = self.shards.get_mut(&stream.shard) {
+            shard.counters.subscriber_count += 1;
+        }
+        self.send_attached(name, sub, filter_id, head, cursor, state_ver, state);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_attached(
+        &mut self,
+        name: &Arc<str>,
+        sub: SubRef,
+        filter_id: u32,
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+    ) {
+        let Some(stream) = self.streams.get_mut(&**name) else {
+            return;
+        };
+        let seq = next_seq(&mut stream.delivery, sub.home);
+        let body = StreamBody::Attached {
+            sub,
+            filter_id,
+            head,
+            cursor,
+            state_ver,
+            state,
+        };
+        if sub.home == self.config.id {
+            self.home.on_stream(Arc::clone(name), seq, body);
+        } else {
+            let _ = self.links.delivery[sub.home].send(DeliveryMsg::Stream {
+                stream: Arc::clone(name),
+                seq,
+                body,
+            });
+        }
+    }
+
+    fn on_detach(&mut self, name: Arc<str>, filter_id: u32, home: usize) {
+        if let Route::Forward(to) = self.route(&name) {
+            let _ = self.links.control[to].send(ControlMsg::Detach {
+                stream: name,
+                filter_id,
+                home,
+            });
+            return;
+        }
+        if let Some(stream) = self.streams.get_mut(&*name) {
+            stream.delivery.table.detach(filter_id, home);
+            if filter_id != STATE_ONLY_FILTER_ID
+                && let Some(shard) = self.shards.get_mut(&stream.shard)
+            {
+                shard.counters.subscriber_count = shard.counters.subscriber_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// A catching-up subscriber asks what comes next. Reaching what is visible attaches it,
+    /// in one step here, so nothing falls between the read and live (section 5.1).
+    fn on_read_step(&mut self, message: ReadStepMsg) {
+        if let Route::Forward(to) = self.route(&message.stream) {
+            let _ = self.links.control[to].send(ControlMsg::ReadStep(Box::new(message)));
+            return;
+        }
+        let me = self.config.id;
+        let Some(stream) = self.streams.get_mut(&*message.stream) else {
+            self.send_catch(
+                message.sub,
+                CatchReply::Fail {
+                    code: ErrorCode::NotFound,
+                    msg: "no such stream".to_owned(),
+                },
+            );
+            return;
+        };
+        if let Some(shard) = self.shards.get_mut(&stream.shard) {
+            shard.counters.catch_up_bytes += message.read_bytes;
+        }
+        let limit = stream.delivery.visible_through;
+        if message.after >= limit {
+            let (head, state_ver) = (stream.ids.last_id(), stream.state.ver());
+            self.attach_live(
+                &message.stream,
+                message.sub,
+                message.filter,
+                head,
+                message.after,
+                state_ver,
+                Bytes::new(),
+            );
+            return;
+        }
+        let mut hops: VecDeque<(u64, usize)> = stream
+            .owners
+            .iter()
+            .filter(|(end, _)| *end > message.after)
+            .copied()
+            .collect();
+        hops.push_back((limit, me));
+        self.on_read_chain(Box::new(ReadChain {
+            stream: message.stream,
+            sub: message.sub,
+            after: message.after,
+            limit,
+            hops,
+            batches: Vec::new(),
+        }));
+    }
+
+    /// The oldest core holding anything wanted gives its batches, and then the owner, last,
+    /// compares them with its extents. Asking in that order means a batch dropped anywhere
+    /// has its extent at the owner by then (D83).
+    fn on_read_chain(&mut self, mut chain: Box<ReadChain>) {
+        while let Some((end, core)) = chain.hops.pop_front() {
+            if core != self.config.id {
+                chain.hops.push_front((end, core));
+                let _ = self.links.control[core].send(ControlMsg::ReadChain(chain));
+                return;
+            }
+            if let Some(log) = self.logs.get(&*chain.stream) {
+                chain.batches =
+                    log.read_after(chain.after, end.min(chain.limit), self.settings.read_bytes);
+                if !chain.batches.is_empty() {
+                    chain.hops.clear();
+                    break;
+                }
+            }
+        }
+        if let Route::Forward(to) = self.route(&chain.stream) {
+            let _ = self.links.control[to].send(ControlMsg::ReadChain(chain));
+            return;
+        }
+        let extent = self
+            .streams
+            .get(&*chain.stream)
+            .and_then(|stream| stream.delivery.first_extent_after(chain.after))
+            .cloned();
+        let memory_first = chain.batches.first().map(first_id);
+        let ReadChain {
+            sub,
+            limit,
+            batches,
+            ..
+        } = *chain;
+        let reply = match (extent, memory_first) {
+            (Some(extent), memory_first)
+                if memory_first.is_none_or(|first| extent.extent.id_first < first) =>
+            {
+                CatchReply::Extent { extent, limit }
+            }
+            _ => CatchReply::Memory { batches, limit },
+        };
+        self.send_catch(sub, reply);
+    }
+
+    fn on_cursor(
+        &mut self,
+        name: Arc<str>,
+        cursor: Arc<str>,
+        op: CursorOp,
+        report: Option<(mpsc::UnboundedSender<crate::connection::Event>, u32)>,
+    ) {
+        if let Route::Forward(to) = self.route(&name) {
+            let _ = self.links.control[to].send(ControlMsg::Cursor {
+                stream: name,
+                name: cursor,
+                op,
+                report,
+            });
+            return;
+        }
+        let fail = |code, msg: &str| {
+            if let Some((out, reference)) = &report {
+                let _ = out.send(crate::connection::Event::Error {
+                    reference: *reference,
+                    code,
+                    msg: msg.to_owned(),
+                });
+            }
+        };
+        let Some(stream) = self.streams.get_mut(&*name) else {
+            match op {
+                CursorOp::Read(reply) => {
+                    let _ = reply.send(None);
+                }
+                _ => fail(ErrorCode::NotFound, "no such stream"),
+            }
+            return;
+        };
+        let head = stream.ids.last_id();
+        match op {
+            CursorOp::Commit(id) if id > head => {
+                fail(ErrorCode::Malformed, "COMMIT above the stream's head");
+            }
+            CursorOp::Commit(id) => {
+                // Forward only: a lower one is ignored (section 5.1).
+                let at = stream.delivery.cursors.entry(cursor).or_insert(id);
+                *at = (*at).max(id);
+            }
+            CursorOp::Reset(id) => {
+                stream.delivery.cursors.insert(cursor, id);
+            }
+            CursorOp::Read(reply) => {
+                let _ = reply.send(stream.delivery.cursors.get(&cursor).copied());
+            }
+        }
+    }
+
+    /// An upload's extents reach the stream's owner before this core lets go of its copies.
+    fn note_extents(
+        &mut self,
+        tag: UploadTag,
+        names: &[Arc<str>],
+        path: &object_store::path::Path,
+        extents: &[storage::StreamExtent],
+    ) {
+        let mut by_stream: HashMap<&str, Vec<storage::StreamExtent>> = HashMap::new();
+        for extent in extents {
+            by_stream
+                .entry(&*extent.stream)
+                .or_default()
+                .push(extent.clone());
+        }
+        for name in names {
+            let own = by_stream.remove(&**name).unwrap_or_default();
+            if let Some(stream) = self.streams.get_mut(&**name) {
+                for extent in &own {
+                    stream.delivery.add_extent(path, extent);
+                }
+                self.note_batches(name, tag);
+            } else if let Route::Forward(to) = self.route(name) {
+                let _ = self.links.control[to].send(ControlMsg::AddExtents {
+                    stream: Arc::clone(name),
+                    path: path.clone(),
+                    extents: own,
+                    origin: self.config.id,
+                    tag,
+                });
+            } else {
+                self.note_batches(name, tag);
+            }
+        }
+    }
+
+    fn note_batches(&mut self, name: &str, tag: UploadTag) {
+        if let Some(log) = self.logs.get_mut(name) {
+            log.note(tag);
+            if log.batches.is_empty() && !self.streams.contains_key(name) {
+                self.logs.remove(name);
+            }
+        }
     }
 
     /// A duplicate is acked once what it duplicates has reached the level asked for. The
@@ -1226,7 +1808,7 @@ impl Core {
                 let at = self.durable_waiters.partition_point(|(t, _)| *t <= ticket);
                 self.durable_waiters.insert(at, (ticket, waiter));
             }
-        } else if batch.upload == BatchUpload::Done {
+        } else if matches!(batch.upload, BatchUpload::Done(_) | BatchUpload::Noted) {
             waiter.fire();
         } else if wal_stopped && batch.upload == BatchUpload::Unsealed {
             waiter.fail_wal_stopped();
@@ -1293,35 +1875,34 @@ impl Core {
     }
 
     fn on_upload_event(&mut self, event: UploadEvent) {
-        let (key, failed) = match event {
-            UploadEvent::Uploaded { key, .. } => (key, false),
-            UploadEvent::Failed { key, .. } => (key, true),
+        let (key, uploaded) = match event {
+            UploadEvent::Uploaded {
+                key, path, extents, ..
+            } => (key, Some((path, extents))),
+            UploadEvent::Failed { key, .. } => (key, None),
             UploadEvent::Empty { .. } | UploadEvent::Retrying { .. } => return,
         };
         let tag = match key {
             UploadKey::Seal(seal) => UploadTag::Seal(seal),
             UploadKey::Dedicated { number, .. } => UploadTag::Dedicated(number),
         };
-        if failed {
+        let Some((path, extents)) = uploaded else {
             // The uploader keeps the references and level 3 stays unacked, since the
             // records aren't in the store (D55).
             if self.in_flight.contains_key(&tag) {
                 self.upload_failed_count += 1;
             }
             return;
-        }
+        };
         let Some(names) = self.in_flight.remove(&tag) else {
             return;
         };
-        for name in names {
-            let Some(log) = self.logs.get_mut(&*name) else {
-                continue;
-            };
-            log.complete(tag);
-            if log.batches.is_empty() && !self.streams.contains_key(&*name) {
-                self.logs.remove(&*name);
+        for name in &names {
+            if let Some(log) = self.logs.get_mut(&**name) {
+                log.complete(tag);
             }
         }
+        self.note_extents(tag, &names, &path, &extents);
     }
 
     fn on_control(&mut self, message: ControlMsg) {
@@ -1399,6 +1980,14 @@ impl Core {
                     unsealed_bytes: self.unsealed_bytes,
                     duplicate_count: self.duplicate_count,
                     forwarded_count: self.forwarded_count,
+                    filter_check_count: self.filter_check_count,
+                    behind_count: self.home.stats.behind_count,
+                    progress_count: self.home.stats.progress_count,
+                    catch_up_blocks_read_count: self.home.stats.blocks_read_count,
+                    catch_up_blocks_skipped_count: self.home.stats.blocks_skipped_count,
+                    catch_up_memory_bytes: self.home.stats.memory_bytes,
+                    catch_up_local_bytes: self.home.stats.local_bytes,
+                    catch_up_object_bytes: self.home.stats.object_bytes,
                 });
             }
             ControlMsg::AckWhenReached {
@@ -1408,6 +1997,56 @@ impl Core {
                 ack,
                 reply,
             } => self.ack_local(&stream, last_id, level, ack, reply),
+            ControlMsg::Conn(command) => self.home.on_command(command),
+            ControlMsg::Attach(message) => self.on_attach(*message),
+            ControlMsg::ReadStep(message) => self.on_read_step(*message),
+            ControlMsg::ReadChain(chain) => self.on_read_chain(chain),
+            ControlMsg::ReadDone { sub, done } => self.home.on_read_done(sub, *done),
+            ControlMsg::Detach {
+                stream,
+                filter_id,
+                home,
+            } => self.on_detach(stream, filter_id, home),
+            ControlMsg::Cursor {
+                stream,
+                name,
+                op,
+                report,
+            } => self.on_cursor(stream, name, op, report),
+            ControlMsg::AddExtents {
+                stream,
+                path,
+                extents,
+                origin,
+                tag,
+            } => {
+                if let Route::Forward(to) = self.route(&stream) {
+                    let _ = self.links.control[to].send(ControlMsg::AddExtents {
+                        stream,
+                        path,
+                        extents,
+                        origin,
+                        tag,
+                    });
+                    return;
+                }
+                if let Some(known) = self.streams.get_mut(&*stream) {
+                    for extent in &extents {
+                        known.delivery.add_extent(&path, extent);
+                    }
+                }
+                if origin == self.config.id {
+                    self.note_batches(&stream, tag);
+                } else {
+                    let _ =
+                        self.links.control[origin].send(ControlMsg::ExtentsNoted { stream, tag });
+                }
+            }
+            ControlMsg::ExtentsNoted { stream, tag } => self.note_batches(&stream, tag),
+            ControlMsg::DurableSeen { core, ticket } => {
+                self.durable_by_core[core] = self.durable_by_core[core].max(ticket);
+                self.drain_foreign_visible();
+            }
             ControlMsg::ProbeBack => self.on_probe_back(),
             ControlMsg::WalSent { core, ticket } => {
                 self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
@@ -1422,6 +2061,16 @@ impl Core {
         if last_id > 0 {
             stream.owners.push((last_id, self.config.id));
         }
+        // The new owner hears when what it takes over from here becomes durable (D84).
+        let durable_ticket = *self.inbox.durable.borrow();
+        for pending in &stream.delivery.pending {
+            if pending.needs_wal && pending.core == self.config.id {
+                self.durable_owed = self.durable_owed.max(pending.ticket);
+            }
+        }
+        if self.durable_owed != 0 && durable_ticket >= self.durable_owed {
+            self.tell_durable_if_owed();
+        }
         let wal_waits = self.wal_waits_for_handoff(name);
         Some(StreamHandoff {
             name: stream.name,
@@ -1431,6 +2080,7 @@ impl Core {
             config: stream.config,
             owners: stream.owners,
             wal_waits,
+            delivery: stream.delivery,
         })
     }
 
@@ -1562,6 +2212,9 @@ impl Core {
                     stamped_through: self.next_ticket,
                 });
             }
+            if !stream.delivery.pending.is_empty() {
+                self.foreign_visible.push(Arc::clone(&stream.name));
+            }
             self.streams.insert(
                 Arc::clone(&stream.name),
                 Stream {
@@ -1572,9 +2225,11 @@ impl Core {
                     dedupe: stream.dedupe,
                     config: stream.config,
                     owners: stream.owners,
+                    delivery: stream.delivery,
                 },
             );
         }
+        self.drain_foreign_visible();
         let mut probes_out_count = 0;
         for (hop, target) in probes {
             let origin = self.config.id;
@@ -1606,4 +2261,70 @@ struct CommitIds {
     first_id: u64,
     last_id: u64,
     record_count: u64,
+    state_after: Option<(u64, Bytes)>,
+}
+
+async fn sleep_until_some(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn first_id(batch: &SlabBytes) -> u64 {
+    format::RecordHeader::read(batch).map_or(0, |header| header.id)
+}
+
+fn next_seq(delivery: &mut StreamDelivery, home: usize) -> u64 {
+    let seq = delivery.seq_by_home[home];
+    delivery.seq_by_home[home] += 1;
+    seq
+}
+
+struct FanOutParts<'a> {
+    me: usize,
+    links: &'a Links,
+    home: &'a mut Home,
+    spans: &'a mut Vec<RecordSpan>,
+    filter_check_count: &'a mut u64,
+    counters: Option<&'a mut ShardCounters>,
+}
+
+/// A batch has become visible: each distinct filter is checked once, here, and every home
+/// core with subscribers gets the answers to share out (section 5.2, 6.1).
+fn fan_out(stream: &mut Stream, entry: PendingVisible, parts: FanOutParts<'_>) {
+    let has_state = entry.state.is_some();
+    let table = &stream.delivery.table;
+    let core_count = stream.delivery.seq_by_home.len();
+    if !(0..core_count).any(|home| table.wants(home, has_state)) {
+        return;
+    }
+    let bytes = SharedBytes::Slab(entry.bytes);
+    walk_records(&bytes, parts.spans);
+    let (matches, check_count, fan_out_bytes) = table.check(&bytes, parts.spans);
+    *parts.filter_check_count += check_count;
+    if let Some(counters) = parts.counters {
+        counters.fan_out_bytes += fan_out_bytes;
+    }
+    let fan = Arc::new(FanOut {
+        through_id: entry.last_id,
+        matches,
+        state: entry.state,
+    });
+    for home in 0..core_count {
+        if !stream.delivery.table.wants(home, has_state) {
+            continue;
+        }
+        let seq = next_seq(&mut stream.delivery, home);
+        let body = StreamBody::Fan(Arc::clone(&fan));
+        if home == parts.me {
+            parts.home.on_stream(Arc::clone(&stream.name), seq, body);
+        } else {
+            let _ = parts.links.delivery[home].send(DeliveryMsg::Stream {
+                stream: Arc::clone(&stream.name),
+                seq,
+                body,
+            });
+        }
+    }
 }

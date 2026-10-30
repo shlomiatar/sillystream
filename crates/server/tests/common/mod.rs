@@ -344,3 +344,127 @@ pub fn map(pairs: &[(&str, Value)]) -> Value {
 pub fn int(value: i64) -> Value {
     Value::Integer(value.into())
 }
+
+/// What one connection heard, in order.
+#[derive(Default)]
+pub struct Heard {
+    pub events: Vec<server::Event>,
+}
+
+impl Heard {
+    /// `(id, last_id, options, data)` of what `sub` received.
+    pub fn records(&self, sub: u32) -> Vec<(u64, u64, u64, Vec<u8>)> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                server::Event::Data { sub: to, records } if *to == sub => {
+                    Some(parse_records(&records.to_vec()))
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    pub fn progress(&self, sub: u32) -> Vec<u64> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                server::Event::Progress { sub: to, id } if *to == sub => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn error_code(&self, sub: u32) -> Option<proto::ErrorCode> {
+        self.events.iter().find_map(|event| match event {
+            server::Event::Error {
+                reference, code, ..
+            } if *reference == sub => Some(*code),
+            _ => None,
+        })
+    }
+}
+
+/// Listens until `done` says so. Fails the test if `WAIT_MS` passes first.
+pub async fn hear_until(
+    connection: &mut server::Connection,
+    heard: &mut Heard,
+    mut done: impl FnMut(&Heard) -> bool,
+) {
+    let give_up = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+    while !done(heard) {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "gave up after hearing {} events",
+            heard.events.len()
+        );
+        if let Some(event) = connection.recv_within(100).await {
+            heard.events.push(event);
+        }
+    }
+}
+
+/// Listens for `quiet_ms`, keeping what comes.
+pub async fn hear_for(connection: &mut server::Connection, heard: &mut Heard, quiet_ms: u64) {
+    let until = std::time::Instant::now() + Duration::from_millis(quiet_ms);
+    while std::time::Instant::now() < until {
+        if let Some(event) = connection.recv_within(5).await {
+            heard.events.push(event);
+        }
+    }
+}
+
+/// Waits until the subscription has answered.
+pub async fn subscribed(connection: &mut server::Connection, heard: &mut Heard, sub: u32) -> u64 {
+    hear_until(connection, heard, |heard| {
+        heard
+            .events
+            .iter()
+            .any(|event| matches!(event, server::Event::Subscribed { sub: to, .. } if *to == sub))
+    })
+    .await;
+    heard
+        .events
+        .iter()
+        .find_map(|event| match event {
+            server::Event::Subscribed { sub: to, head, .. } if *to == sub => Some(*head),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Sums a stat over the node's cores.
+pub async fn total_stat(node: &Node, stat: impl Fn(&server::CoreStats) -> u64) -> u64 {
+    let mut total = 0;
+    for core in 0..node.core_count() {
+        total += stat(&node.stats(core).await.unwrap());
+    }
+    total
+}
+
+/// Makes a stream by publishing nothing into it yet.
+pub async fn make_stream(client: &mut server::Client, stream: &str) {
+    client
+        .configure(stream, server::StreamConfig::default())
+        .await;
+}
+
+/// Waits until no core holds a stream's batches, which means reads go to the extents.
+pub async fn wait_for_memory_to_empty(node: &Node, stream: &str) {
+    let give_up = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+    loop {
+        let mut held = 0;
+        for core in 0..node.core_count() {
+            held += node.read_memory(core, stream).await.len();
+        }
+        if held == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < give_up,
+            "{held} batches stayed in memory"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}

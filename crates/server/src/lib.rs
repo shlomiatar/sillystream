@@ -1,4 +1,4 @@
-//! Cores, the write path and state (SPEC sections 3, 6, 7.2, 10). Delivery, APIs and
+//! Cores, the write path, state and delivery (SPEC sections 3, 5, 6, 7.2, 10). APIs and
 //! recovery come in later milestones.
 //!
 //! Each core is one thread with one current-thread tokio runtime, and owns its streams
@@ -8,8 +8,10 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+mod connection;
 mod core;
 mod dedupe;
+mod delivery;
 mod message;
 mod node;
 mod placement;
@@ -17,12 +19,15 @@ mod slab;
 mod state;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use connection::{Connection, DataFrame, DataPart, Event, Subscription};
 pub use dedupe::{
     DEDUPE_CAP_COUNT, DEDUPE_ENTRY_BYTES, DEDUPE_IDLE_MS, DedupeCheck, DedupeEntry, DedupeTable,
 };
+pub use delivery::Matched;
 pub use message::{CoreStats, Reply, SnapshotReply, StateChange, StreamConfig};
 pub use node::{
-    Client, ClientError, Node, NodeConfig, NodeExit, Publish, SealOutcome, StateOpRequest,
+    Client, ClientError, LocalCacheConfig, Node, NodeConfig, NodeExit, Publish, SealOutcome,
+    StateOpRequest,
 };
 pub use placement::{ShardCounters, ShardMove, plan_moves, shard_of};
 pub use slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};

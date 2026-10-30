@@ -490,6 +490,7 @@ async fn a_state_op_waits_for_the_wal_whatever_the_streams_default_level() {
                 server::StreamConfig {
                     default_ack_level,
                     min_ack_level: 0,
+                    ..Default::default()
                 },
             )
             .await;
