@@ -228,7 +228,7 @@ Each change is two atomic operations (D74).
 | 16,400 | 72.7 µs | 69.0 µs | 58.2 µs |
 | 65,491 | 267 µs | 254 µs | 213 µs |
 
-Rechecked after the fixes on top of `1fd96cd` (D65, D66, D76, D77), load average about 2. `state_apply` is within 2% of this table in every cell, and the no-disk `write_path` runs are within 6% except 1 core with 100 records, 14% faster, which is noise under the caveats below. The real-disk runs weren't repeated. A merge or an `incr` on an existing number doesn't re-parse its result. An `incr` that adds a key does, which isn't in this table: parsing every result was measured at about 78% slower at 64 KB, and is why only that case does it (D76).
+Rechecked after the fixes on top of `1fd96cd` (D65, D66, D76, D77), load average about 2. `state_apply` is within 3% of this table in every cell, and the no-disk `write_path` runs are within 6% except 1 core with 100 records, 15% faster, which is noise under the caveats below. The real-disk runs weren't repeated. A merge or an `incr` on an existing number doesn't re-parse its result. An `incr` that adds a key does, which isn't in this table: parsing every result was measured at about 78% slower at 64 KB, and is why only that case does it (D76).
 
 Reading these:
 
