@@ -608,12 +608,21 @@ async fn a_move_with_a_parked_entry_keeps_the_wal_in_id_order_and_replay_equal_t
     let mut client = node.client(0).await;
 
     harness.wal.hold();
-    for seq in [1, 2] {
-        client
-            .publish(publish(&name, &records, seq, 2))
-            .await
-            .unwrap();
+    client
+        .publish(publish(&name, &records, 1, 2))
+        .await
+        .unwrap();
+    // Once the writer is in its held sync, the next fills the channel and the last parks.
+    // If it took the first two as one group, nothing would park at all.
+    let deadline = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
+    while harness.wal.stream_entries(&name).is_empty() {
+        assert!(std::time::Instant::now() < deadline, "nothing written");
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    client
+        .publish(publish(&name, &records, 2, 2))
+        .await
+        .unwrap();
     let mut last = publish(&name, &records, 3, 2);
     last.state = Some(server::StateChange {
         expect_ver: 0,

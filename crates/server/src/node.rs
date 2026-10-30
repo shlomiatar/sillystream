@@ -128,7 +128,7 @@ enum NodeMsg {
     MoveShard {
         shard: u32,
         to: usize,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     SetOverride {
         stream: Arc<str>,
@@ -234,8 +234,7 @@ impl Control {
                 let _ = reply.send(self.rebalance().await);
             }
             NodeMsg::MoveShard { shard, to, reply } => {
-                self.move_shard(shard, to).await;
-                let _ = reply.send(());
+                let _ = reply.send(self.checked_move(shard, to).await);
             }
             NodeMsg::SetOverride { stream, to, reply } => {
                 let _ = reply.send(self.set_override(stream, to).await);
@@ -320,6 +319,20 @@ impl Control {
         }
     }
 
+    /// What the API can ask for, unlike the rebalancer's plan, may not exist: a core that
+    /// isn't there, a shard past the table, or an override shard with no stream yet (D80).
+    async fn checked_move(&mut self, shard: u32, to: usize) -> bool {
+        let known = self
+            .location
+            .get(shard as usize)
+            .is_some_and(|at| *at != u16::MAX);
+        if !known || to >= self.config.core_count {
+            return false;
+        }
+        self.move_shard(shard, to).await;
+        true
+    }
+
     async fn move_shard(&mut self, shard: u32, to: usize) {
         let from = self.location[shard as usize] as usize;
         if from == to {
@@ -359,6 +372,9 @@ impl Control {
     }
 
     async fn set_override(&mut self, stream: Arc<str>, to: usize) -> Option<u32> {
+        if to >= self.config.core_count {
+            return None;
+        }
         if let Some(shard) = self.overrides.get(&*stream).copied() {
             self.move_shard(shard, to).await;
             return Some(shard);
@@ -642,15 +658,17 @@ impl Node {
         answer.await.unwrap_or_default()
     }
 
-    pub async fn move_shard(&self, shard: u32, to: usize) {
+    /// False, with nothing changed, if the core or the shard doesn't exist.
+    pub async fn move_shard(&self, shard: u32, to: usize) -> bool {
         let (reply, answer) = oneshot::channel();
         let _ = self
             .to_control
             .send(NodeMsg::MoveShard { shard, to, reply });
-        let _ = answer.await;
+        answer.await.unwrap_or(false)
     }
 
-    /// Gives a stream its own shard, on core `to`. `None` if the table is full.
+    /// Gives a stream its own shard, on core `to`. `None` if the table is full or the core
+    /// doesn't exist.
     pub async fn set_override(&self, stream: &str, to: usize) -> Option<u32> {
         let (reply, answer) = oneshot::channel();
         let _ = self.to_control.send(NodeMsg::SetOverride {

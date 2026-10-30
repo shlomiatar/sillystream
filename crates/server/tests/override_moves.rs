@@ -150,7 +150,9 @@ async fn any_order_of_moves_ends_at_one_owner() {
             let to = next(core_count as u64) as usize;
             match next(4) {
                 0 => own = node.set_override(&name, to).await,
-                1 => node.move_shard(hashed, to).await,
+                1 => {
+                    node.move_shard(hashed, to).await;
+                }
                 2 => {
                     if let Some(own) = own {
                         node.move_shard(own, to).await;
@@ -183,4 +185,40 @@ async fn any_order_of_moves_ends_at_one_owner() {
         assert_eq!(stream_count_total(node).await, 1, "case {case}");
         harness.finish();
     }
+}
+
+#[tokio::test]
+async fn bad_placement_arguments_are_refused_and_change_nothing() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let shard = server::shard_of("s", node.virtual_shard_count());
+    let total = node.virtual_shard_count() + 64;
+    let before = node.placement().await;
+
+    // A core that doesn't exist.
+    assert!(!node.move_shard(shard, 2).await);
+    assert_eq!(node.set_override("s", 99).await, None);
+    // A shard that doesn't exist, and an override shard no stream has yet.
+    assert!(!node.move_shard(total, 1).await);
+    assert!(!node.move_shard(node.virtual_shard_count(), 1).await);
+    assert_eq!(node.placement().await, before);
+
+    // Everything still works, including what the panics took down.
+    assert_eq!(node.ping(0).await, Some(0));
+    assert_eq!(node.ping(1).await, Some(1));
+    assert!(matches!(
+        node.seal().await,
+        server::SealOutcome::Empty { .. }
+    ));
+    let mut client = node.client(0).await;
+    let records = record_with(1, b"hello");
+    client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    assert!(
+        node.move_shard(shard, 1 - before[shard as usize] as usize)
+            .await
+    );
+    let own = node.set_override("s", 1).await.unwrap();
+    assert!(node.move_shard(own, 0).await);
+    assert!(harness.finish().wal.is_ok());
 }
