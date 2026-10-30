@@ -550,3 +550,49 @@ fn a_small_segment_matches_its_byte_exact_vector() {
     builder.add_extent("s", [bytes]).unwrap();
     assert_eq!(concat(&builder.finish().unwrap().parts), expected);
 }
+
+async fn an_empty_block_range_is_empty_and_reads_nothing(inner: Arc<dyn ObjectStore>) {
+    let counting = Arc::new(CountingStore::new(inner));
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let mut builder = SegmentBuilder::new();
+    builder
+        .add_extent("s", [Bytes::from(record(1 << 16, 1, 7, b"data"))])
+        .unwrap();
+    let built = builder.finish().unwrap();
+    let path = Path::from("sealed/1/node/a.seg");
+    put_parts(store.as_ref(), &path, &built.parts).await;
+    let reader = SegmentReader::new(store, path);
+    let top = reader.read_top_index().await.unwrap();
+    let extents = reader.lookup(&top, "s").await.unwrap();
+    let table = reader.read_table(&extents[0]).await.unwrap();
+    counting.reset_gets();
+    let bytes = reader.read_blocks(&extents[0], &table, 0..0).await.unwrap();
+    assert!(bytes.is_empty());
+    let end = table.blocks.len();
+    let bytes = reader
+        .read_blocks(&extents[0], &table, end..end)
+        .await
+        .unwrap();
+    assert!(bytes.is_empty());
+    assert_eq!(counting.gets(), 0);
+    assert!(
+        reader
+            .read_blocks(&extents[0], &table, end + 1..end + 1)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_block_range_in_memory() {
+    an_empty_block_range_is_empty_and_reads_nothing(Arc::new(InMemory::new())).await;
+}
+
+#[tokio::test]
+async fn an_empty_block_range_on_the_local_file_system() {
+    let dir = tempfile::tempdir().unwrap();
+    an_empty_block_range_is_empty_and_reads_nothing(Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).unwrap(),
+    ))
+    .await;
+}

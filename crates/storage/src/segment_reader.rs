@@ -17,9 +17,10 @@ use crate::segment_format::{
     decode_page, decode_top_index, decode_trailer, stream_hash,
 };
 
-/// The tail read is big enough for the top index of any segment under the 128 MB cap
-/// of section 7.3 with normal stream ids, so the footer normally takes one read. A
-/// larger top index takes a second read for the rest (D52).
+/// The tail read is big enough for the top index of a segment under the 128 MB cap of
+/// section 7.3 with normal stream ids, so the footer normally takes one read. Nothing
+/// enforces that cap yet (Q18). A larger top index takes a second read for the rest
+/// (D52).
 pub const SEGMENT_TAIL_READ_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,10 @@ impl SegmentReader {
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes, SegmentError> {
         let start = usize::try_from(range.start).map_err(|_| SegmentError::Corrupt("offset"))?;
         let end = usize::try_from(range.end).map_err(|_| SegmentError::Corrupt("offset"))?;
+        // Stores disagree on an empty range (one returns nothing, another an error).
+        if start == end {
+            return Ok(Bytes::new());
+        }
         let bytes = self.store.get_range(&self.path, start..end).await?;
         if bytes.len() != end - start {
             return Err(SegmentError::Corrupt("range read came back short"));
