@@ -4,5 +4,26 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 format.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+fjall.workspace = true
+object_store.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[[bench]]
+name = "wal_throughput"
+harness = false
