@@ -163,6 +163,8 @@ From the review of `aceb637`. Each is confirmed by the reproduction given, and e
 
 Separately, the temp file cleanup in `SegmentCache::put` is tested through a failed rename only. A failed `write_all`, as on a full disk, wasn't injected. It takes the same cleanup path.
 
+**M4 mutation survivors, resolved.** Of the four from the mutation review: the state op level floor is now tested at defaults 0, 1 and 2 (D70); a merge or incr result of exactly 64 KB and one byte over are tested, and that mutant was re-run and dies; D76's re-parse is reached by a deep map as a path key, also re-run and dies. The fourth, `drain_control`, is gone: D78 makes a write read just before an `Adopt` safe, so there is no longer an ordering for it to protect. The other 32 mutations weren't re-run against the code as it now stands.
+
 **M4: what the tests don't reach.** Tests run real threads against a scripted WAL file and store, with an injected clock for ids and dedupe. Thread scheduling isn't scripted, so shard moves are checked under real races and not replayed deterministically, and no crash test exists until M7. The rebalancer's timer runs on real time. No test injects a full uploader channel into a seal (the retry path is the same one as the WAL's).
 
 ## Process
