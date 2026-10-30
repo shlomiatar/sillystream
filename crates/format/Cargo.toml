@@ -13,3 +13,11 @@ crc32c.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "filter_scan"
+harness = false
+
+[[bench]]
+name = "stamping"
+harness = false
