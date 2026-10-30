@@ -113,3 +113,83 @@ async fn a_segment_reader_works_on_the_cache_and_sees_eviction_as_not_found() {
     cache.put(&path("big"), &parts(4096)).unwrap();
     assert!(reader.read_stream("s").await.is_err());
 }
+
+fn temp_files(root: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|item| item.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("tmp-"))
+        .collect()
+}
+
+#[test]
+fn a_failed_put_leaves_no_temp_file_and_the_cache_keeps_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    // A directory at the target makes the final rename fail.
+    let target = path("a");
+    std::fs::create_dir_all(dir.path().join(target.as_ref()).join("in-the-way")).unwrap();
+    for _ in 0..5 {
+        assert!(cache.put(&target, &parts(400 * 1024)).is_err());
+    }
+    assert_eq!(temp_files(dir.path()), Vec::<String>::new());
+    assert_eq!(cache.used_bytes(), 0);
+    assert!(cache.put(&path("b"), &parts(100)).unwrap());
+    assert_eq!(cache.used_bytes(), 100);
+    assert_eq!(temp_files(dir.path()), Vec::<String>::new());
+}
+
+fn count_dirs(root: &std::path::Path) -> usize {
+    let mut count = 0;
+    for item in std::fs::read_dir(root).unwrap() {
+        let item = item.unwrap();
+        if item.metadata().unwrap().is_dir() {
+            count += 1 + count_dirs(&item.path());
+        }
+    }
+    count
+}
+
+#[test]
+fn eviction_removes_the_directories_it_empties() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 100).unwrap();
+    for hour in 0..50 {
+        let object = Path::from(format!("sealed/{hour}/stream-{hour}/a.seg"));
+        assert!(cache.put(&object, &parts(100)).unwrap());
+    }
+    assert_eq!(cache.used_bytes(), 100);
+    // `sealed`, one hour and one stream, for the one file that is left.
+    assert_eq!(count_dirs(dir.path()), 3);
+}
+
+#[test]
+fn eviction_keeps_a_directory_that_still_has_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 200).unwrap();
+    let first = Path::from("sealed/1/node/a.seg");
+    let second = Path::from("sealed/1/node/b.seg");
+    let third = Path::from("sealed/1/node/c.seg");
+    cache.put(&first, &parts(100)).unwrap();
+    cache.put(&second, &parts(100)).unwrap();
+    cache.put(&third, &parts(100)).unwrap();
+    assert_eq!(count_dirs(dir.path()), 3);
+    assert!(dir.path().join(second.as_ref()).exists());
+    assert!(dir.path().join(third.as_ref()).exists());
+}
+
+#[test]
+fn reopening_removes_empty_directories_and_never_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sealed/1/gone")).unwrap();
+    std::fs::create_dir_all(dir.path().join("sealed/2/kept")).unwrap();
+    std::fs::write(dir.path().join("sealed/2/kept/a.seg"), b"data").unwrap();
+    let cache = SegmentCache::open(dir.path(), 1000).unwrap();
+    assert_eq!(cache.used_bytes(), 4);
+    assert_eq!(count_dirs(dir.path()), 3);
+    drop(cache);
+
+    let empty = tempfile::tempdir().unwrap();
+    SegmentCache::open(empty.path(), 1000).unwrap();
+    assert!(empty.path().is_dir());
+}

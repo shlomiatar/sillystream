@@ -65,12 +65,15 @@ pub struct SegmentCache {
     next_temp: u64,
 }
 
+/// Lists every file under `dir`, removing directories that turn out to be empty.
 fn walk(dir: &FsPath, found: &mut Vec<(PathBuf, std::fs::Metadata)>) -> io::Result<()> {
     for item in std::fs::read_dir(dir)? {
         let item = item?;
         let metadata = item.metadata()?;
         if metadata.is_dir() {
             walk(&item.path(), found)?;
+            // Fails if it has anything in it, which is the answer wanted.
+            let _ = std::fs::remove_dir(item.path());
         } else {
             found.push((item.path(), metadata));
         }
@@ -78,9 +81,18 @@ fn walk(dir: &FsPath, found: &mut Vec<(PathBuf, std::fs::Metadata)>) -> io::Resu
     Ok(())
 }
 
+fn write_then_rename(temp: &FsPath, parts: &[Bytes], target: &FsPath) -> io::Result<()> {
+    let mut file = std::fs::File::create(temp)?;
+    for part in parts {
+        file.write_all(part)?;
+    }
+    drop(file);
+    std::fs::rename(temp, target)
+}
+
 impl SegmentCache {
     /// Opens the directory, keeping what is there (oldest modified evicted first) and
-    /// removing leftovers of interrupted writes. Evicts down to `cap_bytes` if needed.
+    /// removing leftovers of interrupted writes and empty directories. Evicts down to `cap_bytes` if needed.
     pub fn open(root: &FsPath, cap_bytes: u64) -> Result<SegmentCache, CacheError> {
         std::fs::create_dir_all(root)?;
         let root = root.canonicalize()?;
@@ -160,15 +172,31 @@ impl SegmentCache {
         }
         let temp = self.root.join(format!("{TEMP_PREFIX}{}", self.next_temp));
         self.next_temp += 1;
-        let mut file = std::fs::File::create(&temp)?;
-        for part in parts {
-            file.write_all(part)?;
+        if let Err(error) = write_then_rename(&temp, parts, &target) {
+            // Not counted in `used_bytes` and out of eviction's sight, so it must not
+            // stay, least of all when the error is a full disk.
+            let _ = std::fs::remove_file(&temp);
+            self.remove_empty_parents(&target);
+            return Err(error.into());
         }
-        drop(file);
-        std::fs::rename(&temp, &target)?;
         self.track(target, len_bytes);
         self.evict()?;
         Ok(true)
+    }
+
+    /// Removes `file`'s directory and those above it, as far as they are empty and
+    /// below the root. A directory with anything in it stops the walk.
+    fn remove_empty_parents(&self, file: &FsPath) {
+        let mut dir = file.parent();
+        while let Some(current) = dir {
+            if current == self.root
+                || !current.starts_with(&self.root)
+                || std::fs::remove_dir(current).is_err()
+            {
+                return;
+            }
+            dir = current.parent();
+        }
     }
 
     /// Marks an object as just used. Returns whether it is cached.
@@ -194,6 +222,7 @@ impl SegmentCache {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            self.remove_empty_parents(&path);
         }
         Ok(())
     }
