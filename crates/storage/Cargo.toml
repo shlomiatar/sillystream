@@ -13,7 +13,7 @@ bytes.workspace = true
 crossbeam-channel.workspace = true
 fjall.workspace = true
 object_store.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 xxhash-rust.workspace = true
 
 [dev-dependencies]

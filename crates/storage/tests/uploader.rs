@@ -878,3 +878,60 @@ async fn a_section_from_a_core_out_of_range_leaves_no_empty_seal_behind() {
     drop(sender);
     assert_eq!(seal_sections_held(&uploader.finish().unfinished), [(9, 1)]);
 }
+
+/// Runs `shutdown` on its own thread, so a stuck one is a failure and not a hung test.
+/// The thread is left behind on failure, and ends with the test process.
+fn shutdown_within_5_s(uploader: Uploader<Bytes>) -> Vec<UnfinishedUpload<Bytes>> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(uploader.shutdown());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("shutdown didn't return within 5 s")
+        .unfinished
+}
+
+async fn wait_for_put_attempt(counting: &CountingStore) {
+    while counting.put_attempt_count.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_interrupts_a_put_that_never_returns() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.hang_puts.store(true, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, _events) = config(store, 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_section(1, 0, one_stream_section("s", &bytes))
+        .unwrap();
+    wait_for_put_attempt(&counting).await;
+    let unfinished = shutdown_within_5_s(uploader);
+    assert_eq!(seal_sections_held(&unfinished), [(1, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_does_not_wait_for_a_put_stuck_on_a_blocking_thread() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    let (release, gate) = std::sync::mpsc::channel();
+    *counting.block_next_put_on.lock().unwrap() = Some(gate);
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, _events) = config(store, 1);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send_dedicated(Arc::from("s"), 7, vec![bytes])
+        .unwrap();
+    wait_for_put_attempt(&counting).await;
+    let unfinished = shutdown_within_5_s(uploader);
+    assert_eq!(unfinished.len(), 1);
+    assert!(matches!(
+        unfinished[0],
+        UnfinishedUpload::Dedicated { number: 7, .. }
+    ));
+    drop(release);
+}

@@ -265,7 +265,11 @@ where
                     last_seal_by_core: vec![None; section_count],
                     unfinished: Vec::new(),
                 };
-                runtime.block_on(worker.run(rx, touch_rx))
+                let exit = runtime.block_on(worker.run(rx, touch_rx));
+                // Dropping the runtime would wait for a cancelled PUT's blocking thread,
+                // which a stalled mount never lets go.
+                runtime.shutdown_background();
+                exit
             })?;
         Ok((
             UploaderSender {
@@ -289,7 +293,8 @@ where
         self.join()
     }
 
-    /// Stops retrying and exits soon, returning whatever wasn't uploaded.
+    /// Stops retrying, abandons a PUT in progress and exits soon, returning whatever
+    /// wasn't uploaded.
     pub fn shutdown(mut self) -> UploaderExit<R> {
         self.request_stop();
         self.join()
@@ -321,6 +326,9 @@ impl<R> Drop for Uploader<R> {
         self.request_stop();
     }
 }
+
+/// How often an upload that is waiting looks at the stop flag.
+const STOP_CHECK_MS: u64 = 20;
 
 struct Worker<R> {
     config: UploaderConfig,
@@ -573,7 +581,10 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match put_once(self.config.store.as_ref(), &path, &built.parts).await {
+            let Some(put) = self.put_unless_stopped(&path, &built.parts).await else {
+                return false;
+            };
+            match put {
                 Ok(()) => break,
                 Err(error @ (PutError::Collision | PutError::Permanent(_))) => {
                     self.emit(UploadEvent::Failed {
@@ -608,9 +619,29 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         true
     }
 
+    /// One PUT, abandoned if the uploader is stopped: nothing bounds how long a store
+    /// takes. An abandoned PUT may still land, so the references that come back may
+    /// already be in the store, which a later upload of them counts as done (D55).
+    async fn put_unless_stopped(
+        &self,
+        path: &Path,
+        parts: &[Bytes],
+    ) -> Option<Result<(), PutError>> {
+        tokio::select! {
+            biased;
+            put = put_once(self.config.store.as_ref(), path, parts) => Some(put),
+            _ = self.wait_for_stop() => None,
+        }
+    }
+
+    async fn wait_for_stop(&self) {
+        while !self.stop.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(STOP_CHECK_MS)).await;
+        }
+    }
+
     /// Sleeps in short steps, so `shutdown` is prompt during a long backoff.
     async fn wait_unless_stopped(&self, wait_ms: u64) -> bool {
-        const STEP_MS: u64 = 20;
         let mut left_ms = wait_ms;
         loop {
             if self.stop.load(Ordering::SeqCst) {
@@ -619,7 +650,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
             if left_ms == 0 {
                 return true;
             }
-            let step_ms = left_ms.min(STEP_MS);
+            let step_ms = left_ms.min(STOP_CHECK_MS);
             tokio::time::sleep(Duration::from_millis(step_ms)).await;
             left_ms -= step_ms;
         }

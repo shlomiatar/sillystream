@@ -2,8 +2,9 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use format::{RecordHeader, encode_record};
@@ -39,6 +40,11 @@ pub struct CountingStore {
     pub fail_next_puts: AtomicU64,
     /// Refuses PUTs with an error that says retrying can't help.
     pub reject_next_puts: AtomicU64,
+    /// PUTs never finish, as a store that accepted the connection and went silent.
+    pub hang_puts: AtomicBool,
+    /// The next PUT blocks a thread on this until its sender is dropped, as a stalled
+    /// mount does inside `LocalFileSystem`.
+    pub block_next_put_on: Mutex<Option<Receiver<()>>>,
 }
 
 impl CountingStore {
@@ -50,6 +56,8 @@ impl CountingStore {
             put_attempt_count: AtomicU64::new(0),
             fail_next_puts: AtomicU64::new(0),
             reject_next_puts: AtomicU64::new(0),
+            hang_puts: AtomicBool::new(false),
+            block_next_put_on: Mutex::new(None),
         }
     }
 
@@ -81,6 +89,16 @@ impl ObjectStore for CountingStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.put_attempt_count.fetch_add(1, Ordering::SeqCst);
+        if self.hang_puts.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let gate = self.block_next_put_on.lock().unwrap().take();
+        if let Some(gate) = gate {
+            tokio::task::spawn_blocking(move || gate.recv())
+                .await
+                .unwrap()
+                .ok();
+        }
         let reject = self
             .reject_next_puts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
