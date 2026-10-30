@@ -374,8 +374,9 @@ fn a_token_with_no_grants_verifies_and_allows_nothing() {
 /// Verification does no I/O. The crate is `no_std`, so the compiler refuses any path
 /// to files, sockets, clocks, threads or the environment, including nested imports
 /// and printing. What that leaves open is opting back in to `std`, which this test
-/// refuses in every source file, and new dependencies, which it refuses too. The two
-/// hash crates themselves are trusted here, not inspected.
+/// refuses in every source file, source from outside `src/`, a build script, and new
+/// dependencies. The two hash crates and the workspace's entries for them are trusted
+/// here, not inspected.
 #[test]
 fn the_crate_can_not_reach_io() {
     let lib = include_str!("../src/lib.rs");
@@ -383,9 +384,10 @@ fn the_crate_can_not_reach_io() {
         lib.lines().any(|line| line.trim() == "#![no_std]"),
         "auth must be unconditionally no_std"
     );
-    let src_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
-    for entry in std::fs::read_dir(src_dir).unwrap() {
-        let path = entry.unwrap().path();
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = rust_sources(&crate_dir.join("src"));
+    assert!(sources.iter().any(|path| path.ends_with("src/lib.rs")));
+    for path in sources {
         let source = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             opt_in_to_std(&source),
@@ -394,32 +396,79 @@ fn the_crate_can_not_reach_io() {
             path.display()
         );
     }
-    let manifest = include_str!("../Cargo.toml");
-    let dependencies = manifest
-        .split("[dependencies]")
-        .nth(1)
-        .unwrap()
-        .split('[')
-        .next()
-        .unwrap();
-    let names: Vec<&str> = dependencies
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.split(['.', ' ']).next().unwrap())
-        .collect();
-    assert_eq!(names, ["hmac", "sha2"]);
+    assert!(
+        !crate_dir.join("build.rs").exists(),
+        "auth has a build script"
+    );
+    assert_eq!(manifest_problem(include_str!("../Cargo.toml")), None);
 }
 
-/// The first word outside comments that could bring `std` or foreign code into a
-/// `no_std` crate. Only `extern crate alloc;` is allowed.
+/// Every `.rs` file under `dir`, at any depth.
+fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            sources.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+    sources
+}
+
+/// The first word that could bring `std` or foreign code into a `no_std` crate. Only
+/// `extern crate alloc;` is allowed, and only whole-line comments are skipped, since a
+/// `//` later in a line may be inside a string. `path` and `include` are refused
+/// because they compile source this test wouldn't scan.
 fn opt_in_to_std(source: &str) -> Option<String> {
     source
         .lines()
-        .map(|line| line.split("//").next().unwrap().trim())
-        .filter(|line| *line != "extern crate alloc;")
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && *line != "extern crate alloc;")
         .flat_map(|line| line.split(|c: char| !c.is_alphanumeric() && c != '_'))
-        .find(|word| matches!(*word, "std" | "extern"))
+        .find(|word| matches!(*word, "std" | "extern" | "path") || word.starts_with("include"))
         .map(str::to_string)
+}
+
+/// The first line of the manifest that isn't one of the few it is allowed to have.
+/// This is an allow list, so it covers target-specific and table-form dependencies,
+/// `path` overrides, `[lib]`, `[features]` and `package.build` without naming each.
+fn manifest_problem(manifest: &str) -> Option<String> {
+    let mut section = "";
+    for line in manifest.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = line;
+        }
+        let allowed = match section {
+            "[package]" => {
+                line == section
+                    || line == "name = \"auth\""
+                    || matches!(
+                        line,
+                        "version.workspace = true"
+                            | "edition.workspace = true"
+                            | "publish.workspace = true"
+                    )
+            }
+            "[dependencies]" => {
+                matches!(
+                    line,
+                    "[dependencies]" | "hmac.workspace = true" | "sha2.workspace = true"
+                )
+            }
+            // Test-only: never linked into the crate itself.
+            "[dev-dependencies]" => true,
+            _ => false,
+        };
+        if !allowed {
+            return Some(line.to_string());
+        }
+    }
+    None
 }
 
 #[test]
@@ -430,11 +479,75 @@ fn the_io_check_sees_every_way_back_to_std() {
         "fn f() { ::std::fs::read(\"x\"); }",
         "extern crate alloc as std;",
         "extern crate alloc; extern crate core as other;",
+        "#[path = \"../outside.rs\"] pub mod sub;",
+        "#[path=\"../outside.rs\"]\nmod sub;",
+        "#[cfg_attr(all(), path = \"../outside.rs\")] mod sub;",
+        "include!(\"../outside.rs\");",
+        "const A: &str = \"//\"; extern crate std;",
     ] {
         assert!(opt_in_to_std(source).is_some(), "{source}");
     }
     let allowed = "// std is not used\nextern crate alloc;\nuse core::fmt;";
     assert_eq!(opt_in_to_std(allowed), None);
+}
+
+#[test]
+fn the_io_check_scans_nested_source_files() {
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("auth_nested_sources");
+    let nested = root.join("sub/deeper");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("leak.rs"), "extern crate std;").unwrap();
+    std::fs::write(root.join("notes.txt"), "not source").unwrap();
+    assert_eq!(rust_sources(&root), [nested.join("leak.rs")]);
+}
+
+#[test]
+fn the_manifest_check_sees_every_way_to_add_code() {
+    let manifest = include_str!("../Cargo.toml");
+    assert_eq!(manifest_problem(manifest), None);
+    for added in [
+        "[target.'cfg(unix)'.dependencies]\nproto.workspace = true",
+        "[build-dependencies]\nproto.workspace = true",
+        "[dependencies.proto]\nworkspace = true",
+        "[lib]\npath = \"../outside.rs\"",
+        "[features]\nstd = []",
+    ] {
+        let changed = format!("{manifest}\n{added}\n");
+        assert!(manifest_problem(&changed).is_some(), "{added}");
+    }
+    for (old, new) in [
+        (
+            "sha2.workspace = true",
+            "sha2.workspace = true\nproto.workspace = true",
+        ),
+        ("hmac.workspace = true", "hmac = { path = \"../evil\" }"),
+        (
+            "name = \"auth\"",
+            "name = \"auth\"\nbuild = \"../outside.rs\"",
+        ),
+    ] {
+        assert!(manifest.contains(old));
+        let changed = manifest.replace(old, new);
+        assert!(manifest_problem(&changed).is_some(), "{new}");
+    }
+}
+
+/// Q14 in BUILD_NOTES.md, not a design choice: a stream id may end in `*`, a pattern
+/// has no literal form, so a grant meant for exactly that stream is a prefix grant.
+/// This pins today's behaviour and changes with the decision.
+#[test]
+fn q14_a_grant_on_a_stream_id_ending_in_star_is_a_prefix_grant() {
+    assert!(proto::is_valid_stream_id("team*"));
+    assert!(proto::is_valid_stream_id("inbox.*"));
+    let token = Token {
+        grants: vec![Grant {
+            pattern: "team*".to_string(),
+            perms: PERM_READ,
+        }],
+        ..token()
+    };
+    assert_eq!(token.check("team*", PERM_READ, NOW_MS), Ok(()));
+    assert_eq!(token.check("teamsecret", PERM_READ, NOW_MS), Ok(()));
 }
 
 fn arb_grant() -> impl Strategy<Value = Grant> {
