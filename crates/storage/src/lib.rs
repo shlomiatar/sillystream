@@ -13,7 +13,7 @@ mod wal_replay;
 mod wal_writer;
 
 pub use cache::{CacheError, SegmentCache};
-pub use metadata::{MetadataEntry, MetadataError, MetadataStore};
+pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{
     MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, build_store, dedicated_path, seal_path,
     stream_fits_dedicated_path,
