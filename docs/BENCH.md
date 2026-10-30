@@ -242,6 +242,31 @@ Reading these:
 - **`no disk` isn't an ingest figure.** Nothing is sealed or uploaded in that run, and a discarded write isn't a WAL.
 - **State ops cost a full decode and encode,** so about 4 µs per KiB: one core could do about 3,700 merges per second on a full 64 KB doc. Section 10 already says state isn't for high-frequency updates. `set` also decodes, to validate.
 
+## M5: `fan_out`
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo bench -p server --bench fan_out
+```
+
+Commit: `db473b0`. A publish of one 288-byte record at level 1, on a WAL file that discards writes and syncs at once, until every subscriber's connection has been handed it and a reader has taken it. Up to 64 publishes are outstanding, so these are rates, not latencies. There are 16 connections (fewer with fewer subscribers), on 8 tokio threads that are also the publisher. Every filter matches every record, so 100 filters means 100 checks per record. The stream's owner is core 0, and connections are spread over the cores. Each cell is time per publish, ns per subscriber, and bytes delivered per second.
+
+| cores | subscribers | 1 filter | 10 filters | 100 filters |
+|---|---|---|---|---|
+| 1 | 1 | 1.69 µs, 1,692 ns, 162 MiB/s | not applicable | not applicable |
+| 1 | 100 | 19.0 µs, 190 ns, 1.41 GiB/s | 19.2 µs, 192 ns, 1.40 GiB/s | 28.6 µs, 286 ns, 961 MiB/s |
+| 1 | 10,000 | 1.99 ms, 199 ns, 1.35 GiB/s | 1.47 ms, 147 ns, 1.82 GiB/s | 1.29 ms, 129 ns, 2.08 GiB/s |
+| 8 | 1 | 1.72 µs, 1,717 ns, 160 MiB/s | not applicable | not applicable |
+| 8 | 100 | 28.3 µs, 283 ns, 971 MiB/s | 27.9 µs, 279 ns, 986 MiB/s | 43.8 µs, 438 ns, 627 MiB/s |
+| 8 | 10,000 | 397 µs, 40 ns, 6.75 GiB/s | 326 µs, 33 ns, 8.24 GiB/s | 427 µs, 43 ns, 6.28 GiB/s |
+
+Reading these:
+
+- **Fan-out per subscriber is about 150 ns on one core,** including the reader's channel and counting, and doesn't grow with subscribers. A byte count in GiB/s here counts each subscriber's share of the same memory, since nothing is copied: it isn't memory bandwidth, and nothing here has been through a socket, which M6 adds.
+- **N cores spread it,** as section 6.1 says: 3 to 5 times the rate at 10,000 subscribers on 8 cores. At 100 subscribers cross-core messages cost more than they save, about 50% slower than one core.
+- **Filter count hardly shows at 10,000 subscribers** (one record, 100 checks, is small next to 10,000 enqueues), and the differences there are under the 2× noise floor below. At 100 subscribers on 1 core, 100 filters cost about 50% more than 1.
+- **A write among catch-ups.** D101's effect, as a one-off in a release build at `db473b0` and not a criterion bench: 1 core, 4,000 publishes of 200 records of 32 B held in memory, K subscribers from 0 with a filter matching nothing, then time one level 1 ack. K=1: 23 µs, K=100: 1.9 ms, K=1,000: 28 ms, K=5,000: 66 ms, against 3.5 ms, 333 ms, 3.34 s and 16.6 s before. The catch-ups themselves took 1.4 ms, 119 ms, 1.16 s and 17.1 s. What remains in the ack is the burst of subscribe commands the core reads first, with one read on each turn.
+- **Not measured:** real disks, catch-up rate (M6's load generator), and delivery with non-matching filters. One filter per connection isn't varied, since connections are fixed at 16.
+
 ## Caveats
 
 - `LocalFileSystem` doesn't fsync objects, so its `PUT` isn't a durability figure, and neither it nor these numbers say anything about S3.
@@ -251,4 +276,4 @@ Reading these:
 
 ## Not run yet
 
-`fan_out` (M5), and all load generator numbers (M6, M10).
+All load generator numbers (M6, M10).
