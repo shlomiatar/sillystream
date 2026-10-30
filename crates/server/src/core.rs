@@ -34,6 +34,8 @@ use crate::state::{StreamState, apply_op, check_doc};
 const RETRY_FULL_MS: u64 = 1;
 /// `actor u64` of a system record, then its doc (section 2.2).
 const ACTOR_BYTES: usize = 8;
+/// What a client hears once nothing more can be made durable (D79).
+const WAL_STOPPED_MSG: &str = "the WAL writer has stopped, so nothing can be made durable";
 
 #[derive(Clone)]
 pub(crate) struct Links {
@@ -107,6 +109,21 @@ impl Waiter {
     fn fire(self) {
         // A client that has gone away no longer needs its ack.
         let _ = self.tx.send(self.reply);
+    }
+
+    /// The write was stamped and may or may not be in the file, so this isn't a `NACK`,
+    /// which would promise it committed nothing (D79).
+    fn fail_wal_stopped(self) {
+        let reference = match self.reply {
+            Reply::Ack { handle, .. } => handle,
+            Reply::StateResult { req, .. } => req,
+            _ => 0,
+        };
+        let _ = self.tx.send(Reply::Error {
+            reference,
+            code: ErrorCode::RateLimited,
+            msg: WAL_STOPPED_MSG.to_owned(),
+        });
     }
 }
 
@@ -376,7 +393,7 @@ impl Core {
         let mut stopping = false;
         while !stopping {
             // A stamped entry that doesn't fit stops new writes being read, and nothing else.
-            let can_write = self.outbound.is_empty();
+            let can_write = !self.is_stalled();
             let need_retry = (!self.outbound.is_empty() && !self.wal_stopped)
                 || (!self.uploads_out.is_empty() && !self.upload_stopped);
             tokio::select! {
@@ -387,7 +404,10 @@ impl Core {
                 },
                 changed = self.inbox.durable.changed(), if durable_open => match changed {
                     Ok(()) => self.on_durable(),
-                    Err(_) => durable_open = false,
+                    Err(_) => {
+                        durable_open = false;
+                        self.on_wal_stopped();
+                    }
                 },
                 event = self.inbox.uploads.recv(), if uploads_open => match event {
                     Some(event) => self.on_upload_event(event),
@@ -409,6 +429,12 @@ impl Core {
             self.flush_uploads();
             self.run_deferred();
         }
+    }
+
+    /// A stamped entry doesn't fit yet. With the WAL gone, none ever will, and writes are
+    /// read in order to be refused (D79).
+    fn is_stalled(&self) -> bool {
+        !self.outbound.is_empty() && !self.wal_stopped
     }
 
     /// A write just read from an inbox. Order across a client's writes depends on this
@@ -444,7 +470,7 @@ impl Core {
 
     /// Passing a write on needs no room here, so that a stalled core still does it.
     fn accept(&mut self, message: WriteMsg) {
-        let waits_here = !self.deferred.is_empty() || !self.outbound.is_empty();
+        let waits_here = !self.deferred.is_empty() || self.is_stalled();
         if waits_here
             && let Some(name) = message.stream()
             && matches!(self.route(name), Route::Here(_))
@@ -456,7 +482,7 @@ impl Core {
     }
 
     fn run_deferred(&mut self) {
-        while self.outbound.is_empty()
+        while !self.is_stalled()
             && let Some(message) = self.deferred.pop_front()
         {
             self.on_write(message);
@@ -535,6 +561,15 @@ impl Core {
     fn on_write(&mut self, message: WriteMsg) {
         match message {
             WriteMsg::Publish(publish) => match self.route(&publish.stream) {
+                Route::Here(_) if self.wal_stopped => send_reply(
+                    &publish.reply,
+                    Reply::Nack {
+                        handle: publish.handle,
+                        producer_seq: publish.producer_seq,
+                        code: ErrorCode::RateLimited,
+                        msg: WAL_STOPPED_MSG.to_owned(),
+                    },
+                ),
                 Route::Here(shard) => self.on_publish(*publish, shard),
                 Route::Forward(to) => {
                     send_reply(
@@ -547,6 +582,14 @@ impl Core {
                 }
             },
             WriteMsg::StateOp(op) => match self.route(&op.stream) {
+                Route::Here(_) if self.wal_stopped => send_reply(
+                    &op.reply,
+                    Reply::Error {
+                        reference: op.req,
+                        code: ErrorCode::RateLimited,
+                        msg: WAL_STOPPED_MSG.to_owned(),
+                    },
+                ),
                 Route::Here(shard) => self.on_state_op(*op, shard),
                 Route::Forward(to) => {
                     send_reply(
@@ -956,6 +999,9 @@ impl Core {
     /// In order, so a full channel keeps a stream's entries in id order, and behind what
     /// earlier owners of its stream have yet to send (D77).
     fn flush_outbound(&mut self) {
+        if self.wal_stopped {
+            return;
+        }
         while let Some(entry) = self.outbound.pop_front() {
             let ticket = entry.ticket_for_core();
             if !self.wal_waits.is_empty() {
@@ -982,14 +1028,31 @@ impl Core {
                     return;
                 }
                 Err(WalSendError::Stopped(entry)) => {
-                    // Nothing more can become durable, so writes stay unread (D7), and no
-                    // other core should wait on what this one holds.
                     self.outbound.push_front(entry);
-                    if !self.wal_stopped {
-                        self.wal_stopped = true;
-                        self.tell_wal_sent(u64::MAX);
-                    }
+                    self.on_wal_stopped();
                     return;
+                }
+            }
+        }
+    }
+
+    /// Nothing more can become durable. No other core should wait on what this one holds,
+    /// and no client should wait for an ack that can't come (D79). What an upload already
+    /// has may still reach level 3.
+    fn on_wal_stopped(&mut self) {
+        if self.wal_stopped {
+            return;
+        }
+        self.wal_stopped = true;
+        self.tell_wal_sent(u64::MAX);
+        self.on_durable();
+        for (_, waiter) in self.durable_waiters.drain(..) {
+            waiter.fail_wal_stopped();
+        }
+        for log in self.logs.values_mut() {
+            for batch in log.batches.iter_mut().skip(log.first_unsealed) {
+                for waiter in batch.waiters.drain(..) {
+                    waiter.fail_wal_stopped();
                 }
             }
         }
@@ -1142,6 +1205,7 @@ impl Core {
 
     fn ack_local(&mut self, name: &str, last_id: u64, level: u8, ack: Reply, tx: ReplyTx) {
         let waiter = Waiter { reply: ack, tx };
+        let wal_stopped = self.wal_stopped;
         let batch = self.logs.get_mut(name).and_then(|log| {
             let at = log.find(last_id)?;
             log.batches.get_mut(at)
@@ -1155,6 +1219,8 @@ impl Core {
             let durable_ticket = *self.inbox.durable.borrow();
             if batch.ticket <= durable_ticket {
                 waiter.fire();
+            } else if wal_stopped {
+                waiter.fail_wal_stopped();
             } else {
                 let ticket = batch.ticket;
                 let at = self.durable_waiters.partition_point(|(t, _)| *t <= ticket);
@@ -1162,6 +1228,8 @@ impl Core {
             }
         } else if batch.upload == BatchUpload::Done {
             waiter.fire();
+        } else if wal_stopped && batch.upload == BatchUpload::Unsealed {
+            waiter.fail_wal_stopped();
         } else {
             batch.waiters.push(waiter);
         }

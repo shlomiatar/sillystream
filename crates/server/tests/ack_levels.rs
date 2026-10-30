@@ -171,9 +171,108 @@ async fn a_failed_sync_stops_level_2_acks_and_leaves_the_core_serving() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let records = record_with(1, b"hello");
     client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    // Never an ack: it wasn't made durable (D79 made this an error rather than silence).
+    assert!(matches!(
+        expect_reply(&mut client).await,
+        Reply::Error { .. }
+    ));
     expect_quiet(&mut client).await;
     assert_eq!(harness.node().ping(0).await, Some(0));
     harness.node.as_ref().unwrap().stats(0).await.unwrap();
     let exit = harness.finish();
     assert!(exit.wal.is_err());
+}
+
+#[tokio::test]
+async fn a_dead_wal_is_reported_to_every_publisher_instead_of_looking_like_backpressure() {
+    let mut config = manual_config(1);
+    config.write_inbox_capacity = 4;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    harness
+        .wal
+        .fail_sync
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let records = record_with(1, b"hello");
+    let send_count = 40u64;
+    for seq in 1..=send_count {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(WAIT_MS),
+            client.publish(publish("s", &records, seq, 2)),
+        )
+        .await
+        .expect("a dead WAL must not look like a full inbox for ever")
+        .unwrap();
+    }
+    // A stamped write's outcome isn't known, and a refused one committed nothing.
+    for _ in 0..send_count {
+        match expect_reply(&mut client).await {
+            Reply::Error { code, .. } | Reply::Nack { code, .. } => {
+                assert_eq!(code, proto::ErrorCode::RateLimited);
+            }
+            other => panic!("nothing can be durable, got {other:?}"),
+        }
+    }
+    client
+        .state_op(server::StateOpRequest {
+            stream: "s",
+            req: 7,
+            author: AUTHOR,
+            expect_ver: 0,
+            op: server::StateOp::Set,
+            doc: cbor(&int(1)),
+        })
+        .await
+        .unwrap();
+    match expect_reply(&mut client).await {
+        Reply::Error {
+            reference, code, ..
+        } => {
+            assert_eq!(reference, 7);
+            assert_eq!(code, proto::ErrorCode::RateLimited);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        harness.node().seal().await,
+        server::SealOutcome::WalStopped
+    ));
+    assert_eq!(harness.node().ping(0).await, Some(0));
+    assert!(harness.finish().wal.is_err());
+}
+
+#[tokio::test]
+async fn a_dead_wal_ends_level_3_waits_and_reaches_a_core_with_nothing_queued() {
+    let harness = Harness::new(manual_config(2));
+    let mut client = harness.node().client(0).await;
+    harness
+        .wal
+        .fail_sync
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let records = record_with(1, b"hello");
+    client.publish(publish("s", &records, 1, 3)).await.unwrap();
+    assert!(matches!(
+        expect_reply(&mut client).await,
+        Reply::Error {
+            code: proto::ErrorCode::RateLimited,
+            ..
+        }
+    ));
+    // The other core has never tried the WAL.
+    let name = (0..)
+        .map(|n| format!("t{n}"))
+        .find(|name| server::shard_of(name, harness.node().virtual_shard_count()) % 2 == 1)
+        .unwrap();
+    let mut other = harness.node().client(1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(QUIET_MS)).await;
+    assert!(harness.node().stats(1).await.unwrap().wal_stopped);
+    other.publish(publish(&name, &records, 1, 1)).await.unwrap();
+    assert!(matches!(
+        expect_reply(&mut other).await,
+        Reply::Nack {
+            code: proto::ErrorCode::RateLimited,
+            ..
+        }
+    ));
+    harness.finish();
 }
