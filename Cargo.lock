@@ -274,7 +274,14 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 name = "cli"
 version = "0.1.0"
 dependencies = [
+ "auth",
+ "object_store",
+ "rcgen",
  "sdk",
+ "server",
+ "storage",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

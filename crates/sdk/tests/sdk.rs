@@ -448,7 +448,7 @@ async fn a_cut_connection_retries_with_the_same_seq_and_nothing_doubles() {
     for wait in waits {
         // `first_id = 0` is the older retry: committed before, id not kept.
         let ack = wait.wait().await.unwrap();
-        assert_eq!(ack.count == 1 || ack.first_id == 0, true, "{ack:?}");
+        assert!(ack.count == 1 || ack.first_id == 0, "{ack:?}");
         count += 1;
     }
     assert_eq!(count, 300);
