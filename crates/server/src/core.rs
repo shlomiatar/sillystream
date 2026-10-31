@@ -2632,7 +2632,17 @@ impl Core {
             return;
         }
         let log = self.logs.entry(Arc::clone(&name)).or_default();
+        let mut previous_last_id = None;
         for batch in restored.batches {
+            // One extent can't go around another's records: take these in separate seals.
+            if previous_last_id.is_some_and(|last_id| {
+                stream.delivery.extents.iter().any(|known| {
+                    last_id < known.extent.id_first && known.extent.id_first < batch.first_id
+                })
+            }) {
+                log.residency += 1;
+            }
+            previous_last_id = Some(batch.last_id);
             let bytes = self.pool.copy_in(&batch.bytes).freeze();
             log.unsealed_bytes += bytes.len() as u64;
             self.unsealed_bytes += bytes.len() as u64;

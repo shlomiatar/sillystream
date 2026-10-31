@@ -719,8 +719,9 @@ impl Node {
         Node::start_parts(config, volume, store, clock, None)
     }
 
-    /// The startup of section 8.1, for a new node and a crashed one alike. Fails, having
-    /// changed nothing, if another process takes ownership first or the local store is held.
+    /// The startup of section 8.1, for a new node and a crashed one alike. Fails if another
+    /// process takes ownership first or the local store is held, having changed nothing but
+    /// what S3 already backs: a checkpoint it owed, and a store another generation left stale.
     pub fn recover(
         mut config: NodeConfig,
         recover: RecoverConfig,

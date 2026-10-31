@@ -69,8 +69,7 @@ pub enum UploadEvent {
         error: String,
     },
     /// This upload can't succeed, and its references are returned at exit: the
-    /// records were invalid, another object already holds its path (D55), or the
-    /// store can't take this object (D59).
+    /// records were invalid, or the store can't take this object (D59).
     Failed { key: UploadKey, error: String },
 }
 
@@ -513,8 +512,9 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     self.emit(UploadEvent::Empty { key });
                     return;
                 };
-                let path = seal_path(&self.config.node, self.config.generation, first_id);
-                self.upload(key, path, built).await
+                let (node, generation) = (self.config.node.clone(), self.config.generation);
+                let path = |first_id| seal_path(&node, generation, first_id);
+                self.upload(key, &path, first_id, built).await
             }
             Err(error) => {
                 self.emit(UploadEvent::Failed {
@@ -547,8 +547,9 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     self.emit(UploadEvent::Empty { key });
                     return;
                 };
-                let path = dedicated_path(&stream, self.config.generation, first_id);
-                self.upload(key, path, built).await
+                let generation = self.config.generation;
+                let path = |first_id| dedicated_path(&stream, generation, first_id);
+                self.upload(key, &path, first_id, built).await
             }
             Err(error) => {
                 self.emit(UploadEvent::Failed {
@@ -568,8 +569,16 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     }
 
     /// Retries until the PUT succeeds or the uploader is stopped. Returns whether the
-    /// object is in the store.
-    async fn upload(&mut self, key: UploadKey, path: Path, built: BuiltSegment) -> bool {
+    /// object is in the store. A path held by different bytes moves to the next `first_id`:
+    /// the name only has to be unique, and readers find objects by extent (D156).
+    async fn upload(
+        &mut self,
+        key: UploadKey,
+        path_for: &dyn Fn(u64) -> Path,
+        mut first_id: u64,
+        built: BuiltSegment,
+    ) -> bool {
+        let mut path = path_for(first_id);
         if !path_fits_stores(&path) {
             self.emit(UploadEvent::Failed {
                 key,
@@ -586,7 +595,12 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
             };
             match put {
                 Ok(()) => break,
-                Err(error @ (PutError::Collision | PutError::Permanent(_))) => {
+                Err(PutError::Collision) => {
+                    first_id += 1;
+                    path = path_for(first_id);
+                    continue;
+                }
+                Err(error @ PutError::Permanent(_)) => {
                     self.emit(UploadEvent::Failed {
                         key,
                         error: error.to_string(),

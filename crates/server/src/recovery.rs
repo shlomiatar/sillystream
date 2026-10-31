@@ -408,7 +408,8 @@ fn replay_stream(
 }
 
 /// Everything up to and including taking ownership. A process that loses that race has written
-/// nothing but a checkpoint its own crash owed, and must stop.
+/// nothing but a checkpoint its own crash owed, has emptied at most a stale local store (D151),
+/// and must stop.
 pub(crate) async fn prepare(
     wal_dir: &FsPath,
     local_store: storage::MetadataStore,

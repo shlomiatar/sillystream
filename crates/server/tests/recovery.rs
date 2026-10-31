@@ -1453,3 +1453,112 @@ async fn a_crash_loop_with_nothing_written_does_not_grow_the_wal() {
     assert_eq!(read_all(&node, "s", 1).await.len(), 1);
     node.shutdown();
 }
+
+/// Ids repeat across streams, and on a clock that hasn't moved, two seals can have the same
+/// lowest id. Nothing an owner acked may depend on that (Q16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seals_with_the_same_lowest_id_lose_nothing_across_a_restart() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(2));
+    let node = Arc::new(node);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sealer = {
+        let (node, stop) = (Arc::clone(&node), Arc::clone(&stop));
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                node.seal_and_checkpoint().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let mut client = node.client(0).await;
+    let names: Vec<String> = (0..8).map(|at| format!("m.{at}")).collect();
+    let mut acked: Vec<Vec<u64>> = vec![Vec::new(); names.len()];
+    let start = std::time::Instant::now();
+    let mut seq = 0;
+    while start.elapsed() < Duration::from_secs(3) {
+        seq += 1;
+        for (at, name) in names.iter().enumerate() {
+            acked[at].push(publish_one(&mut client, name, seq, b"payload").await.0);
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    sealer.await.unwrap();
+    drop(client);
+    let node = Arc::into_inner(node).unwrap();
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(2));
+    for (at, name) in names.iter().enumerate() {
+        let got: Vec<u64> = read_all(&node, name, acked[at].len())
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(got, acked[at], "{name} after a restart");
+    }
+    assert!(node.seal_and_checkpoint().await);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, _) = disk.start(manual_config(2));
+    for (at, name) in names.iter().enumerate() {
+        let got: Vec<u64> = read_all(&node, name, acked[at].len())
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(got, acked[at], "{name} from S3 alone");
+    }
+    node.shutdown();
+}
+
+/// A dedicated object can land before the seal holding earlier ids, so a crash can leave records
+/// to restore on both sides of an object. They can't go up as one extent around it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn records_restored_on_both_sides_of_an_object_stay_readable() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (r1, _) = publish_one(&mut client, "s", 1, b"r1").await;
+    disk.clock.advance(1);
+    let (r2, _) = publish_one(&mut client, "s", 2, b"r2").await;
+    disk.clock.advance(1);
+    let (r3, _) = publish_one(&mut client, "s", 3, b"r3").await;
+    drop(client);
+    node.shutdown();
+
+    let mut builder = SegmentBuilder::new();
+    builder
+        .add_extent("s", vec![stamped(r2, 1, b"r2")])
+        .unwrap();
+    let body: Vec<u8> = builder
+        .finish()
+        .unwrap()
+        .parts
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    disk.store
+        .put(&storage::dedicated_path("s", 1, r2), PutPayload::from(body))
+        .await
+        .unwrap();
+
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.adopted_extent_count, 1);
+    assert!(node.seal_and_checkpoint().await);
+    assert!(node.seal_and_checkpoint().await);
+    let want = [r1, r2, r3];
+    let got: Vec<u64> = read_all(&node, "s", 3).await.iter().map(|r| r.0).collect();
+    assert_eq!(got, want, "after the seals");
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, _) = disk.start(manual_config(1));
+    let got: Vec<u64> = read_all(&node, "s", 3).await.iter().map(|r| r.0).collect();
+    assert_eq!(got, want, "from S3 alone");
+    node.shutdown();
+}

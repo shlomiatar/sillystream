@@ -357,7 +357,7 @@ async fn an_unsorted_section_fails_and_keeps_its_references() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_retry_after_a_lost_response_counts_as_done_and_a_collision_fails() {
+async fn a_retry_after_a_lost_response_counts_as_done_and_a_collision_takes_the_next_name() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     let section = |bytes: &Bytes| Section {
@@ -373,20 +373,18 @@ async fn a_retry_after_a_lost_response_counts_as_done_and_a_collision_fails() {
     // The same bytes again, as after a PUT that succeeded with its response lost.
     sender.try_send_section(2, 0, section(&bytes)).unwrap();
     assert_eq!(next_uploaded(&mut events_one).await.1, path);
-    // Different bytes for the same path must not overwrite the first object.
+    // Different bytes for the same path must not overwrite the first object, and still have
+    // to reach the store.
     let other = Bytes::from(record(FIRST_ID, 1, 7, b"y"));
     sender.try_send_section(3, 0, section(&other)).unwrap();
-    assert!(matches!(
-        events_one.recv().await,
-        Some(UploadEvent::Failed {
-            key: UploadKey::Seal(3),
-            ..
-        })
-    ));
+    let (_, other_path, _) = next_uploaded(&mut events_one).await;
+    assert_eq!(other_path, seal_path("node-1", 3, FIRST_ID + 1));
     drop(sender);
-    assert_eq!(uploader.finish().unfinished.len(), 1);
-    let reader = SegmentReader::new(store, path);
+    assert_eq!(uploader.finish().unfinished.len(), 0);
+    let reader = SegmentReader::new(Arc::clone(&store), path);
     assert_eq!(reader.read_stream("s").await.unwrap(), bytes);
+    let reader = SegmentReader::new(store, other_path);
+    assert_eq!(reader.read_stream("s").await.unwrap(), other);
 }
 
 #[tokio::test(flavor = "multi_thread")]
