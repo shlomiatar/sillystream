@@ -577,3 +577,92 @@ async fn refused_subscribes_dont_use_up_the_limit() {
     drop((writer, reader));
     server.server.shutdown();
 }
+
+/// HTTP's version of `claiming_big_frames_doesnt_stall_other_publishers`: a `Content-Length` is
+/// only a claim too, and a head costs a client almost nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn claiming_big_http_bodies_doesnt_stall_other_publishers() {
+    let server = start_node(node_config(1));
+    let publisher = token(auth::PERM_PUBLISH);
+    let head = format!(
+        "POST /v1/stream/x/publish?ack=2 HTTP/1.1\r\nhost: l\r\nauthorization: Bearer {publisher}\r\n\
+         content-type: application/x-sillystream-records\r\ncontent-length: 16777152\r\n\r\n"
+    );
+    let mut holders = Vec::new();
+    for _ in 0..260 {
+        let mut tls = server.tls().await;
+        tls.write_all(head.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+        holders.push(tls);
+    }
+    for _ in 0..500 {
+        if server.server.io_stats().held_buffer_count == 260 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(server.server.io_stats().held_buffer_count, 260);
+    assert!(
+        server.server.pinned_bytes() < 1024 * 1024 * 1024,
+        "pinned {}",
+        server.server.pinned_bytes()
+    );
+    let mut victim = server.ws(&token(ALL)).await;
+    victim.open(1, "victim").await;
+    victim
+        .publish(1, 1, AckLevel::WalFsync, &record(0, b"v"))
+        .await;
+    let got = victim.recv_within(5_000).await;
+    assert!(matches!(got, Some(Owned::Ack { .. })), "stalled: {got:?}");
+    drop((victim, holders));
+    server.server.shutdown();
+}
+
+/// A body read through its own buffer still arrives whole, in pieces, in both publish forms.
+/// The owner refuses padding that isn't zero, so a 200 says the slab's old bytes were cleared.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_bodies_in_pieces_arrive_intact() {
+    let server = start();
+    let all = token(ALL);
+    let data: Vec<u8> = (0..1_000_001u32).map(|at| (at % 251) as u8).collect();
+    let simple = format!(
+        "POST /v1/stream/pieces/publish?ack=2 HTTP/1.1\r\nhost: l\r\nauthorization: Bearer {all}\r\n\
+         content-length: {}\r\n\r\n",
+        data.len()
+    );
+    let records = record(0, &data);
+    let binary = format!(
+        "POST /v1/stream/pieces/publish?ack=2 HTTP/1.1\r\nhost: l\r\nauthorization: Bearer {all}\r\n\
+         content-type: application/x-sillystream-records\r\ncontent-length: {}\r\n\r\n",
+        records.len()
+    );
+    for (head, body) in [(simple, &data), (binary, &records)] {
+        let mut tls = server.tls().await;
+        tls.write_all(head.as_bytes()).await.unwrap();
+        for piece in body.chunks(90_000) {
+            tls.write_all(piece).await.unwrap();
+            tls.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let reply = read_http_reply(&mut tls).await;
+        assert_eq!(reply.status, 200, "{}", reply.text());
+    }
+    assert_eq!(server.server.io_stats().held_buffer_count, 0);
+    let mut reader = server.ws(&token(ALL)).await;
+    reader.subscribe(1, "pieces", 0).await;
+    assert!(matches!(
+        reader.recv_owned().await,
+        Owned::Subscribed { .. }
+    ));
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        if let Owned::Data { records, .. } = reader.recv_owned().await {
+            got.extend(parse_records(&records));
+        }
+    }
+    for (_, _, _, bytes) in got {
+        assert_eq!(bytes, data);
+    }
+    drop(reader);
+    server.server.shutdown();
+}

@@ -3,8 +3,9 @@
 //! The listener hands each connection to a core round robin (D24), and it lives there as one
 //! task. It holds no read buffer between reads: it waits for the socket to be readable,
 //! borrows a part of the core's current slab without yielding, and hands back what the read
-//! didn't fill (section 6.5). So a publish is read straight into the slab that takes it to
-//! the WAL and S3, and is unmasked in place (D23).
+//! didn't fill (section 6.5). So a publish whose frame came whole is read straight into the
+//! slab that takes it to the WAL and S3, and is unmasked in place (D23). One still arriving
+//! waits in its own buffer until then (D121, D130).
 
 mod conn;
 mod http;

@@ -18,7 +18,7 @@ use format::{Clause, Filter, HEADER_BYTES, RecordHeader};
 use proto::{DATA_PREFIX_BYTES, ErrorCode, is_valid_stream_id};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::conn::{Counted, READ_CHUNK_BYTES, READ_CHUNK_MIN_BYTES, Tls, try_read};
+use super::conn::{Counted, PartRead, READ_CHUNK_BYTES, READ_CHUNK_MIN_BYTES, Tls, try_read};
 use super::json::{Json, quoted};
 use super::ws::accept_key;
 use super::{Shared, with_core_io};
@@ -705,8 +705,9 @@ impl<'a> HttpConn<'a> {
         Ok(body)
     }
 
-    /// Reads a publish's body into a slab, behind `prefix_bytes` left for a header, and hands
-    /// the owner that region with no further copy.
+    /// Reads a publish's body, then moves it to a slab behind `prefix_bytes` left for a header.
+    /// A `Content-Length` only claims a length, so nothing counts against the memory cap until
+    /// the bytes have really come (D130).
     async fn read_body_into_slab(
         &mut self,
         request: &mut Request,
@@ -714,15 +715,29 @@ impl<'a> HttpConn<'a> {
         suffix_bytes: usize,
     ) -> io::Result<crate::slab::SlabRegion> {
         let length = request.content_length as usize;
+        let have = request.leftover.len().min(length);
+        let mut part = PartRead::new(length, &request.leftover[..have]);
+        self.next_bytes = request.leftover.split_off(have);
+        let _held = Counted::new(&self.shared.counters[self.home].held_buffer_count);
+        let tls = &mut self.tls;
+        let read = tokio::time::timeout(Duration::from_millis(REQUEST_TIMEOUT_MS), async {
+            while !part.is_whole() {
+                match tls.read(part.room()).await? {
+                    0 => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                    read_bytes => part.filled(read_bytes),
+                }
+            }
+            Ok(())
+        })
+        .await;
+        match read {
+            Ok(result) => result?,
+            Err(_) => return Err(io::ErrorKind::TimedOut.into()),
+        }
         let mut region = with_core_io(self.shared, self.home, |io| {
             io.pool.alloc(prefix_bytes + length + suffix_bytes)
         });
-        let _held = Counted::new(&self.shared.counters[self.home].held_buffer_count);
-        let have = request.leftover.len().min(length);
-        region[prefix_bytes..prefix_bytes + have].copy_from_slice(&request.leftover[..have]);
-        self.next_bytes = request.leftover.split_off(have);
-        self.read_exact(&mut region[prefix_bytes + have..prefix_bytes + length])
-            .await?;
+        region[prefix_bytes..prefix_bytes + length].copy_from_slice(part.payload());
         // A slab's bytes may have been read into before, and padding has to be zero.
         region[prefix_bytes + length..].fill(0);
         Ok(region)
