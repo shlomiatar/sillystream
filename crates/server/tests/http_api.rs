@@ -728,6 +728,47 @@ async fn a_sink_made_over_http_runs_and_reports_why_it_paused() {
     server.server.shutdown();
 }
 
+/// `admin` is over the stream in the URL. A forward also writes to its target, which takes
+/// `publish` on that stream, as publishing there directly would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_sink_needs_publish_on_its_target() {
+    let mut node = node_config(2);
+    node.sink.pool_thread_count = 2;
+    let server = start_node(node);
+    seed(&server, "victim", &[b"original"]).await;
+    seed(&server, "mine", &[b"injected"]).await;
+    let exp = START_MS + 1000;
+    let attacker = token_at(exp, 77, &[("mine", ALL)]);
+    let body = br#"{"kind":"forward","target":"victim","start":"earliest"}"#;
+    let refused = server
+        .http(&Http::new("PUT", "/v1/stream/mine/sink/42", &attacker).body(body.to_vec()))
+        .await;
+    assert_code(&refused, 403, 1);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let read = server
+        .http(&Http::new(
+            "GET",
+            "/v1/stream/victim/read?from=0",
+            &token(ALL),
+        ))
+        .await;
+    let has = read
+        .body
+        .windows(b"injected".len())
+        .any(|window| window == b"injected");
+    assert!(
+        !has,
+        "a record reached a stream its sender can't publish to"
+    );
+
+    let allowed = token_at(exp, 77, &[("mine", ALL), ("victim", auth::PERM_PUBLISH)]);
+    let created = server
+        .http(&Http::new("PUT", "/v1/stream/mine/sink/42", &allowed).body(body.to_vec()))
+        .await;
+    assert_eq!(created.status, 200, "{}", created.text());
+    server.server.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sink_lifecycle_is_recorded_on_the_stream() {
     let server = start();

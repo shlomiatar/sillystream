@@ -617,7 +617,17 @@ impl<'a> HttpConn<'a> {
                     error(ErrorCode::NotFound, "no such stream")
                 }
             }
-            Route::SinkPut(sink_id) => self.sink_put(&stream, sink_id, &body).await,
+            Route::SinkPut(sink_id) => match forward_target(&body) {
+                // The sink will write there, as a publish would (section 12).
+                Some(target)
+                    if let Err(failure) = token.check(&target, auth::PERM_PUBLISH, now_ms) =>
+                {
+                    let mut response = error(ErrorCode::Unauthorized, &failure.to_string());
+                    response.status = 403;
+                    response
+                }
+                _ => self.sink_put(&stream, sink_id, &body).await,
+            },
             Route::SinkDelete(sink_id) => self.sink(&stream, SinkOp::Delete { sink_id }).await,
             Route::SinkPause(sink_id) => {
                 self.sink(
@@ -1280,6 +1290,17 @@ fn parse_config(body: &[u8]) -> Result<StreamConfigPatch, Response> {
         }
     }
     Ok(patch)
+}
+
+/// A forward's target, if the body is a sink that has one. Anything malformed is left for
+/// `parse_sink` to answer.
+fn forward_target(body: &[u8]) -> Option<String> {
+    let (spec, _) = parse_sink(body).ok()?;
+    if spec.kind == "forward" {
+        spec.target
+    } else {
+        None
+    }
 }
 
 fn parse_start(value: &Json) -> Result<SinkStart, Response> {
