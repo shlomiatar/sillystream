@@ -1086,7 +1086,9 @@ async fn a_full_checkpoint_forgets_objects_that_have_expired() {
     let node = disk.start(settings.clone());
     let mut client = node.client(0).await;
     publish_one(&mut client, "day", 1, b"d").await;
-    seal_path_of(&node).await;
+    let path = seal_path_of(&node).await.to_string();
+    // The manifest comes after the seal. Without it the job rightly keeps the hour back.
+    assert!(manifests_reaching(&node, 1).await.contains(&path));
     node.compact_now(&RetentionClass::ALL).await.unwrap();
     disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
     let report = node.expire_now().await.unwrap();
