@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use format::{Clause, Filter, HEADER_BYTES, RecordHeader};
@@ -39,6 +39,8 @@ const MAX_HEAD_BYTES: usize = 128 * 1024;
 const DRAIN_BODY_MAX_BYTES: u64 = 64 * 1024;
 /// A body other than a publish's: config and state docs, which have smaller limits anyway.
 const SMALL_BODY_MAX_BYTES: u64 = 1024 * 1024;
+/// All a request gets to arrive, and all a response gets to leave. Not per byte: a client could
+/// hold its socket and whatever it has cost for as long as it could send or take one (D238).
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
 const KEEP_ALIVE_TIMEOUT_MS: u64 = 120_000;
 const READ_LIMIT_DEFAULT_COUNT: u64 = 1_000;
@@ -87,6 +89,43 @@ struct Response {
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
     close: bool,
+    /// A read's share of what responses may hold, let go with the body.
+    held: Option<HeldResponseBytes>,
+}
+
+/// Bytes of read responses waiting on their clients, against a bound shared by every connection
+/// (D238). A client's socket decides how long these stay, so they can't be left uncounted.
+#[derive(Debug)]
+struct HeldResponseBytes {
+    total_bytes: Arc<AtomicU64>,
+    cap_bytes: u64,
+    held_bytes: u64,
+}
+
+impl HeldResponseBytes {
+    /// False if there's no room. Nothing else held means any size fits, or a record over the
+    /// bound could never be read.
+    fn try_hold(&mut self, more_bytes: u64) -> bool {
+        let cap_bytes = self.cap_bytes;
+        let held = self
+            .total_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total_bytes| {
+                (total_bytes == 0 || total_bytes.saturating_add(more_bytes) <= cap_bytes)
+                    .then_some(total_bytes + more_bytes)
+            })
+            .is_ok();
+        if held {
+            self.held_bytes += more_bytes;
+        }
+        held
+    }
+}
+
+impl Drop for HeldResponseBytes {
+    fn drop(&mut self) {
+        self.total_bytes
+            .fetch_sub(self.held_bytes, Ordering::Relaxed);
+    }
 }
 
 impl Response {
@@ -96,6 +135,7 @@ impl Response {
             headers: vec![("content-type", "application/json".to_owned())],
             body: body.into_bytes(),
             close: false,
+            held: None,
         }
     }
 
@@ -105,6 +145,7 @@ impl Response {
             headers: vec![("content-type", content_type.to_owned())],
             body,
             close: false,
+            held: None,
         }
     }
 
@@ -432,6 +473,15 @@ impl<'a> HttpConn<'a> {
     async fn read_head(&mut self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
         let mut head = std::mem::take(&mut self.next_bytes);
         let mut held = None;
+        // Neither wait starts again when bytes come, nor when part of a TLS record does, which
+        // adds nothing to the head.
+        let mut request_begun = !head.is_empty();
+        let mut deadline = Instant::now()
+            + Duration::from_millis(if request_begun {
+                REQUEST_TIMEOUT_MS
+            } else {
+                KEEP_ALIVE_TIMEOUT_MS
+            });
         loop {
             if let Some(end) = find_head_end(&head) {
                 let leftover = head.split_off(end + 4);
@@ -473,18 +523,19 @@ impl<'a> HttpConn<'a> {
                 continue;
             }
             // With nothing of a request here yet, this is an idle connection.
-            let wait_ms = if head.is_empty() {
-                KEEP_ALIVE_TIMEOUT_MS
-            } else {
+            if !head.is_empty() {
                 held.get_or_insert_with(|| {
                     Counted::new(&self.shared.counters[self.home].held_buffer_count)
                 });
-                REQUEST_TIMEOUT_MS
-            };
+                if !request_begun {
+                    request_begun = true;
+                    deadline = Instant::now() + Duration::from_millis(REQUEST_TIMEOUT_MS);
+                }
+            }
             // Only now: rustls may hold plaintext that came with the bytes it already took, and
             // the socket won't say so.
             let tcp = self.tls.get_ref().0;
-            match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.readable()).await {
+            match tokio::time::timeout_at(deadline.into(), tcp.readable()).await {
                 Err(_) => return Ok(None),
                 Ok(ready) => ready?,
             }
@@ -508,9 +559,13 @@ impl<'a> HttpConn<'a> {
             head.push_str("connection: close\r\n");
         }
         head.push_str("\r\n");
-        self.tls.write_all(head.as_bytes()).await?;
-        self.tls.write_all(&response.body).await?;
-        self.tls.flush().await
+        let tls = &mut self.tls;
+        write_within_limit(async {
+            tls.write_all(head.as_bytes()).await?;
+            tls.write_all(&response.body).await?;
+            tls.flush().await
+        })
+        .await
     }
 
     async fn upgrade(mut self, request: Request) -> Option<(Tls, Vec<u8>)> {
@@ -536,8 +591,13 @@ impl<'a> HttpConn<'a> {
              sec-websocket-accept: {}\r\n\r\n",
             accept_key(key)
         );
-        self.tls.write_all(accepted.as_bytes()).await.ok()?;
-        self.tls.flush().await.ok()?;
+        let tls = &mut self.tls;
+        write_within_limit(async {
+            tls.write_all(accepted.as_bytes()).await?;
+            tls.flush().await
+        })
+        .await
+        .ok()?;
         Some((self.tls, request.leftover))
     }
 
@@ -699,8 +759,12 @@ impl<'a> HttpConn<'a> {
             .header("expect")
             .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"));
         if wants && (request.leftover.len() as u64) < request.content_length {
-            self.tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-            self.tls.flush().await?;
+            let tls = &mut self.tls;
+            write_within_limit(async {
+                tls.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+                tls.flush().await
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1092,8 +1156,20 @@ impl<'a> HttpConn<'a> {
             limit_count,
             max_bytes,
             self.shared.progress_interval_ms + READ_GRACE_MS,
+            HeldResponseBytes {
+                total_bytes: Arc::clone(&self.shared.held_response_bytes),
+                cap_bytes: self.shared.held_response_cap_bytes,
+                held_bytes: 0,
+            },
         )
         .await
+    }
+}
+
+async fn write_within_limit(write: impl Future<Output = io::Result<()>>) -> io::Result<()> {
+    match tokio::time::timeout(Duration::from_millis(REQUEST_TIMEOUT_MS), write).await {
+        Ok(result) => result,
+        Err(_) => Err(io::ErrorKind::TimedOut.into()),
     }
 }
 
@@ -1154,6 +1230,7 @@ async fn collect_read(
     limit_count: u64,
     max_bytes: usize,
     wait_ms: u64,
+    mut held: HeldResponseBytes,
 ) -> Response {
     let (head, caught_up) = loop {
         match connection.recv_within(wait_ms).await {
@@ -1200,6 +1277,16 @@ async fn collect_read(
                     if got_count >= limit_count || out.len() + bytes.len() > max_bytes.max(1) {
                         break 'read;
                     }
+                    if !held.try_hold(bytes.len() as u64) {
+                        // What is here is a whole prefix, and `x-through` says where to go on.
+                        if out.is_empty() {
+                            return error(
+                                ErrorCode::RateLimited,
+                                "too many read responses are waiting on their clients",
+                            );
+                        }
+                        break 'read;
+                    }
                     out.extend_from_slice(bytes);
                     got_count += 1;
                     through = through.max(record.header.last_id());
@@ -1210,10 +1297,12 @@ async fn collect_read(
             }
         }
     }
-    Response::binary(CONTENT_TYPE_RECORDS, out)
+    let mut response = Response::binary(CONTENT_TYPE_RECORDS, out)
         .header("x-head", head.to_string())
         .header("x-through", through.to_string())
-        .header("x-count", got_count.to_string())
+        .header("x-count", got_count.to_string());
+    response.held = Some(held);
+    response
 }
 
 fn retention_name(retention_ms: u64) -> String {

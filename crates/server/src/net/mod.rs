@@ -80,6 +80,10 @@ pub(crate) struct Shared {
     pub acceptor: tokio_rustls::TlsAcceptor,
     pub counters: Vec<IoCounters>,
     pub session_count: AtomicU64,
+    /// Bytes of HTTP read responses waiting on their clients, on every core. It is only added
+    /// up, so no core waits on another for it.
+    pub held_response_bytes: Arc<AtomicU64>,
+    pub held_response_cap_bytes: u64,
 }
 
 /// The slab a core's sockets read into. It is per thread, so it needs no lock, and connection
@@ -166,6 +170,7 @@ impl Server {
         let partial_frame_timeout_ms = config.node.partial_frame_timeout_ms;
         let progress_interval_ms = config.node.progress_interval_ms;
         let core_count = config.node.core_count;
+        let held_response_cap_bytes = config.node.memory_cap_bytes / 4;
         let node = start(config.node, Arc::clone(&clock))?;
         let shared = Arc::new(Shared {
             secret: config.token_secret,
@@ -178,6 +183,8 @@ impl Server {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
             counters: (0..core_count).map(|_| IoCounters::default()).collect(),
             session_count: AtomicU64::new(0),
+            held_response_bytes: Arc::new(AtomicU64::new(0)),
+            held_response_cap_bytes,
         });
         let stop = Arc::new(Notify::new());
         let runtime = tokio::runtime::Builder::new_current_thread()
