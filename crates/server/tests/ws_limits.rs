@@ -482,3 +482,98 @@ async fn commit_on_an_ended_token_is_error_1() {
     drop(ws);
     server.server.shutdown();
 }
+
+/// The core refuses an id already in use and keeps the subscription it has, so the connection's
+/// own idea of what that id reads must stay too, or a renewal checks the wrong stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_resubscribe_doesnt_hide_the_live_one_from_a_renewal() {
+    let server = start();
+    let mut writer = server.ws(&token(ALL)).await;
+    writer.open(1, "secret").await;
+    publish_acked(&mut writer, 1, b"before").await;
+    writer.open(2, "other").await;
+    publish_acked(&mut writer, 2, b"before").await;
+
+    let both = token_at(
+        START_MS + 3_600_000,
+        5,
+        &[("secret", READ), ("other", READ)],
+    );
+    let mut reader = server.ws(&both).await;
+    reader.subscribe(1, "secret", u64::MAX).await;
+    assert!(matches!(
+        reader.recv_owned().await,
+        Owned::Subscribed { .. }
+    ));
+    reader.subscribe(1, "other", u64::MAX).await;
+    assert_eq!(
+        reader.recv_owned().await,
+        Owned::Error {
+            reference: 1,
+            code: ErrorCode::Malformed
+        }
+    );
+    let narrow = token_at(START_MS + 3_600_000, 5, &[("other", READ)]);
+    reader
+        .send(&ClientFrame::Hello {
+            ver: 1,
+            token: &narrow,
+        })
+        .await;
+    assert!(matches!(reader.recv_owned().await, Owned::Welcome { .. }));
+    assert_eq!(
+        reader.recv_owned().await,
+        Owned::Error {
+            reference: 1,
+            code: ErrorCode::Unauthorized
+        },
+        "the live subscription on `secret` wasn't ended"
+    );
+    publish_acked(&mut writer, 3, b"after-revoke").await;
+    assert!(!saw_record(&mut reader, b"after-revoke", 500).await);
+    drop((writer, reader));
+    server.server.shutdown();
+}
+
+/// Only subscriptions that exist count against the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_subscribes_dont_use_up_the_limit() {
+    let mut node = node_config(1);
+    node.max_subscriptions_per_connection = 2;
+    let server = start_node(node);
+    let mut writer = server.ws(&token(ALL)).await;
+    writer.open(1, "s").await;
+    publish_acked(&mut writer, 1, b"x").await;
+
+    let mut reader = server.ws(&token(ALL)).await;
+    for sub in [100, 101, 102] {
+        reader
+            .send(&ClientFrame::Subscribe(proto::Subscribe {
+                sub,
+                from: u64::MAX,
+                linger_ms: 0,
+                author: None,
+                clauses: proto::WireClauses::default(),
+                stream: "s",
+                name: Some("sink:1"),
+                with_state: false,
+                state_only: false,
+                include_system: false,
+            }))
+            .await;
+        assert_eq!(
+            reader.recv_owned().await,
+            Owned::Error {
+                reference: sub,
+                code: ErrorCode::Malformed
+            }
+        );
+    }
+    reader.subscribe(1, "s", u64::MAX).await;
+    assert!(
+        matches!(reader.recv_owned().await, Owned::Subscribed { sub: 1, .. }),
+        "no subscription is live, so the limit can't be reached"
+    );
+    drop((writer, reader));
+    server.server.shutdown();
+}

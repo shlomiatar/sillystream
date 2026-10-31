@@ -27,6 +27,7 @@ use super::ws::{
 };
 use super::{Shared, with_core_io};
 use crate::connection::{Connection, DataPart, Event, Subscription};
+use crate::delivery::cursor_name_is_allowed;
 use crate::message::{Reply, StateChange};
 use crate::node::{Client, ClientError, OwnedStateOp, RegionPublish};
 use crate::slab::SlabRegion;
@@ -727,9 +728,23 @@ impl WsConn<'_> {
                         return Ok(());
                     }
                 };
-                if session.subs.len() >= self.shared.max_subscriptions
-                    && !session.subs.contains_key(&subscribe.sub)
+                // What the core would refuse is refused here, because `subs` is written before
+                // the core answers and must only ever name what it took (D129).
+                if session.subs.contains_key(&subscribe.sub) {
+                    let reference = subscribe.sub;
+                    self.send_error(reference, ErrorCode::Malformed, "subscription id is in use");
+                    return Ok(());
+                }
+                if subscribe
+                    .name
+                    .is_some_and(|name| !cursor_name_is_allowed(name))
                 {
+                    let reference = subscribe.sub;
+                    let text = "sink: cursors belong to sinks";
+                    self.send_error(reference, ErrorCode::Malformed, text);
+                    return Ok(());
+                }
+                if session.subs.len() >= self.shared.max_subscriptions {
                     self.send_error(
                         subscribe.sub,
                         ErrorCode::TooManySubscriptions,
