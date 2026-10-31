@@ -287,7 +287,7 @@ impl Worker {
 
     async fn warn(&self, first_id: u64, expires_ms: u64) {
         eprintln!(
-            "warning: sink {} on {} has unread data from id {first_id} that expires at {expires_ms} ms",
+            "warning: sink {} on {:?} has unread data from id {first_id} that expires at {expires_ms} ms",
             self.key.1, self.key.0
         );
         self.report(SinkReport::Warning {
@@ -510,7 +510,7 @@ impl<'a> Reading<'a> {
                 }
                 // Nothing a retry of the same read can do better than a fresh look.
                 eprintln!(
-                    "sink {} on {}: reading gave error {code:?}: {msg}",
+                    "sink {} on {:?}: reading gave error {code:?}: {msg:?}",
                     self.worker.key.1, self.worker.key.0
                 );
                 tokio::time::sleep(Duration::from_millis(ERROR_WAIT_MS)).await;
@@ -841,7 +841,7 @@ impl<'a> Reading<'a> {
 
     async fn record_gap(&mut self, first_id: u64, last_id: u64) {
         eprintln!(
-            "sink {} on {} skipped ids {first_id} to {last_id}, which expired unread",
+            "sink {} on {:?} skipped ids {first_id} to {last_id}, which expired unread",
             self.worker.key.1, self.worker.key.0
         );
         self.worker

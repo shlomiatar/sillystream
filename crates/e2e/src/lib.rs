@@ -394,10 +394,10 @@ impl Node {
 
     /// `(tier, bytes)` of each catch-up read of `stream` in this start.
     pub fn tiers_read(&self, stream: &str) -> Vec<(String, u64)> {
-        let wanted = format!("stream={stream} ");
+        let wanted = format!(" stream={stream:?}");
         self.log_text()
             .lines()
-            .filter(|line| line.starts_with("trace catch_up ") && line.contains(&wanted))
+            .filter(|line| line.starts_with("trace catch_up ") && line.ends_with(&wanted))
             .map(|line| {
                 let field = |name: &str| {
                     line.split(' ')

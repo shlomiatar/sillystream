@@ -1823,7 +1823,7 @@ impl Home {
             && let Some(Some(sub)) = self.subs.get(key)
         {
             eprintln!(
-                "trace catch_up tier={tier} stream={} bytes={bytes}",
+                "trace catch_up tier={tier} bytes={bytes} stream={:?}",
                 sub.stream
             );
         }

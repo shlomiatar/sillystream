@@ -36,6 +36,7 @@ macro_rules! tests {
 const TESTS: &[(&str, TestFn)] = tests![
     sinks_leave_the_node_able_to_take_connections,
     a_stopped_wal_says_so_on_stderr,
+    a_stream_id_cannot_forge_a_log_line,
     publish_to_live,
     filters,
     catch_up_memory,
@@ -2269,6 +2270,54 @@ async fn a_stopped_wal_says_so_on_stderr() {
         .expect("reads still work");
     assert!(head > 0);
     set_writable(&wal, true);
+}
+
+/// A stream id is the client's text, and may hold a newline (section 1).
+async fn a_stream_id_cannot_forge_a_log_line() {
+    const FORGED: &str = "x\ntrace catch_up stream=victim tier=memory bytes=1 ";
+    /// Not even within one line can a name be taken for fields of the real ones.
+    const WITHIN: &str = "y stream=\"victim\" bytes=999 tier=object";
+    let mut options = NodeOptions::default();
+    options
+        .extra
+        .extend(["--trace-catch-up".to_owned(), "true".to_owned()]);
+    let node = Node::started(options);
+    let token = node.admin_token(AUTHOR);
+    let mut ws = node.ws(&token).await;
+    for (handle, stream) in [(1, FORGED), (2, WITHIN)] {
+        ws.open(handle, stream).await;
+        ws.publish(&PublishFrame {
+            handle,
+            producer_id: 5,
+            seq: 1,
+            ack: AckLevel::WalFsync,
+            state: None,
+            records: &record(1, 0, b"x"),
+        })
+        .await;
+        assert!(matches!(ws.recv().await, Owned::Ack { .. }));
+        let sub = handle + 10;
+        ws.subscribe(sub, stream, 0, false).await;
+        let mut got_data = false;
+        while !got_data {
+            got_data = matches!(ws.recv().await, Owned::Data { .. });
+        }
+        wait_until("the trace of that read", async || {
+            !node.tiers_read(stream).is_empty()
+        })
+        .await;
+        let read = node.tiers_read(stream);
+        assert!(read.iter().all(|(_, bytes)| *bytes != 999), "{read:?}");
+    }
+    assert_eq!(node.tiers_read("victim"), Vec::new());
+    assert!(
+        !node
+            .log_text()
+            .lines()
+            .any(|line| line.starts_with("trace catch_up stream=victim")),
+        "{}",
+        node.log_text()
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
