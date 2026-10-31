@@ -1248,3 +1248,74 @@ async fn a_reconnect_stuck_on_a_silent_peer_recovers_and_keeps_answering() {
     proxy.abort();
     fixture.server.shutdown();
 }
+
+/// A name the server can't accept would otherwise be a subscription that never hears anything.
+#[tokio::test]
+async fn a_subscription_to_an_invalid_id_is_refused() {
+    let fixture = start();
+    let client = fixture.client().await;
+    let refused = client.subscribe(Subscribe::new("a/b", 0));
+    assert!(matches!(refused, Err(SdkError::Config(_))));
+    drop(client);
+    fixture.server.shutdown();
+}
+
+/// A timed flush on an idle publisher sends nothing, and uses no seq.
+#[tokio::test]
+async fn sending_nothing_sends_nothing() {
+    let fixture = start();
+    let client = fixture.client().await;
+    let config = PublisherConfig {
+        producer_id: Some(7),
+        first_seq: 5,
+        ..PublisherConfig::default()
+    };
+    let mut publisher = client.publisher("idle", config).unwrap();
+    assert!(publisher.send().await.unwrap().is_empty());
+    assert!(publisher.flush().await.unwrap().is_empty());
+    publisher.add(0, b"x".to_vec());
+    let acks = publisher.flush().await.unwrap();
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0].producer_seq, 5);
+    drop((publisher, client));
+    fixture.server.shutdown();
+}
+
+/// A `send` cancelled while it waits for room has lost nothing: the next one goes on from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_send_keeps_what_it_took() {
+    let mut fake = scripted().await;
+    let client = Client::connect(ClientConfig::new(&fake.url, &fake.ca_pem, "t"))
+        .await
+        .unwrap();
+    let config = PublisherConfig {
+        max_inflight_bytes: 100,
+        ..PublisherConfig::default()
+    };
+    let mut publisher = client.publisher("x", config).unwrap();
+    publisher.add(0, vec![1; 50]);
+    let first = publisher.send().await.unwrap();
+    let (_, handle, _, seq) = fake.next_publish().await;
+    assert_eq!(seq, 1);
+
+    publisher.add(0, vec![2; 50]);
+    let cancelled = tokio::time::timeout(Duration::from_millis(50), publisher.send()).await;
+    assert!(cancelled.is_err(), "there's no room for this one yet");
+    fake.nothing_for_a_moment().await;
+
+    fake.replies
+        .send(Reply::Ack {
+            handle,
+            seq,
+            first_id: 1,
+        })
+        .unwrap();
+    for wait in first {
+        wait.wait().await.unwrap();
+    }
+    let waits = publisher.send().await.unwrap();
+    assert_eq!(waits.len(), 1);
+    let (_, _, _, seq) = fake.next_publish().await;
+    assert_eq!(seq, 2);
+    fake.nothing_for_a_moment().await;
+}

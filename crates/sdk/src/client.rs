@@ -369,6 +369,7 @@ impl Client {
             key,
             next_seq: config.first_seq,
             pending: Vec::new(),
+            unsent: VecDeque::new(),
             credit: Arc::new(Semaphore::new(config.max_inflight_bytes)),
             config,
         })
@@ -386,6 +387,12 @@ impl Client {
     }
 
     pub fn subscribe(&self, spec: Subscribe) -> Result<Subscription, SdkError> {
+        if !proto::is_valid_stream_id(&spec.stream) {
+            return Err(SdkError::Config(format!(
+                "{}: not a stream id",
+                spec.stream
+            )));
+        }
         WireClauses::new(&spec.clauses).map_err(|_| SdkError::Config("too many clauses".into()))?;
         let key = self.keys.fetch_add(1, Ordering::Relaxed);
         let (events, receiver) = mpsc::unbounded_channel();
@@ -442,6 +449,8 @@ pub struct Publisher {
     key: u32,
     next_seq: u64,
     pending: Vec<(u64, Vec<u8>)>,
+    /// Encoded publishes a `send` hasn't got out yet, because it was cancelled or failed.
+    unsent: VecDeque<(Vec<u8>, Option<StateChange>)>,
     credit: Arc<Semaphore>,
     config: PublisherConfig,
 }
@@ -486,36 +495,43 @@ impl Publisher {
         &mut self,
         mut state: Option<StateChange>,
     ) -> Result<Vec<AckWait>, SdkError> {
-        let items = std::mem::take(&mut self.pending);
-        let borrowed: Vec<(u64, &[u8])> = items
-            .iter()
-            .map(|(options, bytes)| (*options, bytes.as_slice()))
-            .collect();
-        let records = build_records(&borrowed, &self.config.batch)?;
-        let max_bytes = self.client.max_frame_bytes();
-        let room = max_bytes.saturating_sub(PUBLISH_OVERHEAD_BYTES);
-        let state_bytes = state.as_ref().map_or(0, |state| state.doc.len() + 13);
-        // Whatever can't ever go is refused before any of it does.
-        if records
-            .iter()
-            .any(|record| record.len() + state_bytes > room)
-        {
-            self.pending = items;
-            return Err(SdkError::TooLarge);
-        }
-        let mut waits = Vec::new();
-        let mut frame = Vec::new();
-        for record in records {
-            let used = if state.is_some() { state_bytes } else { 0 };
-            if !frame.is_empty() && frame.len() + record.len() + used > room {
-                waits.push(
-                    self.send_records(&std::mem::take(&mut frame), state.take())
-                        .await?,
-                );
+        if !self.pending.is_empty() {
+            let borrowed: Vec<(u64, &[u8])> = self
+                .pending
+                .iter()
+                .map(|(options, bytes)| (*options, bytes.as_slice()))
+                .collect();
+            let records = build_records(&borrowed, &self.config.batch)?;
+            let max_bytes = self.client.max_frame_bytes();
+            let room = max_bytes.saturating_sub(PUBLISH_OVERHEAD_BYTES);
+            let state_bytes = state.as_ref().map_or(0, |state| state.doc.len() + 13);
+            // Whatever can't ever go is refused before any of it does.
+            if records
+                .iter()
+                .any(|record| record.len() + state_bytes > room)
+            {
+                return Err(SdkError::TooLarge);
             }
-            frame.extend_from_slice(&record);
+            let mut frame = Vec::new();
+            for record in records {
+                let used = if state.is_some() { state_bytes } else { 0 };
+                if !frame.is_empty() && frame.len() + record.len() + used > room {
+                    self.unsent
+                        .push_back((std::mem::take(&mut frame), state.take()));
+                }
+                frame.extend_from_slice(&record);
+            }
+            self.unsent.push_back((frame, state.take()));
+            self.pending.clear();
         }
-        waits.push(self.send_records(&frame, state.take()).await?);
+        // A frame leaves `unsent` only once it has room, so a cancelled or failed `send` loses
+        // nothing: the next one starts from the same frame.
+        let mut waits = Vec::new();
+        while let Some((records, state)) = self.unsent.front() {
+            let permit = self.take_credit(records.len(), state.as_ref()).await?;
+            let (records, state) = self.unsent.pop_front().expect("checked just above");
+            waits.push(self.send_with_permit(&records, state, permit)?);
+        }
         Ok(waits)
     }
 
@@ -526,17 +542,34 @@ impl Publisher {
         records: &[u8],
         state: Option<StateChange>,
     ) -> Result<AckWait, SdkError> {
+        let permit = self.take_credit(records.len(), state.as_ref()).await?;
+        self.send_with_permit(records, state, permit)
+    }
+
+    async fn take_credit(
+        &self,
+        records_bytes: usize,
+        state: Option<&StateChange>,
+    ) -> Result<OwnedSemaphorePermit, SdkError> {
+        let weight = (records_bytes + state.map_or(0, |state| state.doc.len())).max(1);
+        let limit = self.config.max_inflight_bytes;
+        Arc::clone(&self.credit)
+            .acquire_many_owned(weight.min(limit) as u32)
+            .await
+            .map_err(|_| SdkError::Closed)
+    }
+
+    fn send_with_permit(
+        &mut self,
+        records: &[u8],
+        state: Option<StateChange>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<AckWait, SdkError> {
         // A conditional change needs its answer, so level 0 can't apply to it.
         let ack = match (&state, self.config.ack) {
             (Some(change), AckLevel::None) if change.expect_ver != 0 => AckLevel::Memory,
             (_, ack) => ack,
         };
-        let weight = (records.len() + state.as_ref().map_or(0, |state| state.doc.len())).max(1);
-        let limit = self.config.max_inflight_bytes;
-        let permit = Arc::clone(&self.credit)
-            .acquire_many_owned(weight.min(limit) as u32)
-            .await
-            .map_err(|_| SdkError::Closed)?;
         let (reply, answer) = oneshot::channel();
         let seq = self.next_seq;
         self.next_seq += 1;
