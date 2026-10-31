@@ -113,52 +113,43 @@ pub struct Item {
     pub bytes: Vec<u8>,
 }
 
-/// Reads what a `DATA` frame or the read route carries. Items at or below `skip_through` are left
-/// out (section 5.2: the server sends a whole record, and the client skips ahead by id), and a
-/// record wholly below it isn't decompressed.
-pub fn decode_records(
-    records: &[u8],
+/// Opens one record: every item above `skip_through`, or an error and none of them.
+fn open_record(
+    record: &format::RecordView<'_>,
     skip_through: u64,
-    max_decompressed_bytes: usize,
-) -> Result<Vec<Item>, SdkError> {
+    limit_bytes: usize,
+) -> Result<(Vec<Item>, usize), SdkError> {
+    let header = record.header;
+    let plain = match header.codec {
+        CODEC_RAW => std::borrow::Cow::Borrowed(record.data),
+        CODEC_ZSTD => {
+            let mut out = Vec::new();
+            let decoder = zstd::stream::Decoder::new(record.data).map_err(|_| SdkError::Codec)?;
+            let limit = limit_bytes as u64 + 1;
+            std::io::copy(&mut std::io::Read::take(decoder, limit), &mut out)
+                .map_err(|_| SdkError::Codec)?;
+            if out.len() > limit_bytes {
+                return Err(SdkError::TooLarge);
+            }
+            std::borrow::Cow::Owned(out)
+        }
+        _ => return Err(SdkError::Codec),
+    };
     let mut items = Vec::new();
-    for record in Records::new(records) {
-        let record = record.map_err(|_| SdkError::Codec)?;
-        let header = record.header;
-        if header.last_id() <= skip_through {
-            continue;
+    let mut push = |index: u64, bytes: &[u8]| {
+        let id = header.id + index;
+        if id > skip_through {
+            items.push(Item {
+                id,
+                options: header.options,
+                author: header.author,
+                bytes: bytes.to_vec(),
+            });
         }
-        let plain = match header.codec {
-            CODEC_RAW => std::borrow::Cow::Borrowed(record.data),
-            CODEC_ZSTD => {
-                let mut out = Vec::new();
-                let decoder =
-                    zstd::stream::Decoder::new(record.data).map_err(|_| SdkError::Codec)?;
-                let limit = max_decompressed_bytes as u64 + 1;
-                std::io::copy(&mut std::io::Read::take(decoder, limit), &mut out)
-                    .map_err(|_| SdkError::Codec)?;
-                if out.len() > max_decompressed_bytes {
-                    return Err(SdkError::TooLarge);
-                }
-                std::borrow::Cow::Owned(out)
-            }
-            _ => return Err(SdkError::Codec),
-        };
-        let mut push = |index: u64, bytes: &[u8]| {
-            let id = header.id + index;
-            if id > skip_through {
-                items.push(Item {
-                    id,
-                    options: header.options,
-                    author: header.author,
-                    bytes: bytes.to_vec(),
-                });
-            }
-        };
-        if header.count == 1 {
-            push(0, &plain);
-            continue;
-        }
+    };
+    if header.count == 1 {
+        push(0, &plain);
+    } else {
         let table_bytes = header.count as usize * 4;
         let (table, bytes) = plain.split_at_checked(table_bytes).ok_or(SdkError::Codec)?;
         let mut start = 0usize;
@@ -169,7 +160,97 @@ pub fn decode_records(
             start = end;
         }
     }
+    let cost_bytes = plain.len() + items.len() * size_of::<Item>();
+    Ok((items, cost_bytes))
+}
+
+/// Reads what a `DATA` frame or the read route carries, all or nothing. Items at or below
+/// `skip_through` are left out (section 5.2: the server sends a whole record, and the client skips
+/// ahead by id), and a record wholly below it isn't decompressed. The limit covers the whole run.
+pub fn decode_records(
+    records: &[u8],
+    skip_through: u64,
+    max_decompressed_bytes: usize,
+) -> Result<Vec<Item>, SdkError> {
+    let mut items = Vec::new();
+    let mut used_bytes = 0usize;
+    for record in Records::new(records) {
+        let record = record.map_err(|_| SdkError::Codec)?;
+        if record.header.last_id() <= skip_through {
+            continue;
+        }
+        let limit_bytes = max_decompressed_bytes.saturating_sub(used_bytes);
+        let (opened, cost_bytes) = open_record(&record, skip_through, limit_bytes)?;
+        used_bytes = used_bytes.saturating_add(cost_bytes);
+        items.extend(opened);
+    }
     Ok(items)
+}
+
+/// What `decode_some` got from the front of a run of records.
+#[derive(Debug)]
+pub(crate) struct Decoded {
+    pub items: Vec<Item>,
+    /// How many bytes of the run this covers. The rest is for the next call.
+    pub used_bytes: usize,
+    /// The record that ended this, behind `items`. Its bytes are covered by `used_bytes`.
+    pub failed: Option<SdkError>,
+}
+
+/// As `decode_records` for a subscription, where one bad record must not cost its neighbours and
+/// where a frame can't be allowed to decompress to any size. It stops at a record that can't be
+/// opened, and before one that would take what it holds past the limit. A record is always taken
+/// if nothing else is held, so this always moves on.
+pub(crate) fn decode_some(
+    records: &[u8],
+    skip_through: u64,
+    max_decompressed_bytes: usize,
+) -> Decoded {
+    let mut items = Vec::new();
+    let mut held_bytes = 0usize;
+    let mut used_bytes = 0usize;
+    for record in Records::new(records) {
+        let Ok(record) = record else {
+            // Its length can't be trusted, so nothing behind it can be found.
+            return Decoded {
+                items,
+                used_bytes: records.len(),
+                failed: Some(SdkError::Codec),
+            };
+        };
+        let header = record.header;
+        let total_bytes = header.total_bytes();
+        if header.last_id() <= skip_through {
+            used_bytes += total_bytes;
+            continue;
+        }
+        let (opened, cost_bytes) = match open_record(&record, skip_through, max_decompressed_bytes)
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                return Decoded {
+                    items,
+                    used_bytes: used_bytes + total_bytes,
+                    failed: Some(SdkError::BadRecord {
+                        first_id: header.id,
+                        last_id: header.last_id(),
+                        too_large: error == SdkError::TooLarge,
+                    }),
+                };
+            }
+        };
+        if !items.is_empty() && held_bytes + cost_bytes > max_decompressed_bytes {
+            break;
+        }
+        held_bytes += cost_bytes;
+        used_bytes += total_bytes;
+        items.extend(opened);
+    }
+    Decoded {
+        items,
+        used_bytes,
+        failed: None,
+    }
 }
 
 /// The id of the last item in a run of records, without opening any. `None` if there is none.
@@ -253,6 +334,87 @@ mod tests {
         ));
     }
 
+    fn raw_record(options: u64, data: &[u8]) -> Vec<u8> {
+        let config = BatchConfig {
+            zstd_level: None,
+            ..BatchConfig::default()
+        };
+        build_records(&[(options, data)], &config).unwrap().concat()
+    }
+
+    #[test]
+    fn a_frame_of_small_bombs_stops_at_the_limit_all_or_nothing() {
+        let big = vec![0u8; 1024];
+        let items: Vec<(u64, &[u8])> = (0..8).map(|at| (at, big.as_slice())).collect();
+        let records = build_records(&items, &BatchConfig::default()).unwrap();
+        let stamped = stamp(&records, 1);
+        assert!(matches!(
+            decode_records(&stamped, 0, 4 * 1024),
+            Err(SdkError::TooLarge)
+        ));
+        assert_eq!(decode_records(&stamped, 0, 16 * 1024).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn decode_some_steps_over_a_bad_record_and_holds_to_the_limit() {
+        let mut bad = raw_record(2, b"not zstd");
+        bad[30..32].copy_from_slice(&CODEC_ZSTD.to_le_bytes());
+        let good = raw_record(1, &[7u8; 100]);
+        let run = [good.clone(), bad, good.clone(), good.clone()];
+        let stamped = stamp(&run, 10);
+
+        let first = decode_some(&stamped, 0, 1 << 20);
+        assert_eq!(first.items.iter().map(|i| i.id).collect::<Vec<_>>(), [10]);
+        assert_eq!(
+            first.failed,
+            Some(SdkError::BadRecord {
+                first_id: 11,
+                last_id: 11,
+                too_large: false
+            })
+        );
+        assert_eq!(first.used_bytes, run[0].len() + run[1].len());
+        let last = decode_some(&stamped[first.used_bytes..], 11, 1 << 20);
+        assert_eq!(
+            last.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            [12, 13]
+        );
+        assert_eq!(last.failed, None);
+
+        // A limit of one record gives one at a time, and none is ever stuck.
+        let mut at = first.used_bytes;
+        let mut ids = Vec::new();
+        while at < stamped.len() {
+            let some = decode_some(&stamped[at..], 11, 1);
+            assert!(some.used_bytes > 0);
+            assert_eq!(some.items.len(), 1);
+            ids.push(some.items[0].id);
+            at += some.used_bytes;
+        }
+        assert_eq!(ids, [12, 13]);
+    }
+
+    #[test]
+    fn a_bad_table_gives_no_items_from_its_record() {
+        let mut record = raw_record(1, &[]);
+        // count 2, with a second offset past the bytes.
+        record[28..30].copy_from_slice(&2u16.to_le_bytes());
+        record[24..28].copy_from_slice(&8u32.to_le_bytes());
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&9u32.to_le_bytes());
+        let stamped = stamp(&[record], 5);
+        let some = decode_some(&stamped, 0, 1 << 20);
+        assert!(some.items.is_empty());
+        assert_eq!(
+            some.failed,
+            Some(SdkError::BadRecord {
+                first_id: 5,
+                last_id: 6,
+                too_large: false
+            })
+        );
+    }
+
     proptest! {
         #[test]
         fn items_round_trip_in_stable_option_order(
@@ -291,6 +453,7 @@ mod tests {
         #[test]
         fn random_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = decode_records(&bytes, 0, 1 << 16);
+            let _ = decode_some(&bytes, 0, 1 << 16);
             let _ = last_id(&bytes);
         }
     }

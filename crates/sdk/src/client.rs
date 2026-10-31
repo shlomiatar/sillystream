@@ -26,12 +26,14 @@ use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
-use crate::batch::{BatchConfig, Item, build_records, decode_records, last_id};
+use crate::batch::{BatchConfig, Item, build_records, decode_some, last_id};
 use crate::{FROM_LIVE, FROM_START, SdkError};
 
 /// What a frame needs around its records: `type flags handle id seq ack` and a length.
 const PUBLISH_OVERHEAD_BYTES: usize = 27;
 const FIRST_WIRE_ID: u32 = 1 << 31;
+/// The least a connection attempt gets, from the socket to `WELCOME`.
+const CONNECT_TIMEOUT_MIN_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -123,6 +125,8 @@ pub struct Subscribe {
     /// Records waiting for `next`, in bytes. Past it the subscription is dropped until they have
     /// been read, and comes back from its cursor.
     pub max_queue_bytes: usize,
+    /// What one `next` can hold of decompressed items. A frame past it comes over several, and a
+    /// single record past it is `SdkError::BadRecord`.
     pub max_decompressed_bytes: usize,
 }
 
@@ -315,7 +319,7 @@ impl Client {
         let connector = tls_connector(&config.ca_pem)?;
         let (commands, receiver) = mpsc::unbounded_channel();
         let max_frame_bytes = Arc::new(AtomicUsize::new(proto::DEFAULT_MAX_FRAME_BYTES));
-        let mut driver = Driver {
+        let driver = Driver {
             host,
             port,
             connector,
@@ -335,7 +339,8 @@ impl Client {
             max_frame_bytes: Arc::clone(&max_frame_bytes),
             out: None,
         };
-        let ws = driver.connect().await?;
+        let (ws, welcome_max_frame_bytes) = driver.connect_attempt().await?;
+        max_frame_bytes.store(welcome_max_frame_bytes as usize, Ordering::Relaxed);
         tokio::spawn(driver.run(ws));
         Ok(Client {
             commands,
@@ -405,6 +410,8 @@ impl Client {
             skip_through,
             max_decompressed_bytes,
             max_queue_bytes,
+            frame: None,
+            failed: None,
         })
     }
 
@@ -566,13 +573,27 @@ pub struct Subscription {
     skip_through: u64,
     max_decompressed_bytes: usize,
     max_queue_bytes: usize,
+    /// A `DATA` frame not all opened yet, and how far it has been.
+    frame: Option<(Bytes, usize)>,
+    /// A bad record, to report after the items that came before it.
+    failed: Option<SdkError>,
 }
 
 impl Subscription {
     /// The next thing to happen, or `None` once the client has stopped. An `Err` from the server
-    /// ends the subscription, except error 8 for a bad `commit`.
+    /// ends the subscription, except error 8 for a bad `commit`. `SdkError::BadRecord` doesn't
+    /// either: those ids are lost to this reader, and it goes on from the next record.
     pub async fn next(&mut self) -> Option<Result<Event, SdkError>> {
         loop {
+            if let Some(error) = self.failed.take() {
+                return Some(Err(error));
+            }
+            if let Some(items) = self.next_items() {
+                return Some(Ok(Event::Items(items)));
+            }
+            if self.failed.is_some() || self.frame.is_some() {
+                continue;
+            }
             let raw = match self.events.recv().await? {
                 Ok(raw) => raw,
                 Err(error) => return Some(Err(error)),
@@ -595,19 +616,8 @@ impl Subscription {
                     if before > self.max_queue_bytes / 2 && after <= self.max_queue_bytes / 2 {
                         let _ = self.client.send(Command::Drained { key: self.key });
                     }
-                    let items = match decode_records(
-                        &records,
-                        self.skip_through,
-                        self.max_decompressed_bytes,
-                    ) {
-                        Ok(items) => items,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let Some(last) = items.last() else {
-                        continue;
-                    };
-                    self.skip_through = last.id;
-                    Event::Items(items)
+                    self.frame = Some((records, 0));
+                    continue;
                 }
                 Raw::Progress(id) => {
                     self.skip_through = self.skip_through.max(id);
@@ -619,12 +629,34 @@ impl Subscription {
         }
     }
 
+    /// Opens as much of the frame in hand as the limit allows. `None` if that gave no items.
+    fn next_items(&mut self) -> Option<Vec<Item>> {
+        let (records, at) = self.frame.as_mut()?;
+        let decoded = decode_some(
+            &records[*at..],
+            self.skip_through,
+            self.max_decompressed_bytes,
+        );
+        *at += decoded.used_bytes;
+        if *at >= records.len() {
+            self.frame = None;
+        }
+        if let Some(last) = decoded.items.last() {
+            self.skip_through = last.id;
+        }
+        if let Some(SdkError::BadRecord { last_id, .. }) = decoded.failed {
+            self.skip_through = self.skip_through.max(last_id);
+        }
+        self.failed = decoded.failed;
+        (!decoded.items.is_empty()).then_some(decoded.items)
+    }
+
     /// Moves this subscription's named cursor. It moves forward only (section 5.1).
     pub fn commit(&self, id: u64) -> Result<(), SdkError> {
         self.client.send(Command::Commit { key: self.key, id })
     }
 
-    /// The last id handed over. Keep it to resume from elsewhere with a client-held cursor.
+    /// The last id handed over or reported lost. Keep it to resume from elsewhere with a client-held cursor.
     pub fn cursor(&self) -> u64 {
         self.skip_through
     }
@@ -664,6 +696,73 @@ fn encode(frame: &ClientFrame<'_>) -> Result<Message, SdkError> {
     Ok(Message::Binary(bytes))
 }
 
+/// As `encode`, for a frame the caller is waiting on. The server's error 6 refers to nothing it
+/// can name, so one it would refuse has to be found here (D124). This looks at the limit as it is
+/// when the frame leaves, so it holds for what was queued across a reconnect too.
+fn encode_within(frame: &ClientFrame<'_>, max_frame_bytes: usize) -> Result<Message, SdkError> {
+    let message = encode(frame)?;
+    if message.len() > max_frame_bytes {
+        return Err(SdkError::TooLarge);
+    }
+    Ok(message)
+}
+
+/// Socket, TLS, upgrade, `HELLO` and `WELCOME`. It owns what it needs, so the driver goes on
+/// answering commands while this waits. Gives back the connection and its `max_frame`.
+async fn connect_once(
+    host: String,
+    port: u16,
+    connector: Arc<TlsConnector>,
+    token: String,
+) -> Result<(Ws, u32), SdkError> {
+    let failed = |error: std::io::Error| SdkError::Connect(error.to_string());
+    let socket = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(failed)?;
+    socket.set_nodelay(true).map_err(failed)?;
+    let name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|error| SdkError::Config(error.to_string()))?;
+    let tls = connector.connect(name, socket).await.map_err(failed)?;
+    let url = format!("wss://{host}:{port}/v1/ws");
+    let config = WebSocketConfig {
+        max_message_size: None,
+        max_frame_size: None,
+        ..WebSocketConfig::default()
+    };
+    let (mut ws, _) = tokio_tungstenite::client_async_with_config(url, tls, Some(config))
+        .await
+        .map_err(|error| SdkError::Connect(error.to_string()))?;
+    let hello = encode(&ClientFrame::Hello {
+        ver: PROTOCOL_VERSION,
+        token: &token,
+    })?;
+    ws.send(hello)
+        .await
+        .map_err(|error| SdkError::Connect(error.to_string()))?;
+    loop {
+        let bytes = match ws.next().await {
+            Some(Ok(Message::Binary(bytes))) => bytes,
+            Some(Ok(Message::Close(_))) | None => {
+                return Err(SdkError::Connect("closed before WELCOME".to_owned()));
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(error)) => return Err(SdkError::Connect(error.to_string())),
+        };
+        match decode_server(&bytes, usize::MAX) {
+            Ok(ServerFrame::Welcome {
+                max_frame_bytes, ..
+            }) => return Ok((ws, max_frame_bytes)),
+            Ok(ServerFrame::Error { code, msg, .. }) => {
+                return Err(SdkError::Server {
+                    code,
+                    msg: msg.to_owned(),
+                });
+            }
+            _ => return Err(SdkError::Connect("no WELCOME".to_owned())),
+        }
+    }
+}
+
 enum SessionEnd {
     Disconnected,
     /// Everything is answered and nobody can ask for more.
@@ -679,61 +778,20 @@ impl Driver {
         id
     }
 
-    /// Socket, TLS, upgrade, `HELLO` and `WELCOME`.
-    async fn connect(&mut self) -> Result<Ws, SdkError> {
-        let failed = |error: std::io::Error| SdkError::Connect(error.to_string());
-        let socket = TcpStream::connect((self.host.as_str(), self.port))
-            .await
-            .map_err(failed)?;
-        socket.set_nodelay(true).map_err(failed)?;
-        let name = rustls::pki_types::ServerName::try_from(self.host.clone())
-            .map_err(|error| SdkError::Config(error.to_string()))?;
-        let tls = self.connector.connect(name, socket).await.map_err(failed)?;
-        let url = format!("wss://{}:{}/v1/ws", self.host, self.port);
-        let config = WebSocketConfig {
-            max_message_size: None,
-            max_frame_size: None,
-            ..WebSocketConfig::default()
-        };
-        let (mut ws, _) = tokio_tungstenite::client_async_with_config(url, tls, Some(config))
-            .await
-            .map_err(|error| SdkError::Connect(error.to_string()))?;
-        let hello = encode(&ClientFrame::Hello {
-            ver: PROTOCOL_VERSION,
-            token: &self.token,
-        })?;
-        ws.send(hello)
-            .await
-            .map_err(|error| SdkError::Connect(error.to_string()))?;
-        let wait = Duration::from_millis(self.ping_interval_ms.max(10_000));
-        loop {
-            let message = tokio::time::timeout(wait, ws.next())
+    /// One whole attempt, with a time limit: a peer can take a connection and then say nothing
+    /// at any step.
+    fn connect_attempt(&self) -> impl Future<Output = Result<(Ws, u32), SdkError>> + use<> {
+        let wait = Duration::from_millis(self.ping_interval_ms.max(CONNECT_TIMEOUT_MIN_MS));
+        let attempt = connect_once(
+            self.host.clone(),
+            self.port,
+            Arc::clone(&self.connector),
+            self.token.clone(),
+        );
+        async move {
+            tokio::time::timeout(wait, attempt)
                 .await
-                .map_err(|_| SdkError::Connect("no WELCOME in time".to_owned()))?;
-            let bytes = match message {
-                Some(Ok(Message::Binary(bytes))) => bytes,
-                Some(Ok(Message::Close(_))) | None => {
-                    return Err(SdkError::Connect("closed before WELCOME".to_owned()));
-                }
-                Some(Ok(_)) => continue,
-                Some(Err(error)) => return Err(SdkError::Connect(error.to_string())),
-            };
-            match decode_server(&bytes, usize::MAX) {
-                Ok(ServerFrame::Welcome {
-                    max_frame_bytes, ..
-                }) => {
-                    self.max_frame_bytes
-                        .store(max_frame_bytes as usize, Ordering::Relaxed);
-                    return Ok(ws);
-                }
-                Ok(ServerFrame::Error { code, msg, .. }) => {
-                    return Err(SdkError::Server {
-                        code,
-                        msg: msg.to_owned(),
-                    });
-                }
-                _ => return Err(SdkError::Connect("no WELCOME".to_owned())),
-            }
+                .map_err(|_| SdkError::Connect("no WELCOME in time".to_owned()))?
         }
     }
 
@@ -768,8 +826,28 @@ impl Driver {
                 }
             }
             backoff_ms = (backoff_ms * 2).min(self.reconnect_max_ms);
-            match self.connect().await {
-                Ok(ws) => next = Some(ws),
+            let token = self.token.clone();
+            let attempt = self.connect_attempt();
+            tokio::pin!(attempt);
+            let attempted = loop {
+                tokio::select! {
+                    attempted = &mut attempt => break attempted,
+                    command = self.commands.recv(), if self.commands_open => {
+                        match command {
+                            Some(command) => self.apply(command),
+                            None => self.commands_open = false,
+                        }
+                    }
+                }
+            };
+            match attempted {
+                // A newer token came while this one was being presented, so go round again.
+                Ok(_) if self.token != token => {}
+                Ok((ws, max_frame_bytes)) => {
+                    self.max_frame_bytes
+                        .store(max_frame_bytes as usize, Ordering::Relaxed);
+                    next = Some(ws);
+                }
                 Err(SdkError::Server { code, msg }) => {
                     return self.fail_all(SdkError::Server { code, msg });
                 }
@@ -935,6 +1013,19 @@ impl Driver {
                     let _ = reply.send(Err(SdkError::Disconnected));
                     return;
                 }
+                // `handle` and `req` are the same size whatever they are.
+                let max_frame_bytes = self.max_frame_bytes.load(Ordering::Relaxed);
+                let frame = ClientFrame::StateOp {
+                    handle: 0,
+                    req: 0,
+                    expect_ver: change.expect_ver,
+                    op: change.op,
+                    doc: &change.doc,
+                };
+                if let Err(error) = encode_within(&frame, max_frame_bytes) {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
                 let handle = match self.state_handles.get(&stream) {
                     Some(handle) => *handle,
                     None => {
@@ -1033,6 +1124,7 @@ impl Driver {
         let Some(out) = self.out.clone() else {
             return;
         };
+        let max_frame_bytes = self.max_frame_bytes.load(Ordering::Relaxed);
         let Some(producer) = self.producers.get_mut(&key) else {
             return;
         };
@@ -1057,18 +1149,21 @@ impl Driver {
                 at += 1;
                 continue;
             }
-            let message = encode(&ClientFrame::Publish(proto::Publish {
-                handle: key,
-                producer_id,
-                producer_seq: entry.seq,
-                ack: entry.ack,
-                state: entry.state.as_ref().map(|state| PublishState {
-                    expect_ver: state.expect_ver,
-                    op: state.op,
-                    doc: &state.doc,
+            let message = encode_within(
+                &ClientFrame::Publish(proto::Publish {
+                    handle: key,
+                    producer_id,
+                    producer_seq: entry.seq,
+                    ack: entry.ack,
+                    state: entry.state.as_ref().map(|state| PublishState {
+                        expect_ver: state.expect_ver,
+                        op: state.op,
+                        doc: &state.doc,
+                    }),
+                    records: &entry.records,
                 }),
-                records: &entry.records,
-            }));
+                max_frame_bytes,
+            );
             let Ok(message) = message else {
                 let entry = producer.queue.remove(at).unwrap();
                 let _ = entry.reply.send(Err(SdkError::TooLarge));

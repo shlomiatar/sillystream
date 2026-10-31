@@ -31,6 +31,13 @@ pub enum SdkError {
     TooLarge,
     /// A record that doesn't decode.
     Codec,
+    /// A record of a subscription that can't be opened: bad data, or `too_large` for
+    /// `max_decompressed_bytes`. Only those ids are lost, and the subscription carries on.
+    BadRecord {
+        first_id: u64,
+        last_id: u64,
+        too_large: bool,
+    },
     /// Reaching the server: the socket, TLS or the WebSocket upgrade.
     Connect(String),
     /// A bad setting.
@@ -48,6 +55,18 @@ impl std::fmt::Display for SdkError {
             SdkError::Closed => f.write_str("the client has stopped"),
             SdkError::TooLarge => f.write_str("too large for a frame"),
             SdkError::Codec => f.write_str("a record didn't decode"),
+            SdkError::BadRecord {
+                first_id,
+                last_id,
+                too_large,
+            } => {
+                let why = if *too_large {
+                    "too large"
+                } else {
+                    "undecodable"
+                };
+                write!(f, "records {first_id} to {last_id} are {why}")
+            }
             SdkError::Connect(text) => write!(f, "connect: {text}"),
             SdkError::Config(text) => write!(f, "config: {text}"),
         }

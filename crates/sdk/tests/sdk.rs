@@ -896,3 +896,355 @@ async fn level_0_publishes_need_no_answer_and_arrive() {
     );
     fixture.server.shutdown();
 }
+
+fn raw_records(items: &[(u64, &[u8])]) -> Vec<u8> {
+    let raw = BatchConfig {
+        zstd_level: None,
+        ..BatchConfig::default()
+    };
+    sdk::build_records(items, &raw).unwrap().concat()
+}
+
+/// Reads until it is quiet, and gives back the items and the errors in the order they came.
+async fn read_until_quiet(subscription: &mut Subscription) -> (Vec<Vec<u8>>, Vec<SdkError>) {
+    let (mut got, mut errors) = (Vec::new(), Vec::new());
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(1_000), subscription.next()).await
+    {
+        match event {
+            Ok(Event::Items(items)) => got.extend(items.into_iter().map(|item| item.bytes)),
+            Ok(_) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+    (got, errors)
+}
+
+/// Section 2: data is opaque, so any publisher can send a record nobody can decode. That costs
+/// the reader that record and nothing else, and it is told which ids it lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_record_loses_only_itself_and_says_which_ids() {
+    let fixture = start();
+    let client = fixture.client().await;
+    let mut publisher = client
+        .publisher("poison", PublisherConfig::default())
+        .unwrap();
+    let mut bad = raw_records(&[(2, b"garbage!")]);
+    bad[30..32].copy_from_slice(&CODEC_ZSTD.to_le_bytes());
+    let mut joined = raw_records(&[(1, b"good-before")]);
+    joined.extend_from_slice(&bad);
+    joined.extend_from_slice(&raw_records(&[(3, b"good-after")]));
+    let first = publisher
+        .send_records(&joined, None)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    publisher
+        .send_records(&raw_records(&[(1, b"next-publish")]), None)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    let mut subscription = client
+        .subscribe(Subscribe::new("poison", FROM_START))
+        .unwrap();
+    let (got, errors) = read_until_quiet(&mut subscription).await;
+    assert_eq!(
+        got,
+        [
+            b"good-before".to_vec(),
+            b"good-after".to_vec(),
+            b"next-publish".to_vec()
+        ]
+    );
+    assert_eq!(
+        errors,
+        [SdkError::BadRecord {
+            first_id: first.first_id + 1,
+            last_id: first.first_id + 1,
+            too_large: false
+        }]
+    );
+    // Each of them is reported once, in id order, and the cursor is past the lot.
+    assert!(subscription.cursor() > first.first_id + 2);
+    fixture.server.shutdown();
+}
+
+/// The limit is what one `next` can make the reader hold, not a limit per record: otherwise many
+/// small bombs in a frame multiply it. Nothing good is lost for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_decompression_limit_bounds_what_next_holds_across_a_frame() {
+    const LIMIT_BYTES: usize = 1024 * 1024;
+    const RECORD_COUNT: u64 = 64;
+    let fixture = start();
+    let client = fixture.client().await;
+    let mut publisher = client
+        .publisher("bomb", PublisherConfig::default())
+        .unwrap();
+    let zeros = vec![0u8; LIMIT_BYTES];
+    let items: Vec<(u64, &[u8])> = (0..RECORD_COUNT).map(|i| (i, zeros.as_slice())).collect();
+    let joined = sdk::build_records(&items, &BatchConfig::default())
+        .unwrap()
+        .concat();
+    assert!(joined.len() < 64 * 1024, "one frame: {}", joined.len());
+    publisher
+        .send_records(&joined, None)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    // And a single record over the limit is refused, between the good ones.
+    let huge = vec![0u8; LIMIT_BYTES + 1];
+    let joined = sdk::build_records(
+        &[(1, b"ok".as_slice()), (2, &huge), (3, b"ok")],
+        &BatchConfig::default(),
+    )
+    .unwrap()
+    .concat();
+    let second = publisher
+        .send_records(&joined, None)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+
+    let mut spec = Subscribe::new("bomb", FROM_START);
+    spec.max_decompressed_bytes = LIMIT_BYTES;
+    let mut subscription = client.subscribe(spec).unwrap();
+    let (mut total, mut seen, mut errors) = (0, 0, Vec::new());
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(2_000), subscription.next()).await
+    {
+        match event {
+            Ok(Event::Items(items)) => {
+                let bytes: usize = items.iter().map(|item| item.bytes.len()).sum();
+                assert!(bytes <= LIMIT_BYTES, "one event held {bytes}");
+                total += bytes;
+                seen += items.len();
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error),
+        }
+    }
+    assert_eq!(seen as u64, RECORD_COUNT + 2);
+    assert_eq!(total, RECORD_COUNT as usize * LIMIT_BYTES + 4);
+    assert_eq!(
+        errors,
+        [SdkError::BadRecord {
+            first_id: second.first_id + 1,
+            last_id: second.first_id + 1,
+            too_large: true
+        }]
+    );
+    fixture.server.shutdown();
+}
+
+/// A write the node can't take yet is tried again however busy the connection is. The inbox of 1
+/// makes that the common case, and subscribing on the same connection keeps events coming.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_waiting_for_room_goes_through_while_events_keep_arriving() {
+    let mut node = node_config();
+    node.write_inbox_capacity = 1;
+    let fixture = start_with(node);
+    let config = || PublisherConfig {
+        ack: AckLevel::Memory,
+        batch: BatchConfig {
+            zstd_level: None,
+            ..BatchConfig::default()
+        },
+        ..PublisherConfig::default()
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let client = fixture.client().await;
+        let stop = Arc::clone(&stop);
+        tasks.push(tokio::spawn(async move {
+            let mut publisher = client.publisher("hot", config()).unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                publisher.add(1, vec![1u8; 64]);
+                let _ = publisher.flush().await;
+            }
+        }));
+    }
+    let client = fixture.client().await;
+    let mut subscription = client.subscribe(Subscribe::new("hot", FROM_LIVE)).unwrap();
+    tasks.push(tokio::spawn(async move {
+        while let Some(event) = subscription.next().await {
+            if event.is_err() {
+                return;
+            }
+        }
+    }));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut publisher = client.publisher("hot", config()).unwrap();
+    let mut stuck_at = None;
+    for done in 0..300 {
+        publisher.add(1, vec![2u8; 64]);
+        let flushed = tokio::time::timeout(Duration::from_secs(8), publisher.flush()).await;
+        if flushed.is_err() {
+            stuck_at = Some(done);
+            break;
+        }
+        flushed.unwrap().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(stuck_at, None, "the ack never came with events flowing");
+    for task in tasks {
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_op_over_max_frame_is_answered() {
+    let mut node = node_config();
+    node.max_frame_bytes = 128 * 1024;
+    let fixture = start_with(node);
+    let client = fixture.client().await;
+    let change = StateChange {
+        expect_ver: 0,
+        op: StateOp::Set,
+        doc: vec![b'x'; 200 * 1024],
+    };
+    let answer = tokio::time::timeout(Duration::from_secs(5), client.state_op("ov", change)).await;
+    assert_eq!(answer, Ok(Err(SdkError::TooLarge)));
+    let small = StateChange {
+        expect_ver: 0,
+        op: StateOp::Set,
+        doc: doc("a", 1),
+    };
+    let answer = tokio::time::timeout(Duration::from_secs(5), client.state_op("ov", small)).await;
+    assert!(matches!(answer, Ok(Ok(_))), "{answer:?}");
+    fixture.server.shutdown();
+}
+
+/// With `expect_ver` it holds back the producer's later publishes, so going unanswered would stop
+/// that producer for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publish_over_max_frame_is_answered_and_doesnt_wedge_its_producer() {
+    let mut node = node_config();
+    node.max_frame_bytes = 128 * 1024;
+    let fixture = start_with(node);
+    let client = fixture.client().await;
+    let mut publisher = client.publisher("ov", PublisherConfig::default()).unwrap();
+    let big = raw_records(&[(1, &vec![b'x'; 200 * 1024])]);
+    let first = publisher
+        .send_records(
+            &big,
+            Some(StateChange {
+                expect_ver: 7,
+                op: StateOp::Set,
+                doc: doc("a", 1),
+            }),
+        )
+        .await
+        .unwrap();
+    let second = publisher
+        .send_records(&raw_records(&[(1, b"small")]), None)
+        .await
+        .unwrap();
+    let wait = Duration::from_secs(5);
+    assert_eq!(
+        tokio::time::timeout(wait, first.wait()).await,
+        Ok(Err(SdkError::TooLarge))
+    );
+    let later = tokio::time::timeout(wait, second.wait()).await;
+    assert!(matches!(later, Ok(Ok(_))), "{later:?}");
+    fixture.server.shutdown();
+}
+
+/// A peer that takes the connection and then says nothing, which no socket error ever reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn connecting_to_a_silent_peer_gives_up() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let holder = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let fixture = start();
+    let config = ClientConfig::new(&format!("localhost:{port}"), &fixture.ca_pem, "x");
+    let result = tokio::time::timeout(Duration::from_secs(20), Client::connect(config)).await;
+    assert!(
+        matches!(result, Ok(Err(SdkError::Connect(_)))),
+        "{:?}",
+        result.map(|r| r.err())
+    );
+    holder.abort();
+    fixture.server.shutdown();
+}
+
+/// One reconnect attempt stuck on a silent peer doesn't stop the client answering, and doesn't
+/// stop it coming back when a later attempt would work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_stuck_on_a_silent_peer_recovers_and_keeps_answering() {
+    let fixture = start();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let target = fixture.server.local_addr();
+    let cut = Arc::new(tokio::sync::Notify::new());
+    let swallow_next = Arc::new(AtomicBool::new(false));
+    let proxy = {
+        let (cut, swallow_next) = (Arc::clone(&cut), Arc::clone(&swallow_next));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut near, _)) = listener.accept().await {
+                if swallow_next.swap(false, Ordering::SeqCst) {
+                    held.push(near);
+                    continue;
+                }
+                let cut = Arc::clone(&cut);
+                tokio::spawn(async move {
+                    let mut far = TcpStream::connect(target).await.unwrap();
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut near, &mut far) => {}
+                        _ = cut.notified() => {}
+                    }
+                });
+            }
+        })
+    };
+    let mut config = ClientConfig::new(
+        &format!("localhost:{port}"),
+        &fixture.ca_pem,
+        &token(u64::MAX),
+    );
+    config.reconnect_max_ms = 100;
+    let client = Client::connect(config).await.unwrap();
+    let mut publisher = client
+        .publisher("heal", PublisherConfig::default())
+        .unwrap();
+    publisher.add(1, b"before".to_vec());
+    publisher.flush().await.unwrap();
+
+    swallow_next.store(true, Ordering::SeqCst);
+    cut.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.state_op(
+            "heal",
+            StateChange {
+                expect_ver: 0,
+                op: StateOp::Set,
+                doc: doc("a", 1),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(answer, Ok(Err(SdkError::Disconnected)));
+
+    publisher.add(1, b"after".to_vec());
+    let flushed = tokio::time::timeout(Duration::from_secs(30), publisher.flush()).await;
+    assert!(matches!(flushed, Ok(Ok(_))), "{flushed:?}");
+    proxy.abort();
+    fixture.server.shutdown();
+}
