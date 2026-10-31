@@ -31,8 +31,9 @@ pub use meta_format::{
 };
 pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{
-    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, build_store, dedicated_path,
-    list_sealed_objects, object_generation, seal_path, stream_fits_dedicated_path,
+    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, SEALED_PREFIX, build_store, compacted_path,
+    dedicated_path, list_hour_objects, list_hours, list_sealed_objects, object_generation,
+    object_hour, seal_path, stream_fits_dedicated_path,
 };
 pub use ownership::{
     OWNERSHIP_MAGIC, OWNERSHIP_RECORD_BYTES, Ownership, OwnershipError, claim_generation,
@@ -47,7 +48,7 @@ pub use segment_format::{
 pub use segment_reader::{SEGMENT_TAIL_READ_BYTES, SegmentReader};
 pub use uploader::{
     Section, SectionExtent, UnfinishedUpload, UploadEvent, UploadKey, UploadSendError, Uploader,
-    UploaderConfig, UploaderExit, UploaderSender,
+    UploaderConfig, UploaderExit, UploaderSender, put_new_object,
 };
 pub use wal_format::{
     WAL_FILE_HEADER_BYTES, WAL_MAGIC, WalEntry, WalEntryError, encode_file_header, encode_wal_entry,

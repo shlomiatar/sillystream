@@ -14,7 +14,7 @@
 //! A former generation can still upload one of these after losing ownership. An entry from
 //! generation `g` whose last id is above `limit_for(g)` is ignored (section 8.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -358,6 +358,8 @@ impl CheckpointSet {
     ) -> Result<Option<StreamMeta>, CheckpointError> {
         let mut found: Option<StreamMeta> = None;
         let mut extents = Vec::new();
+        // Taken away by a newer entry: compaction or retention (section 7.5, 7.4).
+        let mut dropped: HashSet<u64> = HashSet::new();
         for file in &self.files {
             let Some((id_last, blob)) = read_entry(store, file, name).await? else {
                 continue;
@@ -366,7 +368,13 @@ impl CheckpointSet {
                 continue;
             }
             let meta = decode_meta(&blob)?;
-            extents.extend(meta.extents.iter().cloned());
+            extents.extend(
+                meta.extents
+                    .iter()
+                    .filter(|extent| !dropped.contains(&extent.id_first))
+                    .cloned(),
+            );
+            dropped.extend(meta.dropped_extents.iter().copied());
             let stop = meta.deleted;
             if found.is_none() {
                 found = Some(meta);
@@ -382,6 +390,7 @@ impl CheckpointSet {
         extents.sort_by_key(|extent| extent.id_first);
         extents.dedup_by_key(|extent| extent.id_first);
         meta.extents = if meta.deleted { Vec::new() } else { extents };
+        meta.dropped_extents.clear();
         Ok(Some(meta))
     }
 
@@ -410,13 +419,15 @@ impl CheckpointSet {
 }
 
 /// `newer` on top of what `all` has for its stream: its fields, and the union of extents
-/// above its floor. A tombstone clears them.
+/// above its floor, less what it drops. A tombstone clears them.
 pub fn merge_meta(all: &mut BTreeMap<String, StreamMeta>, newer: StreamMeta) {
     let mut extents = match all.remove(&newer.name) {
         Some(older) if !newer.deleted => older.extents,
         _ => Vec::new(),
     };
     let mut newer = newer;
+    extents.retain(|extent| !newer.dropped_extents.contains(&extent.id_first));
+    newer.dropped_extents.clear();
     extents.append(&mut newer.extents);
     extents.retain(|extent| extent.id_last > newer.floor_id);
     extents.sort_by_key(|extent| extent.id_first);

@@ -280,6 +280,22 @@ pub(crate) struct ExtentRef {
     pub extent: StreamExtent,
 }
 
+impl ExtentRef {
+    fn extent_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// What came of asking an owner to replace extents with a compacted one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplaceResult {
+    Applied,
+    /// None of them are there any more, as after a crash that lost only the cursor.
+    Gone,
+    /// They are there but this can't be done yet. The cursor waits.
+    Retry,
+}
+
 /// What a visible batch changes in the saved view, once its ticket is durable.
 #[derive(Debug)]
 pub(crate) struct UnsavedStep {
@@ -327,6 +343,8 @@ pub(crate) struct StreamDelivery {
     pub saved_gather: u64,
     /// Extents no checkpoint has yet.
     pub new_extents: Vec<ExtentRef>,
+    /// `id_first` of extents gone since the last checkpoint, for it to take away.
+    pub dropped_extents: Vec<u64>,
     /// When it was last used, on its core's own count, for eviction.
     pub last_used: u64,
 }
@@ -352,6 +370,7 @@ impl StreamDelivery {
             meta_dirty: false,
             saved_gather: 0,
             new_extents: Vec::new(),
+            dropped_extents: Vec::new(),
             last_used: 0,
         }
     }
@@ -373,10 +392,16 @@ impl StreamDelivery {
         let at = self
             .extents
             .partition_point(|known| known.extent.id_first < extent.id_first);
-        if self
-            .extents
-            .get(at)
-            .is_some_and(|known| known.extent.id_first == extent.id_first)
+        // A report arriving late can also find a compacted extent already covering it.
+        let covered = at
+            .checked_sub(1)
+            .and_then(|before| self.extents.get(before))
+            .is_some_and(|known| known.extent.id_last >= extent.id_first);
+        if covered
+            || self
+                .extents
+                .get(at)
+                .is_some_and(|known| known.extent.id_first <= extent.id_last)
         {
             return;
         }
@@ -389,6 +414,82 @@ impl StreamDelivery {
             self.new_extents.push(extent_ref.clone());
         }
         self.extents.insert(at, extent_ref);
+    }
+
+    /// Takes away every extent in the object at `path`. How many there were.
+    pub fn drop_path(&mut self, path: &Path) -> usize {
+        let dropped = &mut self.dropped_extents;
+        let before = self.extents.len();
+        self.extents.retain(|known| {
+            let keep = known.extent_path() != path;
+            if !keep {
+                dropped.push(known.extent.id_first);
+            }
+            keep
+        });
+        self.new_extents.retain(|known| known.extent_path() != path);
+        let count = before - self.extents.len();
+        if count > 0 {
+            self.meta_dirty = self.track_meta;
+        }
+        count
+    }
+
+    /// Puts `new` where the extents in `sources` are, all of it or none (section 7.5). They must
+    /// still be there, side by side. Anything may be still unsealed, which a merged extent
+    /// mustn't go around.
+    pub fn replace_extents(
+        &mut self,
+        path: &Path,
+        sources: &[(Path, u64, u64)],
+        new: &StreamExtent,
+        merge_below: u64,
+    ) -> ReplaceResult {
+        let Some((_, first, _)) = sources.first() else {
+            return ReplaceResult::Gone;
+        };
+        let at = self
+            .extents
+            .partition_point(|known| known.extent.id_first < *first);
+        let found = self.extents.get(at..at + sources.len()).filter(|known| {
+            known.iter().zip(sources).all(|(known, source)| {
+                known.path == source.0
+                    && known.extent.id_first == source.1
+                    && known.extent.id_last == source.2
+            })
+        });
+        if found.is_none() {
+            let any_left = sources.iter().any(|source| {
+                self.extents
+                    .iter()
+                    .any(|known| known.path == source.0 && known.extent.id_first == source.1)
+            });
+            return if any_left {
+                ReplaceResult::Retry
+            } else {
+                ReplaceResult::Gone
+            };
+        }
+        if sources.len() > 1 && new.id_last >= merge_below {
+            return ReplaceResult::Retry;
+        }
+        let new_ref = ExtentRef {
+            path: path.clone(),
+            extent: new.clone(),
+        };
+        for known in self
+            .extents
+            .splice(at..at + sources.len(), [new_ref.clone()])
+        {
+            self.dropped_extents.push(known.extent.id_first);
+            self.new_extents
+                .retain(|fresh| fresh.extent.id_first != known.extent.id_first);
+        }
+        if self.track_meta {
+            self.meta_dirty = true;
+            self.new_extents.push(new_ref);
+        }
+        ReplaceResult::Applied
     }
 
     /// An id known to be above `after` in the extents, and the lowest one if the extent
@@ -418,9 +519,10 @@ pub(crate) fn retention_start_id(now_ms: u64, retention_ms: u64) -> u64 {
     make_id(now_ms.saturating_sub(retention_ms), 0)
 }
 
-/// A cursor name for clients. `sink:` names belong to sinks (D27).
+/// A cursor name for clients. `sink:` names belong to sinks (D27), `compact:` to the compactor,
+/// since moving one on would let the delete job expire what was never copied.
 pub(crate) fn cursor_name_is_allowed(name: &str) -> bool {
-    !name.starts_with("sink:")
+    !name.starts_with("sink:") && !name.starts_with("compact:")
 }
 
 #[cfg(test)]

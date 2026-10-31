@@ -181,3 +181,17 @@ fn stamping_changes_only_id_and_author() {
         .collect();
     assert_eq!(ids, [0x0000_0190_0000_0010, 0x0000_0190_0000_0012]);
 }
+
+#[test]
+fn a_manifest_doc_is_its_size_then_its_path() {
+    let doc = format::encode_manifest_doc(0x0102, "sealed/1/n/x.seg");
+    let mut want = vec![2, 1, 0, 0, 0, 0, 0, 0];
+    want.extend_from_slice(b"sealed/1/n/x.seg");
+    assert_eq!(doc, want);
+    assert_eq!(
+        format::decode_manifest_doc(&doc).unwrap(),
+        (0x0102, "sealed/1/n/x.seg")
+    );
+    assert!(format::decode_manifest_doc(&doc[..7]).is_err());
+    assert!(format::decode_manifest_doc(&[0, 0, 0, 0, 0, 0, 0, 0, 0xff]).is_err());
+}

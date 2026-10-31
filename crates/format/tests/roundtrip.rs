@@ -397,3 +397,16 @@ fn system_parse_refuses_other_authors_and_short_data() {
         Err(FormatError::TruncatedSystemRecord)
     );
 }
+
+proptest! {
+    #[test]
+    fn manifest_docs_round_trip(len_bytes in any::<u64>(), path in ".{0,64}") {
+        let doc = format::encode_manifest_doc(len_bytes, &path);
+        prop_assert_eq!(format::decode_manifest_doc(&doc).unwrap(), (len_bytes, path.as_str()));
+    }
+
+    #[test]
+    fn manifest_decoding_never_panics(doc in proptest::collection::vec(any::<u8>(), 0..64)) {
+        let _ = format::decode_manifest_doc(&doc);
+    }
+}

@@ -16,6 +16,7 @@ use storage::{
     read_ownership, replay_file,
 };
 
+use crate::compaction::MANIFEST_STREAM;
 use crate::dedupe::DedupeTable;
 use crate::delivery::ExtentRef;
 use crate::message::{SinkSpec, StreamConfig};
@@ -93,7 +94,16 @@ pub(crate) struct Prepared {
     pub restored: Vec<RestoredStream>,
     /// Objects this startup looked at, for the next checkpoint to record. Their extents are in
     /// `restored`, or are ones nobody should read.
-    pub scanned_objects: Vec<String>,
+    pub scanned_objects: Vec<ScannedObject>,
+}
+
+/// One object no checkpoint recorded.
+pub(crate) struct ScannedObject {
+    pub path: String,
+    pub len_bytes: u64,
+    /// It holds accepted records that aren't the manifest stream's, so it needs a manifest: a
+    /// crash can have lost the one it had (section 7.5).
+    pub needs_manifest: bool,
 }
 
 pub(crate) fn extent_ref(stream: &Arc<str>, extent: &MetaExtent) -> ExtentRef {
@@ -194,22 +204,28 @@ async fn scan_objects(
     store: &Arc<dyn ObjectStore>,
     checkpoints: &CheckpointSet,
     ownership: &Ownership,
-    objects_seen: &mut Vec<String>,
+    objects_seen: &mut Vec<ScannedObject>,
     report: &mut RecoveryReport,
 ) -> Result<Vec<ScannedExtent>, String> {
     let known: HashSet<&str> = checkpoints.recorded_objects().collect();
-    let mut objects: Vec<(u64, Path)> = list_sealed_objects(store.as_ref())
+    let mut objects: Vec<(u64, Path, u64)> = list_sealed_objects(store.as_ref())
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|object| !known.contains(object.location.as_ref()))
-        .filter_map(|object| Some((object_generation(&object.location)?, object.location)))
+        .filter_map(|object| {
+            Some((
+                object_generation(&object.location)?,
+                object.location,
+                object.size as u64,
+            ))
+        })
         .collect();
     objects.sort();
     let mut out = Vec::new();
-    for (generation, path) in objects {
+    for (generation, path, len_bytes) in objects {
         report.scanned_object_count += 1;
-        objects_seen.push(path.to_string());
+        let mut needs_manifest = false;
         let limit = ownership.limit_for(generation);
         let reader = SegmentReader::new(Arc::clone(store), path.clone());
         let top = reader
@@ -239,6 +255,7 @@ async fn scan_objects(
                 },
                 _ => (extent.id_last, records),
             };
+            needs_manifest |= &*extent.stream != MANIFEST_STREAM;
             out.push(ScannedExtent {
                 stream: Arc::clone(&extent.stream),
                 extent: MetaExtent {
@@ -252,6 +269,11 @@ async fn scan_objects(
                 records,
             });
         }
+        objects_seen.push(ScannedObject {
+            path: path.to_string(),
+            len_bytes,
+            needs_manifest,
+        });
     }
     Ok(out)
 }
@@ -338,7 +360,10 @@ fn replay_stream(
             last_id = record.header.last_id();
             item_count += u64::from(record.header.count);
             // The one case the runtime reads a record's data (section 2.2).
-            if record.header.is_system() && record.header.id > applied_id {
+            if record.header.is_system()
+                && record.header.options != format::ENTRY_SEAL_MANIFEST
+                && record.header.id > applied_id
+            {
                 state
                     .replay(&record)
                     .map_err(|error| format!("a state op of {name}: {error}"))?;

@@ -7,6 +7,8 @@ use crate::{FormatError, RecordHeader, RecordView, encode_record};
 pub const ENTRY_STATE_SET: u64 = 1;
 pub const ENTRY_STATE_MERGE: u64 = 2;
 pub const ENTRY_STATE_INCR: u64 = 3;
+/// A seal manifest, in the manifest stream (section 7.5, Q3).
+pub const ENTRY_SEAL_MANIFEST: u64 = 4;
 
 const ACTOR_BYTES: usize = 8;
 
@@ -35,6 +37,24 @@ pub fn encode_system_record(
     data.extend_from_slice(&actor.to_le_bytes());
     data.extend_from_slice(doc);
     encode_record(out, &header, &data)
+}
+
+/// What a seal manifest's doc says: `len_bytes u64 | path`, the object and its size. The extents
+/// are in the object's own footer, so a manifest stays small however many streams it holds.
+pub fn encode_manifest_doc(len_bytes: u64, path: &str) -> Vec<u8> {
+    let mut doc = Vec::with_capacity(8 + path.len());
+    doc.extend_from_slice(&len_bytes.to_le_bytes());
+    doc.extend_from_slice(path.as_bytes());
+    doc
+}
+
+/// `(len_bytes, path)`.
+pub fn decode_manifest_doc(doc: &[u8]) -> Result<(u64, &str), FormatError> {
+    if doc.len() < 8 {
+        return Err(FormatError::TruncatedSystemRecord);
+    }
+    let path = std::str::from_utf8(&doc[8..]).map_err(|_| FormatError::TruncatedSystemRecord)?;
+    Ok((read_u64(doc, 0), path))
 }
 
 /// The parsed contents of a system record.

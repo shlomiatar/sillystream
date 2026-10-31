@@ -193,6 +193,15 @@ impl LocalMeta {
                     changes.push((key, None));
                 }
             }
+            for id_first in &meta.dropped_extents {
+                if !meta
+                    .extents
+                    .iter()
+                    .any(|extent| extent.id_first == *id_first)
+                {
+                    changes.push((extent_key(&meta.name, *id_first), None));
+                }
+            }
             for extent in &meta.extents {
                 let mut value = Vec::with_capacity(64 + extent.path.len());
                 encode_extent(&mut value, extent);
@@ -200,6 +209,7 @@ impl LocalMeta {
             }
             let fields = StreamMeta {
                 extents: Vec::new(),
+                dropped_extents: Vec::new(),
                 ..meta.clone()
             };
             changes.push((
@@ -474,6 +484,15 @@ impl Checkpointer {
             // object in no list gets looked at on the next startup.
             let mut known: HashSet<String> = delta.objects.into_iter().collect();
             known.extend(self.checkpoints.recorded_objects().map(str::to_owned));
+            // What has expired needn't stay on the list for ever (D149). A failed listing only
+            // keeps it one more file.
+            if let Ok(existing) = storage::list_sealed_objects(self.store.as_ref()).await {
+                let existing: HashSet<String> = existing
+                    .into_iter()
+                    .map(|object| object.location.to_string())
+                    .collect();
+                known.retain(|object| existing.contains(object));
+            }
             let head = CheckpointHead {
                 full,
                 max_id: delta.max_id,

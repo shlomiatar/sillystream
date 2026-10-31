@@ -74,7 +74,10 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
         proptest::collection::vec(cursor(), 0..4),
         proptest::collection::vec(dedupe(), 0..4),
         proptest::collection::vec(sink(), 0..3),
-        proptest::collection::vec(extent(), 0..4),
+        (
+            proptest::collection::vec(extent(), 0..4),
+            proptest::collection::vec(any::<u64>(), 0..4),
+        ),
     )
         .prop_map(
             |(
@@ -84,7 +87,7 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 cursors,
                 dedupe,
                 sinks,
-                extents,
+                (extents, dropped_extents),
             )| StreamMeta {
                 name,
                 deleted,
@@ -100,6 +103,7 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 dedupe,
                 sinks,
                 extents,
+                dropped_extents,
             },
         )
 }
@@ -205,6 +209,7 @@ fn meta_bytes_are_exact() {
             id_last: 17,
             block_count: 18,
         }],
+        dropped_extents: vec![19],
     };
     let mut body = Vec::new();
     let u32le = |out: &mut Vec<u8>, value: u32| out.extend_from_slice(&value.to_le_bytes());
@@ -244,6 +249,8 @@ fn meta_bytes_are_exact() {
         u64le(&mut body, value);
     }
     u32le(&mut body, 18);
+    u32le(&mut body, 1);
+    u64le(&mut body, 19);
     let mut want = crc32c(&body).to_le_bytes().to_vec();
     want.extend_from_slice(&body);
     assert_eq!(encode_meta(&meta), want);
@@ -385,4 +392,54 @@ fn a_checkpoint_refuses_a_name_its_pages_cannot_hold() {
     let head = CheckpointHead::default();
     assert!(build_checkpoint(&head, &[meta(65_535)]).is_ok());
     assert!(build_checkpoint(&head, &[meta(65_536)]).is_err());
+}
+
+/// Compaction's update and retention's removal, through the walk and through a full file.
+#[tokio::test]
+async fn a_newer_entry_takes_away_what_it_drops_and_keeps_what_it_adds() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let first = put(
+        &store,
+        1,
+        1,
+        false,
+        20,
+        &[stream("s", 20, &[(1, 5), (6, 9), (10, 20)])],
+    )
+    .await;
+    // (1, 9) replaces two, one of them with the same id_first.
+    let mut replaced = stream("s", 20, &[(1, 9)]);
+    replaced.dropped_extents = vec![1, 6];
+    let second = put(&store, 1, 2, false, 20, &[replaced]).await;
+    let mut expired = stream("s", 20, &[]);
+    expired.dropped_extents = vec![10];
+    let third = put(&store, 1, 3, false, 20, &[expired]).await;
+
+    let set = CheckpointSet {
+        files: vec![third, second, first],
+        ..CheckpointSet::default()
+    };
+    let found = set.lookup(&store, "s").await.unwrap().unwrap();
+    let ranges: Vec<(u64, u64)> = found
+        .extents
+        .iter()
+        .map(|extent| (extent.id_first, extent.id_last))
+        .collect();
+    assert_eq!(ranges, [(1, 9)]);
+    assert!(found.dropped_extents.is_empty());
+
+    let merged = set.merge_all(&store).await.unwrap();
+    assert_eq!(merged["s"].extents, found.extents);
+    assert!(merged["s"].dropped_extents.is_empty());
+}
+
+#[test]
+fn compacted_paths_keep_the_hour_and_generation_form() {
+    let path = storage::compacted_path("7d", 500_000, "node", 3, 77);
+    assert_eq!(
+        path.as_ref(),
+        "7d/500000/node/00000000000000000003-00000000000000000077.seg"
+    );
+    assert_eq!(storage::object_hour(&path), Some(500_000));
+    assert_eq!(storage::object_generation(&path), Some(3));
 }

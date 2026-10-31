@@ -5,7 +5,8 @@
 //! meta   := crc32c u32 | flags u32 | name str32 | last_id u64 | floor_id u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
-//!           n u32 | n × cursor | n u32 | n × dedupe | n u32 | n × sink | n u32 | n × extent
+//!           n u32 | n × cursor | n u32 | n × dedupe | n u32 | n × sink | n u32 | n × extent |
+//!           n u32 | n × dropped_id_first u64
 //! cursor := name str32 | id u64
 //! dedupe := producer_id u64 | producer_seq u64 | first_id u64 | count u32
 //! sink   := sink_id u64 | kind str32 | url opt | target opt | filter opt | on_expire str32 |
@@ -81,6 +82,9 @@ pub struct StreamMeta {
     pub dedupe: Vec<MetaDedupe>,
     pub sinks: Vec<MetaSink>,
     pub extents: Vec<MetaExtent>,
+    /// `id_first` of extents this entry takes away, which compaction replaced or retention
+    /// expired. It applies to what older entries hold, not to `extents` beside it.
+    pub dropped_extents: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +171,10 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     put_u32(&mut out, meta.extents.len() as u32);
     for extent in &meta.extents {
         encode_extent(&mut out, extent);
+    }
+    put_u32(&mut out, meta.dropped_extents.len() as u32);
+    for id_first in &meta.dropped_extents {
+        out.extend_from_slice(&id_first.to_le_bytes());
     }
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
@@ -327,6 +335,9 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     }
     for _ in 0..reader.count(40)? {
         meta.extents.push(reader.extent()?);
+    }
+    for _ in 0..reader.count(8)? {
+        meta.dropped_extents.push(reader.u64()?);
     }
     if reader.at != bytes.len() {
         return Err(MetaError("bytes after the metadata"));

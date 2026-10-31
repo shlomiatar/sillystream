@@ -127,6 +127,8 @@ pub struct ScriptStore {
     pub put_begun_count: Arc<AtomicU64>,
     /// How many more PUTs under `checkpoints/` may succeed. Negative: no limit.
     pub checkpoint_put_budget: Arc<AtomicI64>,
+    /// Every delete, in order.
+    pub deleted: Arc<Mutex<Vec<Path>>>,
 }
 
 impl fmt::Display for ScriptStore {
@@ -143,6 +145,7 @@ impl ScriptStore {
             put_count: Arc::new(AtomicU64::new(0)),
             put_begun_count: Arc::new(AtomicU64::new(0)),
             checkpoint_put_budget: Arc::new(AtomicI64::new(-1)),
+            deleted: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -200,6 +203,7 @@ impl ObjectStore for ScriptStore {
     }
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.deleted.lock().unwrap().push(location.clone());
         self.inner.delete(location).await
     }
 

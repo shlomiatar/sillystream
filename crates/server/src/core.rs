@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::{HEADER_BYTES, IdAllocator, ValidatedPublish, encode_system_record, validate_publish};
+use format::{
+    ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, ValidatedPublish, encode_system_record,
+    validate_publish,
+};
 use proto::ErrorCode;
 use storage::{
     MetaCursor, MetaDedupe, Section, SectionExtent, StreamMeta, UploadEvent, UploadKey,
@@ -20,17 +23,18 @@ use storage::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
+use crate::compaction::MANIFEST_STREAM;
 use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
-    FanOut, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, StreamDelivery,
-    UnsavedStep, retention_start_id, walk_records,
+    FanOut, PendingVisible, RecordSpan, ReplaceResult, STATE_ONLY_FILTER_ID, SharedBytes,
+    StreamDelivery, UnsavedStep, retention_start_id, walk_records,
 };
 use crate::message::{
-    AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
-    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, ShardHandoff, SinkOp,
-    SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff,
-    StreamInfo, SubRef, WriteMsg,
+    AttachMsg, AttachWalk, CatchReply, CompactSource, CompactView, ControlMsg, CoreStats, CursorOp,
+    CursorReport, DeliveryMsg, ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply,
+    ReplyTx, ShardHandoff, SinkOp, SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody,
+    StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
 };
 use crate::metadata::MetaMsg;
 use crate::placement::{ShardCounters, shard_of};
@@ -916,6 +920,10 @@ impl Core {
                 },
             );
         };
+        if &*msg.stream == MANIFEST_STREAM {
+            nack(ErrorCode::Unauthorized, &"this stream is the server's");
+            return;
+        }
         let (mut validated, ack_count) =
             match check_publish(&msg.stream, &mut records, msg.state.as_ref()) {
                 Ok(checked) => checked,
@@ -1047,6 +1055,13 @@ impl Core {
                 },
             );
         };
+        if &*msg.stream == MANIFEST_STREAM {
+            error(
+                ErrorCode::Unauthorized,
+                "this stream is the server's".into(),
+            );
+            return;
+        }
         if !stream_name_is_valid(&msg.stream) {
             error(
                 ErrorCode::Malformed,
@@ -1795,6 +1810,20 @@ impl Core {
         if let Some(shard) = self.shards.get_mut(&stream.shard) {
             shard.counters.catch_up_bytes += message.read_bytes;
         }
+        // Still listed, with the object gone: these records are lost to this reader. A list
+        // that has moved on means compaction has them, and the read carries on from there.
+        if let Some(gone) = &message.gone
+            && stream.delivery.drop_path(gone) > 0
+        {
+            self.send_catch(
+                message.sub,
+                CatchReply::Fail {
+                    code: ErrorCode::RetentionExpired,
+                    msg: "the object holding these records is gone".to_owned(),
+                },
+            );
+            return;
+        }
         let limit = stream.delivery.visible_through;
         if message.after >= limit {
             let head = stream.delivery.visible_head(stream.ids.last_id());
@@ -2225,6 +2254,10 @@ impl Core {
                         reply,
                     });
                 }
+                Route::Here(_) if &*stream == MANIFEST_STREAM => {
+                    let config = self.streams.get(&*stream).map(|known| known.config);
+                    let _ = reply.send(config.unwrap_or_default());
+                }
                 Route::Here(shard) => {
                     let config = &mut self.stream_entry(&stream, shard).config;
                     if let Some(level) = patch.default_ack_level {
@@ -2244,6 +2277,9 @@ impl Core {
             ControlMsg::DeleteStream { stream, reply } => match self.route(&stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::DeleteStream { stream, reply });
+                }
+                Route::Here(_) if &*stream == MANIFEST_STREAM => {
+                    let _ = reply.send(false);
                 }
                 Route::Here(shard) => {
                     let deleted = self.on_delete_stream(&stream, shard);
@@ -2404,6 +2440,71 @@ impl Core {
                 }
             }
             ControlMsg::ExtentsNoted { stream, tag } => self.note_batches(&stream, tag),
+            ControlMsg::PublishManifest { doc, reply } => self.on_publish_manifest(doc, reply),
+            ControlMsg::CompactView {
+                stream,
+                path,
+                footer,
+                reply,
+            } => {
+                if let Route::Forward(to) = self.route(&stream) {
+                    let _ = self.links.control[to].send(ControlMsg::CompactView {
+                        stream,
+                        path,
+                        footer,
+                        reply,
+                    });
+                    return;
+                }
+                let _ = reply.send(self.compact_view(&stream, &path, &footer));
+            }
+            ControlMsg::ReplaceExtents {
+                stream,
+                path,
+                sources,
+                extent,
+                reply,
+            } => {
+                if let Route::Forward(to) = self.route(&stream) {
+                    let _ = self.links.control[to].send(ControlMsg::ReplaceExtents {
+                        stream,
+                        path,
+                        sources,
+                        extent,
+                        reply,
+                    });
+                    return;
+                }
+                let merge_below = self.merge_below(&stream);
+                let result = self
+                    .streams
+                    .get_mut(&*stream)
+                    .map_or(ReplaceResult::Gone, |known| {
+                        known
+                            .delivery
+                            .replace_extents(&path, &sources, &extent, merge_below)
+                    });
+                let _ = reply.send(result);
+            }
+            ControlMsg::DropExtents {
+                stream,
+                path,
+                reply,
+            } => {
+                if let Route::Forward(to) = self.route(&stream) {
+                    let _ = self.links.control[to].send(ControlMsg::DropExtents {
+                        stream,
+                        path,
+                        reply,
+                    });
+                    return;
+                }
+                let dropped = self
+                    .streams
+                    .get_mut(&*stream)
+                    .is_some_and(|known| known.delivery.drop_path(&path) > 0);
+                let _ = reply.send(dropped);
+            }
             ControlMsg::DurableSeen { core, ticket } => {
                 self.durable_by_core[core] = self.durable_by_core[core].max(ticket);
                 self.drain_foreign_visible();
@@ -2549,6 +2650,106 @@ impl Core {
                 self.run_parked(&name, loading.parked);
             }
         }
+    }
+
+    /// A seal manifest is a system record, so nothing a client sends can look like one
+    /// (sections 2.2, 7.5).
+    fn on_publish_manifest(&mut self, doc: Vec<u8>, reply: ReplyTx) {
+        let name: Arc<str> = Arc::from(MANIFEST_STREAM);
+        let shard = match self.route(&name) {
+            Route::Forward(to) => {
+                let _ = self.links.control[to].send(ControlMsg::PublishManifest { doc, reply });
+                return;
+            }
+            Route::Here(shard) => shard,
+        };
+        if self.wal_stopped {
+            return;
+        }
+        let now_ms = self.clock.now_ms();
+        let stream = self.stream_entry(&name, shard);
+        // Its objects stay until every worker has passed them, so time doesn't limit a reader.
+        stream.config.retention_ms = u64::MAX;
+        let Ok(id) = stream.ids.allocate(now_ms, 1) else {
+            return;
+        };
+        let mut system = Vec::with_capacity(HEADER_BYTES + ACTOR_BYTES + doc.len() + 8);
+        encode_system_record(&mut system, id, ENTRY_SEAL_MANIFEST, 0, &doc)
+            .expect("a path is far under the length limit");
+        let mut region = self.pool.alloc(system.len());
+        region.copy_from_slice(&system);
+        self.commit(
+            &name,
+            CommitIds {
+                producer_id: 0,
+                producer_seq: 0,
+                first_id: id,
+                last_id: id,
+                record_count: 1,
+                state_after: None,
+            },
+            region.freeze(),
+            2,
+            Waiter {
+                reply: Reply::Ack {
+                    handle: 0,
+                    producer_seq: 0,
+                    first_id: id,
+                    count: 1,
+                },
+                tx: reply,
+            },
+        );
+    }
+
+    /// Records at or above this may have no extent yet, here or on an earlier owner.
+    fn merge_below(&self, name: &str) -> u64 {
+        let elsewhere = self
+            .streams
+            .get(name)
+            .is_some_and(|stream| !stream.delivery.held_elsewhere.is_empty());
+        if elsewhere {
+            return 0;
+        }
+        self.logs
+            .get(name)
+            .and_then(|log| log.batches.front())
+            .map_or(u64::MAX, |batch| batch.first_id)
+    }
+
+    fn compact_view(
+        &self,
+        name: &str,
+        path: &object_store::path::Path,
+        footer: &[(u64, u64)],
+    ) -> Option<CompactView> {
+        let stream = self.streams.get(name)?;
+        let delivery = &stream.delivery;
+        let unnoted = footer.iter().any(|(id_first, id_last)| {
+            *id_last > delivery.floor_id
+                && delivery
+                    .first_extent_after(id_first.saturating_sub(1))
+                    .is_none_or(|known| known.extent.id_first > *id_last)
+        });
+        let sources = delivery
+            .extents
+            .iter()
+            .enumerate()
+            .filter(|(_, known)| known.path == *path)
+            .map(|(at, known)| CompactSource {
+                extent: known.extent.clone(),
+                next_id_first: delivery
+                    .extents
+                    .get(at + 1)
+                    .map(|next| next.extent.id_first),
+            })
+            .collect();
+        Some(CompactView {
+            retention_ms: stream.config.retention_ms,
+            unnoted,
+            sources,
+            merge_below: self.merge_below(name),
+        })
     }
 
     fn install_meta(&mut self, name: &Arc<str>, meta: StreamMeta, shard: u32) {
@@ -2738,6 +2939,7 @@ impl Core {
                     .drain(..)
                     .map(|known| crate::recovery::meta_extent(&known))
                     .collect(),
+                dropped_extents: std::mem::take(&mut delivery.dropped_extents),
             });
         }
         for (name, last_id) in self.dirty_tombstones.drain(..) {
@@ -3130,7 +3332,11 @@ fn control_stream(message: &ControlMsg) -> Option<Arc<str>> {
         | ControlMsg::Snapshot { stream, .. }
         | ControlMsg::Configure { stream, .. }
         | ControlMsg::Cursor { stream, .. }
+        | ControlMsg::CompactView { stream, .. }
+        | ControlMsg::ReplaceExtents { stream, .. }
+        | ControlMsg::DropExtents { stream, .. }
         | ControlMsg::AddExtents { stream, .. } => Some(Arc::clone(stream)),
+        ControlMsg::PublishManifest { .. } => Some(Arc::from(MANIFEST_STREAM)),
         ControlMsg::Attach(message) => Some(Arc::clone(&message.stream)),
         _ => None,
     }

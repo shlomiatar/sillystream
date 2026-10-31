@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use server::net::{Server, ServerConfig};
-use server::{LocalCacheConfig, NodeConfig, RecoverConfig, SystemClock};
+use server::{Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SystemClock};
 use storage::{ObjectStoreConfig, S3Config, build_store};
 
 const USAGE: &str = "\
@@ -13,7 +13,8 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
     --token-secret-file FILE --object-store local:DIR|memory|s3:BUCKET
   [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
-  [--active-stream-limit N]
+  [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
+  [--compact-merge-wait-ms N]
 
 For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
 usual AWS variables. Real S3 has not been exercised.";
@@ -50,6 +51,7 @@ fn run() -> Result<(), String> {
     let mut preallocate_bytes = WAL_PREALLOCATE_DEFAULT_BYTES;
     let mut max_frame_bytes = None;
     let mut active_stream_limit = None;
+    let mut compaction = CompactionConfig::default();
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!("{USAGE}");
@@ -77,6 +79,9 @@ fn run() -> Result<(), String> {
             "--wal-preallocate-bytes" => preallocate_bytes = number(&value)?,
             "--max-frame-bytes" => max_frame_bytes = Some(number(&value)?),
             "--active-stream-limit" => active_stream_limit = Some(number(&value)? as usize),
+            "--compact-period-ms" => compaction.compact_period_ms = Some(number(&value)?),
+            "--expire-period-ms" => compaction.expire_period_ms = Some(number(&value)?),
+            "--compact-merge-wait-ms" => compaction.merge_wait_ms = number(&value)?,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -118,6 +123,7 @@ fn run() -> Result<(), String> {
         node.max_frame_bytes = frame_bytes;
     }
     node.active_stream_limit = active_stream_limit;
+    node.compaction = Some(compaction);
     node.local_cache = Some(LocalCacheConfig {
         dir: data_dir.join("cache"),
         cap_bytes: cache_cap_bytes,
@@ -137,7 +143,7 @@ fn run() -> Result<(), String> {
             wal_preallocate_bytes: preallocate_bytes,
         },
         store,
-        Arc::new(SystemClock),
+        clock(),
     )
     .map_err(|error| error.to_string())?;
     if let Some(warning) = report.warning() {
@@ -164,6 +170,28 @@ fn run() -> Result<(), String> {
         return Err(format!("the WAL stopped with an error: {error}"));
     }
     Ok(())
+}
+
+/// With `test-hooks`, `SILLYSTREAM_CLOCK_OFFSET_MS` moves the time ids and expiry read, so that
+/// retention can be reached end to end. A release build has no such thing (D32).
+#[cfg(feature = "test-hooks")]
+fn clock() -> Arc<dyn Clock> {
+    struct OffsetClock(u64);
+    impl Clock for OffsetClock {
+        fn now_ms(&self) -> u64 {
+            SystemClock.now_ms() + self.0
+        }
+    }
+    let offset_ms = std::env::var("SILLYSTREAM_CLOCK_OFFSET_MS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    Arc::new(OffsetClock(offset_ms))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn clock() -> Arc<dyn Clock> {
+    Arc::new(SystemClock)
 }
 
 fn parse_store(text: &str) -> Result<ObjectStoreConfig, String> {

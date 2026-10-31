@@ -697,6 +697,29 @@ where
 /// failure, which counts as done (D55).
 async fn put_once(store: &dyn ObjectStore, path: &Path, parts: &[Bytes]) -> Result<(), PutError> {
     crate::crash::crash_point("seal.before_put");
+    put_create(store, path, parts).await
+}
+
+/// An object nobody else can overwrite, under the first free name from `first_id` on (D156). The
+/// same bytes at a path count as done. Compaction's outputs go through this. A store error is
+/// the caller's to retry.
+pub async fn put_new_object(
+    store: &dyn ObjectStore,
+    path_for: impl Fn(u64) -> Path,
+    mut first_id: u64,
+    parts: &[Bytes],
+) -> Result<Path, String> {
+    loop {
+        let path = path_for(first_id);
+        match put_create(store, &path, parts).await {
+            Ok(()) => return Ok(path),
+            Err(PutError::Collision) => first_id += 1,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+async fn put_create(store: &dyn ObjectStore, path: &Path, parts: &[Bytes]) -> Result<(), PutError> {
     let payload = PutPayload::from_iter(parts.iter().cloned());
     let options = PutOptions {
         mode: PutMode::Create,

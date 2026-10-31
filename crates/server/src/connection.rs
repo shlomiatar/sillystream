@@ -519,6 +519,8 @@ struct Sub {
     /// A `BEHIND` is on its way. Catching up waits until the client has read it (D86, D99).
     behind_unread: bool,
     extent: Option<ExtentProgress>,
+    /// An object found missing, for the next step to tell the owner of.
+    gone: Option<object_store::path::Path>,
     read_bytes_since: u64,
     state_ver: u64,
     latest_state: Option<(u64, Bytes)>,
@@ -1040,6 +1042,7 @@ impl Home {
             read_out: false,
             behind_unread: false,
             extent: None,
+            gone: None,
             read_bytes_since: 0,
             state_ver: 0,
             latest_state: None,
@@ -1716,6 +1719,7 @@ impl Home {
             filter: sub.filter,
             after: sub.position,
             read_bytes: std::mem::take(&mut sub.read_bytes_since),
+            gone: sub.gone.take(),
         };
         let _ = self.links.reads[self.me].send(ReadMsg::Step(Box::new(message)));
     }
@@ -1825,6 +1829,10 @@ impl Home {
         sub.read_out = false;
         match done {
             ReadDone::Retry => {}
+            ReadDone::Gone => {
+                // Compaction may have moved these records, and the owner knows where.
+                sub.gone = sub.extent.take().map(|progress| progress.extent.path);
+            }
             ReadDone::Fail { code, msg } => {
                 let (conn, id) = (sub.conn, sub.id);
                 self.send_event(
@@ -1987,10 +1995,7 @@ async fn run_extent_job(job: ExtentJob) {
         }
         None => match read_from(Arc::clone(&job.stores.object), &job).await {
             Ok(read) => ReadDone::Read(read),
-            Err(SegmentError::Store(object_store::Error::NotFound { .. })) => ReadDone::Fail {
-                code: ErrorCode::RetentionExpired,
-                msg: "the object holding these records is gone".to_owned(),
-            },
+            Err(SegmentError::Store(object_store::Error::NotFound { .. })) => ReadDone::Gone,
             Err(SegmentError::Store(_)) => {
                 tokio::time::sleep(Duration::from_millis(READ_RETRY_MS)).await;
                 ReadDone::Retry

@@ -26,5 +26,6 @@ pub use record::{
 };
 pub use summary::{BlockAuthor, BlockSummary, Decision};
 pub use system::{
-    ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, SystemRecord, encode_system_record,
+    ENTRY_SEAL_MANIFEST, ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, SystemRecord,
+    decode_manifest_doc, encode_manifest_doc, encode_system_record,
 };

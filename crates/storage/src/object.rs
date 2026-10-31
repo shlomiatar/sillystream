@@ -118,6 +118,54 @@ pub fn object_generation(path: &Path) -> Option<u64> {
     name.split_once('-')?.0.parse().ok()
 }
 
+/// The prefix a compacted object goes in, or `sealed` for new ones (section 7.4).
+pub const SEALED_PREFIX: &str = "sealed";
+
+/// `<class>/<ingest_hour>/<node>/<generation>-<first_id>.seg`, the same form as `sealed/`. The
+/// hour is the sources', so a prefix holds what expires together.
+pub fn compacted_path(class: &str, hour: u64, node: &str, generation: u64, first_id: u64) -> Path {
+    let hour = hour.to_string();
+    let name = format!("{generation:020}-{first_id:020}.seg");
+    Path::from_iter([
+        PathPart::from(class),
+        PathPart::from(hour.as_str()),
+        PathPart::from(node),
+        PathPart::from(name.as_str()),
+    ])
+}
+
+/// The ingest hour in an object's path (D53).
+pub fn object_hour(path: &Path) -> Option<u64> {
+    path.parts().nth(1)?.as_ref().parse().ok()
+}
+
+/// The hours under a prefix such as `sealed/`, oldest first.
+pub async fn list_hours(store: &dyn ObjectStore, root: &str) -> object_store::Result<Vec<u64>> {
+    let listed = store.list_with_delimiter(Some(&Path::from(root))).await?;
+    let mut hours: Vec<u64> = listed
+        .common_prefixes
+        .iter()
+        .filter_map(|prefix| prefix.filename()?.parse().ok())
+        .collect();
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// Every object of one hour under a prefix.
+pub async fn list_hour_objects(
+    store: &dyn ObjectStore,
+    root: &str,
+    hour: u64,
+) -> object_store::Result<Vec<object_store::ObjectMeta>> {
+    let prefix = Path::from_iter([root, hour.to_string().as_str()]);
+    let owners = store.list_with_delimiter(Some(&prefix)).await?;
+    let mut out = owners.objects;
+    for owner in owners.common_prefixes {
+        out.extend(store.list_with_delimiter(Some(&owner)).await?.objects);
+    }
+    Ok(out)
+}
+
 /// Every object under `sealed/`, listing hour by hour and owner by owner.
 pub async fn list_sealed_objects(
     store: &dyn ObjectStore,

@@ -24,6 +24,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::clock::Clock;
+use crate::compaction::{
+    CompactCmd, CompactReport, CompactionConfig, Compactor, ExpireReport, MANIFEST_STREAM,
+    RetentionClass,
+};
 use crate::connection::{Connection, DeliverySettings, Stores};
 use crate::core::{Core, CoreConfig, CoreInbox, CoreParts, CoreToNode, Links};
 use crate::message::{
@@ -34,7 +38,7 @@ use crate::metadata::{
     CheckpointDone, CheckpointJob, Checkpointer, LocalMeta, run_checkpointer, run_loader,
 };
 use crate::placement::{ShardMove, plan_moves, shard_of};
-use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, prepare};
+use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, ScannedObject, prepare};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 use crate::state::StateOp;
 
@@ -97,6 +101,9 @@ pub struct NodeConfig {
     /// With a metadata store, every this many checkpoint files one holds everything, and older
     /// ones can go (D20).
     pub full_checkpoint_every_count: usize,
+    /// With a metadata store: seal manifests, the compactor and the delete job (sections 7.4,
+    /// 7.5). `None` keeps every record for good.
+    pub compaction: Option<CompactionConfig>,
 }
 
 impl NodeConfig {
@@ -133,6 +140,7 @@ impl NodeConfig {
             catch_up_read_bytes: 1024 * 1024,
             active_stream_limit: None,
             full_checkpoint_every_count: 64,
+            compaction: None,
         }
     }
 }
@@ -159,7 +167,7 @@ pub enum SealOutcome {
     NodeStopped,
 }
 
-enum NodeMsg {
+pub(crate) enum NodeMsg {
     FromCore(CoreToNode),
     Seal {
         reply: oneshot::Sender<SealOutcome>,
@@ -168,6 +176,14 @@ enum NodeMsg {
     /// node has none or can no longer seal.
     SealAndCheckpoint {
         reply: oneshot::Sender<bool>,
+    },
+    /// Answers when the next seal's checkpoint is saved, without asking for a seal.
+    NextCheckpoint {
+        reply: oneshot::Sender<bool>,
+    },
+    /// An object's manifest is in the WAL, so a checkpoint may record it (section 7.5).
+    ManifestDurable {
+        path: String,
     },
     CheckpointSaved(CheckpointDone),
     RetryRotate,
@@ -210,6 +226,10 @@ struct Control {
     waiters_by_seal: HashMap<u64, Vec<oneshot::Sender<SealOutcome>>>,
     /// `None` on a node without a metadata store.
     meta: Option<ControlMeta>,
+    /// Whether objects get a manifest.
+    manifests: bool,
+    /// Objects a startup found that need one.
+    startup_manifests: Vec<(String, u64)>,
 }
 
 /// Who waits for a checkpoint, and what each is told if none can come.
@@ -239,6 +259,9 @@ impl Control {
         };
         let mut next_seal = after(self.config.seal_window_ms);
         let mut next_rebalance = after(self.config.rebalance_period_ms);
+        for (path, len_bytes) in std::mem::take(&mut self.startup_manifests) {
+            self.publish_manifest(path, len_bytes);
+        }
         loop {
             tokio::select! {
                 biased;
@@ -287,6 +310,17 @@ impl Control {
                 self.wait_for_checkpoint((reply, true));
             }
             NodeMsg::SealAndCheckpoint { reply } => self.wait_for_checkpoint((reply, false)),
+            NodeMsg::NextCheckpoint { reply } => match &mut self.meta {
+                Some(meta) => meta.next_waiters.push((reply, false)),
+                None => {
+                    let _ = reply.send(false);
+                }
+            },
+            NodeMsg::ManifestDurable { path } => {
+                if let Some(meta) = &mut self.meta {
+                    meta.objects.push(path);
+                }
+            }
             NodeMsg::CheckpointSaved(done) => self.on_checkpoint_saved(done),
             NodeMsg::Seal { reply } => {
                 self.seal_waiters.push(reply);
@@ -473,8 +507,23 @@ impl Control {
     }
 
     async fn on_upload_event(&mut self, event: UploadEvent) {
-        if let (Some(meta), UploadEvent::Uploaded { path, .. }) = (&mut self.meta, &event) {
-            meta.objects.push(path.to_string());
+        if let UploadEvent::Uploaded {
+            path,
+            len_bytes,
+            extents,
+            ..
+        } = &event
+        {
+            // The rule section 7.5 asks for: the manifest stream's own objects get none, or
+            // each manifest would make an object that makes a manifest (Q4).
+            let others = extents
+                .iter()
+                .any(|extent| &*extent.stream != MANIFEST_STREAM);
+            if self.manifests && others {
+                self.publish_manifest(path.to_string(), *len_bytes);
+            } else if let Some(meta) = &mut self.meta {
+                meta.objects.push(path.to_string());
+            }
         }
         let (seal, outcome) = match event {
             UploadEvent::Uploaded {
@@ -504,6 +553,24 @@ impl Control {
         for waiter in self.waiters_by_seal.remove(&seal).unwrap_or_default() {
             let _ = waiter.send(outcome.clone());
         }
+    }
+
+    /// The manifest of an uploaded object. Only once it is in the WAL does a checkpoint record
+    /// the object: a startup looks at any object no checkpoint records and publishes again, so
+    /// a crash can't leave an object the compactor will never hear of (section 7.5).
+    fn publish_manifest(&mut self, path: String, len_bytes: u64) {
+        storage::crash_point("manifest.before_publish");
+        let (reply, mut answer) = mpsc::unbounded_channel();
+        let shard = shard_of(MANIFEST_STREAM, self.config.virtual_shard_count);
+        let core = self.location[shard as usize] as usize;
+        let doc = format::encode_manifest_doc(len_bytes, &path);
+        let _ = self.links.control[core].send(ControlMsg::PublishManifest { doc, reply });
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Some(Reply::Ack { .. }) = answer.recv().await {
+                let _ = tx.send(NodeMsg::ManifestDurable { path });
+            }
+        });
     }
 
     /// What the API can ask for, unlike the rebalancer's plan, may not exist: a core that
@@ -588,7 +655,7 @@ impl Control {
     }
 }
 
-async fn sleep_until_some(deadline: Option<Instant>) {
+pub(crate) async fn sleep_until_some(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
@@ -683,6 +750,9 @@ pub struct Node {
     /// The metadata threads, which go last since cores and control send to them.
     meta_threads: Vec<JoinHandle<()>>,
     meta_stop: Arc<AtomicBool>,
+    /// `None` without a metadata store or with compaction off.
+    compact_tx: Option<mpsc::UnboundedSender<CompactCmd>>,
+    compact_stop: Option<oneshot::Sender<()>>,
 }
 
 /// What a recovering start adds to a plain one.
@@ -693,7 +763,7 @@ struct RecoveredParts {
     first_seq: u64,
     closed_seqs: Vec<u64>,
     restored: Vec<RestoredStream>,
-    scanned_objects: Vec<String>,
+    scanned_objects: Vec<ScannedObject>,
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
@@ -931,6 +1001,9 @@ impl Node {
             .collect();
         let mut meta_threads = Vec::new();
         let mut meta = None;
+        let mut startup_manifests = Vec::new();
+        let mut manifests = false;
+        let mut compactor = None;
         if let (Some(parts), Some((loader_tx, loader_rx))) = (recovered, loader) {
             // Before anything can reach the cores: these come first in each one's control
             // channel, and control is what a core reads first (D134).
@@ -938,6 +1011,38 @@ impl Node {
                 let shard = shard_of(&stream.meta.name, config.virtual_shard_count);
                 let core = shard as usize % core_count;
                 let _ = links.control[core].send(ControlMsg::Restore(Box::new(stream)));
+            }
+            manifests = config.compaction.is_some();
+            let mut known_objects = Vec::new();
+            for object in parts.scanned_objects {
+                if manifests && object.needs_manifest {
+                    startup_manifests.push((object.path, object.len_bytes));
+                } else {
+                    known_objects.push(object.path);
+                }
+            }
+            if let Some(compaction) = &config.compaction {
+                compactor = Some(Compactor {
+                    config: compaction.clone(),
+                    node_name: config.node_name.clone(),
+                    generation: config.generation,
+                    ownership: parts.checkpoints.ownership.clone(),
+                    store: Arc::clone(&store),
+                    clock: Arc::clone(&clock),
+                    links: links.clone(),
+                    virtual_shard_count: config.virtual_shard_count,
+                    core_count,
+                    window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
+                    has_seal_window: config.seal_window_ms.is_some(),
+                    to_control: to_control.clone(),
+                    noted: std::sync::Mutex::new(
+                        parts
+                            .checkpoints
+                            .recorded_objects()
+                            .map(str::to_owned)
+                            .collect(),
+                    ),
+                });
             }
             let (jobs, job_rx) = mpsc::unbounded_channel();
             let checkpointer = Checkpointer {
@@ -977,7 +1082,7 @@ impl Node {
             meta = Some(ControlMeta {
                 jobs,
                 closed_seq_by_seal: HashMap::new(),
-                objects: parts.scanned_objects,
+                objects: known_objects,
                 gather_count: 0,
                 next_waiters: Vec::new(),
                 waiters_by_seal: BTreeMap::new(),
@@ -996,6 +1101,8 @@ impl Node {
             seal_waiters: Vec::new(),
             waiters_by_seal: HashMap::new(),
             meta,
+            manifests,
+            startup_manifests,
         };
         let runtime = runtime()?;
         threads.push(
@@ -1005,6 +1112,19 @@ impl Node {
                     runtime.block_on(control.run(control_rx, core_rx, control_uploads))
                 })?,
         );
+
+        let (mut compact_tx, mut compact_stop) = (None, None);
+        if let Some(compactor) = compactor {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (stop, stopped) = oneshot::channel();
+            compact_tx = Some(tx);
+            compact_stop = Some(stop);
+            meta_threads.push(
+                std::thread::Builder::new()
+                    .name("compactor".to_owned())
+                    .spawn(move || compactor.run(rx, stopped))?,
+            );
+        }
 
         Ok(Node {
             config,
@@ -1017,6 +1137,8 @@ impl Node {
             wal: Some(wal_handle),
             meta_threads,
             meta_stop,
+            compact_tx,
+            compact_stop,
         })
     }
 
@@ -1131,6 +1253,30 @@ impl Node {
         answer.await.unwrap_or(false)
     }
 
+    /// Runs these classes' workers now, up to everything published, whatever `merge_wait_ms` says,
+    /// and seals to make it durable. `None` if this node has no compactor.
+    pub async fn compact_now(&self, classes: &[RetentionClass]) -> Option<CompactReport> {
+        let (reply, answer) = oneshot::channel();
+        self.compact_tx
+            .as_ref()?
+            .send(CompactCmd::Compact {
+                classes: classes.to_vec(),
+                reply,
+            })
+            .ok()?;
+        answer.await.ok()
+    }
+
+    /// Runs the delete job now (section 7.4). `None` if this node has no compactor.
+    pub async fn expire_now(&self) -> Option<ExpireReport> {
+        let (reply, answer) = oneshot::channel();
+        self.compact_tx
+            .as_ref()?
+            .send(CompactCmd::Expire { reply })
+            .ok()?;
+        answer.await.ok()
+    }
+
     /// Runs the periodic check now, and returns its moves once they have finished.
     pub async fn rebalance_now(&self) -> Vec<ShardMove> {
         let (reply, answer) = oneshot::channel();
@@ -1168,6 +1314,7 @@ impl Node {
 
     /// Stops everything and waits. A WAL held in a `sync_data` has to be let go first.
     pub fn shutdown(mut self) -> NodeExit {
+        self.compact_stop.take();
         self.request_stop();
         self.meta_stop.store(true, Ordering::SeqCst);
         for thread in self.threads.drain(..) {
@@ -1199,6 +1346,7 @@ impl Node {
 impl Drop for Node {
     /// A dropped node's threads end by themselves. The uploader's own drop stops it.
     fn drop(&mut self) {
+        self.compact_stop.take();
         self.request_stop();
         self.meta_stop.store(true, Ordering::SeqCst);
     }

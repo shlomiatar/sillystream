@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod clock;
+mod compaction;
 mod connection;
 mod core;
 mod dedupe;
@@ -22,6 +23,10 @@ mod slab;
 mod state;
 
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use compaction::{
+    CLASS_GRACE_MS, CompactReport, CompactionConfig, ExpireReport, MANIFEST_STREAM, RetentionClass,
+    SEALED_EXPIRY_MS,
+};
 pub use connection::{Connection, DataFrame, DataPart, Event, Subscription};
 pub use dedupe::{
     DEDUPE_CAP_COUNT, DEDUPE_ENTRY_BYTES, DEDUPE_IDLE_MS, DedupeCheck, DedupeEntry, DedupeTable,

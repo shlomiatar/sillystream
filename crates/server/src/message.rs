@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::connection::{CommandTicket, Event, ExtentRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
-use crate::delivery::{ExtentRef, FanOut, StreamDelivery};
+use crate::delivery::{ExtentRef, FanOut, ReplaceResult, StreamDelivery};
 use crate::placement::ShardCounters;
 use crate::slab::{SlabBytes, SlabRegion};
 use crate::state::{StateOp, StreamState};
@@ -60,7 +60,7 @@ pub(crate) type ReplyTx = mpsc::UnboundedSender<Reply>;
 pub struct StreamConfig {
     pub default_ack_level: u8,
     pub min_ack_level: u8,
-    /// Section 7.4's class, as a length of time. Only reads use it until M8 (D89).
+    /// Section 7.4's class, as a length of time.
     pub retention_ms: u64,
 }
 
@@ -451,6 +451,34 @@ pub(crate) enum ControlMsg {
     CheckpointDone {
         gather: u64,
     },
+    /// Writes a seal manifest to the manifest stream, and acks at level 2 (section 7.5).
+    PublishManifest {
+        doc: Vec<u8>,
+        reply: ReplyTx,
+    },
+    /// What the compactor needs of a stream, for one source object.
+    CompactView {
+        stream: Arc<str>,
+        path: object_store::path::Path,
+        /// Id ranges the object's footer holds for this stream.
+        footer: Vec<(u64, u64)>,
+        reply: oneshot::Sender<Option<CompactView>>,
+    },
+    /// Readers follow a compacted extent from here on (section 7.5).
+    ReplaceExtents {
+        stream: Arc<str>,
+        path: object_store::path::Path,
+        /// `(path, id_first, id_last)`, neighbours in id order.
+        sources: Vec<(object_store::path::Path, u64, u64)>,
+        extent: storage::StreamExtent,
+        reply: oneshot::Sender<ReplaceResult>,
+    },
+    /// An object is about to expire, so nothing may point at it.
+    DropExtents {
+        stream: Arc<str>,
+        path: object_store::path::Path,
+        reply: oneshot::Sender<bool>,
+    },
     /// The metadata a load found, or `None` if there is no such stream (section 7.6).
     Loaded {
         stream: Arc<str>,
@@ -459,6 +487,25 @@ pub(crate) enum ControlMsg {
         rebuilt: bool,
     },
     Stop,
+}
+
+/// One source extent, and the extent after it in the owner's list.
+#[derive(Debug, Clone)]
+pub(crate) struct CompactSource {
+    pub extent: storage::StreamExtent,
+    pub next_id_first: Option<u64>,
+}
+
+/// An owner's answer to the compactor.
+#[derive(Debug)]
+pub(crate) struct CompactView {
+    pub retention_ms: u64,
+    /// The footer holds ids this owner hasn't heard of yet: its extents are still on their way.
+    pub unnoted: bool,
+    /// What it holds at this path. A footer range missing here was compacted, or expired.
+    pub sources: Vec<CompactSource>,
+    /// A merged extent must end below this: at or above it, records may still be unsealed.
+    pub merge_below: u64,
 }
 
 /// A connection on its home core, and the reference an error about a cursor should use.
@@ -595,6 +642,8 @@ pub(crate) struct ReadStepMsg {
     pub after: u64,
     /// Bytes read since the last step, for the shard's counters.
     pub read_bytes: u64,
+    /// An object the subscriber found missing, which may have been compacted away.
+    pub gone: Option<object_store::path::Path>,
 }
 
 /// A read step's walk over the cores that stamped the ids in question, oldest first, which
@@ -638,6 +687,8 @@ pub(crate) enum ReadDone {
     Read(ExtentRead),
     /// The store failed. The next try is the subscriber's to start.
     Retry,
+    /// The object isn't there. The owner knows if the records are somewhere else.
+    Gone,
     Fail {
         code: ErrorCode,
         msg: String,
