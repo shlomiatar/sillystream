@@ -466,12 +466,12 @@ Separately, the temp file cleanup in `SegmentCache::put` is tested through a fai
 
 **M10: `sink_forward` restarts during load.** It does `kill -9` while source publishes are still flowing, so forwarding is usually in progress, though the suite can't see that from outside.
 
-**M10: two older tests failed in full workspace runs. Neither is fixed, weakened or skipped, and neither is in the e2e suite.** Both are timing failures seen with \`cargo test --workspace --no-fail-fast\` on the code at \`0681e76\`:
+**M10: two older tests failed in full workspace runs. Neither is fixed, weakened or skipped, and neither is in the e2e suite.** Both are timing failures seen with `cargo test --workspace --no-fail-fast` on the code at `0681e76`:
 
-- \`server --test compaction a_manifest_only_in_the_wal_leaves_its_object_unrecorded\`, line 1601, one of two workspace runs. Already listed above as depending on timing.
-- \`server --test sinks on_expire_stop_warns_then_halts\`, line 176, "more requests arrived than expected", 4 against 3, one of two workspace runs. Measured: 1 of 15 alone, 0 of 6 runs of the whole binary. The test takes its count once the sink reports paused, so a delivery already in flight could arrive after that, which section 9 allows. That cause is inferred from reading the test, and wasn't shown. If it's wrong, a paused sink is sending a request.
+- `server --test compaction a_manifest_only_in_the_wal_leaves_its_object_unrecorded`, line 1601, one of two workspace runs. Already listed above as depending on timing.
+- `server --test sinks on_expire_stop_warns_then_halts`, line 176, "more requests arrived than expected", 4 against 3, one of two workspace runs. Measured: 1 of 15 alone, 0 of 6 runs of the whole binary. The test takes its count once the sink reports paused, so a delivery already in flight could arrive after that, which section 9 allows. That cause is inferred from reading the test, and wasn't shown. If it's wrong, a paused sink is sending a request.
 
-So \`cargo test --workspace\` isn't reliably green, though all other tests passed on those runs (705 passed, 1 failed on the second).
+So `cargo test --workspace` isn't reliably green, though all other tests passed on those runs (705 passed, 1 failed on the second).
 
 ## Process
 
