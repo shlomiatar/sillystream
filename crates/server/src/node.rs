@@ -73,6 +73,8 @@ pub struct NodeConfig {
     pub stream_buffer_bytes: u64,
     pub upload_retry_initial_ms: u64,
     pub upload_retry_max_ms: u64,
+    /// The least one PUT attempt gets before it counts as failed and retries (D242).
+    pub upload_put_timeout_min_ms: u64,
     /// `None` rebalances only when asked.
     pub rebalance_period_ms: Option<u64>,
     /// A core is overloaded above this × the mean.
@@ -130,6 +132,7 @@ impl NodeConfig {
             stream_buffer_bytes: 32 * 1024 * 1024,
             upload_retry_initial_ms: 100,
             upload_retry_max_ms: 10_000,
+            upload_put_timeout_min_ms: 60_000,
             rebalance_period_ms: Some(10_000),
             overload_ratio: 1.25,
             max_moves_per_check: 16,
@@ -925,6 +928,7 @@ impl Node {
             channel_capacity: config.upload_channel_capacity,
             retry_initial_ms: config.upload_retry_initial_ms,
             retry_max_ms: config.upload_retry_max_ms,
+            put_timeout_min_ms: config.upload_put_timeout_min_ms,
             cache,
             events: upload_txs,
         })?;

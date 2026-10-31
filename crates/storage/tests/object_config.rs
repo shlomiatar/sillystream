@@ -132,6 +132,7 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
         channel_capacity: 4,
         retry_initial_ms: 1,
         retry_max_ms: 4,
+        put_timeout_min_ms: 60_000,
         cache: None,
         events: vec![events_tx],
     })

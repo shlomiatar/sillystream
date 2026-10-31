@@ -46,6 +46,7 @@ fn config(
             channel_capacity: 64,
             retry_initial_ms: 1,
             retry_max_ms: 4,
+            put_timeout_min_ms: 60_000,
             cache: None,
             events: vec![tx],
         },
@@ -932,4 +933,109 @@ async fn shutdown_does_not_wait_for_a_put_stuck_on_a_blocking_thread() {
         UnfinishedUpload::Dedicated { number: 7, .. }
     ));
     drop(release);
+}
+
+/// A store whose first PUT never returns.
+#[derive(Debug)]
+struct HangsOnce {
+    inner: InMemory,
+    hung: AtomicBool,
+}
+
+impl std::fmt::Display for HangsOnce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HangsOnce")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for HangsOnce {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if !self.hung.swap(true, Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// A PUT that doesn't return counts as a failed attempt, and doesn't hold up the node's uploads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_that_hangs_times_out_and_retries() {
+    let store: Arc<dyn ObjectStore> = Arc::new(HangsOnce {
+        inner: InMemory::new(),
+        hung: AtomicBool::new(false),
+    });
+    let (mut config, mut events) = config(Arc::clone(&store), SECTIONS);
+    config.put_timeout_min_ms = 50;
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sections, _) = sections(4, FIRST_ID);
+    for (core, section) in sections.into_iter().enumerate() {
+        sender.try_send_section(1, core, section).unwrap();
+    }
+    let mut retried = false;
+    let path = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            match events.recv().await.expect("the uploader stopped") {
+                UploadEvent::Uploaded { path, .. } => return path,
+                UploadEvent::Retrying { error, .. } => {
+                    assert!(error.contains("took over"), "{error}");
+                    retried = true;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the upload stayed behind the hung PUT");
+    assert!(retried);
+    store.get(&path).await.unwrap();
+    drop(sender);
+    uploader.shutdown();
 }

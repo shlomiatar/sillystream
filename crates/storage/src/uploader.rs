@@ -103,6 +103,9 @@ pub struct UploaderConfig {
     pub channel_capacity: usize,
     pub retry_initial_ms: u64,
     pub retry_max_ms: u64,
+    /// The least one PUT attempt gets, before allowing for its size. Past that it counts as a
+    /// retryable failure (D242).
+    pub put_timeout_min_ms: u64,
     /// Where uploaded objects are copied (section 6.2, step 5).
     pub cache: Option<SegmentCache>,
     /// Every core's event channel. Each event goes to all.
@@ -328,6 +331,8 @@ impl<R> Drop for Uploader<R> {
 
 /// How often an upload that is waiting looks at the stop flag.
 const STOP_CHECK_MS: u64 = 20;
+/// What a PUT attempt is allowed on top of its minimum: 1 MiB/s, about.
+const PUT_TIMEOUT_BYTES_PER_MS: u64 = 1_024;
 
 struct Worker<R> {
     config: UploaderConfig,
@@ -643,9 +648,24 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         path: &Path,
         parts: &[Bytes],
     ) -> Option<Result<(), PutError>> {
+        let total_bytes: usize = parts.iter().map(Bytes::len).sum();
+        let timeout_ms = self
+            .config
+            .put_timeout_min_ms
+            .saturating_add(total_bytes as u64 / PUT_TIMEOUT_BYTES_PER_MS);
+        let put = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            put_once(self.config.store.as_ref(), path, parts),
+        );
         tokio::select! {
             biased;
-            put = put_once(self.config.store.as_ref(), path, parts) => Some(put),
+            put = put => Some(put.unwrap_or_else(|_| {
+                // If the abandoned PUT lands after all, the retry finds the same bytes there.
+                Err(PutError::Retryable(object_store::Error::Generic {
+                    store: "uploader",
+                    source: format!("a PUT of {total_bytes} bytes took over {timeout_ms} ms").into(),
+                }))
+            })),
             _ = self.wait_for_stop() => None,
         }
     }
