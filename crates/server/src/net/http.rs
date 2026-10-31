@@ -587,6 +587,15 @@ impl<'a> HttpConn<'a> {
             response.status = 403;
             return self.refuse(&mut request, response).await;
         }
+        // A sink hands the stream's records to its destination, so making one takes what reading
+        // them takes (D235). Read and admin may come from different grants.
+        if matches!(route, Route::SinkPut(_))
+            && let Err(failure) = token.check(&stream, auth::PERM_READ, now_ms)
+        {
+            let mut response = error(ErrorCode::Unauthorized, &failure.to_string());
+            response.status = 403;
+            return self.refuse(&mut request, response).await;
+        }
         let limit_bytes = if route == Route::Publish {
             self.max_records_bytes()
         } else {

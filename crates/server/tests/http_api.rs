@@ -127,7 +127,14 @@ async fn every_route_checks_its_permission() {
     auth_is_checked(&server, "PUT", stream("/cursor/c"), auth::PERM_READ, b"1").await;
     auth_is_checked(&server, "PUT", stream(""), auth::PERM_ADMIN, b"{}").await;
     let sink = br#"{"kind":"archive"}"#;
-    auth_is_checked(&server, "PUT", stream("/sink/1"), auth::PERM_ADMIN, sink).await;
+    auth_is_checked(
+        &server,
+        "PUT",
+        stream("/sink/1"),
+        auth::PERM_ADMIN | auth::PERM_READ,
+        sink,
+    )
+    .await;
     auth_is_checked(
         &server,
         "POST",
@@ -1345,4 +1352,62 @@ async fn a_read_with_nothing_to_catch_up_on_doesnt_wait() {
         "{:?}",
         started.elapsed()
     );
+}
+
+/// A sink hands a stream's records to whoever made it, so making one takes what a read takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn making_a_sink_needs_read_on_its_source() {
+    let mut node = node_config(2);
+    node.sink.pool_thread_count = 2;
+    let server = start_node(node);
+    seed(&server, "secret", &[b"TOPSECRET"]).await;
+    seed(&server, "mine", &[b"mine"]).await;
+    let exp = START_MS + 1000;
+    let forward = br#"{"kind":"forward","target":"mine","start":"earliest"}"#;
+    let path = "/v1/stream/secret/sink/5";
+
+    let admin_only = token_at(
+        exp,
+        AUTHOR,
+        &[
+            ("secret", auth::PERM_ADMIN),
+            ("mine", auth::PERM_READ | auth::PERM_PUBLISH),
+        ],
+    );
+    let refused = server
+        .http(&Http::new("PUT", path, &admin_only).body(forward.to_vec()))
+        .await;
+    assert_code(&refused, 403, 1);
+    let archive = server
+        .http(&Http::new("PUT", path, &admin_only).body(br#"{"kind":"archive"}"#.to_vec()))
+        .await;
+    assert_code(&archive, 403, 1);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let read = server
+        .http(&Http::new(
+            "GET",
+            "/v1/stream/mine/read?from=0",
+            &token(ALL),
+        ))
+        .await;
+    assert!(
+        !read.body.windows(9).any(|window| window == b"TOPSECRET"),
+        "a token with no read permission got a stream's records"
+    );
+
+    // Read and admin may come from two grants that both match.
+    let both = token_at(
+        exp,
+        AUTHOR,
+        &[
+            ("secret", auth::PERM_ADMIN),
+            ("sec*", auth::PERM_READ),
+            ("mine", auth::PERM_PUBLISH),
+        ],
+    );
+    let created = server
+        .http(&Http::new("PUT", path, &both).body(forward.to_vec()))
+        .await;
+    assert_eq!(created.status, 200, "{}", created.text());
+    server.server.shutdown();
 }
