@@ -321,3 +321,18 @@ target/release/sillystream bench all --count 5000 --seconds 10 --idle-count 1000
 ## Not run yet
 
 The rest of the load generator numbers (M10): many streams on 16 cores, catch-up rate, memory per idle stream, PUTs per seal. Real S3 and EBS have not been exercised at all.
+
+### Throughput after D121
+
+The same throughput command, re-run after frames that span reads gained a copy (D121), on the same machine with a load average around 4. One run each, so differences of this size are within what a re-run moves, and this shows no large cost rather than no cost.
+
+| ack | connections | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 340293 | 348.5 |
+| 1 | 1 | 65536 | 14069 | 922.0 |
+| 1 | 4 | 1024 | 453805 | 464.7 |
+| 1 | 4 | 65536 | 25586 | 1676.8 |
+| 2 | 1 | 1024 | 187784 | 192.3 |
+| 2 | 1 | 65536 | 7259 | 475.7 |
+| 2 | 4 | 1024 | 486434 | 498.1 |
+| 2 | 4 | 65536 | 13759 | 901.7 |
