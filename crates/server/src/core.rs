@@ -3280,6 +3280,10 @@ impl Core {
         let now_ms = self.clock.now_ms();
         let stream = self.streams.get_mut(name).ok_or(ErrorCode::NotFound)?;
         let head = stream.delivery.visible_head(stream.ids.last_id());
+        // A cursor up there would hide every later record while the sink looks healthy, so this
+        // goes the way of `SUBSCRIBE` and `COMMIT` (D230, D236). An update keeps its cursor.
+        let last_id = stream.ids.last_id();
+        let above_head = |start: &SinkStart| matches!(start, SinkStart::Id(id) if *id != u64::MAX && *id > last_id);
         let cursor_at = |start: SinkStart| match start {
             SinkStart::Now => head,
             SinkStart::Earliest => 0,
@@ -3313,6 +3317,9 @@ impl Core {
                     if delivery.sinks.len() >= SINK_CAP_COUNT {
                         return Err(ErrorCode::TooManySubscriptions);
                     }
+                    if above_head(&start) {
+                        return Err(ErrorCode::Malformed);
+                    }
                     spec.update_count = 0;
                     spec.update_head_id = 0;
                     // Past any deleted sink's, whose delivery may still be ending (D195).
@@ -3342,6 +3349,9 @@ impl Core {
                     .sinks
                     .get_mut(&sink_id)
                     .ok_or(ErrorCode::NotFound)?;
+                if above_head(&start) {
+                    return Err(ErrorCode::Malformed);
+                }
                 spec.epoch = now_ms.max(spec.epoch + 1);
                 // A warning is about the position just left.
                 spec.expiry_warning_id = None;

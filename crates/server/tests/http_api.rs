@@ -1411,3 +1411,37 @@ async fn making_a_sink_needs_read_on_its_source() {
     assert_eq!(created.status, 200, "{}", created.text());
     server.server.shutdown();
 }
+
+/// Such a cursor would hide every later record while the sink's status stays clean, so this is
+/// refused as `SUBSCRIBE` and `COMMIT` refuse it (D230).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_start_above_the_head_is_refused() {
+    let server = start();
+    let ids = seed(&server, "k", &[b"1"]).await;
+    let text = token(ALL);
+    let put = |id: u64, start: u64| {
+        format!("/v1/stream/k/sink/{id}|{{\"kind\":\"archive\",\"start\":{start}}}")
+    };
+    let call = async |method: &'static str, target: String| {
+        let (path, body) = target.split_once('|').unwrap();
+        server
+            .http(&Http::new(method, path, &text).body(body.as_bytes().to_vec()))
+            .await
+    };
+    let head = ids[0];
+    assert_code(&call("PUT", put(1, 1 << 63)).await, 400, 8);
+    assert_code(&call("PUT", put(1, head + 1)).await, 400, 8);
+    let info = server
+        .http(&Http::new("GET", "/v1/stream/k", &text))
+        .await
+        .text();
+    assert!(info.contains("\"sinks\":[]"), "{info}");
+
+    assert_eq!(call("PUT", put(1, head)).await.status, 200);
+    // The same id section 5.1 reads as "live only" still means that.
+    assert_eq!(call("PUT", put(2, u64::MAX)).await.status, 200);
+    let reset = |start: u64| format!("/v1/stream/k/sink/1/reset|{{\"start\":{start}}}");
+    assert_code(&call("POST", reset(1 << 63)).await, 400, 8);
+    assert_eq!(call("POST", reset(head)).await.status, 200);
+    server.server.shutdown();
+}

@@ -1050,7 +1050,8 @@ impl<'a> HttpConn<'a> {
             Ok(()) => Response::json(200, "{\"ok\":true}".to_owned()),
             Err(code) if code == ErrorCode::Malformed => error(
                 code,
-                "a forward needs a non-zero id and a target other than its source",
+                "a forward needs a non-zero id and a target other than its source, and a start \
+                 can't be above the stream's head",
             ),
             Err(code) if code == ErrorCode::TooManySubscriptions => {
                 error(code, "the stream holds as many sinks as it can")
