@@ -24,7 +24,7 @@ sillystream sink create|update STREAM ID --kind K [--sink-url U] [--target T] [-
 sillystream sink delete|pause|resume STREAM ID
 sillystream sink reset STREAM ID [--start S]
 sillystream publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
-sillystream tail STREAM [--from start|live|ID] [--filter F] [--limit N] [--name CURSOR]
+sillystream tail STREAM [--from start|live|ID] [--to ID] [--filter F] [--limit N] [--name CURSOR]
 sillystream bench latency|throughput|idle|catch-up|many-streams|puts|idle-streams|all
                         [--server-bin FILE] [--count N] [--seconds N] [--idle-count N]
                         [--levels 0,1,2,3] [--cores N] [--catch-up-mib N] [--idle-streams N]
@@ -421,7 +421,7 @@ pub(crate) fn parse_filter(text: &str, spec: &mut Subscribe) -> Result<(), Strin
 }
 
 async fn tail(args: &Args, stream: &str) -> Result<(), String> {
-    args.only(&["--from", "--filter", "--limit", "--name"])?;
+    args.only(&["--from", "--to", "--filter", "--limit", "--name"])?;
     let (url, ca_pem, token) = connection(args)?;
     let client = Client::connect(ClientConfig::new(&url, &ca_pem, &token))
         .await
@@ -436,12 +436,16 @@ async fn tail(args: &Args, stream: &str) -> Result<(), String> {
         parse_filter(filter, &mut spec)?;
     }
     spec.name = args.one("--name").map(str::to_owned);
+    spec.until = args.number("--to")?;
     let named = spec.name.is_some();
     let mut left = args.number("--limit")?;
     let mut subscription = client.subscribe(spec).map_err(|error| error.to_string())?;
     let mut out = std::io::stdout().lock();
     while left != Some(0) {
         let Some(event) = subscription.next().await else {
+            if subscription.reached_until() {
+                break;
+            }
             return Err("the connection stopped".to_owned());
         };
         let Event::Items(items) = event.map_err(|error| error.to_string())? else {

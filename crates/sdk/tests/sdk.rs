@@ -1319,3 +1319,48 @@ async fn a_cancelled_send_keeps_what_it_took() {
     assert_eq!(seq, 2);
     fake.nothing_for_a_moment().await;
 }
+
+/// Section 4's "from any point to any point": the range ends by itself, inside a record too, and
+/// also when a filter leaves nothing to show for the end of the range.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_with_an_end_stops_there() {
+    let fixture = start();
+    let client = fixture.client().await;
+    let mut publisher = client
+        .publisher("range", PublisherConfig::default())
+        .unwrap();
+    for index in 0..10u8 {
+        publisher.add(1, vec![index]);
+    }
+    let first_id = publisher.flush().await.unwrap()[0].first_id;
+
+    let mut spec = Subscribe::new("range", first_id + 1);
+    spec.until = Some(first_id + 4);
+    let mut subscription = client.subscribe(spec).unwrap();
+    let mut got = Vec::new();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = subscription.next().await {
+            if let Event::Items(items) = event.unwrap() {
+                got.extend(items);
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "it never ended, with {got:?}");
+    assert!(subscription.reached_until());
+    assert_eq!(bytes_of(&got), [vec![2u8], vec![3], vec![4]]);
+
+    // Nothing matches, so `PROGRESS` is what reaches the end.
+    let mut spec = Subscribe::new("range", 0);
+    spec.until = Some(first_id + 9);
+    spec.author = Some(987_654);
+    let mut subscription = client.subscribe(spec).unwrap();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(event) = subscription.next().await {
+            assert!(!matches!(event.unwrap(), Event::Items(_)));
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "a filter that matches nothing never ended");
+    fixture.server.shutdown();
+}

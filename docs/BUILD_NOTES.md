@@ -6,7 +6,7 @@ Choices made where `docs/SPEC.md` is silent or ambiguous, and questions for the 
 
 Each has a working assumption so the build can continue.
 
-- **Q1. No `to` on subscribe.** Section 4 says an id range "from any point to any point", but `SUBSCRIBE` and HTTP `read` carry only a start (`from`, plus `limit`). Assumption: no new field; the client stops at its end id.
+- **Q1. No `to` on subscribe.** Section 4 says an id range "from any point to any point", but `SUBSCRIBE` and HTTP `read` carry only a start (`from`, plus `limit`). Assumption: no new field; the client stops at its end id, which the SDK and CLI now do (D253).
 - **Q2. No admin API.** Sections 9, 12 and 13 require stream create, config, delete and the sink lifecycle under `admin`, but section 11 has no route for them. Assumption: the smallest HTTP additions, listed in D21.
 - **Q3. Manifest record type.** *(Built this way in M8, D158. Still an assumption until you confirm.)* Section 7.5 publishes seal manifests to a system stream, and only `author = 0` data may be read by the server, but section 2.2 defines entry types 1–3 only. Assumption: manifests are system records with entry type 4 in a stream named `_sys.manifests`.
 - **Q4. Manifest stream's special rule.** *(Built this way in M8, D159. Still an assumption until you confirm.)* Section 7.5 says one is needed but not what it is. Assumption: manifest stream segments are never listed in a manifest and never compacted; they stay in `sealed/`, and the delete job's compaction check covers them.
@@ -346,6 +346,7 @@ These follow the delivery decisions and change them where they say so. Tests: `c
 - **D250.** `--sink-archive-store s3:BUCKET` reads `SINK_ARCHIVE_S3_REGION`, `SINK_ARCHIVE_S3_ENDPOINT`, `SINK_ARCHIVE_AWS_ACCESS_KEY_ID` and `SINK_ARCHIVE_AWS_SECRET_ACCESS_KEY`, and a store given its own keys takes nothing from the environment. Half a key pair is refused at start. Reason: an archive to R2 has to sit beside a node on AWS, and an AWS session token must not go to R2 with R2's keys. Run only against a local stub: real S3 and R2 weren't exercised.
 - **D251.** `docs/DEPLOYMENT.md` is the deployment document section 7.1 requires, and the server's `--help` also says to mount EBS at `--wal-dir`. Reason: section 7.1 says the docs must say so.
 - **D252.** Replay notes a closed WAL file with anything other than zeros after its valid entries, and the start warns on stderr, naming the files. Reason: since D60 a closed file ends in zeros or its end, so Q15's "can't be told from its normal end" no longer holds, and this needs no format change. It can't tell bit rot from a torn write left by an earlier crash, so the warning says both, and it can't restore what is lost. Damage that leaves a valid-looking run of zeros, such as a lost block, still goes unseen.
+- **D253.** `sdk::Subscribe::until` and `sillystream tail --to ID` end a read at an id on the client, and `Subscription::reached_until` tells that end from a stopped client. Nothing changes on the wire. Reason: this is Q1's assumption made usable, so callers needn't each write it. An end above the head waits for it, as a live read does. HTTP `read` still stops only by `limit`.
 
 ## Review findings not fixed
 

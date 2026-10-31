@@ -128,6 +128,9 @@ pub struct Subscribe {
     /// What one `next` can hold of decompressed items. A frame past it comes over several, and a
     /// single record past it is `SdkError::BadRecord`.
     pub max_decompressed_bytes: usize,
+    /// The last id wanted, for section 4's "any point to any point". The client stops there by
+    /// itself: `next` hands over nothing above it and then says `None`. The server doesn't know.
+    pub until: Option<u64>,
 }
 
 impl Subscribe {
@@ -144,6 +147,7 @@ impl Subscribe {
             include_system: false,
             max_queue_bytes: 64 * 1024 * 1024,
             max_decompressed_bytes: 256 * 1024 * 1024,
+            until: None,
         }
     }
 }
@@ -403,6 +407,7 @@ impl Client {
         };
         let max_decompressed_bytes = spec.max_decompressed_bytes;
         let max_queue_bytes = spec.max_queue_bytes;
+        let until = spec.until;
         self.send(Command::Subscribe {
             key,
             spec,
@@ -419,6 +424,7 @@ impl Client {
             max_queue_bytes,
             frame: None,
             failed: None,
+            until,
         })
     }
 
@@ -610,6 +616,8 @@ pub struct Subscription {
     frame: Option<(Bytes, usize)>,
     /// A bad record, to report after the items that came before it.
     failed: Option<SdkError>,
+    /// `Subscribe::until`. Past it, nothing more is handed over.
+    until: Option<u64>,
 }
 
 impl Subscription {
@@ -621,7 +629,16 @@ impl Subscription {
             if let Some(error) = self.failed.take() {
                 return Some(Err(error));
             }
-            if let Some(items) = self.next_items() {
+            if self.reached_until() {
+                return None;
+            }
+            if let Some(mut items) = self.next_items() {
+                if let Some(until) = self.until {
+                    items.retain(|item| item.id <= until);
+                    if items.is_empty() {
+                        continue;
+                    }
+                }
                 return Some(Ok(Event::Items(items)));
             }
             if self.failed.is_some() || self.frame.is_some() {
@@ -660,6 +677,12 @@ impl Subscription {
                 Raw::Behind(resume_from) => Event::Behind { resume_from },
             }));
         }
+    }
+
+    /// True once everything up to `Subscribe::until` has been handed over or reported to match
+    /// nothing, so that the caller can tell this end from a client that has stopped.
+    pub fn reached_until(&self) -> bool {
+        self.until.is_some_and(|until| self.skip_through >= until)
     }
 
     /// Opens as much of the frame in hand as the limit allows. `None` if that gave no items.
