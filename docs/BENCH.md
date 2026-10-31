@@ -265,15 +265,59 @@ Reading these:
 - **N cores spread it,** as section 6.1 says: 3 to 5 times the rate at 10,000 subscribers on 8 cores. At 100 subscribers cross-core messages cost more than they save, about 50% slower than one core.
 - **Filter count hardly shows at 10,000 subscribers** (one record, 100 checks, is small next to 10,000 enqueues), and the differences there are under the 2× noise floor below. At 100 subscribers on 1 core, 100 filters cost about 50% more than 1.
 - **A write among catch-ups.** D101's effect, as a one-off in a release build at `db473b0` and not a criterion bench: 1 core, 4,000 publishes of 200 records of 32 B held in memory, K subscribers from 0 with a filter matching nothing, then time one level 1 ack. K=1: 23 µs, K=100: 1.9 ms, K=1,000: 28 ms, K=5,000: 66 ms, against 3.5 ms, 333 ms, 3.34 s and 16.6 s before. The catch-ups themselves took 1.4 ms, 119 ms, 1.16 s and 17.1 s. What remains in the ack is the burst of subscribe commands the core reads first, with one read on each turn.
-- **Not measured:** real disks, catch-up rate (M6's load generator), and delivery with non-matching filters. One filter per connection isn't varied, since connections are fixed at 16.
+- **Not measured:** real disks, catch-up rate (M10's load generator), and delivery with non-matching filters. One filter per connection isn't varied, since connections are fixed at 16.
+
+## M6: `sillystream bench`
+
+The real server binary as a child process, a client in another process, TLS 1.3 and WebSocket over loopback, through the SDK. Run at commit `0d8ceb5`, on the machine above with a load average around 3.
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo build --release -p server -p cli
+target/release/sillystream bench all --count 5000 --seconds 10 --idle-count 10000 --cores 4
+```
+
+### Latency, 256-byte record, one publisher, 4 cores
+
+| level | measures | samples | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|---|---|---|
+| 0 | publish to delivery | 5000 | 37 | 137 | 217 |
+| 1 | ack, closed loop | 5000 | 34 | 45 | 54 |
+| 2 | ack, closed loop, local disk | 5000 | 4578 | 7807 | 75056 |
+| 3 | ack at 50 per second, `LocalFileSystem`, 1 s window | 1000 | 507916 | 996214 | 1008570 |
+
+### Throughput, one stream, 4 cores, 10 s each
+
+| ack | connections | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 320381 | 328.1 |
+| 1 | 1 | 65536 | 13326 | 873.3 |
+| 1 | 4 | 1024 | 509079 | 521.3 |
+| 1 | 4 | 65536 | 25561 | 1675.2 |
+| 2 | 1 | 1024 | 195262 | 199.9 |
+| 2 | 1 | 65536 | 7482 | 490.3 |
+| 2 | 4 | 1024 | 476923 | 488.4 |
+| 2 | 4 | 65536 | 13022 | 853.4 |
+
+### Memory per idle connection, 4 cores
+
+| connections | server RSS before | server RSS after | bytes per connection |
+|---|---|---|---|
+| 10000 | 10223616 | 225263616 | 21504 |
+
+- **Level 0** has no ack to time, so its row is publish to delivery on a subscriber of the stream, closed loop.
+- **Levels 1 and 2** are closed loop: each ack before the next publish, so they include the SDK and TLS on both sides and one loopback round trip. Level 2 is on this laptop's SSD with `F_FULLFSYNC`. Section 7.2's NVMe and EBS figures are neither confirmed nor refuted by it.
+- **Level 3** goes out at 50 per second so that the spread of a 1 s seal window shows, and its target is `LocalFileSystem`, which doesn't fsync objects. It measures the wait for the window, not S3.
+- **Throughput** rows are one stream, so one owning core, whatever `--cores` says. The window is 8 MiB unanswered per connection, or 16 records if larger. Each row has its own server. Rows include the client's own cost on the same machine, so the server may not be the limit.
+- **Memory per idle connection** is the server's RSS after minus before over the connection count, from `ps`. It counts what the process itself holds for a connection, such as the rustls state, the task and its channels, and not the kernel's socket buffers. The read buffer isn't in it, which `crates/server/tests/idle_connections.rs` asserts on the pool's counters: 10,000 connections, `held_buffer_count = 0`.
+- **Not measured:** real S3 and EBS (unmeasured estimates remain as section 7.2's table has them), many streams on 16 cores, catch-up rate, memory per idle stream, and object PUTs per seal. Those belong to M10.
 
 ## Caveats
 
 - `LocalFileSystem` doesn't fsync objects, so its `PUT` isn't a durability figure, and neither it nor these numbers say anything about S3.
 - `sync_data` on macOS is `F_FULLFSYNC`, which behaves differently from `fdatasync` on Linux NVMe or EBS.
 - One laptop, under whatever else it was running. Treat differences under about 2× as noise.
-- M1 and M2 are single-threaded CPU measurements with no I/O, and no latency figure in SPEC.md section 7.2 is confirmed or refuted by any number here.
+- M1 and M2 are single-threaded CPU measurements with no I/O, and no latency figure in SPEC.md section 7.2 is confirmed or refuted by those two.
 
 ## Not run yet
 
-All load generator numbers (M6, M10).
+The rest of the load generator numbers (M10): many streams on 16 cores, catch-up rate, memory per idle stream, PUTs per seal. Real S3 and EBS have not been exercised at all.
