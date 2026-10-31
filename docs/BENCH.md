@@ -232,6 +232,8 @@ With the hand-written CBOR reader and writer (D81), short runs (2 s measuring) m
 
 After D78 and D79 changed the core loop, `publish_no_disk` with 1 record on 1 core measured 941 ns in a short run, no significant change from the previous run. Only that cell was repeated.
 
+Merge after D237, short runs (2 s measuring), small patch, scan path: 706 ns, 4.82 µs, 63.5 µs, 237 µs by the same doc sizes, in line with the hand-written reader's figures above. A patch of 16,000 integer keys merged into the same 64,003-byte document takes the index path: 3.3 ms in release, measured once by a test's timer, not criterion, against about 600 ms before.
+
 Rechecked after the fixes on top of `1fd96cd` (D65, D66, D76, D77), load average about 2. `state_apply` is within 3% of this table in every cell, and the no-disk `write_path` runs are within 6% except 1 core with 100 records, 15% faster, which is noise under the caveats below. The real-disk runs weren't repeated. A merge or an `incr` on an existing number doesn't re-parse its result. An `incr` that adds a key does, which isn't in this table: parsing every result was measured at about 78% slower at 64 KB, and is why only that case does it (D76).
 
 Reading these:
