@@ -2,6 +2,9 @@
 //! the only place an operation changes a document, and live application and replay both
 //! go through it, so they can't disagree.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
+
 use bytes::Bytes;
 use ciborium::value::{Integer, Value};
 use format::{ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, RecordView, SystemRecord};
@@ -359,14 +362,61 @@ pub fn check_doc(doc: &[u8]) -> Result<(), StateError> {
     parse(doc).map(|_| ())
 }
 
+/// Hashes as `==` compares a key: `0.0 == -0.0`, and anything unequal may share a hash.
+struct KeyHash<'a>(&'a Value);
+
+impl Hash for KeyHash<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.0 {
+            Value::Integer(number) => (0u8, i128::from(*number)).hash(state),
+            Value::Bytes(bytes) => (1u8, bytes).hash(state),
+            Value::Float(number) => (2u8, (*number + 0.0).to_bits()).hash(state),
+            Value::Text(text) => (3u8, text).hash(state),
+            Value::Bool(flag) => (4u8, flag).hash(state),
+            Value::Null => 5u8.hash(state),
+            Value::Tag(tag, inner) => {
+                (6u8, tag).hash(state);
+                KeyHash(inner).hash(state);
+            }
+            Value::Array(items) => {
+                (7u8, items.len()).hash(state);
+                items.iter().for_each(|item| KeyHash(item).hash(state));
+            }
+            Value::Map(pairs) => {
+                (8u8, pairs.len()).hash(state);
+                for (key, value) in pairs {
+                    KeyHash(key).hash(state);
+                    KeyHash(value).hash(state);
+                }
+            }
+            _ => 9u8.hash(state),
+        }
+    }
+}
+
+/// A scan per patch key costs nothing to set up, and is what a usual small patch wants. A big
+/// one takes the index, or one 64 KB document stops the core's event loop for 0.6 s (D237).
+const MERGE_SCAN_MAX_PATCH_KEYS: usize = 16;
+
 fn merge(target: Option<Value>, patch: Value) -> Value {
     let Value::Map(patch) = patch else {
         return patch;
     };
-    let mut map = match target {
+    let map = match target {
         Some(Value::Map(map)) => map,
         _ => Vec::new(),
     };
+    Value::Map(if patch.len() <= MERGE_SCAN_MAX_PATCH_KEYS {
+        merge_by_scanning(map, patch)
+    } else {
+        merge_with_index(map, patch)
+    })
+}
+
+fn merge_by_scanning(
+    mut map: Vec<(Value, Value)>,
+    patch: Vec<(Value, Value)>,
+) -> Vec<(Value, Value)> {
     for (key, value) in patch {
         let at = map.iter().position(|(existing, _)| *existing == key);
         if value == Value::Null {
@@ -393,7 +443,56 @@ fn merge(target: Option<Value>, patch: Value) -> Value {
             }
         }
     }
-    Value::Map(map)
+    map
+}
+
+/// The same as `merge_by_scanning`, in time linear in the document.
+fn merge_with_index(map: Vec<(Value, Value)>, patch: Vec<(Value, Value)>) -> Vec<(Value, Value)> {
+    // A patch's key may be a client's choice, so its hash has a key the client can't know. The
+    // result can't depend on it: a hash only narrows what `==` then decides.
+    let hasher = RandomState::new();
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(map.len());
+    let mut slots: Vec<Option<(Value, Value)>> = Vec::with_capacity(map.len() + patch.len());
+    for pair in map {
+        index
+            .entry(hasher.hash_one(KeyHash(&pair.0)))
+            .or_default()
+            .push(slots.len());
+        slots.push(Some(pair));
+    }
+    for (key, value) in patch {
+        let bucket = index.entry(hasher.hash_one(KeyHash(&key))).or_default();
+        let mut first = None;
+        bucket.retain(|at| {
+            if !slots[*at].as_ref().is_some_and(|(held, _)| *held == key) {
+                return true;
+            }
+            if first.is_none() {
+                first = Some(*at);
+                return true;
+            }
+            slots[*at] = None;
+            false
+        });
+        match first {
+            Some(at) if value == Value::Null => {
+                slots[at] = None;
+                bucket.retain(|other| *other != at);
+            }
+            None if value == Value::Null => {}
+            Some(at) => {
+                let (_, held) = slots[at].as_mut().expect("the bucket holds live slots");
+                let old = std::mem::replace(held, Value::Null);
+                *held = merge(Some(old), value);
+            }
+            None => {
+                bucket.push(slots.len());
+                let merged = merge(None, value);
+                slots.push(Some((key, merged)));
+            }
+        }
+    }
+    slots.into_iter().flatten().collect()
 }
 
 fn parse_incr(doc: Value) -> Result<(Vec<Value>, i128), StateError> {
@@ -1058,6 +1157,70 @@ mod tests {
     }
 
     /// `{"a": text, "b": 1}`, where the text makes it exactly `total_bytes`.
+    /// Keys from a small set, repeats and all, of every kind `==` can be odd about.
+    fn arb_key() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            (0i64..4).prop_map(int),
+            (0u8..4).prop_map(|n| Value::Text(n.to_string())),
+            Just(Value::Float(0.0)),
+            Just(Value::Float(-0.0)),
+            Just(Value::Float(f64::NAN)),
+            Just(Value::Null),
+            Just(Value::Bool(true)),
+            Just(Value::Array(vec![int(1)])),
+            Just(Value::Tag(1, Box::new(int(1)))),
+            Just(Value::Map(vec![(int(1), int(2))])),
+        ]
+    }
+
+    fn arb_map() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![Just(Value::Null), (0i64..3).prop_map(int)];
+        let value = leaf.prop_recursive(2, 16, 4, |inner| {
+            proptest::collection::vec((arb_key(), inner), 0..4).prop_map(Value::Map)
+        });
+        proptest::collection::vec((arb_key(), value), 0..12).prop_map(Value::Map)
+    }
+
+    /// `NaN != NaN`, so `assert_eq` can't compare what holds one.
+    fn same_bytes(left: &Value, right: &Value) -> bool {
+        cbor(left) == cbor(right)
+    }
+
+    proptest! {
+        #[test]
+        fn the_two_merges_agree(current in arb_map(), patch in arb_map()) {
+            let Value::Map(pairs) = patch.clone() else { unreachable!() };
+            let Value::Map(held) = current.clone() else { unreachable!() };
+            let fast = merge_with_index(held, pairs);
+            let Value::Map(pairs) = patch else { unreachable!() };
+            let Value::Map(held) = current else { unreachable!() };
+            let plain = merge_by_scanning(held, pairs);
+            let (fast, plain) = (Value::Map(fast), Value::Map(plain));
+            prop_assert!(same_bytes(&fast, &plain), "{fast:?} and {plain:?}");
+        }
+    }
+
+    /// One document in the limit runs on the core's event loop, ahead of every other stream
+    /// there. Scanning took 2.7 s for this in a debug build, and 0.6 s in release.
+    #[test]
+    fn merging_a_flat_document_of_the_most_keys_stays_linear() {
+        let pairs: Vec<(Value, Value)> = (0..16_000).map(|n| (int(n + 1_000), int(0))).collect();
+        let doc = cbor(&Value::Map(pairs));
+        assert!(doc.len() <= MAX_STATE_BYTES, "{}", doc.len());
+        let best = (0..3)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                apply_op(&doc, StateOp::Merge, &doc).unwrap();
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(
+            best < std::time::Duration::from_millis(1_000),
+            "{best:?} for one merge"
+        );
+    }
+
     fn merge_inputs(total_bytes: usize) -> (Vec<u8>, Value) {
         let text_bytes = total_bytes - (1 + 2 + 3 + 2 + 1);
         let current = cbor(&map(&[("a", Value::Text("x".repeat(text_bytes)))]));
