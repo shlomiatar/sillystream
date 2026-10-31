@@ -4,7 +4,7 @@
 //! One task does both directions, and nothing in it waits except the one `select!`, so a
 //! socket that won't take bytes doesn't stop it hearing the node, or the reverse.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -51,6 +51,7 @@ const READS_PER_WAKE_COUNT: usize = 16;
 const RETRY_FULL_MS: u64 = 1;
 const OPEN_HANDLES_MAX_COUNT: usize = 65_536;
 const IOV_MAX_COUNT: usize = 64;
+const REVOKED_MESSAGE: &str = "the renewed token doesn't grant this stream";
 
 /// What a connection writes, in order.
 enum Chunk {
@@ -184,6 +185,8 @@ struct Session {
     connection: Connection,
     handles: HashMap<u32, Arc<str>>,
     subs: HashMap<u32, Arc<str>>,
+    /// Subscriptions a renewed token ended, so that a `COMMIT` on one still hears why.
+    revoked_subs: HashSet<u32>,
 }
 
 struct WsConn<'a> {
@@ -195,7 +198,7 @@ struct WsConn<'a> {
     /// A header split across two reads.
     head: [u8; MAX_HEADER_BYTES],
     head_have_bytes: usize,
-    /// A frame still arriving, with its own region, so what is left is read straight into it.
+    /// A frame still arriving (D121).
     part: Option<(FrameHeader, PartRead)>,
     /// Payload to throw away, of a frame over the limit.
     /// rustls may hold plaintext: the last read did not come back empty.
@@ -208,6 +211,11 @@ struct WsConn<'a> {
     /// What couldn't be looked at until `pending` empties.
     backlog: Option<SlabRegion>,
     pending: VecDeque<PendingOp>,
+    /// When `pending` is next tried. It stays put across wakes, or a busy connection would keep
+    /// pushing it back (D122).
+    retry_at: Option<Instant>,
+    /// When a frame or fragmented message still arriving runs out of time.
+    partial_deadline: Option<Instant>,
     closing: bool,
     hello_deadline: Instant,
     /// The token's expiry timer ended the subscriptions, so it needn't fire again.
@@ -222,6 +230,7 @@ enum Wake {
     Readable(io::Result<()>),
     Expiry,
     HelloTimeout,
+    PartialTimeout,
 }
 
 async fn recv_reply(client: Option<&mut Client>) -> Option<Reply> {
@@ -234,6 +243,14 @@ async fn recv_reply(client: Option<&mut Client>) -> Option<Reply> {
 async fn recv_event(connection: Option<&mut Connection>) -> Option<Event> {
     match connection {
         Some(connection) => connection.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Never finishes without a time to finish at, for a timer that may not be running.
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
 }
@@ -255,6 +272,8 @@ pub(super) async fn run(shared: &Shared, home: usize, tls: Tls, leftover: Vec<u8
         dropping_fragments: false,
         backlog: None,
         pending: VecDeque::new(),
+        retry_at: None,
+        partial_deadline: None,
         closing: false,
         hello_deadline: Instant::now() + Duration::from_millis(HELLO_TIMEOUT_MS),
         expiry_seen: false,
@@ -305,8 +324,14 @@ impl WsConn<'_> {
                 && self.pending.is_empty()
                 && self.backlog.is_none()
                 && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES;
-            let want_events = !self.closing && self.out.data_bytes < OUT_DATA_HIGH_BYTES;
-            let retry = !self.pending.is_empty();
+            let want_events = !self.closing && self.out_has_event_room();
+            if self.pending.is_empty() {
+                self.retry_at = None;
+            } else if self.retry_at.is_none() {
+                self.retry_at = Some(Instant::now() + Duration::from_millis(RETRY_FULL_MS));
+            }
+            let retry_at = self.retry_at;
+            let partial_deadline = self.update_partial_deadline();
             let no_session = self.session.is_none();
             let hello_deadline = self.hello_deadline;
             let expiry = self.expiry_wait();
@@ -319,14 +344,16 @@ impl WsConn<'_> {
             };
             let wake = tokio::select! {
                 biased;
+                // Timers first: a steady flow below is always ready, and must not starve them.
+                _ = sleep_until_some(retry_at) => Wake::Retry,
+                _ = sleep_until_some(partial_deadline) => Wake::PartialTimeout,
+                _ = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => Wake::Expiry,
                 ready = tcp.writable(), if want_write => Wake::Writable(ready),
                 reply = recv_reply(client) => Wake::Reply(reply),
                 event = recv_event(connection), if want_events => Wake::Event(event),
-                _ = tokio::time::sleep(Duration::from_millis(RETRY_FULL_MS)), if retry => Wake::Retry,
                 // rustls may hold plaintext the socket no longer says anything about.
                 _ = std::future::ready(()), if read_again && may_read => Wake::Readable(Ok(())),
                 ready = tcp.readable(), if may_read => Wake::Readable(ready),
-                _ = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => Wake::Expiry,
                 _ = tokio::time::sleep_until(hello_deadline), if no_session => Wake::HelloTimeout,
                 _ = tokio::time::sleep(Duration::from_millis(CLOSE_TIMEOUT_MS)), if close_wait => {
                     return Ok(());
@@ -356,7 +383,7 @@ impl WsConn<'_> {
                         return Ok(());
                     };
                     self.on_event(event);
-                    while self.out.data_bytes < OUT_DATA_HIGH_BYTES {
+                    while self.out_has_event_room() {
                         let Some(event) = self
                             .session
                             .as_mut()
@@ -367,7 +394,10 @@ impl WsConn<'_> {
                         self.on_event(event);
                     }
                 }
-                Wake::Retry => self.retry_pending().await?,
+                Wake::Retry => {
+                    self.retry_at = None;
+                    self.retry_pending().await?;
+                }
                 Wake::Readable(ready) => {
                     ready?;
                     self.on_readable().await?;
@@ -377,8 +407,31 @@ impl WsConn<'_> {
                     self.send_error(0, ErrorCode::Unauthorized, "no HELLO in time");
                     self.close(1008);
                 }
+                Wake::PartialTimeout => {
+                    self.send_error(0, ErrorCode::Malformed, "a frame didn't finish in time");
+                    self.settle_held();
+                    self.fragments = None;
+                    self.close(1008);
+                }
             }
         }
+    }
+
+    /// Events wait when either kind of frame has backed up: `STATE` and `SUBSCRIBED` go out as
+    /// replies, and leaving them in the connection is what closes its window (D123).
+    fn out_has_event_room(&self) -> bool {
+        self.out.data_bytes < OUT_DATA_HIGH_BYTES && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES
+    }
+
+    /// Starts the clock when a frame or message begins, and stops it when none is under way.
+    fn update_partial_deadline(&mut self) -> Option<Instant> {
+        if self.closing || (self.part.is_none() && self.fragments.is_none()) {
+            self.partial_deadline = None;
+        } else if self.partial_deadline.is_none() {
+            let timeout = Duration::from_millis(self.shared.partial_frame_timeout_ms);
+            self.partial_deadline = Some(Instant::now() + timeout);
+        }
+        self.partial_deadline
     }
 
     /// Reads while there is something to read, for a bounded number of reads. A frame still
@@ -392,7 +445,7 @@ impl WsConn<'_> {
                 return Ok(());
             }
             if let Some((_, part)) = &mut self.part {
-                let read = try_read(&mut self.tls, &mut part.region[part.have_bytes..]);
+                let read = try_read(&mut self.tls, part.room());
                 match read {
                     None => {
                         self.read_again = false;
@@ -401,8 +454,8 @@ impl WsConn<'_> {
                     Some(Err(error)) => return Err(error),
                     Some(Ok(0)) => return Err(io::ErrorKind::UnexpectedEof.into()),
                     Some(Ok(read_bytes)) => {
-                        part.have_bytes += read_bytes;
-                        if part.have_bytes == part.region.len() {
+                        part.filled(read_bytes);
+                        if part.is_whole() {
                             self.finish_part().await?;
                         }
                     }
@@ -457,12 +510,9 @@ impl WsConn<'_> {
                 continue;
             }
             if let Some((_, part)) = &mut self.part {
-                let copy_bytes = (part.region.len() - part.have_bytes).min(rest.len());
-                part.region[part.have_bytes..part.have_bytes + copy_bytes]
-                    .copy_from_slice(&rest[..copy_bytes]);
-                part.have_bytes += copy_bytes;
+                let copy_bytes = part.add(&rest);
                 let _ = rest.split_to(copy_bytes);
-                if part.have_bytes == part.region.len() {
+                if part.is_whole() {
                     self.finish_part().await?;
                 }
                 continue;
@@ -492,15 +542,13 @@ impl WsConn<'_> {
                 let payload = rest.split_to(payload_bytes);
                 self.on_frame(header, payload).await?;
             } else {
-                let mut region =
-                    with_core_io(self.shared, self.home, |io| io.pool.alloc(payload_bytes));
-                let have_bytes = rest.len();
-                region[..have_bytes].copy_from_slice(&rest);
-                let _ = rest.split_to(have_bytes);
+                let part = PartRead::new(payload_bytes, &rest);
+                let all_bytes = rest.len();
+                let _ = rest.split_to(all_bytes);
                 self.counters()
                     .held_buffer_count
                     .fetch_add(1, Ordering::Relaxed);
-                self.part = Some((header, PartRead { region, have_bytes }));
+                self.part = Some((header, part));
             }
         }
         Ok(())
@@ -553,7 +601,9 @@ impl WsConn<'_> {
             self.counters()
                 .held_buffer_count
                 .fetch_sub(1, Ordering::Relaxed);
-            self.on_frame(header, part.region).await?;
+            let region = with_core_io(self.shared, self.home, |io| io.pool.copy_in(part.payload()));
+            drop(part);
+            self.on_frame(header, region).await?;
         }
         Ok(())
     }
@@ -687,6 +737,7 @@ impl WsConn<'_> {
                     );
                     return Ok(());
                 }
+                session.revoked_subs.remove(&subscribe.sub);
                 session
                     .subs
                     .insert(subscribe.sub, Arc::from(subscribe.stream));
@@ -706,6 +757,7 @@ impl WsConn<'_> {
             ClientFrame::Unsubscribe { sub } => {
                 if let Some(session) = &mut self.session {
                     session.subs.remove(&sub);
+                    session.revoked_subs.remove(&sub);
                     session.connection.unsubscribe(sub);
                 }
             }
@@ -713,6 +765,14 @@ impl WsConn<'_> {
                 let Some(session) = &mut self.session else {
                     return Ok(());
                 };
+                if now_ms >= session.token.expiry_ms {
+                    self.send_error(sub, ErrorCode::Unauthorized, "token has expired");
+                    return Ok(());
+                }
+                if session.revoked_subs.contains(&sub) {
+                    self.send_error(sub, ErrorCode::Unauthorized, REVOKED_MESSAGE);
+                    return Ok(());
+                }
                 // A subscription this connection never had is the handle's error to report.
                 let allowed = match session.subs.get(&sub) {
                     Some(stream) => session.token.check(stream, auth::PERM_READ, now_ms),
@@ -835,6 +895,7 @@ impl WsConn<'_> {
                 connection,
                 handles: HashMap::new(),
                 subs: HashMap::new(),
+                revoked_subs: HashSet::new(),
             }));
         }
         let number = self.shared.session_count.fetch_add(1, Ordering::Relaxed);
@@ -843,7 +904,34 @@ impl WsConn<'_> {
             max_frame_bytes: self.shared.max_frame_bytes.min(u32::MAX as u64) as u32,
             server_ms: now_ms,
         });
+        self.end_subs_token_doesnt_grant(now_ms);
         Ok(())
+    }
+
+    /// A renewal is a new set of grants, and a subscription only lasts under one that covers it.
+    /// Section 12 revokes by expiry, so without this a renewal could never take a stream away.
+    fn end_subs_token_doesnt_grant(&mut self, now_ms: u64) {
+        let max_revoked_count = self.shared.max_subscriptions;
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let mut ended = Vec::new();
+        session.subs.retain(|sub, stream| {
+            let keep = session.token.check(stream, auth::PERM_READ, now_ms).is_ok();
+            if !keep {
+                ended.push(*sub);
+            }
+            keep
+        });
+        for sub in &ended {
+            session.connection.unsubscribe(*sub);
+            if session.revoked_subs.len() < max_revoked_count {
+                session.revoked_subs.insert(*sub);
+            }
+        }
+        for sub in ended {
+            self.send_error(sub, ErrorCode::Unauthorized, REVOKED_MESSAGE);
+        }
     }
 
     /// Hands a write to the node, or lets it wait in order if the node can't take it.

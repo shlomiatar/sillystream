@@ -11,7 +11,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::Shared;
-use crate::slab::SlabRegion;
 
 pub(super) type Tls = tokio_rustls::server::TlsStream<TcpStream>;
 
@@ -94,8 +93,51 @@ pub(super) fn try_flush(tls: &mut Tls) -> Option<io::Result<()>> {
     }
 }
 
-/// A region and how far it has been read: the unfinished read of a frame or a body.
+/// A frame still arriving. It lives in its own buffer, sized by what has really come, and moves
+/// to a slab once whole: a header only claims a length, and a claim must not count against the
+/// memory cap (D121).
 pub(super) struct PartRead {
-    pub region: SlabRegion,
-    pub have_bytes: usize,
+    bytes: Vec<u8>,
+    have_bytes: usize,
+    payload_bytes: usize,
+}
+
+impl PartRead {
+    pub(super) fn new(payload_bytes: usize, first: &[u8]) -> PartRead {
+        PartRead {
+            bytes: first.to_vec(),
+            have_bytes: first.len(),
+            payload_bytes,
+        }
+    }
+
+    /// Where the next bytes go: more than has come so far, up to what the frame claims.
+    pub(super) fn room(&mut self) -> &mut [u8] {
+        if self.have_bytes == self.bytes.len() {
+            let wanted_bytes = (self.have_bytes * 2).max(READ_CHUNK_BYTES);
+            self.bytes.resize(wanted_bytes.min(self.payload_bytes), 0);
+        }
+        &mut self.bytes[self.have_bytes..]
+    }
+
+    pub(super) fn filled(&mut self, read_bytes: usize) {
+        self.have_bytes += read_bytes;
+    }
+
+    /// Takes what it still needs, and says how much that was.
+    pub(super) fn add(&mut self, rest: &[u8]) -> usize {
+        let copy_bytes = (self.payload_bytes - self.have_bytes).min(rest.len());
+        self.bytes.truncate(self.have_bytes);
+        self.bytes.extend_from_slice(&rest[..copy_bytes]);
+        self.have_bytes += copy_bytes;
+        copy_bytes
+    }
+
+    pub(super) fn is_whole(&self) -> bool {
+        self.have_bytes == self.payload_bytes
+    }
+
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.bytes[..self.have_bytes]
+    }
 }

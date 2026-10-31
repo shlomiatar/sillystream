@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use format::{Clause, Filter, HEADER_BYTES, RecordHeader};
-use proto::{ErrorCode, is_valid_stream_id};
+use proto::{DATA_PREFIX_BYTES, ErrorCode, is_valid_stream_id};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::conn::{Counted, READ_CHUNK_BYTES, READ_CHUNK_MIN_BYTES, Tls, try_read};
@@ -547,6 +547,14 @@ impl<'a> HttpConn<'a> {
     }
 
     /// Answers one request. An `Err` ends the connection, with no response.
+    /// The most records a publish can carry. They leave in a `DATA` frame, and `max_frame` covers
+    /// the whole of that (D43).
+    fn max_records_bytes(&self) -> u64 {
+        self.shared
+            .max_frame_bytes
+            .saturating_sub(DATA_PREFIX_BYTES as u64)
+    }
+
     async fn handle(&mut self, mut request: Request) -> io::Result<Response> {
         let (stream, route) = match route(&request.method, &request.path) {
             Ok(routed) => routed,
@@ -575,7 +583,7 @@ impl<'a> HttpConn<'a> {
             return self.refuse(&mut request, response).await;
         }
         let limit_bytes = if route == Route::Publish {
-            self.shared.max_frame_bytes
+            self.max_records_bytes()
         } else {
             SMALL_BODY_MAX_BYTES
         };
@@ -745,7 +753,7 @@ impl<'a> HttpConn<'a> {
             let length = request.content_length as usize;
             let padded_bytes = length.next_multiple_of(8);
             let total_bytes = (HEADER_BYTES + padded_bytes) as u64;
-            if total_bytes > self.shared.max_frame_bytes {
+            if total_bytes > self.max_records_bytes() {
                 let response = error(ErrorCode::FrameTooLarge, "the record is too large");
                 return self.refuse(request, response).await;
             }

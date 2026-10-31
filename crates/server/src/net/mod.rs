@@ -73,6 +73,7 @@ pub(crate) struct Shared {
     pub node: NodeHandle,
     pub max_frame_bytes: u64,
     pub max_subscriptions: usize,
+    pub partial_frame_timeout_ms: u64,
     pub progress_interval_ms: u64,
     pub acceptor: tokio_rustls::TlsAcceptor,
     pub counters: Vec<IoCounters>,
@@ -134,6 +135,7 @@ impl Server {
         let local_addr = listener.local_addr()?;
         let max_frame_bytes = config.node.max_frame_bytes;
         let max_subscriptions = config.node.max_subscriptions_per_connection;
+        let partial_frame_timeout_ms = config.node.partial_frame_timeout_ms;
         let progress_interval_ms = config.node.progress_interval_ms;
         let core_count = config.node.core_count;
         let node = Node::start(config.node, volume, store, Arc::clone(&clock))?;
@@ -143,6 +145,7 @@ impl Server {
             node: node.handle(),
             max_frame_bytes,
             max_subscriptions,
+            partial_frame_timeout_ms,
             progress_interval_ms,
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
             counters: (0..core_count).map(|_| IoCounters::default()).collect(),

@@ -78,6 +78,9 @@ pub struct NodeConfig {
     pub progress_interval_ms: u64,
     pub max_frame_bytes: u64,
     pub max_subscriptions_per_connection: usize,
+    /// How long a WebSocket message may take to arrive once it has begun. Past it the
+    /// connection is closed, because what it sent so far is held in memory.
+    pub partial_frame_timeout_ms: u64,
     /// What a subscription sends per turn on its connection (section 5.2).
     pub fair_share_bytes: u64,
     /// Bytes a connection can have that its client hasn't taken. M6 has a socket for this.
@@ -114,6 +117,7 @@ impl NodeConfig {
             progress_interval_ms: 5_000,
             max_frame_bytes: 16 * 1024 * 1024,
             max_subscriptions_per_connection: 1_024,
+            partial_frame_timeout_ms: 60_000,
             fair_share_bytes: 256 * 1024,
             connection_window_bytes: 4 * 1024 * 1024,
             catch_up_read_bytes: 1024 * 1024,
