@@ -20,7 +20,7 @@ use storage::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
-use crate::connection::{DeliverySettings, Home, Stores};
+use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
     FanOut, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, StreamDelivery,
@@ -1748,6 +1748,7 @@ impl Core {
         cursor: Arc<str>,
         op: CursorOp,
         report: Option<CursorReport>,
+        ticket: Option<CommandTicket>,
     ) {
         if let Route::Forward(to) = self.route(&name) {
             let _ = self.links.control[to].send(ControlMsg::Cursor {
@@ -1755,6 +1756,7 @@ impl Core {
                 name: cursor,
                 op,
                 report,
+                ticket,
             });
             return;
         }
@@ -2190,7 +2192,8 @@ impl Core {
                 name,
                 op,
                 report,
-            } => self.on_cursor(stream, name, op, report),
+                ticket,
+            } => self.on_cursor(stream, name, op, report, ticket),
             ControlMsg::AddExtents {
                 stream,
                 path,

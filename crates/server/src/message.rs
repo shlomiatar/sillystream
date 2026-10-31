@@ -8,7 +8,7 @@ use format::IdAllocator;
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::{Event, ExtentRead, Outbox};
+use crate::connection::{CommandTicket, Event, ExtentRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
 use crate::delivery::{ExtentRef, FanOut, StreamDelivery};
@@ -401,6 +401,8 @@ pub(crate) enum ControlMsg {
         op: CursorOp,
         /// Where an error goes.
         report: Option<CursorReport>,
+        /// A `COMMIT` from a socket, which ends with this message.
+        ticket: Option<CommandTicket>,
     },
     /// An upload's extents for a stream whose owner is elsewhere. Goes back to `origin`
     /// when noted, which is what lets it drop its batches (D83).
@@ -478,15 +480,18 @@ pub(crate) enum ConnCmd {
         name: Option<Arc<str>>,
         with_state: bool,
         state_only: bool,
+        ticket: CommandTicket,
     },
     Unsubscribe {
         conn: usize,
         sub: u32,
+        ticket: CommandTicket,
     },
     Commit {
         conn: usize,
         sub: u32,
         id: u64,
+        ticket: CommandTicket,
     },
     ResetCursor {
         conn: usize,
@@ -538,6 +543,8 @@ pub(crate) struct AttachMsg {
     pub state_only: bool,
     /// Set while the check of an explicit id is asking earlier owners (D100).
     pub walk: Option<AttachWalk>,
+    /// Ends with this message, on whichever core finishes with it.
+    pub ticket: CommandTicket,
 }
 
 /// Which of a stream's earlier owners still have to say what they hold above `cursor`.

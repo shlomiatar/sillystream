@@ -46,6 +46,9 @@ const OUT_DATA_HIGH_BYTES: u64 = 256 * 1024;
 /// Commands stop being read when this many reply bytes wait for the socket, which bounds
 /// what a client can make the server hold by never reading (D102).
 const OUT_REPLY_HIGH_BYTES: u64 = 1024 * 1024;
+/// No more frames are looked at while this many commands wait in the node's inboxes, which have
+/// no bound of their own and no answer on the socket to slow a client down (D131).
+const COMMANDS_OUT_MAX_COUNT: u64 = 256;
 /// Reads per wake, so that a fast sender leaves the socket's other work a turn.
 const READS_PER_WAKE_COUNT: usize = 16;
 /// How often a write the node can't take yet is tried again (D62).
@@ -321,12 +324,10 @@ impl WsConn<'_> {
                 .await;
                 return Ok(());
             }
-            let may_read = !self.closing
-                && self.pending.is_empty()
-                && self.backlog.is_none()
-                && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES;
+            let held_up = self.is_held_up();
+            let may_read = !self.closing && !held_up && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES;
             let want_events = !self.closing && self.out_has_event_room();
-            if self.pending.is_empty() {
+            if !held_up {
                 self.retry_at = None;
             } else if self.retry_at.is_none() {
                 self.retry_at = Some(Instant::now() + Duration::from_millis(RETRY_FULL_MS));
@@ -418,6 +419,17 @@ impl WsConn<'_> {
         }
     }
 
+    /// Whether frames have to wait: for room in the node, or for it to catch up on commands.
+    fn is_held_up(&self) -> bool {
+        !self.pending.is_empty() || self.backlog.is_some() || self.commands_are_full()
+    }
+
+    fn commands_are_full(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.connection.commands_out_count() >= COMMANDS_OUT_MAX_COUNT
+        })
+    }
+
     /// Events wait when either kind of frame has backed up: `STATE` and `SUBSCRIBED` go out as
     /// replies, and leaving them in the connection is what closes its window (D123).
     fn out_has_event_room(&self) -> bool {
@@ -442,7 +454,7 @@ impl WsConn<'_> {
         // Only a read that found nothing clears this.
         self.read_again = true;
         for _ in 0..READS_PER_WAKE_COUNT {
-            if self.closing || !self.pending.is_empty() || self.backlog.is_some() {
+            if self.closing || self.is_held_up() {
                 return Ok(());
             }
             if let Some((_, part)) = &mut self.part {
@@ -495,7 +507,7 @@ impl WsConn<'_> {
     /// Takes frames out of what was read. Whatever is whole is handled where it lies.
     async fn feed(&mut self, mut rest: SlabRegion) -> io::Result<()> {
         while !rest.is_empty() {
-            if !self.pending.is_empty() || self.closing {
+            if !self.pending.is_empty() || self.closing || self.commands_are_full() {
                 if !self.closing {
                     self.counters()
                         .held_buffer_count

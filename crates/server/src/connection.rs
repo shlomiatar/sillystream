@@ -6,6 +6,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -165,6 +166,27 @@ struct OutFrames {
 pub(crate) struct Outbox {
     frames: Mutex<OutFrames>,
     wake: Notify,
+    /// Commands from the client that no core has finished with (D131).
+    commands_out_count: AtomicU64,
+}
+
+/// One client command on its way. It travels with the command across however many cores that
+/// takes, and is dropped wherever the command ends, so a connection can see how much of the
+/// node's unbounded inboxes it is using without any reply to count (D131).
+#[derive(Debug)]
+pub(crate) struct CommandTicket(Arc<Outbox>);
+
+impl CommandTicket {
+    fn new(out: &Arc<Outbox>) -> CommandTicket {
+        out.commands_out_count.fetch_add(1, Ordering::Relaxed);
+        CommandTicket(Arc::clone(out))
+    }
+}
+
+impl Drop for CommandTicket {
+    fn drop(&mut self) {
+        self.0.commands_out_count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Outbox {
@@ -308,6 +330,7 @@ impl Connection {
             name: subscription.name.map(Arc::from),
             with_state: subscription.with_state,
             state_only: subscription.state_only,
+            ticket: CommandTicket::new(&self.out),
         });
     }
 
@@ -315,6 +338,7 @@ impl Connection {
         self.send(ConnCmd::Unsubscribe {
             conn: self.conn,
             sub,
+            ticket: CommandTicket::new(&self.out),
         });
     }
 
@@ -324,7 +348,13 @@ impl Connection {
             conn: self.conn,
             sub,
             id,
+            ticket: CommandTicket::new(&self.out),
         });
+    }
+
+    /// Commands sent that the node hasn't finished with.
+    pub(crate) fn commands_out_count(&self) -> u64 {
+        self.out.commands_out_count.load(Ordering::Relaxed)
     }
 
     /// The explicit reset of section 5.1, which alone can move a cursor back.
@@ -816,10 +846,11 @@ impl Home {
                 name,
                 with_state,
                 state_only,
+                ticket,
             } => self.subscribe(
-                conn, sub, stream, from, linger_ms, filter, name, with_state, state_only,
+                conn, sub, stream, from, linger_ms, filter, name, with_state, state_only, ticket,
             ),
-            ConnCmd::Unsubscribe { conn, sub } => {
+            ConnCmd::Unsubscribe { conn, sub, .. } => {
                 let key = self.conns[conn]
                     .as_ref()
                     .and_then(|c| c.subs.get(&sub).copied());
@@ -835,7 +866,12 @@ impl Home {
                     ),
                 }
             }
-            ConnCmd::Commit { conn, sub, id } => self.commit(conn, sub, id),
+            ConnCmd::Commit {
+                conn,
+                sub,
+                id,
+                ticket,
+            } => self.commit(conn, sub, id, ticket),
             ConnCmd::ResetCursor {
                 conn,
                 stream,
@@ -854,13 +890,13 @@ impl Home {
                     return;
                 }
                 let report = self.cursor_report(conn, 0);
-                self.post_cursor(stream, name, CursorOp::Reset(id), report);
+                self.post_cursor(stream, name, CursorOp::Reset(id), report, None);
             }
             ConnCmd::ReadCursor {
                 stream,
                 name,
                 reply,
-            } => self.post_cursor(stream, name, CursorOp::Read(reply), None),
+            } => self.post_cursor(stream, name, CursorOp::Read(reply), None, None),
             ConnCmd::Credit { conn, bytes } => self.on_credit(conn, bytes),
             ConnCmd::BehindRead { conn, sub } => {
                 let key = self.conns[conn]
@@ -901,16 +937,18 @@ impl Home {
         name: Arc<str>,
         op: CursorOp,
         report: Option<CursorReport>,
+        ticket: Option<CommandTicket>,
     ) {
         let _ = self.links.control[self.me].send(ControlMsg::Cursor {
             stream,
             name,
             op,
             report,
+            ticket,
         });
     }
 
-    fn commit(&mut self, conn: usize, sub: u32, id: u64) {
+    fn commit(&mut self, conn: usize, sub: u32, id: u64, ticket: CommandTicket) {
         let key = self.conns[conn]
             .as_ref()
             .and_then(|c| c.subs.get(&sub).copied());
@@ -929,7 +967,7 @@ impl Home {
             return;
         };
         let report = self.cursor_report(conn, sub);
-        self.post_cursor(stream, name, CursorOp::Commit(id), report);
+        self.post_cursor(stream, name, CursorOp::Commit(id), report, Some(ticket));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -944,6 +982,7 @@ impl Home {
         name: Option<Arc<str>>,
         with_state: bool,
         state_only: bool,
+        ticket: CommandTicket,
     ) {
         let error = |code, msg: &str| Event::Error {
             reference: id,
@@ -1028,6 +1067,7 @@ impl Home {
             with_state,
             state_only,
             walk: None,
+            ticket,
         })));
     }
 
