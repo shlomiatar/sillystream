@@ -484,10 +484,22 @@ target/release/sillystream bench idle-streams --cores 4 --idle-streams 20000
 
 #### What to make of these
 
-- **Memory is the slowest tier in these runs, and that isn't explained.** 319 to 353 MB/s from memory against 1,743 to 2,538 MB/s from the other two, on the same records. The 256 MiB run's first read, mostly local with 100 MB from memory, is also the slow one at 488 MB/s. Nothing here measured why. Recorded in BUILD_NOTES as a finding, not fixed.
+- **Explained since, a measurement error: see "Catch-up, memory tier, corrected" below.** Memory is the slowest tier in these runs. 319 to 353 MB/s from memory against 1,743 to 2,538 MB/s from the other two, on the same records. The 256 MiB run's first read, mostly local with 100 MB from memory, is also the slow one at 488 MB/s. Nothing here measured why. Recorded in BUILD_NOTES as a finding, not fixed.
 - **Tier columns come from the server's own trace** (`--trace-catch-up`, D213). The trace was on in all of these runs, at one line on stderr per read. The bench tempdir is on the same SSD as everything else.
 - **The 256 MiB run's "memory" rows aren't all memory:** a stream that fills its buffer gets a dedicated object before the window ends (section 7.3), so its records were already on disk even with a 120 s window. The 8 MiB run is the one that reads only memory. Records read are through the SDK, which copies them out, so these are client-side rates.
 - **Many streams:** the client shares the machine and uses one Tokio runtime, and 64 streams on 16 cores gives 1.2 to 2.4 times one stream, so this shows the client or the machine as much as section 6.1's limit. Maximum ingest across 16 cores wasn't reached, and this can't say what it is. The one-stream rows here run with 16 cores and the throughput table's with 4, and that difference is one run each, inside this file's 2x noise.
 - **Objects per seal:** one new file in `sealed/` per window at 10, 1,000 and 10,000 streams, and one other (a checkpoint). A new file on `LocalFileSystem` stands for one PUT. Overwrites aren't counted. The 10,000 row reads 0.87 because publishing 10,000 streams takes up part of a window, so windows were missed in that count, which has no seal counter behind it, and the count isn't exact.
 - **Memory per idle stream** counts RSS with one 64-byte record per stream, after the records sealed, with 20,000 producers' dedupe entries among it. The active limit made no difference to RSS in this run. Whether the streams left RAM wasn't asserted here (M7's tests do that), and an allocator doesn't have to give memory back, so this isn't evidence for or against eviction.
 - All of section 7.2's caveats and this file's Caveats apply. Criterion suites weren't re-run at this commit: each table above names the commit it came from, and the code they measure may have changed since.
+
+## Catch-up, memory tier, corrected
+
+`target/release/sillystream bench catch-up --cores 4 --catch-up-mib 8`, release build, one set of 3 runs each way, 2048 records of 4096 bytes. The earlier memory figures were the bench's own trace: `--trace-catch-up` printed one stderr line per memory batch, 2048 here, where the other tiers print one per read. The server now prints one line per memory read. The trace-per-batch column is the same code with only that line put back.
+
+| tier | one line per batch, MB/s | one line per read, MB/s |
+|---|---|---|
+| memory | 214, 253, 271 | 1010, 1507, 1596 |
+| local disk | 859, 1694, 1882 | 816, 1479, 1886 |
+| `LocalFileSystem` object store | 1024, 1640, 1854 | 1148, 1644, 1555 |
+
+The bench's tier columns also read 0 since D226 changed the trace line. That is fixed, and all three tiers above were confirmed by the bytes each reported. Without the trace flag, ordinary nodes never paid this cost. Other tables in this file weren't re-run.
