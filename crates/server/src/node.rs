@@ -114,6 +114,40 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// What would otherwise go wrong later and quietly. A read of 0 bytes, for one, reports
+    /// `PROGRESS` past records it never fetched.
+    pub fn validate(&self) -> io::Result<()> {
+        let refuse = |what: &str| Err(io::Error::new(io::ErrorKind::InvalidInput, what.to_owned()));
+        if self.core_count == 0 {
+            return refuse("core_count is 0");
+        }
+        if self.virtual_shard_count == 0 {
+            return refuse("virtual_shard_count is 0");
+        }
+        if self.slab_bytes == 0 {
+            return refuse("slab_bytes is 0");
+        }
+        if self.wal_channel_capacity == 0 || self.upload_channel_capacity == 0 {
+            return refuse("a channel capacity is 0");
+        }
+        if self.write_inbox_capacity == 0 {
+            return refuse("write_inbox_capacity is 0");
+        }
+        if self.seal_window_ms == Some(0) {
+            return refuse("seal_window_ms is 0");
+        }
+        if self.catch_up_read_bytes == 0 {
+            return refuse("catch_up_read_bytes is 0");
+        }
+        if self.max_frame_bytes == 0 {
+            return refuse("max_frame_bytes is 0");
+        }
+        if self.fair_share_bytes == 0 || self.connection_window_bytes == 0 {
+            return refuse("fair_share_bytes and connection_window_bytes can't be 0");
+        }
+        Ok(())
+    }
+
     pub fn new(core_count: usize) -> NodeConfig {
         NodeConfig {
             node_name: "node".to_owned(),
@@ -830,6 +864,8 @@ impl Node {
         clock: Arc<dyn Clock>,
         make_volume: impl FnOnce(u64) -> V,
     ) -> io::Result<(Node, RecoveryReport)> {
+        // Before anything claims ownership.
+        config.validate()?;
         std::fs::create_dir_all(&recover.wal_dir)?;
         std::fs::create_dir_all(&recover.metadata_dir)?;
         let local_store = MetadataStore::open(&recover.metadata_dir).map_err(io::Error::other)?;
@@ -882,6 +918,7 @@ impl Node {
         clock: Arc<dyn Clock>,
         recovered: Option<RecoveredParts>,
     ) -> io::Result<Node> {
+        config.validate()?;
         let core_count = config.core_count;
         let meta_stop = Arc::new(AtomicBool::new(false));
         let (first_seq, closed_seqs) = recovered.as_ref().map_or((1, Vec::new()), |parts| {

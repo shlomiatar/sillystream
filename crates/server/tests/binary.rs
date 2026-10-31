@@ -101,7 +101,7 @@ async fn running_out_of_descriptors_at_a_seal_does_not_stop_writes_for_good() {
     let cert = api::test_cert();
     std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
     std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
-    args.extend(["--seal-window-ms".to_owned(), "200".to_owned()]);
+    args.extend(["--seal-window-ms".to_owned(), "1000".to_owned()]);
     let stderr_path = dir.path().join("stderr");
     let mut child = Command::new("/bin/sh")
         .arg("-c")
@@ -185,5 +185,31 @@ async fn running_out_of_descriptors_at_a_seal_does_not_stop_writes_for_good() {
     assert!(
         stderr.contains("can't open a new file"),
         "the flood never reached a rotation:\n{stderr}"
+    );
+}
+
+/// Section 7.1's range is refused outside it, not quietly moved into it.
+#[test]
+fn a_seal_window_out_of_range_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut args = write_files(dir.path(), &[7u8; 32]);
+    let cert = api::test_cert();
+    std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
+    std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
+    args.extend(["--seal-window-ms".to_owned(), "999".to_owned()]);
+    let output = Command::new(BIN).args(args).output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--seal-window-ms"), "{stderr}");
+}
+
+#[test]
+fn a_config_that_cant_work_is_refused() {
+    let mut config = server::NodeConfig::new(1);
+    config.validate().unwrap();
+    config.catch_up_read_bytes = 0;
+    assert_eq!(
+        config.validate().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
     );
 }

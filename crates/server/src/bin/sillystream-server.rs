@@ -144,7 +144,14 @@ fn run() -> Result<(), String> {
     if let Some(name) = node_name {
         node.node_name = name;
     }
-    node.seal_window_ms = Some(seal_window_ms.unwrap_or(10_000).clamp(1_000, 120_000));
+    // Section 7.1's range. A value outside it is a mistake to report, not to change quietly.
+    let seal_window_ms = seal_window_ms.unwrap_or(10_000);
+    if !(1_000..=120_000).contains(&seal_window_ms) {
+        return Err(format!(
+            "--seal-window-ms is 1000 to 120000, not {seal_window_ms}"
+        ));
+    }
+    node.seal_window_ms = Some(seal_window_ms);
     if let Some(cap_bytes) = memory_cap_bytes {
         node.memory_cap_bytes = cap_bytes;
     }
