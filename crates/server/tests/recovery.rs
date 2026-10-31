@@ -1388,3 +1388,68 @@ async fn a_reader_gets_a_record_its_former_core_still_holds() {
     drop(client);
     node.shutdown();
 }
+
+fn wal_file_count(disk: &Disk) -> usize {
+    storage::list_wal_files(&disk.wal_dir()).unwrap().len()
+}
+
+/// The writer hears of a recycle by message, and doesn't answer it.
+async fn wait_for_wal_files(disk: &Disk, count: usize, what: &str) {
+    for _ in 0..2_000 {
+        if wal_file_count(disk) <= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{what}: {} files", wal_file_count(disk));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarts_leave_no_wal_files_behind() {
+    let disk = Disk::new();
+    for round in 1..=8u64 {
+        let (node, _) = disk.start(manual_config(1));
+        let mut client = node.client(0).await;
+        disk.clock.advance(1);
+        publish_one(&mut client, "s", round, b"x").await;
+        assert!(node.seal_and_checkpoint().await);
+        drop(client);
+        wait_for_wal_files(&disk, 2, &format!("round {round}")).await;
+        node.shutdown();
+    }
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    for seq in 100..150u64 {
+        disk.clock.advance(1);
+        publish_one(&mut client, "s", seq, b"x").await;
+        assert!(node.seal_and_checkpoint().await);
+        wait_for_wal_files(&disk, 2, &format!("seq {seq}")).await;
+    }
+    assert_eq!(read_all(&node, "s", 58).await.len(), 58);
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_loop_with_nothing_written_does_not_grow_the_wal() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "s", 1, b"kept").await;
+    drop(client);
+    node.shutdown();
+    for _ in 0..8 {
+        let (node, report) = disk.start(manual_config(1));
+        assert_eq!(
+            report.replayed_entry_count, 1,
+            "the file with an entry stays"
+        );
+        node.shutdown();
+    }
+    // That file, the file before the last start's, and the last start's own.
+    assert_eq!(wal_file_count(&disk), 3);
+    let (node, report) = disk.start(manual_config(1));
+    assert!(!report.wal_lost);
+    assert_eq!(read_all(&node, "s", 1).await.len(), 1);
+    node.shutdown();
+}

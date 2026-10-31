@@ -34,6 +34,8 @@ pub trait WalVolume: Send {
     /// Record data is the publisher's, so old bytes could hold an entry that is valid
     /// under `new_seq`, and a CRC can't tell it apart (D60).
     fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<Self::File>;
+    /// Removes a closed file nothing needs, one more than reuse has a place for.
+    fn remove(&mut self, seq: u64) -> io::Result<()>;
 }
 
 /// Tells cores what is durable. Called only after the `sync_data` covering `ticket`.
@@ -148,6 +150,10 @@ impl WalVolume for DirVolume {
         self.write_header(&mut file, new_seq)?;
         self.sync_dir()?;
         Ok(file)
+    }
+
+    fn remove(&mut self, seq: u64) -> io::Result<()> {
+        std::fs::remove_file(self.path(seq))
     }
 }
 
@@ -354,18 +360,31 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                     let _ = done.send(rotated);
                 }
                 Some(WalCommand::Recycle { up_to_seq }) => {
-                    while self
+                    while let Some(seq) = self
                         .closed_seqs
                         .front()
-                        .is_some_and(|seq| *seq <= up_to_seq)
+                        .copied()
+                        .filter(|seq| *seq <= up_to_seq)
                     {
-                        self.free_seqs.extend(self.closed_seqs.pop_front());
+                        self.closed_seqs.pop_front();
+                        self.free(seq);
                     }
                 }
                 Some(WalCommand::Append(_)) | None => {}
             }
         }
         Ok(self.stats)
+    }
+
+    /// One spare is all a rotation needs, and any more only stays on the volume and in the next
+    /// startup's reading (D155). A file that can't be removed is harmless: it replays as
+    /// entries already covered, and the next startup has it back in its closed list.
+    fn free(&mut self, seq: u64) {
+        if self.free_seqs.is_empty() {
+            self.free_seqs.push_back(seq);
+        } else if let Err(error) = self.volume.remove(seq) {
+            eprintln!("removing WAL file {seq}: {error}");
+        }
     }
 
     /// Writes the group, syncs, and only then notifies. An error returns before

@@ -453,11 +453,15 @@ pub(crate) async fn prepare(
             .push(extent);
     }
     let mut closed_seqs = Vec::with_capacity(wal_files.len());
+    let mut empty_files = Vec::new();
     let mut first_seq = 1;
     for file in &wal_files {
         closed_seqs.push(file.seq);
         first_seq = first_seq.max(file.seq + 1);
         let replayed = replay_file(file).map_err(|error| error.to_string())?;
+        if replayed.entries.is_empty() {
+            empty_files.push(file);
+        }
         // A file from before generations were known to it has nothing to say.
         let limit = (replayed.generation != 0)
             .then(|| ownership.limit_for(replayed.generation))
@@ -499,6 +503,15 @@ pub(crate) async fn prepare(
         .await
         .map_err(|error| error.to_string())?;
     local.claim(generation).map_err(|error| error.to_string())?;
+    // Only now that this process owns the disks. The newest file stays, whatever it holds, so
+    // that a crash right here doesn't look like a lost WAL (D155).
+    for file in empty_files {
+        if wal_files.last().is_some_and(|last| last.seq != file.seq)
+            && std::fs::remove_file(&file.path).is_ok()
+        {
+            closed_seqs.retain(|seq| *seq != file.seq);
+        }
+    }
     ownership.record(generation, last_valid_id);
     checkpoints.ownership = ownership;
     report.generation = generation;

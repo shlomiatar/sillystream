@@ -111,6 +111,10 @@ impl WalVolume for WalScript {
     fn reuse(&mut self, _old_seq: u64, new_seq: u64) -> io::Result<ScriptFile> {
         self.create(new_seq)
     }
+
+    fn remove(&mut self, _seq: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A store whose `PUT`s wait while held.

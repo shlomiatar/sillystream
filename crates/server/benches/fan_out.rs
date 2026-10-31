@@ -49,6 +49,10 @@ impl WalVolume for NullVolume {
     fn reuse(&mut self, _old_seq: u64, _new_seq: u64) -> io::Result<NullFile> {
         Ok(NullFile)
     }
+
+    fn remove(&mut self, _seq: u64) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn record(options: u64) -> Vec<u8> {

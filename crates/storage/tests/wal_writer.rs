@@ -18,6 +18,7 @@ use storage::{
 enum Call {
     Create(u64),
     Reuse(u64, u64),
+    Remove(u64),
     Write(usize),
     Sync,
     Durable(usize, u64),
@@ -141,6 +142,11 @@ impl WalVolume for Script {
     fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<ScriptFile> {
         self.log.push(Call::Reuse(old_seq, new_seq));
         Ok(self.open_file())
+    }
+
+    fn remove(&mut self, seq: u64) -> io::Result<()> {
+        self.log.push(Call::Remove(seq));
+        Ok(())
     }
 }
 
