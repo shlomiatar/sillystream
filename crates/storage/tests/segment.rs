@@ -596,3 +596,41 @@ async fn an_empty_block_range_on_the_local_file_system() {
     ))
     .await;
 }
+
+/// A stream moving from a higher core to a lower one: the later ids are in the earlier section.
+#[tokio::test]
+async fn a_stream_in_two_sections_reads_in_id_order_either_way() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut builder = SegmentBuilder::new();
+    let early = Bytes::from(record(FIRST_ID, 1, 7, b"on the old core"));
+    let late = Bytes::from(record(FIRST_ID + 1, 1, 7, b"on the new core"));
+    builder.add_extent("moved", [late.clone()]).unwrap();
+    builder.add_extent("zz", [late.clone()]).unwrap();
+    builder.add_extent("moved", [early.clone()]).unwrap();
+    let (path, _built) = write(store.as_ref(), builder).await;
+    let reader = SegmentReader::new(store, path);
+    let mut both = early.to_vec();
+    both.extend_from_slice(&late);
+    assert_eq!(reader.read_stream("moved").await.unwrap(), both);
+}
+
+/// The index's id range covers every item, which is what a reader finds it by.
+#[tokio::test]
+async fn an_extents_last_id_is_its_last_items() {
+    let mut bytes = Vec::new();
+    let header = RecordHeader {
+        id: FIRST_ID,
+        options: 1,
+        author: 7,
+        len: 4,
+        count: 5,
+        codec: 0,
+    };
+    format::encode_record(&mut bytes, &header, b"data").unwrap();
+    let mut builder = SegmentBuilder::new();
+    builder.add_extent("s", [Bytes::from(bytes)]).unwrap();
+    let built = builder.finish().unwrap();
+    assert_eq!(built.extents[0].id_first, FIRST_ID);
+    assert_eq!(built.extents[0].id_last, FIRST_ID + 4);
+    assert_eq!(built.last_id, Some(FIRST_ID + 4));
+}

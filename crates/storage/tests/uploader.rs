@@ -1039,3 +1039,121 @@ async fn a_put_that_hangs_times_out_and_retries() {
     drop(sender);
     uploader.shutdown();
 }
+
+/// A store whose first PUTs fail with an error that can't be told from an outage.
+#[derive(Debug)]
+struct FailsAtFirst {
+    inner: InMemory,
+    left: std::sync::atomic::AtomicU32,
+}
+
+impl std::fmt::Display for FailsAtFirst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FailsAtFirst")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailsAtFirst {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if self
+            .left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(object_store::Error::Generic {
+                store: "FailsAtFirst",
+                source: "down".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Waits double up to `retry_max_ms`. The lower bounds are exact; the upper one is loose, since
+/// a loaded machine can only make a wait longer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retries_back_off_exponentially_up_to_the_maximum() {
+    let store: Arc<dyn ObjectStore> = Arc::new(FailsAtFirst {
+        inner: InMemory::new(),
+        left: std::sync::atomic::AtomicU32::new(7),
+    });
+    let (mut config, mut events) = config(store, SECTIONS);
+    config.retry_initial_ms = 25;
+    config.retry_max_ms = 100;
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sections, _) = sections(4, FIRST_ID);
+    for (core, section) in sections.into_iter().enumerate() {
+        sender.try_send_section(1, core, section).unwrap();
+    }
+    let mut times = Vec::new();
+    loop {
+        match events.recv().await.expect("the uploader stopped") {
+            UploadEvent::Retrying { .. } => times.push(std::time::Instant::now()),
+            UploadEvent::Uploaded { .. } => break,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let gaps_ms: Vec<u128> = times
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).as_millis())
+        .collect();
+    assert_eq!(gaps_ms.len(), 6, "{gaps_ms:?}");
+    // Event times can be a little closer than the waits, so these allow a few ms.
+    for (gap_ms, least_ms) in gaps_ms.iter().zip([25u128, 50, 100, 100, 100, 100]) {
+        assert!(*gap_ms + 5 >= least_ms, "{gaps_ms:?}");
+    }
+    // Uncapped, these would be 400, 800 and 1,600 ms.
+    assert!(gaps_ms[5] < 800, "{gaps_ms:?}");
+    drop(sender);
+    uploader.shutdown();
+}
