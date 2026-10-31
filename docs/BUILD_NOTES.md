@@ -577,3 +577,33 @@ Code at `e7e0a95`, on macOS, in one sitting. `cargo test -p e2e` passed 3 consec
 
 **Every question still listed under Questions for the user:** Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q11, Q12, Q13, Q10, Q14, Q15, Q16, Q17, Q20, Q21, Q18, Q19, Q23, Q24, Q25, Q26, Q27, Q28, Q22, Q29, Q32, Q31, Q30, Q33, Q34, Q35, Q36, Q37, Q38, Q39, Q40, Q41, Q42, Q43. Only Q19 has been acted on (D242), and its values need checking.
 
+
+## Close-out of the D246 to D253 round
+
+**Suite:** `cargo test --workspace --no-fail-fast`, debug, macOS, 16 cores, three full runs in a row on the same commit, all exit 0: 771 tests passed, 1 ignored (in `crash_matrix`), and the e2e harness's 21 tests with its process check. Run 1 took about 36 minutes and runs 2 and 3 about 6, and I didn't look into why beyond that run 1 included the build. Real S3, R2 and EBS were not exercised. Three clean runs don't settle `a_manifest_only_in_the_wal_leaves_its_object_unrecorded` or `on_expire_stop_warns_then_halts`, which remain timing-dependent.
+
+**Fixed and proved on the old code first:** forward sinks stopping publishers (D246), a stream's config lost in a crash (D248) and `x-through` rewinding a caught-up client (D247). Each has an e2e test against the real binary that failed without its fix. Note that `forward_sinks_leave_publishers_running` differs from the original probe (8 sinks, not 3, and a 2.5 s spacing).
+
+**Added:** the override route and CLI (D249), archive store settings (D250), `docs/DEPLOYMENT.md` (D251), a warning for damage in a closed WAL file (D252), and an end id in the SDK and CLI (D253). Tests added for the WAL group cap (checked by removing the cap: it fails), store read retries (D87), a corrupt local copy, a full upload channel at a seal, and D241's 5 s stop bound.
+
+**Needs your decision, deliberately not changed:**
+
+- Q32: silent record loss past retention after a restart or eviction. Still the most serious open item. Option (a) adds a field section 7.6 doesn't list, so it waits for you. `q32_after_a_restart_...` still pins today's behaviour.
+- Q40: a retry after losing both WAL and data disks can be stamped again. Every option adds a field or changes a guarantee.
+- Q42: whether the server exits when the WAL writer stops. It still stays up refusing writes. `docs/DEPLOYMENT.md` tells operators what to watch for.
+- Q43: fenced WAL entries still have no way back and no tool. The docs say to keep the files.
+- Q44, new: whether the override table should survive a restart.
+- Q8: checkpoint files still pile up on a running node until its next restart.
+
+**Left undone, no decision needed:**
+
+- M9's stalled-sink acceptance is still not met: 0.73 to 0.80 once stalled, 0.24 to 0.40 of baseline while filling, with no cause isolated (BENCH.md). `sink_stall.rs` still asserts only above 0.7, and only on the steady phase.
+- Sparse preallocation showed no cost on macOS, but it hasn't been measured on EBS or Linux, which is what matters (BENCH.md).
+- Q15's warning can't tell bit rot from an older torn write, and doesn't repair anything (D252).
+- Q21's move history isn't pruned. Limits on connections, sinks per tenant, and inbound HTTP and WebSocket partial bytes are unchanged.
+- Test gaps left: metadata `SyncData` durability, multi-core delivery pressure, and proof of redelivery in `sink_webhook_outage`. `sink_forward`, `state_cas`, `atomic_publish` and `token_rejection` had no mutation run. `a_full_upload_channel_at_a_seal_...` assumes that a seal with two sections fills a channel of 1, which the test doesn't observe directly.
+- `Client::publish` keeps its partly filled slab (D246). It has only in-process callers.
+- Conditional puts on real R2 are unverified.
+- Many older items under "Review findings not fixed" were not re-checked one by one. I corrected those I checked against the code, so don't read that list as complete or current.
+
+**Stray process, left running:** PID 4275, `target/debug/deps/wal_writer-53ccb395b8f4af84`, was already about 23 hours old when this round began. I didn't start it, so I left it. It's safe for you to stop.
