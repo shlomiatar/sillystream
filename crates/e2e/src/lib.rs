@@ -63,7 +63,11 @@ fn cargo_build(target_dir: &Path, root: &Path, args: &[&str]) {
 pub fn binaries() -> &'static Binaries {
     static BINARIES: OnceLock<Binaries> = OnceLock::new();
     BINARIES.get_or_init(|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        // As cargo sets it for this run. This library can come from another checkout's build of
+        // the same target directory, so the compile-time value can name that checkout (D224).
+        let manifest_dir =
+            std::env::var("CARGO_MANIFEST_DIR").unwrap_or(env!("CARGO_MANIFEST_DIR").to_owned());
+        let root = Path::new(&manifest_dir).join("../..");
         let root = root.canonicalize().expect("the workspace root");
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map_or_else(|| root.join("target"), PathBuf::from)
