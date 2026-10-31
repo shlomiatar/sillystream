@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::{HEADER_BYTES, IdAllocator, encode_system_record, validate_publish};
+use format::{HEADER_BYTES, IdAllocator, ValidatedPublish, encode_system_record, validate_publish};
 use proto::ErrorCode;
 use storage::{
     Section, SectionExtent, UploadEvent, UploadKey, UploadSendError, UploaderSender, WalEntry,
@@ -322,6 +322,34 @@ fn entry_fits(records_bytes: usize, change: Option<&StateChange>) -> bool {
         HEADER_BYTES + (ACTOR_BYTES + change.doc.len()).next_multiple_of(8)
     });
     u32::try_from(records_bytes + system_bytes).is_ok()
+}
+
+/// What an owner refuses of a publish with error 8 before anything about the stream counts
+/// (section 3). It reads no record's data. Gives the records, ready to stamp, and how many ids
+/// they and the state change take.
+pub(crate) fn check_publish<'a>(
+    stream: &str,
+    records: &'a mut [u8],
+    change: Option<&StateChange>,
+) -> Result<(ValidatedPublish<'a>, u32), String> {
+    if !stream_name_is_valid(stream) {
+        return Err("stream id is empty or too long".to_owned());
+    }
+    let validated = validate_publish(records).map_err(|error| error.to_string())?;
+    let item_count = validated.item_count() + u64::from(change.is_some());
+    if item_count == 0 {
+        return Err("publish has no records or state".to_owned());
+    }
+    let Ok(ack_count) = u32::try_from(item_count) else {
+        return Err("publish has too many items".to_owned());
+    };
+    if !entry_fits(validated.as_bytes().len(), change) {
+        return Err("publish is too large".to_owned());
+    }
+    if let Some(change) = change {
+        check_doc(&change.doc).map_err(|error| error.to_string())?;
+    }
+    Ok((validated, ack_count))
 }
 
 pub(crate) struct Core {
@@ -809,37 +837,16 @@ impl Core {
                 },
             );
         };
-        if !stream_name_is_valid(&msg.stream) {
-            nack(ErrorCode::Malformed, &"stream id is empty or too long");
-            return;
-        }
-        let mut validated = match validate_publish(&mut records) {
-            Ok(validated) => validated,
-            Err(error) => {
-                nack(ErrorCode::Malformed, &error);
-                return;
-            }
-        };
+        let (mut validated, ack_count) =
+            match check_publish(&msg.stream, &mut records, msg.state.as_ref()) {
+                Ok(checked) => checked,
+                Err(error) => {
+                    nack(ErrorCode::Malformed, &error);
+                    return;
+                }
+            };
         let has_state = msg.state.is_some();
-        let item_count = validated.item_count() + u64::from(has_state);
-        if item_count == 0 {
-            nack(ErrorCode::Malformed, &"publish has no records or state");
-            return;
-        }
-        let Ok(ack_count) = u32::try_from(item_count) else {
-            nack(ErrorCode::Malformed, &"publish has too many items");
-            return;
-        };
-        if !entry_fits(validated.as_bytes().len(), msg.state.as_ref()) {
-            nack(ErrorCode::Malformed, &"publish is too large");
-            return;
-        }
-        if let Some(change) = &msg.state
-            && let Err(error) = check_doc(&change.doc)
-        {
-            nack(ErrorCode::Malformed, &error);
-            return;
-        }
+        let item_count = u64::from(ack_count);
         let now_ms = self.clock.now_ms();
         if msg.producer_id != 0
             && let Some(stream) = self.streams.get_mut(&*msg.stream)

@@ -336,3 +336,18 @@ The same throughput command, re-run after frames that span reads gained a copy (
 | 2 | 1 | 65536 | 7259 | 475.7 |
 | 2 | 4 | 1024 | 486434 | 498.1 |
 | 2 | 4 | 65536 | 13759 | 901.7 |
+
+### Throughput after D129 to D133
+
+`sillystream bench throughput --seconds 3 --cores 4`, release build, re-run after the command gate (D131) and the changes to `wsconn`. One run each at 3 s, where the table above used a longer run, so this shows no large cost rather than no cost. The publisher has no subscriber here, so it doesn't exercise D132's release of `DATA` chunks, and it publishes over WebSocket, so D130's extra copy on HTTP publishes wasn't measured.
+
+| ack | connections | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 338870 | 347.0 |
+| 1 | 1 | 65536 | 24632 | 1614.3 |
+| 1 | 4 | 1024 | 448522 | 459.3 |
+| 1 | 4 | 65536 | 34103 | 2235.0 |
+| 2 | 1 | 1024 | 190548 | 195.1 |
+| 2 | 1 | 65536 | 6586 | 431.6 |
+| 2 | 4 | 1024 | 468264 | 479.5 |
+| 2 | 4 | 65536 | 13788 | 903.6 |

@@ -764,7 +764,7 @@ impl<'a> HttpConn<'a> {
                 .map(|info| effective_default(&info.config))
                 .unwrap_or_else(|_| effective_default(&StreamConfig::default())),
         };
-        let records = if shape.simple {
+        let mut records = if shape.simple {
             let length = request.content_length as usize;
             let padded_bytes = length.next_multiple_of(8);
             let total_bytes = (HEADER_BYTES + padded_bytes) as u64;
@@ -788,6 +788,13 @@ impl<'a> HttpConn<'a> {
         } else {
             self.read_body_into_slab(request, 0, 0).await?
         };
+        // Nothing will come back to answer with, so what the owner would refuse is refused here,
+        // or the caller is told a publish was accepted that commits nothing (D133).
+        if ack_level == 0
+            && let Err(msg) = crate::core::check_publish(stream, &mut records, None)
+        {
+            return Ok(error(ErrorCode::Malformed, &msg));
+        }
         let handle = self.number();
         let mut publish = RegionPublish {
             stream: Arc::from(stream),

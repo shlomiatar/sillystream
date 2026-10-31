@@ -1006,3 +1006,51 @@ async fn a_bad_certificate_is_refused_at_the_start() {
     );
     assert!(result.is_err());
 }
+
+/// Level 0 has no ack to wait for, but it can't be told it was accepted when the owner is going
+/// to refuse it. Section 3 says a rejected publish commits nothing and gets a `NACK`.
+#[tokio::test(flavor = "multi_thread")]
+async fn level_0_is_refused_what_any_other_level_is_refused() {
+    let server = start();
+    let all = token(ALL);
+    let bad_length = vec![1u8, 2, 3];
+    let mut bad_padding = record(0, b"abc");
+    bad_padding[35] = 1;
+    let mut has_id = record(0, b"abc");
+    has_id[0] = 1;
+    let cases: [(&str, &[u8]); 4] = [
+        ("too short", &bad_length),
+        ("padding", &bad_padding),
+        ("id", &has_id),
+        ("empty", b""),
+    ];
+    for (name, body) in cases {
+        for ack in [0, 2] {
+            let path = format!("/v1/stream/g.{ack}/publish?ack={ack}");
+            let reply = server
+                .http(
+                    &Http::new("POST", &path, &all)
+                        .header("content-type", "application/x-sillystream-records")
+                        .body(body),
+                )
+                .await;
+            assert_eq!(reply.status, 400, "{name} at level {ack}: {}", reply.text());
+            assert_eq!(reply.code(), Some(8), "{name} at level {ack}");
+        }
+    }
+    // What is fine still goes, and answers as level 0 does, in both forms.
+    for (content_type, body) in [
+        ("application/x-sillystream-records", record(0, b"abc")),
+        ("application/octet-stream", b"abc".to_vec()),
+    ] {
+        let reply = server
+            .http(
+                &Http::new("POST", "/v1/stream/g.0/publish?ack=0", &all)
+                    .header("content-type", content_type)
+                    .body(body),
+            )
+            .await;
+        assert_eq!(reply.status, 202, "{}", reply.text());
+    }
+    server.server.shutdown();
+}
