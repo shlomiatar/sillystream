@@ -35,6 +35,7 @@ macro_rules! tests {
 
 const TESTS: &[(&str, TestFn)] = tests![
     sinks_leave_the_node_able_to_take_connections,
+    a_stopped_wal_says_so_on_stderr,
     publish_to_live,
     filters,
     catch_up_memory,
@@ -2204,6 +2205,70 @@ async fn a_publisher_cannot_skew_other_streams_through_a_restart() {
         lead_of(id)
     );
     node.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the log says
+// ---------------------------------------------------------------------------------------------
+
+/// The process goes on serving reads (D79), so its log is all that tells an operator.
+async fn a_stopped_wal_says_so_on_stderr() {
+    const STREAM: &str = "wal.stops";
+    let node = Node::started(NodeOptions::default());
+    let token = node.admin_token(AUTHOR);
+    let mut ws = node.ws(&token).await;
+    ws.open(1, STREAM).await;
+    let wal = node.path("wal");
+    let body = record(1, 0, b"x");
+    let mut refused = None;
+    for seq in 1..=2_000 {
+        if seq == 5 {
+            // A new file can't be made, which the next seal's rotation needs.
+            set_writable(&wal, false);
+        }
+        ws.publish(&PublishFrame {
+            handle: 1,
+            producer_id: 5,
+            seq,
+            ack: AckLevel::WalFsync,
+            state: None,
+            records: &body,
+        })
+        .await;
+        match ws.recv().await {
+            Owned::Ack { .. } => tokio::time::sleep(Duration::from_millis(5)).await,
+            other => {
+                refused = Some(other);
+                break;
+            }
+        }
+    }
+    let refused = refused.expect("the WAL never stopped");
+    assert!(
+        matches!(
+            refused,
+            Owned::Nack {
+                code: ErrorCode::RateLimited,
+                ..
+            } | Owned::Error {
+                code: ErrorCode::RateLimited,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    wait_until("the log to say the WAL stopped", async || {
+        node.log_text().contains("the WAL writer stopped")
+    })
+    .await;
+    assert!(node.is_running(), "reads go on until an operator acts");
+    let (head, _) = node
+        .http(&token)
+        .info(STREAM)
+        .await
+        .expect("reads still work");
+    assert!(head > 0);
+    set_writable(&wal, true);
 }
 
 // ---------------------------------------------------------------------------------------------

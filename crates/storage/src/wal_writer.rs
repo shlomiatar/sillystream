@@ -310,7 +310,17 @@ where
     };
     let thread = std::thread::Builder::new()
         .name("wal-writer".to_owned())
-        .spawn(move || writer.run(rx))?;
+        .spawn(move || {
+            let result = writer.run(rx);
+            // The node goes on serving reads, so nothing else tells an operator (D79).
+            if let Err(error) = &result {
+                eprintln!(
+                    "the WAL writer stopped: {error}. This node refuses writes until it is \
+                     restarted."
+                );
+            }
+            result
+        })?;
     Ok((WalSender { tx }, WalHandle { thread }))
 }
 
