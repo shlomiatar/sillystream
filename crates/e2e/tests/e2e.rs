@@ -1715,21 +1715,63 @@ async fn sink_forward() {
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
+const EXPIRE_PERIOD_MS: u64 = 200;
+const EXPIRE_PERIOD_SLOW_MS: u64 = 1_000;
+
+fn retention_args(expire_period_ms: u64) -> Vec<String> {
+    [
+        "--compact-period-ms",
+        "200",
+        "--compact-merge-wait-ms",
+        "0",
+        "--expire-period-ms",
+        &expire_period_ms.to_string(),
+    ]
+    .iter()
+    .map(|text| (*text).to_owned())
+    .collect()
+}
+
 fn retention_options() -> NodeOptions {
     NodeOptions {
         hooks: true,
-        extra: [
-            "--compact-period-ms",
-            "200",
-            "--compact-merge-wait-ms",
-            "0",
-            "--expire-period-ms",
-            "200",
-        ]
-        .iter()
-        .map(|text| (*text).to_owned())
-        .collect(),
+        extra: retention_args(EXPIRE_PERIOD_MS),
         ..NodeOptions::default()
+    }
+}
+
+/// Watches each hour prefix of `before` go, and fails if the first object and the last of one
+/// prefix go further apart than a pass of the delete job, or if a prefix never goes.
+async fn watch_prefixes_go(node: &Node, before: &HashSet<String>) {
+    let mut left = hours(before);
+    let mut first_gone: HashMap<String, Instant> = HashMap::new();
+    let started = Instant::now();
+    while !left.is_empty() {
+        assert!(
+            started.elapsed() < WAIT,
+            "these never expired: {:?}",
+            left.keys()
+        );
+        let now_there = node.objects("sealed");
+        left.retain(|prefix, files| {
+            let there = files
+                .iter()
+                .filter(|file| now_there.contains(*file))
+                .count();
+            if there < files.len() {
+                let first = *first_gone
+                    .entry(prefix.clone())
+                    .or_insert_with(Instant::now);
+                let span_ms = first.elapsed().as_millis() as u64;
+                assert!(
+                    span_ms < EXPIRE_PERIOD_SLOW_MS,
+                    "{prefix} still holds {there} of {} objects {span_ms} ms after it began to go",
+                    files.len()
+                );
+            }
+            there > 0
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -1866,22 +1908,31 @@ async fn retention_and_compaction() {
     let http = node.http(&fill.admin);
     let week_bytes: Vec<u8> = fill.week.iter().flat_map(|one| one.bytes.clone()).collect();
     assert_eq!(http.read_bytes("keep.week", 0, None).await, week_bytes);
+    // More seals, so that some hour prefix holds several objects: two hours at most in this run.
+    wait_until("several objects in `sealed/`", async || {
+        http.publish_records("keep.pad", &record(1, 0, b"pad"))
+            .await;
+        node.objects("sealed").len() >= 4
+    })
+    .await;
     node.stop();
     let sealed_before = node.objects("sealed");
     let week_objects = node.objects("7d");
-    assert!(!sealed_before.is_empty());
+    assert!(
+        hours(&sealed_before).values().any(|files| files.len() >= 2),
+        "no prefix to delete whole: {sealed_before:?}"
+    );
     assert!(
         !node.path("objects/1d").exists(),
         "the 1d class is never compacted"
     );
 
-    // Three days on, past `sealed/`'s two.
+    // Three days on, past `sealed/`'s two. A slower delete job, because one pass of it takes a
+    // prefix whole, and a job that took a prefix bit by bit would then need several seconds.
     node.clock_offset_ms = 3 * DAY_MS;
+    node.options.extra = retention_args(EXPIRE_PERIOD_SLOW_MS);
     node.start();
-    wait_until("`sealed/` to expire", async || {
-        node.objects("sealed").is_disjoint(&sealed_before)
-    })
-    .await;
+    watch_prefixes_go(&node, &sealed_before).await;
     assert_only_whole_prefixes(&sealed_before, &node.objects("sealed"), "sealed/ at 3 days");
     assert!(
         node.objects("7d").is_superset(&week_objects),
