@@ -1170,3 +1170,122 @@ async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
     );
     node.shutdown();
 }
+
+/// An old disk coming back after another generation ran on the bucket: its local store is only
+/// a cache of what S3 had then, and S3 has moved on (section 7.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_store_left_from_before_a_replacement_is_not_trusted() {
+    let disk_a = Disk::new();
+    let (node, _) = disk_a.start(manual_config(2));
+    let mut client = node.client(0).await;
+    let (x1, _) = publish_one(&mut client, "x", 1, b"x1").await;
+    publish_one(&mut client, "z", 1, b"z1").await;
+    set_state(&mut client, "x", &map(&[("n", int(1))])).await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    let disk_b = replacement_for(&disk_a);
+    disk_b.clock.advance(10_000);
+    let (node, _) = disk_b.start(manual_config(2));
+    let mut client = node.client(0).await;
+    let (x2, _) = publish_one(&mut client, "x", 2, b"x2").await;
+    set_state(&mut client, "x", &map(&[("n", int(2))])).await;
+    publish_one(&mut client, "y", 1, b"y1").await;
+    assert!(client.delete_stream("z").await);
+    assert!(node.seal_and_checkpoint().await);
+    let before = client.snapshot("x").await.unwrap();
+    drop(client);
+    node.shutdown();
+
+    disk_a.clock.advance(20_000);
+    let (node, _) = disk_a.start(manual_config(2));
+    let mut client = node.client(0).await;
+    let after = client.snapshot("x").await.unwrap();
+    assert_eq!(after.state_ver, before.state_ver, "x's state went back");
+    assert_eq!(after.head, before.head, "x's head went back");
+    assert!(client.snapshot("y").await.is_ok(), "y is gone");
+    assert!(client.snapshot("z").await.is_err(), "deleted z is back");
+    let got: Vec<u64> = read_all(&node, "x", 2)
+        .await
+        .into_iter()
+        .filter(|(_, data)| data == b"x1" || data == b"x2")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(got, [x1, x2]);
+    drop(client);
+    node.shutdown();
+}
+
+/// A plain restart keeps its store, and reads nothing it doesn't have to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_with_no_other_generation_keeps_its_local_store() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(evicting_config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "a", 1, b"a1").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    assert!(client.snapshot("a").await.is_ok());
+    assert_eq!(total_stats(&node).await.rebuilt_count, 0);
+    drop(client);
+    node.shutdown();
+}
+
+/// Section 8.1 holds for what a former generation left in its WAL, as it does for its objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wal_entry_above_the_former_generations_limit_is_ignored() {
+    let disk_a = Disk::new();
+    let (node, _) = disk_a.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (r1, _) = publish_one(&mut client, "s", 1, b"r1").await;
+    assert!(node.seal_and_checkpoint().await);
+    disk_a.clock.advance(1_000);
+    let (r2, _) = publish_one(&mut client, "s", 2, b"r2").await;
+    drop(client);
+    node.shutdown();
+
+    let disk_b = replacement_for(&disk_a);
+    disk_b.clock.advance(5_000);
+    let (node, report) = disk_b.start(manual_config(1));
+    assert!(report.last_valid_id < r2, "the replacement never saw r2");
+    let mut client = node.client(0).await;
+    let (r3, _) = publish_one(&mut client, "s", 3, b"r3").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk_a.metadata_dir()).unwrap();
+    disk_a.clock.advance(10_000);
+    let (node, report) = disk_a.start(manual_config(1));
+    assert_eq!(report.replayed_entry_count, 1, "only r1 is at or below it");
+    let got: Vec<u64> = read_all(&node, "s", 2)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(got, [r1, r3]);
+    node.shutdown();
+}
+
+/// A crash of the same generation's process replays every entry: nothing has limited it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_entries_survive_two_restarts_on_their_own_disk() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (r1, _) = publish_one(&mut client, "s", 1, b"r1").await;
+    drop(client);
+    node.shutdown();
+    let (node, _) = disk.start(manual_config(1));
+    node.shutdown();
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.replayed_entry_count, 1);
+    let got = read_all(&node, "s", 1).await;
+    assert_eq!(got[0].0, r1);
+    node.shutdown();
+}

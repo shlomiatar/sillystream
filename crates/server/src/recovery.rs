@@ -40,6 +40,8 @@ pub struct RecoveryReport {
     /// there is no telling how many (section 8.1).
     pub wal_lost: bool,
     pub replayed_entry_count: u64,
+    /// WAL entries above their former generation's limit, left out of replay (section 8.1).
+    pub ignored_entry_count: u64,
     pub restored_stream_count: u64,
     /// Objects no checkpoint knew of, whose extents were looked at.
     pub scanned_object_count: u64,
@@ -171,6 +173,12 @@ pub(crate) fn accepted_prefix(bytes: &Bytes, limit: u64) -> Option<(u64, Bytes)>
         last_id = Some(record.header.last_id());
     }
     last_id.map(|last_id| (last_id, bytes.slice(..accepted_bytes)))
+}
+
+/// A publish commits as one unit (section 3), so any of it over the limit rules out all of it.
+fn entry_is_above(entry: &storage::ReplayedEntry, limit: u64) -> bool {
+    Records::new(&entry.records)
+        .any(|record| record.is_ok_and(|record| record.header.last_id() > limit))
 }
 
 struct ScannedExtent {
@@ -419,8 +427,12 @@ pub(crate) async fn prepare(
         .await
         .map_err(|error| error.to_string())?;
     let local = Arc::new(
-        LocalMeta::open(local_store, checkpoints.files.is_empty())
-            .map_err(|error| error.to_string())?,
+        LocalMeta::open(
+            local_store,
+            ownership.current_generation(),
+            checkpoints.files.is_empty(),
+        )
+        .map_err(|error| error.to_string())?,
     );
     let mut scanned_objects = Vec::new();
     let scanned = scan_objects(
@@ -445,10 +457,16 @@ pub(crate) async fn prepare(
     for file in &wal_files {
         closed_seqs.push(file.seq);
         first_seq = first_seq.max(file.seq + 1);
-        for entry in replay_file(file)
-            .map_err(|error| error.to_string())?
-            .entries
-        {
+        let replayed = replay_file(file).map_err(|error| error.to_string())?;
+        // A file from before generations were known to it has nothing to say.
+        let limit = (replayed.generation != 0)
+            .then(|| ownership.limit_for(replayed.generation))
+            .flatten();
+        for entry in replayed.entries {
+            if limit.is_some_and(|limit| entry_is_above(&entry, limit)) {
+                report.ignored_entry_count += 1;
+                continue;
+            }
             report.replayed_entry_count += 1;
             pending
                 .entry(entry.stream.clone())
@@ -480,6 +498,7 @@ pub(crate) async fn prepare(
     let (generation, last_valid_id) = claim_generation(store.as_ref(), &ownership, max_id)
         .await
         .map_err(|error| error.to_string())?;
+    local.claim(generation).map_err(|error| error.to_string())?;
     ownership.record(generation, last_valid_id);
     checkpoints.ownership = ownership;
     report.generation = generation;

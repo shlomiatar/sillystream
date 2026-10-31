@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use format::{crc32c_append, crc32c_seeded};
+use format::{crc32c, crc32c_append, crc32c_seeded};
 
 use crate::wal_format::{ENTRY_FIXED_BYTES, WAL_FILE_HEADER_BYTES, WAL_MAGIC};
 
@@ -23,6 +23,8 @@ pub struct ReplayedFile {
     pub entries: Vec<ReplayedEntry>,
     /// Where the prefix ends. 0 if the file header itself isn't valid.
     pub valid_end_bytes: usize,
+    /// The generation that opened the file. 0 if it had none, or the header isn't valid.
+    pub generation: u64,
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
@@ -79,19 +81,23 @@ fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, 
 }
 
 /// The longest valid prefix of a file that should have the given `seq`. A file whose
-/// header isn't exactly `magic, seq` has no valid entries: this covers a crash between
-/// the rename and the header write of a reused file (D8).
+/// header isn't exactly `magic, seq, generation, crc, 0` has no valid entries: this covers a
+/// crash between the rename and the header write of a reused file (D8).
 pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
     let mut replayed = ReplayedFile {
         entries: Vec::new(),
         valid_end_bytes: 0,
+        generation: 0,
     };
     if file.len() < WAL_FILE_HEADER_BYTES
         || read_u64(file, 0) != WAL_MAGIC
         || read_u64(file, 8) != seq
+        || read_u32(file, 24) != crc32c(&file[..24])
+        || read_u32(file, 28) != 0
     {
         return replayed;
     }
+    replayed.generation = read_u64(file, 16);
     let mut offset = WAL_FILE_HEADER_BYTES;
     while let Some((entry, next)) = parse_entry(file, offset, seq) {
         replayed.entries.push(entry);

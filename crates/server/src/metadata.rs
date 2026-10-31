@@ -27,6 +27,9 @@ const KEY_MAX_ID: &[u8] = b"g";
 /// seal's local write, since a crash before its PUT would leave the store ahead of S3 with
 /// nothing to say what S3 lacks.
 const KEY_OWED: &[u8] = b"p";
+/// The generation this store belongs to, little-endian. Any other generation having claimed the
+/// bucket since means S3 has moved on without it (section 7.6).
+const KEY_GENERATION: &[u8] = b"o";
 /// A stream id can be as long as a whole key (D57), so the longest ones are shortened. The
 /// value holds the whole name, which a read checks (D135).
 const KEY_NAME_BYTES: usize = 65_000;
@@ -110,17 +113,33 @@ pub(crate) struct LocalMeta {
 }
 
 impl LocalMeta {
-    /// `no_checkpoints`: nothing exists that this store could be missing.
+    /// `current_generation`: the latest claim on the bucket. A store of any other generation
+    /// is emptied, since another owner may have changed anything in it, and S3 has all it held
+    /// once its owed file is there (D148, D151). `no_checkpoints`: nothing exists that this
+    /// store could be missing.
     pub(crate) fn open(
         store: MetadataStore,
+        current_generation: Option<u64>,
         no_checkpoints: bool,
     ) -> Result<LocalMeta, MetadataError> {
+        let current = current_generation.map(|generation| generation.to_le_bytes().to_vec());
+        if store.get(KEY_GENERATION)? != current {
+            let entries = store.scan_prefix(&[])?;
+            store.apply(entries.iter().map(|(key, _)| (key.as_slice(), None)))?;
+        }
         let mut complete = store.get(KEY_COMPLETE)?.is_some();
         if !complete && no_checkpoints {
             store.apply([(KEY_COMPLETE, Some(&b"1"[..]))])?;
             complete = true;
         }
         Ok(LocalMeta { store, complete })
+    }
+
+    /// Called once this process has claimed `generation`, so that the next startup can tell
+    /// nobody else has run since. A crash before this only costs a rebuild from the checkpoints.
+    pub(crate) fn claim(&self, generation: u64) -> Result<(), MetadataError> {
+        let bytes = generation.to_le_bytes();
+        self.store.apply([(KEY_GENERATION, Some(&bytes[..]))])
     }
 
     pub(crate) fn get(&self, name: &str) -> Result<Option<StreamMeta>, LocalError> {

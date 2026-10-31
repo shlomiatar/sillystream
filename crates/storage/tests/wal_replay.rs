@@ -41,7 +41,7 @@ fn cases() -> Vec<Case> {
 
 /// The file's bytes, and the offset where each entry ends.
 fn file(seq: u64, cases: &[Case]) -> (Vec<u8>, Vec<usize>) {
-    let mut bytes = encode_file_header(seq).to_vec();
+    let mut bytes = encode_file_header(seq, 0).to_vec();
     let mut ends = Vec::new();
     for case in cases {
         bytes.extend(
@@ -129,8 +129,9 @@ fn stale_entries_of_a_reused_file_are_not_returned() {
         "the new entry ends exactly where an old one starts"
     );
     let mut reused = old.clone();
-    reused[..16].copy_from_slice(&encode_file_header(42));
-    reused[16..16 + new_entry.len()].copy_from_slice(&new_entry);
+    reused[..WAL_FILE_HEADER_BYTES].copy_from_slice(&encode_file_header(42, 0));
+    reused[WAL_FILE_HEADER_BYTES..WAL_FILE_HEADER_BYTES + new_entry.len()]
+        .copy_from_slice(&new_entry);
     let replayed = replay_bytes(&Bytes::from(reused), 42);
     assert_eq!(replayed.entries.len(), 1);
     assert_eq!(replayed.entries[0].producer_seq, 5);
@@ -170,11 +171,12 @@ fn an_entry_matches_its_byte_exact_vector() {
         .step_by(2)
         .map(|at| u8::from_str_radix(&vector[at..at + 2], 16).unwrap())
         .collect();
-    let mut bytes = encode_file_header(3).to_vec();
+    let mut bytes = encode_file_header(3, 5).to_vec();
     bytes.extend(encode_wal_entry(3, "logs.a", 7, 42, &[0xAB; 32]).unwrap());
     bytes.extend(encode_wal_entry(3, "b", 0, 0, &[0xCD; 8]).unwrap());
     assert_eq!(bytes, expected);
     let replayed = replay_bytes(&Bytes::from(expected), 3);
+    assert_eq!(replayed.generation, 5);
     assert_eq!(replayed.entries.len(), 2);
     assert_eq!(replayed.entries[0].stream, "logs.a");
     assert_eq!(replayed.entries[0].producer_id, 7);
@@ -191,7 +193,7 @@ proptest! {
         seq in any::<u64>(),
         tail in prop::collection::vec(any::<u8>(), 0..8),
     ) {
-        let mut bytes = encode_file_header(seq).to_vec();
+        let mut bytes = encode_file_header(seq, 0).to_vec();
         for (stream, id, producer_seq, records) in &entries {
             let entry = encode_wal_entry(seq, stream, *id, *producer_seq, records).unwrap();
             prop_assert_eq!(entry.len() % 8, 0);
@@ -216,7 +218,7 @@ proptest! {
         body in prop::collection::vec(any::<u8>(), 0..2048),
         seq in any::<u64>(),
     ) {
-        let mut bytes = encode_file_header(seq).to_vec();
+        let mut bytes = encode_file_header(seq, 0).to_vec();
         bytes.extend(body);
         let replayed = replay_bytes(&Bytes::from(bytes), seq);
         // A CRC could in theory pass by chance, but not within what proptest tries.

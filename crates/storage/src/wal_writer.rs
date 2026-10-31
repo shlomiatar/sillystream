@@ -75,6 +75,8 @@ impl WalFile for File {
 pub struct DirVolume {
     dir: PathBuf,
     preallocate_bytes: u64,
+    /// Goes in each file's header. 0 for a node with no ownership record.
+    generation: u64,
 }
 
 impl DirVolume {
@@ -82,6 +84,19 @@ impl DirVolume {
         DirVolume {
             dir: dir.into(),
             preallocate_bytes,
+            generation: 0,
+        }
+    }
+
+    /// The volume of a process that owns `generation`.
+    pub fn for_generation(
+        dir: impl Into<PathBuf>,
+        preallocate_bytes: u64,
+        generation: u64,
+    ) -> DirVolume {
+        DirVolume {
+            generation,
+            ..DirVolume::new(dir, preallocate_bytes)
         }
     }
 
@@ -93,9 +108,9 @@ impl DirVolume {
         File::open(&self.dir)?.sync_all()
     }
 
-    fn write_header(file: &mut File, seq: u64) -> io::Result<()> {
+    fn write_header(&self, file: &mut File, seq: u64) -> io::Result<()> {
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&encode_file_header(seq))?;
+        file.write_all(&encode_file_header(seq, self.generation))?;
         file.sync_all()?;
         Ok(())
     }
@@ -111,7 +126,7 @@ impl WalVolume for DirVolume {
             .write(true)
             .open(self.path(seq))?;
         file.set_len(self.preallocate_bytes.max(WAL_FILE_HEADER_BYTES as u64))?;
-        DirVolume::write_header(&mut file, seq)?;
+        self.write_header(&mut file, seq)?;
         self.sync_dir()?;
         Ok(file)
     }
@@ -130,7 +145,7 @@ impl WalVolume for DirVolume {
         std::fs::rename(old_path, &path)?;
         crash_point("recycle.after_rename");
         file.set_len(size_bytes)?;
-        DirVolume::write_header(&mut file, new_seq)?;
+        self.write_header(&mut file, new_seq)?;
         self.sync_dir()?;
         Ok(file)
     }

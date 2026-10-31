@@ -101,7 +101,7 @@ impl WalVolume for WalScript {
         self.files
             .lock()
             .unwrap()
-            .insert(seq, encode_file_header(seq).to_vec());
+            .insert(seq, encode_file_header(seq, 0).to_vec());
         Ok(ScriptFile {
             script: self.clone(),
             seq,

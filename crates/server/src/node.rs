@@ -748,7 +748,11 @@ impl Node {
         let report = prepared.report;
         let node = Node::start_parts(
             config,
-            DirVolume::new(&recover.wal_dir, recover.wal_preallocate_bytes),
+            DirVolume::for_generation(
+                &recover.wal_dir,
+                recover.wal_preallocate_bytes,
+                report.generation,
+            ),
             store,
             clock,
             Some(RecoveredParts {

@@ -504,7 +504,10 @@ fn a_real_reused_file_returns_none_of_its_stale_entries() {
         .collect();
     assert_eq!(names, [2, 3]);
     let raw = std::fs::read(dir.path().join(storage::wal_file_name(3))).unwrap();
-    assert_eq!(&raw[..16], encode_file_header(3));
+    assert_eq!(
+        &raw[..storage::WAL_FILE_HEADER_BYTES],
+        encode_file_header(3, 0)
+    );
     let stale = encode_wal_entry(1, "stream", 7, 2, &[2; 40]).unwrap();
     assert!(!raw.windows(stale.len()).any(|window| window == stale));
     let entries = replay_dir(dir.path()).unwrap();
@@ -536,7 +539,7 @@ fn entries_that_the_format_cannot_hold_are_refused() {
 #[test]
 fn record_data_in_a_reused_file_cannot_be_replayed_as_an_entry() {
     const AUTHOR: u64 = 7;
-    const FORGED_AT_BYTES: usize = 88;
+    const FORGED_AT_BYTES: usize = 104;
     let dir = tempfile::tempdir().unwrap();
     let (notify, _receivers) = durable_watches(1);
     let (sender, handle) =
@@ -596,7 +599,14 @@ fn reuse_keeps_the_size_and_nothing_of_the_old_contents() {
     drop(volume.reuse(1, 2).unwrap());
     let raw = std::fs::read(dir.path().join(storage::wal_file_name(2))).unwrap();
     assert_eq!(raw.len() as u64, size_bytes);
-    assert_eq!(&raw[..16], encode_file_header(2));
-    assert!(raw[16..].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        &raw[..storage::WAL_FILE_HEADER_BYTES],
+        encode_file_header(2, 0)
+    );
+    assert!(
+        raw[storage::WAL_FILE_HEADER_BYTES..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
     assert!(!dir.path().join(storage::wal_file_name(1)).exists());
 }

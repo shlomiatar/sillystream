@@ -1,6 +1,8 @@
 //! Bytes of the WAL (SPEC section 6.3, D8, D9, D50).
 //!
-//! A file is `magic u64 | seq u64`, then entries, each starting at a multiple of 8:
+//! A file is `magic u64 | seq u64 | generation u64 | crc32c u32 | 0 u32`, then entries, each
+//! starting at a multiple of 8. `generation` is the owner that opened it, 0 if there is none,
+//! which is what tells a replay how far to accept its entries (section 8.1, D152):
 //!
 //! ```text
 //! stream_len u16 | stream | producer_id u64 | producer_seq u64 | len u32 | crc32c u32 |
@@ -12,19 +14,22 @@
 use std::fmt;
 use std::sync::Arc;
 
-use format::{crc32c_append, crc32c_seeded};
+use format::{crc32c, crc32c_append, crc32c_seeded};
 
 /// `SSWAL001` as little-endian bytes on disk.
 pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SSWAL001");
-pub const WAL_FILE_HEADER_BYTES: usize = 16;
+pub const WAL_FILE_HEADER_BYTES: usize = 32;
 /// The entry's fixed fields, without the stream name.
 pub(crate) const ENTRY_FIXED_BYTES: usize = 2 + 8 + 8 + 4 + 4;
 pub(crate) const ZERO_PADDING: [u8; 8] = [0; 8];
 
-pub fn encode_file_header(seq: u64) -> [u8; WAL_FILE_HEADER_BYTES] {
+pub fn encode_file_header(seq: u64, generation: u64) -> [u8; WAL_FILE_HEADER_BYTES] {
     let mut out = [0u8; WAL_FILE_HEADER_BYTES];
     out[..8].copy_from_slice(&WAL_MAGIC.to_le_bytes());
-    out[8..].copy_from_slice(&seq.to_le_bytes());
+    out[8..16].copy_from_slice(&seq.to_le_bytes());
+    out[16..24].copy_from_slice(&generation.to_le_bytes());
+    let crc = crc32c(&out[..24]);
+    out[24..28].copy_from_slice(&crc.to_le_bytes());
     out
 }
 
