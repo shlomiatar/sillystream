@@ -1670,6 +1670,22 @@ impl Core {
             .name
             .as_ref()
             .and_then(|name| stream.delivery.cursors.get(name).copied());
+        // Forward only through `COMMIT`, which refuses this too (section 5.1): a new cursor up
+        // there would hide every record until an explicit reset.
+        if message.name.is_some()
+            && stored.is_none()
+            && message.from != u64::MAX
+            && message.from > stream.ids.last_id()
+        {
+            self.send_catch(
+                sub,
+                CatchReply::Fail {
+                    code: ErrorCode::Malformed,
+                    msg: "a new named cursor can't start above the stream's head".to_owned(),
+                },
+            );
+            return;
+        }
         let from = stored.unwrap_or(message.from);
         let cursor = match from {
             // The start of retention is what's left, whatever class the stream has now.

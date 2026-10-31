@@ -221,3 +221,39 @@ async fn named_cursors_are_limited_per_stream_and_by_name_length() {
     drop((connection, client));
     harness.finish();
 }
+
+/// Section 5.1: a named cursor gets forward only through `COMMIT`, which refuses an id above the
+/// head. A `SUBSCRIBE` naming a new cursor can't place it there either, or later records would
+/// never be delivered under that name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subscribe_cant_make_a_named_cursor_above_the_head() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let ids = publish_records(&mut client, 1, 1).await;
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+
+    connection.subscribe(named(7, "c", u64::MAX - 5));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(7).is_some()
+    })
+    .await;
+    assert_eq!(heard.error_code(7), Some(ErrorCode::Malformed));
+    assert_eq!(connection.read_cursor(STREAM, "c").await, None);
+
+    // The head itself is fine, and so a later record comes.
+    connection.subscribe(named(8, "c", ids[0]));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard
+            .events
+            .iter()
+            .any(|event| matches!(event, server::Event::Subscribed { sub: 8, .. }))
+    })
+    .await;
+    let later = publish_records(&mut client, 1, 2).await;
+    wait_for_records(&mut connection, &mut heard, 8, 1).await;
+    assert_eq!(heard.records(8)[0].0, later[0]);
+    drop((connection, client));
+}
