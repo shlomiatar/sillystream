@@ -1599,7 +1599,8 @@ impl Core {
             id => id,
         }
         .max(stream.delivery.floor_id);
-        if from != 0 && from != u64::MAX {
+        // State outlives records, and this reads no records (section 7.4).
+        if from != 0 && from != u64::MAX && !message.state_only {
             if cursor < stream.delivery.expired_through {
                 self.send_catch(
                     sub,
@@ -2363,6 +2364,10 @@ impl Core {
                         config,
                         reply,
                     });
+                }
+                // Nobody but the node sets this one's config (D159).
+                Route::Here(_) if &*stream == MANIFEST_STREAM => {
+                    let _ = reply.send(());
                 }
                 Route::Here(shard) => {
                     self.stream_entry(&stream, shard).config = config;

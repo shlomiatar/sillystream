@@ -129,6 +129,10 @@ pub struct ScriptStore {
     pub checkpoint_put_budget: Arc<AtomicI64>,
     /// Every delete, in order.
     pub deleted: Arc<Mutex<Vec<Path>>>,
+    /// `GET`s of a path ending in this wait this long, once each.
+    pub slow_get_once: Arc<Mutex<Vec<(String, Duration)>>>,
+    /// `PUT`s of a path ending in this wait this long, every time.
+    pub slow_put: Arc<Mutex<Vec<(String, Duration)>>>,
 }
 
 impl fmt::Display for ScriptStore {
@@ -146,7 +150,14 @@ impl ScriptStore {
             put_begun_count: Arc::new(AtomicU64::new(0)),
             checkpoint_put_budget: Arc::new(AtomicI64::new(-1)),
             deleted: Arc::new(Mutex::new(Vec::new())),
+            slow_get_once: Arc::new(Mutex::new(Vec::new())),
+            slow_put: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Removes an object without it counting as one of the node's deletes.
+    pub async fn inner_delete(&self, location: &Path) {
+        self.inner.delete(location).await.unwrap();
     }
 
     pub fn hold(&self) {
@@ -169,6 +180,16 @@ impl ObjectStore for ScriptStore {
         self.put_begun_count.fetch_add(1, Ordering::SeqCst);
         while self.hold_put.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let slow = self
+            .slow_put
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(end, _)| location.as_ref().ends_with(end.as_str()))
+            .map(|(_, delay)| *delay);
+        if let Some(delay) = slow {
+            tokio::time::sleep(delay).await;
         }
         if location.as_ref().starts_with("checkpoints/") {
             let budget = &self.checkpoint_put_budget;
@@ -199,6 +220,16 @@ impl ObjectStore for ScriptStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let slow = {
+            let mut armed = self.slow_get_once.lock().unwrap();
+            armed
+                .iter()
+                .position(|(end, _)| location.as_ref().ends_with(end.as_str()))
+                .map(|at| armed.remove(at).1)
+        };
+        if let Some(delay) = slow {
+            tokio::time::sleep(delay).await;
+        }
         self.inner.get_opts(location, options).await
     }
 

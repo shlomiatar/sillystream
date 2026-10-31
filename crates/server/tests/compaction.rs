@@ -186,6 +186,18 @@ async fn manifests(node: &Node) -> Vec<String> {
     paths
 }
 
+/// The manifests once at least `count` have arrived. They are published after an upload and wait
+/// for an fsync, so a seal returning doesn't mean they are readable yet.
+async fn manifests_reaching(node: &Node, count: usize) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(WAIT_MS);
+    loop {
+        let paths = manifests(node).await;
+        if paths.len() >= count || std::time::Instant::now() >= deadline {
+            return paths;
+        }
+    }
+}
+
 async fn seal_path_of(node: &Node) -> Path {
     match node.seal().await {
         SealOutcome::Uploaded { path, .. } => path,
@@ -204,7 +216,7 @@ async fn each_seal_publishes_one_manifest_and_the_manifest_stream_none_for_itsel
         publish_one(&mut client, "user.b", round + 1, b"b").await;
         user_objects.push(seal_path_of(&node).await.to_string());
     }
-    assert_eq!(manifests(&node).await, user_objects);
+    assert_eq!(manifests_reaching(&node, 3).await, user_objects);
 
     // What's left is only the manifest stream's, which gets none, and then there's nothing.
     let manifest_only = seal_path_of(&node).await;
@@ -734,7 +746,11 @@ async fn a_former_generations_records_above_its_limit_are_dropped_by_compaction(
     client.configure("late", class_config(7 * DAY_MS)).await;
     let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
     assert_eq!(report.errors, Vec::<String>::new());
-    assert!(manifests(&node).await.contains(&late_path.to_string()));
+    assert!(
+        manifests_reaching(&node, 1)
+            .await
+            .contains(&late_path.to_string())
+    );
     let mut want = below.to_vec();
     want.extend_from_slice(&at);
     assert_eq!(disk.stream_bytes("7d", "late").await, want);
@@ -1503,6 +1519,71 @@ async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     let report = node.expire_now().await.unwrap();
     assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
     assert_eq!(read_all(&node, "raised", 1).await[0].0, raised);
+    drop(client);
+    node.shutdown();
+}
+
+/// Retention applies to records only: state lasts until the stream is deleted (section 7.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_state_only_subscribe_from_before_what_expired_gets_the_state() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    let old = publish_one(&mut client, "so", 1, b"a").await;
+    publish_one(&mut client, "so", 2, b"b").await;
+    seal_path_of(&node).await;
+    client
+        .state_op(StateOpRequest {
+            stream: "so",
+            req: 1,
+            author: AUTHOR,
+            expect_ver: 0,
+            op: server::StateOp::Set,
+            doc: cbor(&int(5)),
+        })
+        .await
+        .unwrap();
+    expect_reply(&mut client).await;
+    seal_path_of(&node).await;
+    disk.clock.advance(3 * DAY_MS);
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    let report = node.expire_now().await.unwrap();
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+
+    let mut connection = node.connection(0).await.unwrap();
+    let mut subscription = Subscription::new(1, "so", old);
+    subscription.state_only = true;
+    connection.subscribe(subscription);
+    let mut heard = Heard::default();
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(1).is_some()
+            || heard
+                .events
+                .iter()
+                .any(|event| matches!(event, server::Event::Subscribed { .. }))
+    })
+    .await;
+    assert_eq!(heard.error_code(1), None);
+    let state = heard.events.iter().find_map(|event| match event {
+        server::Event::Subscribed { state, .. } => Some(state.clone()),
+        _ => None,
+    });
+    assert_eq!(state, Some(cbor(&int(5))));
+    drop((connection, client));
+    node.shutdown();
+}
+
+/// D159: nothing but the node sets this stream's config, or the delete job's reads shorten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_cannot_change_the_manifest_stream() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "a", 1, b"x").await;
+    seal_path_of(&node).await;
+    client.configure(MANIFEST_STREAM, class_config(1)).await;
+    let info = client.stream_info(MANIFEST_STREAM).await.unwrap();
+    assert_eq!(info.config.retention_ms, u64::MAX);
     drop(client);
     node.shutdown();
 }
