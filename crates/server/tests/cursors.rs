@@ -166,3 +166,57 @@ async fn a_cursor_moves_with_its_stream_and_can_commit_progress() {
     drop((connection, client));
     harness.finish();
 }
+
+/// A `read` grant can write cursors, so a stream's table and its names must have a limit, or
+/// one such token can fill a node's memory, and a restart loads it all again (D218).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_cursors_are_limited_per_stream_and_by_name_length() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let ids = publish_records(&mut client, 2, 1).await;
+
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    for at in 0..server::NAMED_CURSOR_CAP_COUNT {
+        connection.reset_cursor(STREAM, &format!("c{at}"), ids[0]);
+    }
+    let last = format!("c{}", server::NAMED_CURSOR_CAP_COUNT - 1);
+    assert_eq!(connection.read_cursor(STREAM, &last).await, Some(ids[0]));
+
+    // Full: a new name is refused, by a subscribe or a reset, and nothing is stored.
+    connection.subscribe(named(1, "by_subscribe", 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(1).is_some()
+    })
+    .await;
+    assert_eq!(heard.error_code(1), Some(ErrorCode::TooManySubscriptions));
+    assert_eq!(connection.read_cursor(STREAM, "by_subscribe").await, None);
+    connection.reset_cursor(STREAM, "by_reset", ids[0]);
+    assert_eq!(connection.read_cursor(STREAM, "by_reset").await, None);
+
+    // A subscribe under a name it already has is fine.
+    connection.subscribe(named(3, "c0", u64::MAX));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.events.iter().any(
+            |event| matches!(event, server::Event::Subscribed { sub, .. } if *sub == 3),
+        )
+    })
+    .await;
+
+    // One already there still moves.
+    connection.reset_cursor(STREAM, "c0", ids[1]);
+    assert_eq!(connection.read_cursor(STREAM, "c0").await, Some(ids[1]));
+
+    // A name over the limit is malformed, at a subscribe.
+    let long = "n".repeat(server::CURSOR_NAME_MAX_BYTES + 1);
+    connection.subscribe(named(2, &long, 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(2).is_some()
+    })
+    .await;
+    assert_eq!(heard.error_code(2), Some(ErrorCode::Malformed));
+    drop((connection, client));
+    harness.finish();
+}

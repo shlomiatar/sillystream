@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use crate::core::Links;
 use crate::delivery::{
     ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
-    cursor_name_is_allowed, walk_records,
+    CURSOR_NAME_REFUSED, cursor_name_is_allowed, walk_records,
 };
 use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
@@ -888,7 +888,7 @@ impl Home {
                         Event::Error {
                             reference: 0,
                             code: ErrorCode::Malformed,
-                            msg: "sink: cursors belong to sinks".to_owned(),
+                            msg: CURSOR_NAME_REFUSED.to_owned(),
                         },
                     );
                     return;
@@ -1009,7 +1009,7 @@ impl Home {
             .as_deref()
             .is_some_and(|name| !cursor_name_is_allowed(name))
         {
-            Some(error(ErrorCode::Malformed, "sink: cursors belong to sinks"))
+            Some(error(ErrorCode::Malformed, CURSOR_NAME_REFUSED))
         } else {
             None
         };

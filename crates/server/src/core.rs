@@ -191,6 +191,8 @@ struct Batch {
     waiters: Vec<Waiter>,
 }
 
+const NO_CURSOR_ROOM: &str = "this stream has too many named cursors";
+
 /// The batches this core has stamped for one stream and not yet seen uploaded. It stays
 /// here after the stream moves away, since this core's section is what covers them.
 #[derive(Default)]
@@ -1723,6 +1725,16 @@ impl Core {
             }
         }
         if let Some(name) = &message.name {
+            if !crate::delivery::cursor_has_room(&stream.delivery.cursors, name) {
+                self.send_catch(
+                    sub,
+                    CatchReply::Fail {
+                        code: ErrorCode::TooManySubscriptions,
+                        msg: NO_CURSOR_ROOM.to_owned(),
+                    },
+                );
+                return;
+            }
             stream
                 .delivery
                 .cursors
@@ -2044,9 +2056,13 @@ impl Core {
         };
         let head = stream.ids.last_id();
         stream.delivery.meta_dirty = stream.delivery.track_meta;
+        let room = crate::delivery::cursor_has_room(&stream.delivery.cursors, &cursor);
         match op {
             CursorOp::Commit(id) if id > head => {
                 fail(ErrorCode::Malformed, "COMMIT above the stream's head");
+            }
+            CursorOp::Commit(_) | CursorOp::Reset(_) if !room => {
+                fail(ErrorCode::TooManySubscriptions, NO_CURSOR_ROOM);
             }
             CursorOp::Commit(id) => {
                 // Forward only: a lower one is ignored (section 5.1).
@@ -2062,6 +2078,10 @@ impl Core {
             CursorOp::Put { id, reset, reply } => {
                 if !reset && id > head {
                     let _ = reply.send(Err(ErrorCode::Malformed));
+                    return;
+                }
+                if !room {
+                    let _ = reply.send(Err(ErrorCode::TooManySubscriptions));
                     return;
                 }
                 let at = stream.delivery.cursors.entry(cursor).or_insert(id);

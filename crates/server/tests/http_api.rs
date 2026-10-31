@@ -581,6 +581,33 @@ async fn cursors_move_forward_and_reset_goes_back() {
     server.server.shutdown();
 }
 
+/// A read-only token can't grow a node's memory without limit (D218).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_token_is_limited_in_cursors_and_their_names() {
+    let server = start();
+    let ids = seed(&server, "c", &[b"1"]).await;
+    let text = token(auth::PERM_READ);
+    let put = async |name: &str| {
+        server
+            .http(
+                &Http::new("PUT", &format!("/v1/stream/c/cursor/{name}"), &text)
+                    .body(ids[0].to_string().into_bytes()),
+            )
+            .await
+    };
+    let longest = "n".repeat(server::CURSOR_NAME_MAX_BYTES);
+    assert_eq!(put(&longest).await.status, 200);
+    assert_code(&put(&format!("{longest}n")).await, 400, 8);
+    for at in 1..server::NAMED_CURSOR_CAP_COUNT {
+        let reply = put(&format!("c{at}")).await;
+        assert_eq!(reply.status, 200, "{at}: {}", reply.text());
+    }
+    assert_code(&put("one_more").await, 429, 5);
+    // One already there still moves.
+    assert_eq!(put(&longest).await.status, 200);
+    server.server.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_put_creates_and_changes_config() {
     let server = start();

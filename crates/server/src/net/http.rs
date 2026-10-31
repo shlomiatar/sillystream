@@ -23,7 +23,7 @@ use super::json::{Json, quoted};
 use super::ws::accept_key;
 use super::{Shared, with_core_io};
 use crate::connection::{Connection, Event, Subscription};
-use crate::delivery::cursor_name_is_allowed;
+use crate::delivery::{CURSOR_NAME_REFUSED, cursor_name_is_allowed};
 use crate::message::{
     Reply, SinkOp, SinkSpec, SinkStart, StateChange, StreamConfig, StreamConfigPatch, StreamInfo,
 };
@@ -340,7 +340,11 @@ fn parse_request(head: &[u8], leftover: Vec<u8>) -> Result<Request, Response> {
     }
     let mut lengths = headers.iter().filter(|(name, _)| name == "content-length");
     let content_length = match lengths.next() {
-        Some((_, value)) => value.parse().map_err(|_| bad())?,
+        // `u64::from_str` also takes a leading `+`, which RFC 9110 doesn't.
+        Some((_, value)) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+            value.parse().map_err(|_| bad())?
+        }
+        Some(_) => return Err(bad()),
         None => 0,
     };
     if lengths.next().is_some() {
@@ -970,7 +974,7 @@ impl<'a> HttpConn<'a> {
         body: &[u8],
     ) -> Response {
         if !cursor_name_is_allowed(name) {
-            return malformed("sink: cursors belong to sinks");
+            return malformed(CURSOR_NAME_REFUSED);
         }
         let text = std::str::from_utf8(body).unwrap_or("").trim();
         let id = match Json::parse(body) {
@@ -987,6 +991,10 @@ impl<'a> HttpConn<'a> {
         match self.client().put_cursor(stream, name, id, reset).await {
             Ok(at) => Response::json(200, format!("{{\"id\":\"{at}\"}}")),
             Err(ErrorCode::NotFound) => error(ErrorCode::NotFound, "no such stream"),
+            Err(ErrorCode::TooManySubscriptions) => error(
+                ErrorCode::TooManySubscriptions,
+                "this stream has too many named cursors",
+            ),
             Err(code) => error(code, "a commit can't be above the stream's head"),
         }
     }
@@ -1508,6 +1516,11 @@ mod tests {
     fn requests_with_two_lengths_or_a_transfer_encoding_are_refused() {
         let parse = |head: &str| parse_request(head.as_bytes(), Vec::new());
         assert!(parse("GET / HTTP/1.1\r\ncontent-length: 1\r\nContent-Length: 2").is_err());
+        // RFC 9110: digits only, or a proxy could frame the request differently.
+        for length in ["+3", "-3", "", "3 3", "0x3", "3,3", "\u{0663}"] {
+            let head = format!("POST /a HTTP/1.1\r\nContent-Length: {length}");
+            assert!(parse(&head).is_err(), "{length:?}");
+        }
         assert!(parse("GET / HTTP/1.1\r\ntransfer-encoding: chunked").is_err());
         assert!(parse("GET / HTTP/1.1\r\n bad: fold").is_err());
         assert!(parse("GET / HTTP/2").is_err());

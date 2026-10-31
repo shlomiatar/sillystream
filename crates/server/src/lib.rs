@@ -32,7 +32,7 @@ pub use connection::{Connection, DataFrame, DataPart, Event, Subscription};
 pub use dedupe::{
     DEDUPE_CAP_COUNT, DEDUPE_ENTRY_BYTES, DEDUPE_IDLE_MS, DedupeCheck, DedupeEntry, DedupeTable,
 };
-pub use delivery::Matched;
+pub use delivery::{CURSOR_NAME_MAX_BYTES, Matched, NAMED_CURSOR_CAP_COUNT};
 pub use message::{
     CoreStats, Reply, SinkGap, SinkOp, SinkReport, SinkSpec, SinkStart, SnapshotReply, StateChange,
     StreamConfig, StreamConfigPatch, StreamInfo,

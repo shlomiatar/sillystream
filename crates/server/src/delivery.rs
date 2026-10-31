@@ -528,10 +528,33 @@ pub(crate) fn retention_start_id(now_ms: u64, retention_ms: u64) -> u64 {
     make_id(now_ms.saturating_sub(retention_ms), 0)
 }
 
+/// The cursors clients can name on one stream, and how long a name can be. `read` is enough to
+/// write one, and they last as long as the stream, so nothing else limits them (D218).
+pub const NAMED_CURSOR_CAP_COUNT: usize = 1000;
+pub const CURSOR_NAME_MAX_BYTES: usize = 256;
+
+/// What a client hears for a name `cursor_name_is_allowed` refuses.
+pub(crate) const CURSOR_NAME_REFUSED: &str =
+    "a cursor name is at most 256 bytes, and sink: and compact: names are reserved";
+
 /// A cursor name for clients. `sink:` names belong to sinks (D27), `compact:` to the compactor,
 /// since moving one on would let the delete job expire what was never copied.
 pub(crate) fn cursor_name_is_allowed(name: &str) -> bool {
-    !name.starts_with("sink:") && !name.starts_with("compact:")
+    name.len() <= CURSOR_NAME_MAX_BYTES
+        && !name.starts_with("sink:")
+        && !name.starts_with("compact:")
+}
+
+/// Whether `name` can be stored: it is there already, it is a sink's or the compactor's, or the
+/// stream has room for one more of the clients'.
+pub(crate) fn cursor_has_room(cursors: &HashMap<Arc<str>, u64>, name: &str) -> bool {
+    cursors.contains_key(name)
+        || !cursor_name_is_allowed(name)
+        || cursors
+            .keys()
+            .filter(|name| cursor_name_is_allowed(name))
+            .count()
+            < NAMED_CURSOR_CAP_COUNT
 }
 
 #[cfg(test)]

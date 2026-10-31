@@ -27,7 +27,7 @@ use super::ws::{
 };
 use super::{Shared, with_core_io};
 use crate::connection::{Connection, DataPart, Event, Subscription};
-use crate::delivery::cursor_name_is_allowed;
+use crate::delivery::{CURSOR_NAME_REFUSED, cursor_name_is_allowed};
 use crate::message::{Reply, StateChange};
 use crate::node::{Client, ClientError, OwnedStateOp, RegionPublish};
 use crate::slab::SlabRegion;
@@ -808,8 +808,7 @@ impl WsConn<'_> {
                     .is_some_and(|name| !cursor_name_is_allowed(name))
                 {
                     let reference = subscribe.sub;
-                    let text = "sink: cursors belong to sinks";
-                    self.send_error(reference, ErrorCode::Malformed, text);
+                    self.send_error(reference, ErrorCode::Malformed, CURSOR_NAME_REFUSED);
                     return Ok(());
                 }
                 if session.subs.len() >= self.shared.max_subscriptions {
