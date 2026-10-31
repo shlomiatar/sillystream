@@ -277,7 +277,7 @@ fn parse_u64(text: &str) -> Option<u64> {
 }
 
 /// D26's filter text. `None` if it isn't one.
-pub(super) fn parse_filter(text: &str) -> Option<(Vec<Clause>, Option<u64>)> {
+pub(crate) fn parse_filter(text: &str) -> Option<(Vec<Clause>, Option<u64>)> {
     let mut clauses = Vec::new();
     let mut author = None;
     for part in text.split(',').filter(|part| !part.is_empty()) {
@@ -999,7 +999,7 @@ impl<'a> HttpConn<'a> {
                     stream,
                     SinkOp::Put {
                         sink_id,
-                        spec,
+                        spec: Box::new(spec),
                         start,
                     },
                 )
@@ -1012,6 +1012,10 @@ impl<'a> HttpConn<'a> {
     async fn sink(&mut self, stream: &str, op: SinkOp) -> Response {
         match self.client().sink_op(stream, op).await {
             Ok(()) => Response::json(200, "{\"ok\":true}".to_owned()),
+            Err(code) if code == ErrorCode::Malformed => error(
+                code,
+                "a forward needs a non-zero id and a target other than its source",
+            ),
             Err(code) => error(code, "no such stream or sink"),
         }
     }
@@ -1189,6 +1193,32 @@ fn config_json(config: &StreamConfig) -> String {
     )
 }
 
+/// How a sink is doing. Its secret is never shown, and neither is its URL, which often holds one.
+fn sink_status_json(spec: &SinkSpec) -> String {
+    let text = |value: &Option<String>| value.as_deref().map_or("null".to_owned(), quoted);
+    let gaps: Vec<String> = spec
+        .gaps
+        .iter()
+        .map(|gap| {
+            format!(
+                "{{\"first_id\":\"{}\",\"last_id\":\"{}\"}}",
+                gap.first_id, gap.last_id
+            )
+        })
+        .collect();
+    format!(
+        "{{\"pause_reason\":{},\"failure_count\":{},\"last_error\":{},\"expiry_warning_id\":{},\
+         \"gap_count\":{},\"gaps\":[{}]}}",
+        text(&spec.pause_reason),
+        spec.failure_count,
+        text(&spec.last_error),
+        spec.expiry_warning_id
+            .map_or("null".to_owned(), |id| format!("\"{id}\"")),
+        spec.gap_count,
+        gaps.join(",")
+    )
+}
+
 fn info_json(stream: &str, info: &StreamInfo) -> String {
     let mut sinks = String::new();
     for (id, spec, cursor) in &info.sinks {
@@ -1196,10 +1226,11 @@ fn info_json(stream: &str, info: &StreamInfo) -> String {
             sinks.push(',');
         }
         sinks.push_str(&format!(
-            "{{\"id\":\"{id}\",\"kind\":{},\"paused\":{},\"cursor\":\"{}\"}}",
+            "{{\"id\":\"{id}\",\"kind\":{},\"paused\":{},\"cursor\":\"{}\",\"status\":{}}}",
             quoted(&spec.kind),
             spec.paused,
-            cursor.unwrap_or(0)
+            cursor.unwrap_or(0),
+            sink_status_json(spec)
         ));
     }
     format!(
@@ -1275,13 +1306,9 @@ fn parse_sink_reset(body: &[u8]) -> Result<SinkStart, Response> {
 
 fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
     let mut spec = SinkSpec {
-        kind: String::new(),
-        url: None,
-        target: None,
-        filter: None,
         on_expire: "stop".to_owned(),
         concurrency: 1,
-        paused: false,
+        ..SinkSpec::default()
     };
     let mut start = SinkStart::Now;
     let text = |value: &Json, name: &str| -> Result<String, Response> {
@@ -1315,6 +1342,17 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
                     .filter(|count| *count > 0)
                     .ok_or_else(|| malformed("concurrency is a count above 0"))?;
             }
+            "secret" => spec.secret = Some(text(&value, "secret")?),
+            "interval_ms" => {
+                spec.interval_ms = value
+                    .as_u64()
+                    .ok_or_else(|| malformed("interval_ms is a number"))?;
+            }
+            "budget_bytes" => {
+                spec.budget_bytes = value
+                    .as_u64()
+                    .ok_or_else(|| malformed("budget_bytes is a number"))?;
+            }
             "start" => start = parse_start(&value)?,
             _ => return Err(malformed("unknown sink field")),
         }
@@ -1322,13 +1360,22 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
     match spec.kind.as_str() {
         "webhook.notify" | "webhook.deliver" => {
             let url = spec.url.as_deref().unwrap_or("");
-            if !url.starts_with("https://") && !url.starts_with("http://") {
+            if crate::sink::parse_url(url).is_none() {
                 return Err(malformed("a webhook needs an http or https url"));
+            }
+            if spec.kind == "webhook.deliver" && spec.secret.is_none() {
+                return Err(malformed("webhook.deliver needs a secret to sign with"));
+            }
+            if spec.kind == "webhook.notify" && spec.concurrency > 1 {
+                return Err(malformed("webhook.notify sends one at a time"));
             }
         }
         "forward" => {
             if !spec.target.as_deref().is_some_and(is_valid_stream_id) {
                 return Err(malformed("forward needs a target stream"));
+            }
+            if spec.concurrency > 1 {
+                return Err(malformed("forward keeps its target's order, one at a time"));
             }
         }
         "archive" => {}

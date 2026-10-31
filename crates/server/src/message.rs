@@ -82,8 +82,8 @@ pub struct StreamConfigPatch {
     pub retention_ms: Option<u64>,
 }
 
-/// One sink as it is registered. Its runtime is M9, so nothing here delivers yet (BUILD_NOTES).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One sink as the stream holds it: what it was told, then how it is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SinkSpec {
     pub kind: String,
     /// `webhook.*`: where it goes.
@@ -95,7 +95,36 @@ pub struct SinkSpec {
     pub on_expire: String,
     pub concurrency: u32,
     pub paused: bool,
+    /// `webhook.*`: the HMAC key. Never shown (D29).
+    pub secret: Option<String>,
+    /// `webhook.notify`: least time between sends. 0 takes the node's.
+    pub interval_ms: u64,
+    /// What the sink may hold at once. 0 takes the node's.
+    pub budget_bytes: u64,
+    /// Why it paused itself. A person pausing leaves this empty, and a resume clears it.
+    pub pause_reason: Option<String>,
+    /// The latest gaps a skip recorded (D30), and how many there have been.
+    pub gaps: Vec<SinkGap>,
+    pub gap_count: u64,
+    /// Failures in a row, and the last one. Not saved.
+    pub failure_count: u32,
+    pub last_error: Option<String>,
+    /// The unread id that is about to expire. Not saved.
+    pub expiry_warning_id: Option<u64>,
+    /// Goes up when the cursor is set from outside, so that a delivery started before then
+    /// can't move it back on (D195). Not saved.
+    pub epoch: u64,
 }
+
+/// Ids a sink skipped because they expired unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkGap {
+    pub first_id: u64,
+    pub last_id: u64,
+}
+
+/// How many gaps a sink keeps listed.
+pub(crate) const SINK_GAPS_KEPT_COUNT: usize = 16;
 
 /// `GET /v1/stream/<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,13 +136,13 @@ pub struct StreamInfo {
     pub sinks: Vec<(u64, SinkSpec, Option<u64>)>,
 }
 
-/// A change to a stream's sinks (section 9's lifecycle, without its runtime).
+/// A change to a stream's sinks: section 9's lifecycle, and what the sink's worker reports.
 #[derive(Debug, Clone)]
 pub enum SinkOp {
     /// Creates at `start`, or updates a sink that exists and keeps its cursor and pause.
     Put {
         sink_id: u64,
-        spec: SinkSpec,
+        spec: Box<SinkSpec>,
         start: SinkStart,
     },
     Delete {
@@ -127,6 +156,41 @@ pub enum SinkOp {
         sink_id: u64,
         start: SinkStart,
     },
+    /// From the sink's worker: the cursor moves forward to `id`, unless `epoch` is stale.
+    Commit {
+        sink_id: u64,
+        id: u64,
+        epoch: u64,
+    },
+    /// From the sink's worker.
+    Report {
+        sink_id: u64,
+        report: SinkReport,
+    },
+}
+
+impl SinkOp {
+    /// Which sink, if this is the lifecycle rather than the worker's own traffic: a person is
+    /// waiting for these, and they have to outlive a crash (section 9, D196).
+    pub(crate) fn lifecycle_sink(&self) -> Option<u64> {
+        match self {
+            SinkOp::Put { sink_id, .. }
+            | SinkOp::Delete { sink_id }
+            | SinkOp::SetPaused { sink_id, .. }
+            | SinkOp::Reset { sink_id, .. } => Some(*sink_id),
+            SinkOp::Commit { .. } | SinkOp::Report { .. } => None,
+        }
+    }
+}
+
+/// What a sink's worker has to say about itself.
+#[derive(Debug, Clone)]
+pub enum SinkReport {
+    Failure { count: u32, error: String },
+    Healthy,
+    Warning { first_id: Option<u64> },
+    Paused { reason: String },
+    Gap { first_id: u64, last_id: u64 },
 }
 
 /// Where a sink's cursor starts, or goes on reset.
@@ -157,6 +221,8 @@ pub(crate) struct PublishMsg {
     pub state: Option<StateChange>,
     pub records: SlabRegion,
     pub reply: ReplyTx,
+    /// From a forward sink: records keep their own author, and `author` isn't used (section 9.1).
+    pub forward: bool,
     /// `(core, its forward count)` the first time each core forwarded this, so that a core
     /// can put its own forwards back in the order it first read them (D78).
     pub passed: Vec<(u16, u64)>,

@@ -18,7 +18,8 @@ sillystream token issue --secret-file FILE --author N --grant PATTERN:PERM[,PERM
 sillystream stream create|config NAME [--retention R] [--default-ack N] [--min-ack N]
 sillystream stream info|delete NAME
 sillystream sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filter F]
-                        [--on-expire E] [--concurrency N] [--start S]
+                        [--on-expire E] [--concurrency N] [--start S] [--secret K]
+                        [--interval-ms N] [--budget-bytes N]
 sillystream sink delete|pause|resume STREAM ID
 sillystream sink reset STREAM ID [--start S]
 sillystream publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
@@ -281,6 +282,9 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 "--concurrency",
                 "--start",
                 "--sink-url",
+                "--secret",
+                "--interval-ms",
+                "--budget-bytes",
             ])?;
             let kind = args.one("--kind").ok_or("needs --kind")?;
             let mut fields = vec![format!("\"kind\":{}", json_string(kind))];
@@ -290,6 +294,7 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 ("--filter", "filter"),
                 ("--on-expire", "on_expire"),
                 ("--start", "start"),
+                ("--secret", "secret"),
             ] {
                 if let Some(value) = args.one(flag) {
                     fields.push(format!("\"{field}\":{}", json_string(value)));
@@ -297,6 +302,12 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
             }
             if let Some(concurrency) = args.number("--concurrency")? {
                 fields.push(format!("\"concurrency\":{concurrency}"));
+            }
+            if let Some(interval_ms) = args.number("--interval-ms")? {
+                fields.push(format!("\"interval_ms\":{interval_ms}"));
+            }
+            if let Some(budget_bytes) = args.number("--budget-bytes")? {
+                fields.push(format!("\"budget_bytes\":{budget_bytes}"));
             }
             let body = format!("{{{}}}", fields.join(","));
             client.request("PUT", &path, &[], body.as_bytes()).await

@@ -19,6 +19,7 @@ pub mod net;
 mod node;
 mod placement;
 mod recovery;
+mod sink;
 mod slab;
 mod state;
 
@@ -33,8 +34,8 @@ pub use dedupe::{
 };
 pub use delivery::Matched;
 pub use message::{
-    CoreStats, Reply, SinkOp, SinkSpec, SinkStart, SnapshotReply, StateChange, StreamConfig,
-    StreamConfigPatch, StreamInfo,
+    CoreStats, Reply, SinkGap, SinkOp, SinkReport, SinkSpec, SinkStart, SnapshotReply, StateChange,
+    StreamConfig, StreamConfigPatch, StreamInfo,
 };
 pub use node::{
     Client, ClientError, LocalCacheConfig, Node, NodeConfig, NodeExit, Publish, SealOutcome,
@@ -42,5 +43,9 @@ pub use node::{
 };
 pub use placement::{ShardCounters, ShardMove, plan_moves, shard_of};
 pub use recovery::{RecoverConfig, RecoveryReport};
+pub use sink::{
+    SinkAction, SinkConfig, SinkHook, SinkResolver, SinkStep, StatusClass, WebhookUrl, backoff_ms,
+    classify_status, is_private_address, parse_url, signature_hex,
+};
 pub use slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 pub use state::{MAX_STATE_BYTES, StateError, StateOp, StreamState, apply_op, check_doc};

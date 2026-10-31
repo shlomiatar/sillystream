@@ -2,7 +2,7 @@
 //! is node-wide: the seal window (section 7.1), rebalancing (section 6.1), and the
 //! in-process API that later milestones put sockets in front of.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -39,6 +39,7 @@ use crate::metadata::{
 };
 use crate::placement::{ShardMove, plan_moves, shard_of};
 use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, ScannedObject, prepare};
+use crate::sink::{SinkConfig, SinkNote, SinkPool};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 use crate::state::StateOp;
 
@@ -104,6 +105,8 @@ pub struct NodeConfig {
     /// With a metadata store: seal manifests, the compactor and the delete job (sections 7.4,
     /// 7.5). `None` keeps every record for good.
     pub compaction: Option<CompactionConfig>,
+    /// The sink pool (section 9).
+    pub sink: SinkConfig,
 }
 
 impl NodeConfig {
@@ -141,6 +144,7 @@ impl NodeConfig {
             active_stream_limit: None,
             full_checkpoint_every_count: 64,
             compaction: None,
+            sink: SinkConfig::default(),
         }
     }
 }
@@ -760,6 +764,7 @@ pub struct Node {
     /// `None` without a metadata store or with compaction off.
     compact_tx: Option<mpsc::UnboundedSender<CompactCmd>>,
     compact_stop: Option<oneshot::Sender<()>>,
+    sink_pool: Option<SinkPool>,
 }
 
 /// What a recovering start adds to a plain one.
@@ -948,6 +953,7 @@ impl Node {
         let mut threads = Vec::with_capacity(core_count + 1);
         let (to_control, control_rx) = mpsc::unbounded_channel();
         let loader = recovered.as_ref().map(|_| mpsc::unbounded_channel());
+        let (sink_notes_tx, sink_notes) = mpsc::unbounded_channel::<SinkNote>();
         let core_limit = config
             .active_stream_limit
             .map(|limit| (limit / core_count).max(1));
@@ -980,6 +986,7 @@ impl Node {
                 stores: stores.clone(),
                 accounts: accounts.clone(),
                 loader: loader.as_ref().map(|(tx, _)| tx.clone()),
+                sink_notes: sink_notes_tx.clone(),
             });
             let runtime = runtime()?;
             threads.push(
@@ -1011,7 +1018,18 @@ impl Node {
         let mut startup_manifests = Vec::new();
         let mut manifests = false;
         let mut compactor = None;
+        let mut sink_streams = Vec::new();
         if let (Some(parts), Some((loader_tx, loader_rx))) = (recovered, loader) {
+            // The newest saved list, and anything only the WAL's replay has found (D198).
+            let saved_sink_streams: BTreeSet<String> =
+                parts.checkpoints.sink_streams().into_iter().collect();
+            let mut known_sink_streams = saved_sink_streams;
+            for stream in &parts.restored {
+                if !stream.meta.sinks.is_empty() {
+                    known_sink_streams.insert(stream.meta.name.clone());
+                }
+            }
+            sink_streams = known_sink_streams.iter().cloned().collect();
             // Before anything can reach the cores: these come first in each one's control
             // channel, and control is what a core reads first (D134).
             for stream in parts.restored {
@@ -1061,6 +1079,7 @@ impl Node {
                 max_id: parts.max_id,
                 loader: loader_tx,
                 stop: Arc::clone(&meta_stop),
+                sink_streams: known_sink_streams,
             };
             let saved = to_control.clone();
             meta_threads.push(
@@ -1134,7 +1153,7 @@ impl Node {
             );
         }
 
-        Ok(Node {
+        let mut node = Node {
             config,
             links,
             to_control,
@@ -1147,7 +1166,18 @@ impl Node {
             meta_stop,
             compact_tx,
             compact_stop,
-        })
+            sink_pool: None,
+        };
+        node.sink_pool = Some(SinkPool::start(
+            node.config.sink.clone(),
+            clock,
+            node.handle(),
+            store,
+            sink_notes_tx,
+            sink_notes,
+            sink_streams,
+        )?);
+        Ok(node)
     }
 
     pub fn core_count(&self) -> usize {
@@ -1322,6 +1352,9 @@ impl Node {
 
     /// Stops everything and waits. A WAL held in a `sync_data` has to be let go first.
     pub fn shutdown(mut self) -> NodeExit {
+        if let Some(pool) = &mut self.sink_pool {
+            pool.join();
+        }
         self.compact_stop.take();
         self.request_stop();
         self.meta_stop.store(true, Ordering::SeqCst);
@@ -1354,6 +1387,9 @@ impl Node {
 impl Drop for Node {
     /// A dropped node's threads end by themselves. The uploader's own drop stops it.
     fn drop(&mut self) {
+        if let Some(pool) = &mut self.sink_pool {
+            pool.stop();
+        }
         self.compact_stop.take();
         self.request_stop();
         self.meta_stop.store(true, Ordering::SeqCst);
@@ -1513,6 +1549,7 @@ impl Client {
                 state: publish.state,
                 records,
                 reply: self.reply_tx.clone(),
+                forward: false,
                 passed: Vec::new(),
             })),
         )
@@ -1593,6 +1630,7 @@ impl Client {
                     state: publish.state,
                     records: publish.records,
                     reply,
+                    forward: false,
                     passed: Vec::new(),
                 })));
                 Ok(())
@@ -1655,7 +1693,44 @@ impl Client {
         answer.await.unwrap_or(false)
     }
 
-    pub(crate) async fn sink_op(&mut self, stream: &str, op: SinkOp) -> Result<(), ErrorCode> {
+    /// A forward sink's publish, whose records already carry their authors (section 9.1).
+    pub(crate) async fn publish_forward(
+        &mut self,
+        target: &str,
+        records: &[u8],
+        producer_id: u64,
+        producer_seq: u64,
+        ack_level: u8,
+    ) -> Result<(), ClientError> {
+        while self.pool.account().pinned_bytes() >= self.memory_cap_bytes {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        self.wait_for_barrier(target).await?;
+        let (stream, core) = self.route(target);
+        let records = self.pool.copy_in(records);
+        let message = WriteMsg::Publish(Box::new(PublishMsg {
+            stream,
+            handle: 0,
+            producer_id,
+            producer_seq,
+            ack_level: Some(ack_level),
+            // Not used: a forwarded record keeps the author it has.
+            author: NonZeroU64::MIN,
+            state: None,
+            records,
+            reply: self.reply_tx.clone(),
+            forward: true,
+            passed: Vec::new(),
+        }));
+        self.links.direct[core]
+            .send(message)
+            .await
+            .map_err(|_| ClientError::NodeStopped)
+    }
+
+    /// A change to a stream's sinks. Stream and sink ops from a person are answered once a
+    /// checkpoint holds them, on a node with a store (D196).
+    pub async fn sink_op(&mut self, stream: &str, op: SinkOp) -> Result<(), ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::Sink { stream, op, reply });

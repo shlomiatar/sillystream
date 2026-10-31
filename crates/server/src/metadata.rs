@@ -367,6 +367,8 @@ pub(crate) struct Checkpointer {
     pub max_id: u64,
     pub loader: mpsc::UnboundedSender<MetaMsg>,
     pub stop: Arc<AtomicBool>,
+    /// Every stream with a sink, which each file lists (D198).
+    pub sink_streams: std::collections::BTreeSet<String>,
 }
 
 /// A stream gathered twice in one job, as a tombstone on the core it left and alive on the
@@ -413,11 +415,19 @@ impl Checkpointer {
         for meta in &metas {
             self.max_id = self.max_id.max(meta.last_id);
         }
+        for meta in &metas {
+            if meta.sinks.is_empty() {
+                self.sink_streams.remove(&meta.name);
+            } else {
+                self.sink_streams.insert(meta.name.clone());
+            }
+        }
         let changed = !metas.is_empty() || !job.objects.is_empty();
         let head = CheckpointHead {
             full: false,
             max_id: self.max_id,
             objects: job.objects,
+            sink_streams: self.sink_streams.iter().cloned().collect(),
         };
         let built = if changed {
             match build_checkpoint(&head, &metas) {
@@ -497,6 +507,7 @@ impl Checkpointer {
                 full,
                 max_id: delta.max_id,
                 objects: known.into_iter().collect(),
+                sink_streams: delta.sink_streams,
             };
             let metas: Vec<StreamMeta> = all.into_values().collect();
             match build_checkpoint(&head, &metas) {

@@ -55,6 +55,9 @@ pub struct CheckpointHead {
     /// Segment objects whose extents are recorded by now, so a startup needn't look in them.
     /// A full file's list includes those of the files it replaces.
     pub objects: Vec<String>,
+    /// Every stream with a sink as of this file, so a startup can start them without loading
+    /// every stream (D198).
+    pub sink_streams: Vec<String>,
 }
 
 fn encode_head(head: &CheckpointHead) -> Vec<u8> {
@@ -66,6 +69,11 @@ fn encode_head(head: &CheckpointHead) -> Vec<u8> {
     for object in &head.objects {
         out.extend_from_slice(&(object.len() as u32).to_le_bytes());
         out.extend_from_slice(object.as_bytes());
+    }
+    out.extend_from_slice(&(head.sink_streams.len() as u32).to_le_bytes());
+    for stream in &head.sink_streams {
+        out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        out.extend_from_slice(stream.as_bytes());
     }
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
@@ -83,16 +91,25 @@ fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
     max_id.copy_from_slice(&bytes[8..16]);
     let count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
     let mut at = 20;
-    let mut objects = Vec::new();
-    for _ in 0..count {
-        let len_end = at + 4;
-        let len = bytes.get(at..len_end).ok_or(BAD)?;
-        let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-        let end = len_end.checked_add(len).ok_or(BAD)?;
-        let text = bytes.get(len_end..end).ok_or(BAD)?;
-        objects.push(std::str::from_utf8(text).map_err(|_| BAD)?.to_owned());
-        at = end;
-    }
+    let read_list = |count: usize, at: &mut usize| -> Result<Vec<String>, MetaError> {
+        let mut list = Vec::new();
+        for _ in 0..count {
+            let len_end = *at + 4;
+            let len = bytes.get(*at..len_end).ok_or(BAD)?;
+            let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+            let end = len_end.checked_add(len).ok_or(BAD)?;
+            let text = bytes.get(len_end..end).ok_or(BAD)?;
+            list.push(std::str::from_utf8(text).map_err(|_| BAD)?.to_owned());
+            *at = end;
+        }
+        Ok(list)
+    };
+    let objects = read_list(count, &mut at)?;
+    let sink_count = bytes.get(at..at + 4).ok_or(BAD)?;
+    let sink_count =
+        u32::from_le_bytes([sink_count[0], sink_count[1], sink_count[2], sink_count[3]]) as usize;
+    at += 4;
+    let sink_streams = read_list(sink_count, &mut at)?;
     if at != bytes.len() {
         return Err(BAD);
     }
@@ -100,6 +117,7 @@ fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
         full: bytes[4] == 1,
         max_id: u64::from_le_bytes(max_id),
         objects,
+        sink_streams,
     })
 }
 
@@ -319,6 +337,14 @@ impl CheckpointSet {
             set.files.push(file);
         }
         Ok(set)
+    }
+
+    /// The newest list of streams with sinks that a reader can trust (section 8.1).
+    pub fn sink_streams(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .find(|file| self.accepts(file.generation, file.head.max_id))
+            .map_or_else(Vec::new, |file| file.head.sink_streams.clone())
     }
 
     /// Goes in front: it is the newest. A running node doesn't need what a full one replaces,

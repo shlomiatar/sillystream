@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use format::{
-    ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, ValidatedPublish, encode_system_record,
-    validate_publish,
+    ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, ValidatedForward, ValidatedPublish,
+    encode_system_record, validate_forward, validate_publish,
 };
 use proto::ErrorCode;
 use storage::{
@@ -33,11 +33,13 @@ use crate::delivery::{
 use crate::message::{
     AttachMsg, AttachWalk, CatchReply, CompactSource, CompactView, ControlMsg, CoreStats, CursorOp,
     CursorReport, DeliveryMsg, ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply,
-    ReplyTx, ShardHandoff, SinkOp, SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody,
-    StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
+    ReplyTx, SINK_GAPS_KEPT_COUNT, ShardHandoff, SinkGap, SinkOp, SinkReport, SinkStart,
+    SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff, StreamInfo,
+    SubRef, WriteMsg,
 };
 use crate::metadata::MetaMsg;
 use crate::placement::{ShardCounters, shard_of};
+use crate::sink::SinkNote;
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
 use crate::state::{StreamState, apply_op, check_doc};
 
@@ -376,6 +378,50 @@ pub(crate) fn check_publish<'a>(
     Ok((validated, ack_count))
 }
 
+/// Records ready to stamp, from a producer or from a forward sink.
+enum CheckedRecords<'a> {
+    Publish(ValidatedPublish<'a>),
+    Forward(ValidatedForward<'a>),
+}
+
+impl CheckedRecords<'_> {
+    fn stamp(&mut self, first_id: u64, author: NonZeroU64) {
+        match self {
+            CheckedRecords::Publish(records) => records.stamp(first_id, author),
+            CheckedRecords::Forward(records) => records.stamp(first_id),
+        }
+    }
+
+    fn record_count(&self) -> u32 {
+        match self {
+            CheckedRecords::Publish(records) => records.record_count(),
+            CheckedRecords::Forward(records) => records.record_count(),
+        }
+    }
+}
+
+/// `check_publish` for a forward sink, which keeps each record's author (section 9.1). It has
+/// no state change, since a sink never forwards a system record (D28).
+fn check_forward<'a>(
+    stream: &str,
+    records: &'a mut [u8],
+) -> Result<(ValidatedForward<'a>, u32), String> {
+    if !stream_name_is_valid(stream) {
+        return Err("stream id is empty or too long".to_owned());
+    }
+    let validated = validate_forward(records).map_err(|error| error.to_string())?;
+    let Ok(ack_count) = u32::try_from(validated.item_count()) else {
+        return Err("publish has too many items".to_owned());
+    };
+    if ack_count == 0 {
+        return Err("publish has no records".to_owned());
+    }
+    if !entry_fits(validated.as_bytes().len(), None) {
+        return Err("publish is too large".to_owned());
+    }
+    Ok((validated, ack_count))
+}
+
 pub(crate) struct Core {
     config: CoreConfig,
     clock: Arc<dyn Clock>,
@@ -440,6 +486,7 @@ pub(crate) struct Core {
     spans: Vec<RecordSpan>,
 
     loader: Option<mpsc::UnboundedSender<MetaMsg>>,
+    sink_notes: mpsc::UnboundedSender<SinkNote>,
     loading: HashMap<Arc<str>, Loading>,
     load_count: u64,
     /// While a load's parked messages run, that a stream it found no trace of is known new.
@@ -469,6 +516,8 @@ pub(crate) struct CoreParts {
     pub accounts: Vec<SlabAccount>,
     /// `None` on a node without a metadata store.
     pub loader: Option<mpsc::UnboundedSender<MetaMsg>>,
+    /// Where a change to a sink is told, so that the pool looks at it (section 9).
+    pub sink_notes: mpsc::UnboundedSender<SinkNote>,
 }
 
 impl Core {
@@ -537,6 +586,7 @@ impl Core {
             filter_check_count: 0,
             spans: Vec::new(),
             loader: parts.loader,
+            sink_notes: parts.sink_notes,
             loading: HashMap::new(),
             load_count: 0,
             load_passed: None,
@@ -924,14 +974,20 @@ impl Core {
             nack(ErrorCode::Unauthorized, &"this stream is the server's");
             return;
         }
-        let (mut validated, ack_count) =
-            match check_publish(&msg.stream, &mut records, msg.state.as_ref()) {
-                Ok(checked) => checked,
-                Err(error) => {
-                    nack(ErrorCode::Malformed, &error);
-                    return;
-                }
-            };
+        let checked = if msg.forward {
+            check_forward(&msg.stream, &mut records)
+                .map(|(validated, count)| (CheckedRecords::Forward(validated), count))
+        } else {
+            check_publish(&msg.stream, &mut records, msg.state.as_ref())
+                .map(|(validated, count)| (CheckedRecords::Publish(validated), count))
+        };
+        let (mut validated, ack_count) = match checked {
+            Ok(checked) => checked,
+            Err(error) => {
+                nack(ErrorCode::Malformed, &error);
+                return;
+            }
+        };
         let has_state = msg.state.is_some();
         let item_count = u64::from(ack_count);
         let now_ms = self.clock.now_ms();
@@ -2320,9 +2376,35 @@ impl Core {
                     let _ = self.links.control[to].send(ControlMsg::Sink { stream, op, reply });
                 }
                 Route::Here(_) => {
+                    let lifecycle_sink = op.lifecycle_sink();
                     let result = self.on_sink(&stream, op);
                     self.mark_dirty(&stream);
-                    let _ = reply.send(result);
+                    let note = lifecycle_sink
+                        .filter(|_| result.is_ok())
+                        .map(|sink_id| SinkNote {
+                            stream: Arc::clone(&stream),
+                            sink_id,
+                        });
+                    let notes = self.sink_notes.clone();
+                    if note.is_some() && self.loader.is_some() {
+                        // Once a checkpoint holds it, the pool hears and then the caller, so
+                        // nothing runs of a change a crash could take back (D196). The core
+                        // doesn't wait.
+                        let (saved, answer) = oneshot::channel();
+                        let _ = self.to_node.send(CoreToNode::DurableRequested(saved));
+                        tokio::spawn(async move {
+                            let _ = answer.await;
+                            if let Some(note) = note {
+                                let _ = notes.send(note);
+                            }
+                            let _ = reply.send(result);
+                        });
+                    } else {
+                        if let Some(note) = note {
+                            let _ = notes.send(note);
+                        }
+                        let _ = reply.send(result);
+                    }
                 }
             },
             ControlMsg::Ping { reply } => {
@@ -3090,6 +3172,12 @@ impl Core {
         if let Some(shard) = self.shards.get_mut(&shard) {
             shard.streams.remove(&**name);
         }
+        for sink_id in stream.delivery.sinks.keys() {
+            let _ = self.sink_notes.send(SinkNote {
+                stream: Arc::clone(name),
+                sink_id: *sink_id,
+            });
+        }
         // Everything at or below the last valid id is older than this delete, though a former
         // generation's late object can hold ids of it this stream never had (section 8.1).
         let floor_id = stream.ids.last_id().max(self.config.last_valid_id);
@@ -3114,6 +3202,7 @@ impl Core {
     }
 
     fn on_sink(&mut self, name: &str, op: SinkOp) -> Result<(), ErrorCode> {
+        let now_ms = self.clock.now_ms();
         let stream = self.streams.get_mut(name).ok_or(ErrorCode::NotFound)?;
         let head = stream.delivery.visible_head(stream.ids.last_id());
         let cursor_at = |start: SinkStart| match start {
@@ -3125,12 +3214,24 @@ impl Core {
         match op {
             SinkOp::Put {
                 sink_id,
-                mut spec,
+                spec,
                 start,
             } => {
+                let mut spec = *spec;
+                if spec.kind == "forward" && (sink_id == 0 || spec.target.as_deref() == Some(name))
+                {
+                    // Producer id 0 means no idempotency (D6), and a stream into itself never
+                    // ends.
+                    return Err(ErrorCode::Malformed);
+                }
                 if let Some(existing) = delivery.sinks.get(&sink_id) {
                     spec.paused = existing.paused;
+                    spec.pause_reason.clone_from(&existing.pause_reason);
+                    spec.gaps.clone_from(&existing.gaps);
+                    spec.gap_count = existing.gap_count;
+                    spec.epoch = existing.epoch;
                 } else {
+                    spec.epoch = now_ms;
                     delivery
                         .cursors
                         .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
@@ -3142,19 +3243,60 @@ impl Core {
                 delivery.cursors.remove(sink_cursor_name(sink_id).as_str());
             }
             SinkOp::SetPaused { sink_id, paused } => {
-                delivery
+                let spec = delivery
                     .sinks
                     .get_mut(&sink_id)
-                    .ok_or(ErrorCode::NotFound)?
-                    .paused = paused;
+                    .ok_or(ErrorCode::NotFound)?;
+                spec.paused = paused;
+                spec.pause_reason = None;
+                spec.failure_count = 0;
             }
             SinkOp::Reset { sink_id, start } => {
-                if !delivery.sinks.contains_key(&sink_id) {
-                    return Err(ErrorCode::NotFound);
-                }
+                let spec = delivery
+                    .sinks
+                    .get_mut(&sink_id)
+                    .ok_or(ErrorCode::NotFound)?;
+                spec.epoch = now_ms.max(spec.epoch + 1);
                 delivery
                     .cursors
                     .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
+            }
+            SinkOp::Commit { sink_id, id, epoch } => {
+                let spec = delivery.sinks.get(&sink_id).ok_or(ErrorCode::NotFound)?;
+                if spec.epoch == epoch {
+                    let name = sink_cursor_name(sink_id);
+                    match delivery.cursors.get_mut(name.as_str()) {
+                        Some(cursor) => *cursor = (*cursor).max(id),
+                        None => {
+                            delivery.cursors.insert(Arc::from(name), id);
+                        }
+                    }
+                }
+            }
+            SinkOp::Report { sink_id, report } => {
+                let spec = delivery
+                    .sinks
+                    .get_mut(&sink_id)
+                    .ok_or(ErrorCode::NotFound)?;
+                match report {
+                    SinkReport::Failure { count, error } => {
+                        spec.failure_count = count;
+                        spec.last_error = Some(error);
+                    }
+                    SinkReport::Healthy => spec.failure_count = 0,
+                    SinkReport::Warning { first_id } => spec.expiry_warning_id = first_id,
+                    SinkReport::Paused { reason } => {
+                        spec.paused = true;
+                        spec.pause_reason = Some(reason);
+                    }
+                    SinkReport::Gap { first_id, last_id } => {
+                        spec.gaps.push(SinkGap { first_id, last_id });
+                        if spec.gaps.len() > SINK_GAPS_KEPT_COUNT {
+                            spec.gaps.remove(0);
+                        }
+                        spec.gap_count += 1;
+                    }
+                }
             }
         }
         Ok(())

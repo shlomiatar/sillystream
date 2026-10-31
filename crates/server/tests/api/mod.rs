@@ -93,6 +93,9 @@ pub fn node_config(core_count: usize) -> NodeConfig {
     node.seal_window_ms = None;
     node.rebalance_period_ms = None;
     node.progress_interval_ms = 100;
+    // These tests look at what the routes record, so nothing may move a cursor behind them.
+    // `sinks.rs` runs the pool.
+    node.sink.pool_thread_count = 0;
     node
 }
 

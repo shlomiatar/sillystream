@@ -11,15 +11,15 @@ use format::Records;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    CheckpointSet, MetaDedupe, MetaExtent, MetaSink, Ownership, SegmentReader, StreamExtent,
-    StreamMeta, claim_generation, list_sealed_objects, list_wal_files, object_generation,
-    read_ownership, replay_file,
+    CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership, SegmentReader,
+    StreamExtent, StreamMeta, claim_generation, list_sealed_objects, list_wal_files,
+    object_generation, read_ownership, replay_file,
 };
 
 use crate::compaction::MANIFEST_STREAM;
 use crate::dedupe::DedupeTable;
 use crate::delivery::ExtentRef;
-use crate::message::{SinkSpec, StreamConfig};
+use crate::message::{SinkGap, SinkSpec, StreamConfig};
 use crate::metadata::{LocalMeta, load_stream, put_owed_checkpoint};
 use crate::state::StreamState;
 
@@ -140,6 +140,20 @@ pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
         on_expire: sink.on_expire.clone(),
         concurrency: sink.concurrency,
         paused: sink.paused,
+        secret: sink.secret.clone(),
+        interval_ms: sink.interval_ms,
+        budget_bytes: sink.budget_bytes,
+        pause_reason: sink.pause_reason.clone(),
+        gaps: sink
+            .gaps
+            .iter()
+            .map(|gap| SinkGap {
+                first_id: gap.first_id,
+                last_id: gap.last_id,
+            })
+            .collect(),
+        gap_count: sink.gap_count,
+        ..SinkSpec::default()
     }
 }
 
@@ -153,6 +167,19 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
         on_expire: spec.on_expire.clone(),
         concurrency: spec.concurrency,
         paused: spec.paused,
+        secret: spec.secret.clone(),
+        interval_ms: spec.interval_ms,
+        budget_bytes: spec.budget_bytes,
+        pause_reason: spec.pause_reason.clone(),
+        gaps: spec
+            .gaps
+            .iter()
+            .map(|gap| MetaSinkGap {
+                first_id: gap.first_id,
+                last_id: gap.last_id,
+            })
+            .collect(),
+        gap_count: spec.gap_count,
     }
 }
 

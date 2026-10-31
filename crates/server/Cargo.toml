@@ -28,6 +28,9 @@ object_store.workspace = true
 rustls = { workspace = true }
 rustls-pemfile = "2"
 sha1 = "0.10"
+hmac.workspace = true
+sha2.workspace = true
+webpki-roots = "1"
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 tokio-rustls = { workspace = true }
 

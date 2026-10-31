@@ -43,12 +43,25 @@ fn sink() -> impl Strategy<Value = MetaSink> {
             |(sink_id, kind, url, target, filter, on_expire, concurrency, paused)| MetaSink {
                 sink_id,
                 kind,
-                url,
-                target,
+                url: url.clone(),
+                target: target.clone(),
                 filter,
                 on_expire,
                 concurrency,
                 paused,
+                secret: url.clone(),
+                interval_ms: concurrency.into(),
+                budget_bytes: u64::from(concurrency) + 1,
+                pause_reason: target.clone(),
+                gaps: if paused {
+                    vec![storage::MetaSinkGap {
+                        first_id: sink_id,
+                        last_id: sink_id / 2,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                gap_count: u64::from(paused),
             },
         )
 }
@@ -200,6 +213,15 @@ fn meta_bytes_are_exact() {
             on_expire: "e".to_owned(),
             concurrency: 13,
             paused: true,
+            secret: Some("x".to_owned()),
+            interval_ms: 20,
+            budget_bytes: 21,
+            pause_reason: Some("r".to_owned()),
+            gaps: vec![storage::MetaSinkGap {
+                first_id: 22,
+                last_id: 23,
+            }],
+            gap_count: 24,
         }],
         extents: vec![MetaExtent {
             path: "p".to_owned(),
@@ -243,6 +265,16 @@ fn meta_bytes_are_exact() {
     text(&mut body, b"e");
     u32le(&mut body, 13);
     body.push(1);
+    body.push(1);
+    text(&mut body, b"x");
+    u64le(&mut body, 20);
+    u64le(&mut body, 21);
+    body.push(1);
+    text(&mut body, b"r");
+    u32le(&mut body, 1);
+    u64le(&mut body, 22);
+    u64le(&mut body, 23);
+    u64le(&mut body, 24);
     u32le(&mut body, 1);
     text(&mut body, b"p");
     for value in [14, 15, 16, 17] {
@@ -285,6 +317,7 @@ async fn put(
     metas: &[StreamMeta],
 ) -> CheckpointFile {
     let head = CheckpointHead {
+        sink_streams: vec!["with.sink".to_owned()],
         full,
         max_id,
         objects: vec![format!("obj-{seq}")],

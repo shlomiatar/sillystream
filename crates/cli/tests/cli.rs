@@ -157,6 +157,27 @@ fn sink_admin() {
     fixture.ok(&["sink", "reset", "k", "1", "--start", "earliest"]);
     fixture.ok(&["sink", "delete", "k", "1"]);
     assert!(fixture.fails(&["sink", "delete", "k", "1"]).contains("404"));
+    fixture.ok(&[
+        "sink",
+        "create",
+        "k",
+        "3",
+        "--kind",
+        "webhook.notify",
+        "--sink-url",
+        "https://example.invalid/x",
+        "--secret",
+        "s",
+        "--interval-ms",
+        "500",
+        "--budget-bytes",
+        "1024",
+    ]);
+    assert!(
+        !fixture.ok(&["stream", "info", "k"]).contains("\"secret\""),
+        "a sink's secret is never shown"
+    );
+    fixture.ok(&["sink", "delete", "k", "3"]);
     assert!(
         fixture
             .fails(&["sink", "create", "k", "2", "--kind", "nope"])

@@ -1152,6 +1152,7 @@ async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
         full: false,
         max_id: limit + 1,
         objects: vec![seal_path("former", 1, limit - 1).to_string()],
+        sink_streams: Vec::new(),
     };
     let built = storage::build_checkpoint(&head, &[meta]).unwrap();
     storage::put_checkpoint(

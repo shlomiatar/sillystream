@@ -10,7 +10,8 @@
 //! cursor := name str32 | id u64
 //! dedupe := producer_id u64 | producer_seq u64 | first_id u64 | count u32
 //! sink   := sink_id u64 | kind str32 | url opt | target opt | filter opt | on_expire str32 |
-//!           concurrency u32 | paused u8
+//!           concurrency u32 | paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
+//!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
 //! extent := path str32 | offset u64 | len_bytes u64 | id_first u64 | id_last u64 | block_count u32
 //! str32  := len u32 | bytes        bytes32 likewise
 //! opt    := present u8 | str32 if present
@@ -49,6 +50,23 @@ pub struct MetaSink {
     pub on_expire: String,
     pub concurrency: u32,
     pub paused: bool,
+    /// `webhook.*`: the HMAC key (D29).
+    pub secret: Option<String>,
+    /// `webhook.notify`: least time between sends. 0 takes the node's.
+    pub interval_ms: u64,
+    /// What the sink may hold at once. 0 takes the node's.
+    pub budget_bytes: u64,
+    pub pause_reason: Option<String>,
+    /// The latest gaps a skip recorded (D30), and how many there have been.
+    pub gaps: Vec<MetaSinkGap>,
+    pub gap_count: u64,
+}
+
+/// Ids a sink skipped because they expired unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaSinkGap {
+    pub first_id: u64,
+    pub last_id: u64,
 }
 
 /// `id range → location` of section 7.6.
@@ -167,6 +185,16 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
         put_bytes(&mut out, sink.on_expire.as_bytes());
         put_u32(&mut out, sink.concurrency);
         out.push(u8::from(sink.paused));
+        put_opt(&mut out, sink.secret.as_deref());
+        put_u64(&mut out, sink.interval_ms);
+        put_u64(&mut out, sink.budget_bytes);
+        put_opt(&mut out, sink.pause_reason.as_deref());
+        put_u32(&mut out, sink.gaps.len() as u32);
+        for gap in &sink.gaps {
+            put_u64(&mut out, gap.first_id);
+            put_u64(&mut out, gap.last_id);
+        }
+        put_u64(&mut out, sink.gap_count);
     }
     put_u32(&mut out, meta.extents.len() as u32);
     for extent in &meta.extents {
@@ -311,7 +339,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             count: reader.u32()?,
         });
     }
-    for _ in 0..reader.count(25)? {
+    for _ in 0..reader.count(55)? {
         let sink_id = reader.u64()?;
         let kind = reader.text()?;
         let (url, target, filter) = (reader.opt()?, reader.opt()?, reader.opt()?);
@@ -322,6 +350,17 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             1 => true,
             _ => return Err(MetaError("a paused flag isn't 0 or 1")),
         };
+        let secret = reader.opt()?;
+        let (interval_ms, budget_bytes) = (reader.u64()?, reader.u64()?);
+        let pause_reason = reader.opt()?;
+        let mut gaps = Vec::new();
+        for _ in 0..reader.count(16)? {
+            gaps.push(MetaSinkGap {
+                first_id: reader.u64()?,
+                last_id: reader.u64()?,
+            });
+        }
+        let gap_count = reader.u64()?;
         meta.sinks.push(MetaSink {
             sink_id,
             kind,
@@ -331,6 +370,12 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             on_expire,
             concurrency,
             paused,
+            secret,
+            interval_ms,
+            budget_bytes,
+            pause_reason,
+            gaps,
+            gap_count,
         });
     }
     for _ in 0..reader.count(40)? {

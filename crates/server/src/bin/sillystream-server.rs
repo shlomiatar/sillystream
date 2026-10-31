@@ -5,7 +5,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use server::net::{Server, ServerConfig};
-use server::{Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SystemClock};
+use server::{
+    Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SinkConfig, SystemClock,
+};
 use storage::{ObjectStoreConfig, S3Config, build_store};
 
 const USAGE: &str = "\
@@ -14,7 +16,9 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
-  [--compact-merge-wait-ms N]
+  [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
+  [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
+  [--sink-pool-threads N]
 
 For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
 usual AWS variables. Real S3 has not been exercised.";
@@ -52,6 +56,9 @@ fn run() -> Result<(), String> {
     let mut max_frame_bytes = None;
     let mut active_stream_limit = None;
     let mut compaction = CompactionConfig::default();
+    let mut sink = SinkConfig::default();
+    let mut sink_archive_store = None;
+    let mut sink_ca_file = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!("{USAGE}");
@@ -82,6 +89,16 @@ fn run() -> Result<(), String> {
             "--compact-period-ms" => compaction.compact_period_ms = Some(number(&value)?),
             "--expire-period-ms" => compaction.expire_period_ms = Some(number(&value)?),
             "--compact-merge-wait-ms" => compaction.merge_wait_ms = number(&value)?,
+            "--sink-allow-private-addresses" => {
+                sink.allow_private_addresses = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("{flag} is true or false")),
+                };
+            }
+            "--sink-ca-file" => sink_ca_file = Some(PathBuf::from(value)),
+            "--sink-archive-store" => sink_archive_store = Some(value),
+            "--sink-pool-threads" => sink.pool_thread_count = number(&value)? as usize,
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -124,6 +141,15 @@ fn run() -> Result<(), String> {
     }
     node.active_stream_limit = active_stream_limit;
     node.compaction = Some(compaction);
+    if let Some(path) = sink_ca_file {
+        sink.extra_roots_pem =
+            Some(std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?);
+    }
+    if let Some(text) = sink_archive_store {
+        let config = parse_store(&text)?;
+        sink.archive_store = Some(build_store(&config).map_err(|error| error.to_string())?);
+    }
+    node.sink = sink;
     node.local_cache = Some(LocalCacheConfig {
         dir: data_dir.join("cache"),
         cap_bytes: cache_cap_bytes,

@@ -678,6 +678,56 @@ async fn stream_delete_ends_subscribers_and_a_new_stream_starts_above() {
     server.server.shutdown();
 }
 
+/// With the pool running: what a route creates delivers, and the status shows, secret unshown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_made_over_http_runs_and_reports_why_it_paused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut bytes = [0u8; 4096];
+                let _ = socket.read(&mut bytes).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    let mut node = node_config(2);
+    node.sink.pool_thread_count = 2;
+    node.sink.allow_private_addresses = true;
+    let server = start_node(node);
+    let text = token(ALL);
+    let ids = seed(&server, "h", &[b"1"]).await;
+    let body = format!(
+        r#"{{"kind":"webhook.deliver","url":"http://{address}/x","secret":"never shown",
+             "start":"earliest"}}"#
+    );
+    let created = server
+        .http(&Http::new("PUT", "/v1/stream/h/sink/1", &text).body(body.into_bytes()))
+        .await;
+    assert_eq!(created.status, 200, "{}", created.text());
+    let started = std::time::Instant::now();
+    loop {
+        let info = server
+            .http(&Http::new("GET", "/v1/stream/h", &text))
+            .await
+            .text();
+        if info.contains("\"paused\":true") {
+            assert!(info.contains("\"pause_reason\":\"status 410\""), "{info}");
+            assert!(info.contains("\"failure_count\":1"), "{info}");
+            assert!(!info.contains("never shown"), "{info}");
+            assert!(info.contains("\"cursor\":\"0\""), "{info}");
+            break;
+        }
+        assert!(started.elapsed().as_secs() < 10, "{info}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let _ = ids;
+    server.server.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sink_lifecycle_is_recorded_on_the_stream() {
     let server = start();
@@ -689,7 +739,7 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
             .await
     };
     let sink = r#"{"kind":"webhook.deliver","url":"https://example.invalid/x","filter":"any:1",
-                   "on_expire":"skip","concurrency":2,"start":"now"}"#;
+                   "secret":"s","on_expire":"skip","concurrency":2,"start":"now"}"#;
     assert_code(&call("PUT", "/v1/stream/k/sink/1", sink).await, 404, 2);
 
     let ids = seed(&server, "k", &[b"1", b"2"]).await;
@@ -763,6 +813,19 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
             r#"{"kind":"forward","target":"a/b"}"#,
         ),
         ("/v1/stream/k/sink/9", r#"{"kind":"webhook.notify"}"#),
+        (
+            "/v1/stream/k/sink/9",
+            r#"{"kind":"webhook.deliver","url":"https://example.invalid/x"}"#,
+        ),
+        (
+            "/v1/stream/k/sink/9",
+            r#"{"kind":"forward","target":"other","concurrency":2}"#,
+        ),
+        (
+            "/v1/stream/k/sink/0",
+            r#"{"kind":"forward","target":"other"}"#,
+        ),
+        ("/v1/stream/k/sink/9", r#"{"kind":"forward","target":"k"}"#),
         (
             "/v1/stream/k/sink/9",
             r#"{"kind":"webhook.notify","url":"ftp://x"}"#,

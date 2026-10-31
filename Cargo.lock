@@ -1878,6 +1878,7 @@ dependencies = [
  "format",
  "futures",
  "futures-util",
+ "hmac",
  "object_store",
  "proptest",
  "proto",
@@ -1886,11 +1887,13 @@ dependencies = [
  "rustls-pemfile",
  "server",
  "sha1",
+ "sha2",
  "storage",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "webpki-roots",
  "xxhash-rust",
 ]
 
@@ -2547,6 +2550,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

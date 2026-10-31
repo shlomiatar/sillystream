@@ -8,7 +8,7 @@
 //! waits in its own buffer until then (D121, D130).
 
 mod conn;
-mod http;
+pub(crate) mod http;
 pub mod json;
 mod tls;
 pub mod ws;
