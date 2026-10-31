@@ -453,6 +453,36 @@ async fn filters() {
         let items = collect_items(&mut plain, published.len()).await;
         assert!(items.iter().all(|item| item.author != 0));
     }
+
+    // From an id, across the end of catch-up into live: nothing lost or repeated at the joint.
+    let mut crossing = Vec::new();
+    for case in &cases {
+        let mut spec = Subscribe::new(STREAM, middle);
+        spec.clauses = case.clauses.clone();
+        spec.author = case.author;
+        let mut subscription = reader.subscribe(spec).unwrap();
+        let want = wanted(case, middle);
+        let items = collect_items(&mut subscription, want.len()).await;
+        check(format!("crossing catch-up {}", case.name), items, want);
+        crossing.push(subscription);
+    }
+    let mut later: Vec<(u64, u64, u64, Vec<u8>)> = Vec::new();
+    for (at, options) in options_set.iter().enumerate() {
+        let (author, _, publisher) = &mut publishers[at % 2];
+        let bytes = format!("later:{at}").into_bytes();
+        publisher.add(*options, bytes.clone());
+        let ack = publisher.flush().await.unwrap()[0];
+        later.push((ack.first_id, *options, *author, bytes));
+    }
+    for (case, subscription) in cases.iter().zip(&mut crossing) {
+        let want: Vec<_> = later
+            .iter()
+            .filter(|(_, options, author, _)| (case.wanted)(*options, *author))
+            .cloned()
+            .collect();
+        let items = collect_items(subscription, want.len()).await;
+        check(format!("crossing live {}", case.name), items, want);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

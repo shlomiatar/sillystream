@@ -55,7 +55,11 @@ fn cargo_build(target_dir: &Path, root: &Path, args: &[&str]) {
 
 /// Builds both forms of the server here, because a test can't name another package's binary, and
 /// `cargo test --workspace` would otherwise hand every test the one `test-hooks` turned on in.
-/// The directory is the suite's own, so another build can't swap a binary during a run.
+///
+/// Both forms build to one path, so a lock covers each build and its copy, across every run on
+/// this target directory, whichever worktree it came from. The copies are this process's own,
+/// so another run can't swap or truncate a binary during this one, and `servers_running` sees
+/// only this run's servers.
 pub fn binaries() -> &'static Binaries {
     static BINARIES: OnceLock<Binaries> = OnceLock::new();
     BINARIES.get_or_init(|| {
@@ -64,7 +68,14 @@ pub fn binaries() -> &'static Binaries {
         let target = std::env::var_os("CARGO_TARGET_DIR")
             .map_or_else(|| root.join("target"), PathBuf::from)
             .join("e2e");
-        let dir = target.join("bin");
+        let runs = target.join("bin");
+        std::fs::create_dir_all(&runs).expect("the binary directory");
+        let lock = File::create(target.join("build.lock")).expect("the build lock");
+        lock.lock().expect("taking the build lock");
+        remove_finished_runs(&runs);
+        // A trailing separator, so that one run's directory is no prefix of another's.
+        let dir = runs.join(std::process::id().to_string()).join("");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("plain")).expect("the binary directory");
         std::fs::create_dir_all(dir.join("hooks")).expect("the binary directory");
         let keep = |name: &str, form: &str| {
@@ -81,6 +92,7 @@ pub fn binaries() -> &'static Binaries {
             &["-p", "server", "--bins", "--features", "test-hooks"],
         );
         let hooks_server = keep("sillystream-server", "hooks");
+        drop(lock);
         Binaries {
             dir,
             server,
@@ -88,6 +100,25 @@ pub fn binaries() -> &'static Binaries {
             cli,
         }
     })
+}
+
+/// The copies of runs whose process is gone. Called with the build lock held, and a run has its
+/// process until it exits, so a live run's copies stay.
+fn remove_finished_runs(runs: &Path) {
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            // What a run before this layout left: `plain` and `hooks`, nobody's now.
+            let _ = std::fs::remove_dir_all(entry.path());
+            continue;
+        };
+        if command_line(pid).is_empty() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Every server this run started and hasn't seen exit.
@@ -1007,17 +1038,19 @@ impl Producer {
     }
 
     /// One with a count makes them all, and one without stops making more. Either way, this
-    /// waits until everything made has been acked.
+    /// waits until everything made has been acked. In seq order, whatever order the acks came.
     pub async fn finish(self) -> Vec<Published> {
         self.stop.store(true, Ordering::SeqCst);
         tokio::time::timeout(WAIT * 2, self.task)
             .await
             .expect("a producer that finishes")
             .expect("a producer that doesn't panic");
-        Arc::into_inner(self.acked)
+        let mut acked = Arc::into_inner(self.acked)
             .expect("the only holder")
             .into_inner()
-            .expect("not poisoned")
+            .expect("not poisoned");
+        assert_ids_follow_seqs(&mut acked);
+        acked
     }
 }
 
@@ -1031,6 +1064,40 @@ fn no_more_to_make(spec: &ProducerSpec, stop: &AtomicBool, next_seq: u64) -> boo
     match spec.count {
         Some(count) => next_seq > count,
         None => stop.load(Ordering::SeqCst),
+    }
+}
+
+/// Takes an acked publish out of those on their way. Acks can overtake each other when a shard
+/// moves (D217), so it can be any of them; what is left is retried in order under the same seq.
+fn take_acked(
+    inflight: &mut std::collections::VecDeque<Inflight>,
+    producer_seq: u64,
+    first_id: u64,
+) -> Published {
+    let at = inflight
+        .iter()
+        .position(|entry| entry.published.seq == producer_seq)
+        .unwrap_or_else(|| panic!("an ack of {producer_seq} that isn't owed"));
+    let mut published = inflight.remove(at).expect("found above").published;
+    published.first_id = first_id;
+    published
+}
+
+/// Section 3's order across publishes, which is what ack order must not be mistaken for. An id
+/// of 0 is a retry's answer, "already committed, id not kept". Takes publishes in any order.
+fn assert_ids_follow_seqs(acked: &mut [Published]) {
+    acked.sort_by_key(|published| published.seq);
+    let mut last: Option<(u64, u64)> = None;
+    for published in acked.iter().filter(|published| published.first_id != 0) {
+        if let Some((seq, first_id)) = last {
+            assert!(
+                published.first_id > first_id,
+                "seq {} has id {}, not above seq {seq}'s {first_id}",
+                published.seq,
+                published.first_id
+            );
+        }
+        last = Some((published.seq, published.first_id));
     }
 }
 
@@ -1115,14 +1182,7 @@ async fn run_producer(
                     first_id,
                     ..
                 }) => {
-                    let at = inflight
-                        .iter()
-                        .position(|entry| entry.published.seq == producer_seq)
-                        .unwrap_or_else(|| panic!("an ack of {producer_seq} that isn't owed"));
-                    // In order per producer, so there is nothing ahead of it to retry.
-                    assert_eq!(at, 0, "ack of seq {producer_seq} before earlier ones");
-                    let mut published = inflight.pop_front().expect("found above").published;
-                    published.first_id = first_id;
+                    let published = take_acked(&mut inflight, producer_seq, first_id);
                     acked.lock().expect("not poisoned").push(published);
                 }
                 Some(Owned::Closed) => break,
@@ -1208,5 +1268,55 @@ pub async fn until_subscribed(subscription: &mut Subscription) -> (u64, u64, Vec
             Ok(Some(Ok(_))) => {}
             other => panic!("no SUBSCRIBED: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn published(seq: u64, first_id: u64) -> Published {
+        Published {
+            seq,
+            first_id,
+            options: 0,
+            payload: Vec::new(),
+            has_state: false,
+        }
+    }
+
+    /// A level 2 ack of seq K + 1 can arrive first once a shard moves between them (D217).
+    #[test]
+    fn an_ack_can_overtake_an_earlier_one_and_the_earlier_stays_owed() {
+        let mut inflight: std::collections::VecDeque<Inflight> = (1..=3)
+            .map(|seq| Inflight {
+                records: Vec::new(),
+                published: published(seq, 0),
+            })
+            .collect();
+        assert_eq!(take_acked(&mut inflight, 2, 200).first_id, 200);
+        let owed: Vec<u64> = inflight.iter().map(|entry| entry.published.seq).collect();
+        assert_eq!(owed, [1, 3], "what a new connection retries, in order");
+        assert_eq!(take_acked(&mut inflight, 1, 100).first_id, 100);
+        assert_eq!(take_acked(&mut inflight, 3, 300).first_id, 300);
+    }
+
+    #[test]
+    #[should_panic(expected = "isn't owed")]
+    fn an_ack_nobody_is_owed_still_fails() {
+        take_acked(&mut std::collections::VecDeque::new(), 1, 100);
+    }
+
+    #[test]
+    fn ids_must_follow_seqs_whatever_order_the_acks_came() {
+        let mut acked = [published(2, 200), published(1, 100), published(3, 0)];
+        assert_ids_follow_seqs(&mut acked);
+        assert_eq!(acked.map(|one| one.seq), [1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not above")]
+    fn ids_against_seq_order_fail() {
+        assert_ids_follow_seqs(&mut [published(1, 200), published(2, 100)]);
     }
 }
