@@ -18,7 +18,7 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
   [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
   [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
-  [--sink-pool-threads N]
+  [--sink-pool-threads N] [--trace-catch-up true|false]
 
 For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
 usual AWS variables. Real S3 has not been exercised.";
@@ -59,6 +59,7 @@ fn run() -> Result<(), String> {
     let mut sink = SinkConfig::default();
     let mut sink_archive_store = None;
     let mut sink_ca_file = None;
+    let mut trace_catch_up = false;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!("{USAGE}");
@@ -99,6 +100,13 @@ fn run() -> Result<(), String> {
             "--sink-ca-file" => sink_ca_file = Some(PathBuf::from(value)),
             "--sink-archive-store" => sink_archive_store = Some(value),
             "--sink-pool-threads" => sink.pool_thread_count = number(&value)? as usize,
+            "--trace-catch-up" => {
+                trace_catch_up = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("{flag} is true or false")),
+                };
+            }
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -140,6 +148,7 @@ fn run() -> Result<(), String> {
         node.max_frame_bytes = frame_bytes;
     }
     node.active_stream_limit = active_stream_limit;
+    node.trace_catch_up = trace_catch_up;
     node.compaction = Some(compaction);
     if let Some(path) = sink_ca_file {
         sink.extra_roots_pem =

@@ -4,5 +4,26 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-[dependencies]
+[lib]
+bench = false
 
+# Its own `main`, because the suite's last step, that no server is left, has to run after every
+# test, which the standard harness can't promise.
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+harness = false
+
+[dependencies]
+ciborium.workspace = true
+futures-util.workspace = true
+hmac.workspace = true
+proto.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sdk.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true

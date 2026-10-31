@@ -85,6 +85,8 @@ pub struct NodeConfig {
     pub subscriber_queue_bytes: u64,
     /// `PROGRESS` goes at most this often (section 5.2).
     pub progress_interval_ms: u64,
+    /// Section 5.1's tiers, shown on stderr: one line per catch-up read (D213).
+    pub trace_catch_up: bool,
     pub max_frame_bytes: u64,
     pub max_subscriptions_per_connection: usize,
     /// How long a WebSocket message may take to arrive once it has begun. Past it the
@@ -135,6 +137,7 @@ impl NodeConfig {
             local_cache: None,
             subscriber_queue_bytes: 8 * 1024 * 1024,
             progress_interval_ms: 5_000,
+            trace_catch_up: false,
             max_frame_bytes: 16 * 1024 * 1024,
             max_subscriptions_per_connection: 1_024,
             partial_frame_timeout_ms: 60_000,
@@ -943,6 +946,7 @@ impl Node {
         let settings = DeliverySettings {
             queue_bytes: delivery_bound_bytes(&config, config.subscriber_queue_bytes),
             progress_interval_ms: config.progress_interval_ms,
+            trace_catch_up: config.trace_catch_up,
             max_frame_bytes: config.max_frame_bytes,
             max_subscriptions: config.max_subscriptions_per_connection,
             share_bytes: config.fair_share_bytes,

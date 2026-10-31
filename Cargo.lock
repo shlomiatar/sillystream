@@ -474,6 +474,20 @@ dependencies = [
 [[package]]
 name = "e2e"
 version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "futures-util",
+ "hmac",
+ "proto",
+ "rcgen",
+ "rustls",
+ "sdk",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+]
 
 [[package]]
 name = "either"

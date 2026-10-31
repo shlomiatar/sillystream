@@ -436,6 +436,8 @@ impl Drop for Connection {
 pub(crate) struct DeliverySettings {
     pub queue_bytes: u64,
     pub progress_interval_ms: u64,
+    /// Prints a line on stderr for each catch-up read, naming its tier.
+    pub trace_catch_up: bool,
     pub max_frame_bytes: u64,
     pub max_subscriptions: usize,
     pub share_bytes: u64,
@@ -1774,6 +1776,7 @@ impl Home {
                     let bytes = SharedBytes::Slab(batch);
                     walk_records(&bytes, &mut spans);
                     self.stats.memory_bytes += bytes.len() as u64;
+                    self.trace_read("memory", key, bytes.len());
                     if let Some(last) = spans.last() {
                         position = position.max(last.header.last_id());
                     }
@@ -1812,6 +1815,18 @@ impl Home {
         }
         self.progress(key, 0, false);
         self.pump_catch_up(key);
+    }
+
+    /// Off unless asked for, because a core shouldn't wait on stderr (D213).
+    fn trace_read(&self, tier: &str, key: usize, bytes: usize) {
+        if self.settings.trace_catch_up
+            && let Some(Some(sub)) = self.subs.get(key)
+        {
+            eprintln!(
+                "trace catch_up tier={tier} stream={} bytes={bytes}",
+                sub.stream
+            );
+        }
     }
 
     fn account_read(&mut self, key: usize, bytes: u64) {
@@ -1863,8 +1878,10 @@ impl Home {
                 if let Some(bytes) = read.bytes {
                     if local {
                         self.stats.local_bytes += bytes.len() as u64;
+                        self.trace_read("local", key, bytes.len());
                     } else {
                         self.stats.object_bytes += bytes.len() as u64;
+                        self.trace_read("object", key, bytes.len());
                     }
                     self.account_read(key, bytes.len() as u64);
                     let bytes = SharedBytes::Plain(bytes);

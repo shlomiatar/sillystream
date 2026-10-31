@@ -24,8 +24,9 @@ sillystream sink delete|pause|resume STREAM ID
 sillystream sink reset STREAM ID [--start S]
 sillystream publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
 sillystream tail STREAM [--from start|live|ID] [--filter F] [--limit N] [--name CURSOR]
-sillystream bench latency|throughput|idle|all [--server-bin FILE] [--count N] [--seconds N]
-                        [--idle-count N] [--levels 0,1,2,3] [--cores N]
+sillystream bench latency|throughput|idle|catch-up|many-streams|puts|idle-streams|all
+                        [--server-bin FILE] [--count N] [--seconds N] [--idle-count N]
+                        [--levels 0,1,2,3] [--cores N] [--catch-up-mib N] [--idle-streams N]
 
 Connecting takes --url HOST:PORT, --ca PEM and --token TEXT or --token-file FILE, or
 SILLYSTREAM_URL, SILLYSTREAM_CA and SILLYSTREAM_TOKEN.
