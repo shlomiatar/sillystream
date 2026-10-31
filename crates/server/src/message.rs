@@ -120,6 +120,11 @@ pub struct SinkSpec {
     /// Goes up when the cursor is set from outside, so that a delivery started before then
     /// can't move it back on (D195). Not saved.
     pub epoch: u64,
+    /// How many updates this sink has had, so the owner can tell a commit from a spell under an
+    /// older spec (D207). Not saved: no spell outlives a restart.
+    pub update_count: u64,
+    /// The visible head when the latest update was made. Not saved.
+    pub update_head_id: u64,
 }
 
 /// Ids a sink skipped because they expired unread.
@@ -164,11 +169,13 @@ pub enum SinkOp {
         sink_id: u64,
         start: SinkStart,
     },
-    /// From the sink's worker: the cursor moves forward to `id`, unless `epoch` is stale.
+    /// From the sink's worker: the cursor moves forward to `id`, unless `epoch` is stale. A
+    /// spell under an older spec than the sink's now moves it no further than D207 allows.
     Commit {
         sink_id: u64,
         id: u64,
         epoch: u64,
+        update_count: u64,
     },
     /// From the sink's worker.
     Report {

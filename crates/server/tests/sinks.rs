@@ -2817,3 +2817,265 @@ async fn a_sinks_budget_cant_pass_the_nodes() {
     drop(client);
     harness.finish();
 }
+
+/// Only ids that have expired are a gap. A notify's run can hold younger ones, which still need
+/// their wake-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notify_skip_doesnt_pass_over_what_hasnt_expired() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = notify_spec(receiver.url(), DAY_MS + DAY_MS / 2);
+    spec.on_expire = "skip".to_owned();
+    put_sink(&mut client, STREAM, 3, spec, SinkStart::Earliest).await;
+    let first = send(&mut client, STREAM, b"a", 1).await;
+    receiver.wait_for_count(1).await;
+    wait_for_cursor(&mut client, STREAM, 3, first).await;
+
+    send(&mut client, STREAM, b"old", 2).await;
+    harness.clock.advance(DAY_MS - 1_000);
+    let fresh = send(&mut client, STREAM, b"fresh", 3).await;
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
+    harness.clock.advance(1_000);
+    tokio::time::sleep(Duration::from_millis(QUIET_MS * 2)).await;
+    let (spec, cursor) = sink_of(&mut client, STREAM, 3).await;
+    assert!(
+        spec.gaps.iter().all(|gap| gap.last_id < fresh),
+        "{:?} names a record 1 s old",
+        spec.gaps
+    );
+    assert!(cursor < fresh, "the cursor passed an undelivered record");
+    assert_eq!(receiver.count(), 1);
+
+    // The wake-up still comes, for all that has arrived since the last one.
+    harness.clock.advance(DAY_MS / 2);
+    let seen = receiver.wait_for_count(2).await;
+    assert_eq!(json_number(&seen[1].body, "unread"), 2);
+    wait_for_cursor(&mut client, STREAM, 3, fresh).await;
+    drop(client);
+    harness.finish();
+}
+
+/// Once the whole run has expired, it is a gap as any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notify_skip_records_a_run_that_has_all_expired() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = notify_spec(receiver.url(), 3 * DAY_MS);
+    spec.on_expire = "skip".to_owned();
+    put_sink(&mut client, STREAM, 3, spec, SinkStart::Earliest).await;
+    let first = send(&mut client, STREAM, b"a", 1).await;
+    receiver.wait_for_count(1).await;
+    wait_for_cursor(&mut client, STREAM, 3, first).await;
+
+    let old = send(&mut client, STREAM, b"old", 2).await;
+    harness.clock.advance(DAY_MS - 1_000);
+    let fresh = send(&mut client, STREAM, b"fresh", 3).await;
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
+    harness.clock.advance(DAY_MS);
+    wait_for_cursor(&mut client, STREAM, 3, fresh).await;
+    let (spec, _) = sink_of(&mut client, STREAM, 3).await;
+    assert_eq!(spec.gap_count, 1);
+    assert_eq!((spec.gaps[0].first_id, spec.gaps[0].last_id), (old, fresh));
+    assert_eq!(receiver.count(), 1);
+    drop(client);
+    harness.finish();
+}
+
+/// A batch whose put keeps failing is passed over only once all of it has expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_skip_keeps_a_batch_with_younger_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    // A file where the archive's directory goes, so that every put fails.
+    let blocker = dir.path().join("archive");
+    std::fs::write(&blocker, b"in the way").unwrap();
+    let mut config = config();
+    config.sink.archive_store = Some(store.clone());
+    config.sink.archive_window_ms = DAY_MS;
+    config.sink.max_failure_count = u32::MAX;
+    let harness = Harness::new(config);
+    let now_ms = server::Clock::now_ms(&harness.clock);
+    harness.clock.set(now_ms.next_multiple_of(DAY_MS));
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = archive_spec(None);
+    spec.on_expire = "skip".to_owned();
+    put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
+    send(&mut client, STREAM, b"old", 1).await;
+    harness.clock.advance(DAY_MS - 1_000);
+    let fresh = send(&mut client, STREAM, b"fresh", 2).await;
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
+    // This closes the window and expires `old`, and the put fails.
+    harness.clock.advance(1_000);
+    tokio::time::sleep(Duration::from_millis(QUIET_MS * 3)).await;
+    let (spec, cursor) = sink_of(&mut client, STREAM, 5).await;
+    assert!(spec.last_error.is_some(), "the put should have failed");
+    assert_eq!(spec.gap_count, 0, "{:?}", spec.gaps);
+    assert!(cursor < fresh);
+
+    std::fs::remove_file(&blocker).unwrap();
+    harness.clock.advance(5_000);
+    wait_for_cursor(&mut client, STREAM, 5, fresh).await;
+    let objects = archive_objects(&store, STREAM, 5).await;
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].1.len(), 2, "both records are in it");
+    drop(client);
+    harness.finish();
+}
+
+/// `unread` counts from the last success (D187), so a retry says what is unread as it goes, and
+/// what it covered isn't sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notify_retry_counts_what_arrived_while_it_failed() {
+    let receiver = Receiver::start().await;
+    receiver.answer(Answer::Status(503));
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    put_sink(
+        &mut client,
+        STREAM,
+        3,
+        notify_spec(receiver.url(), 1_000),
+        SinkStart::Earliest,
+    )
+    .await;
+    send(&mut client, STREAM, b"first", 1).await;
+    let seen = receiver.wait_for_count(1).await;
+    assert_eq!(json_number(&seen[0].body, "unread"), 1);
+    let mut last = 0;
+    for seq in 2..=6 {
+        last = send(&mut client, STREAM, b"more", seq).await;
+    }
+    tokio::time::sleep(Duration::from_millis(QUIET_MS * 2)).await;
+    receiver.answer(Answer::Status(200));
+    harness.clock.advance(1_000);
+    let seen = receiver.wait_for_count(2).await;
+    assert_eq!(json_number(&seen[1].body, "unread"), 6);
+    assert_eq!(json_number(&seen[1].body, "head"), last);
+    assert_eq!(seen[1].triple().2, last, "the retry covers all it counts");
+    wait_for_cursor(&mut client, STREAM, 3, last).await;
+    harness.clock.advance(5_000);
+    receiver.stays_at(2).await;
+    drop(client);
+    harness.finish();
+}
+
+/// Holds the pool's thread at a delivery, as a busy thread would.
+struct SlowDelivery {
+    sink_id: u64,
+    sleep_ms: u64,
+}
+
+impl SinkHook for SlowDelivery {
+    fn at(&self, sink_id: u64, step: SinkStep) -> SinkAction {
+        if sink_id == self.sink_id && step == SinkStep::BeforeDelivery {
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+        }
+        SinkAction::Continue
+    }
+}
+
+/// A record published once an update is answered belongs to the new spec, even if the old
+/// spell hasn't heard yet and has read past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_after_a_widening_update_is_not_lost_to_the_old_filter() {
+    const OTHER: &str = "sink.other";
+    for round in 0..12 {
+        let (receiver, other) = (Receiver::start().await, Receiver::start().await);
+        let mut config = config();
+        config.sink.pool_thread_count = 1;
+        config.sink.hook = Some(Arc::new(SlowDelivery {
+            sink_id: 2,
+            sleep_ms: 400,
+        }));
+        let harness = Harness::new(config);
+        let mut client = harness.node().client(0).await;
+        make_stream(&mut client, STREAM).await;
+        make_stream(&mut client, OTHER).await;
+        let mut narrow = deliver_spec(&receiver.url());
+        narrow.filter = Some("eq:255:1".to_owned());
+        put_sink(&mut client, STREAM, 1, narrow, SinkStart::Earliest).await;
+        put_sink(
+            &mut client,
+            OTHER,
+            2,
+            deliver_spec(&other.url()),
+            SinkStart::Earliest,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        send(&mut client, OTHER, b"occupies the thread", 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        put_sink(
+            &mut client,
+            STREAM,
+            1,
+            deliver_spec(&receiver.url()),
+            SinkStart::Earliest,
+        )
+        .await;
+        let records = record_with(2, b"only the new filter takes this");
+        client
+            .publish(publish(STREAM, &records, 1, 1))
+            .await
+            .unwrap();
+        let id = expect_ack(&mut client).await.1;
+        let seen = receiver.wait_for_count(1).await;
+        assert_eq!(seen[0].triple().1, id, "round {round}");
+        drop(client);
+        harness.finish();
+    }
+}
+
+/// What the owner does with commits from a spell older than the spec, with no task running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_from_before_an_update_stops_at_what_was_visible_then() {
+    let mut config = config();
+    config.sink.pool_thread_count = 0;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let spec = deliver_spec("http://127.0.0.1:1/x");
+    put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
+    let (before, _) = sink_of(&mut client, STREAM, 1).await;
+    let (epoch, generation) = (before.epoch, before.update_count);
+    let commit = |id: u64, update_count: u64| SinkOp::Commit {
+        sink_id: 1,
+        id,
+        epoch,
+        update_count,
+    };
+
+    let visible = send(&mut client, STREAM, b"before", 1).await;
+    put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
+    let later = send(&mut client, STREAM, b"after", 2).await;
+    client
+        .sink_op(STREAM, commit(later, generation))
+        .await
+        .unwrap();
+    assert_eq!(sink_of(&mut client, STREAM, 1).await.1, visible);
+
+    // The current spell's goes as far as it says.
+    let current = generation + 1;
+    client
+        .sink_op(STREAM, commit(later, current))
+        .await
+        .unwrap();
+    assert_eq!(sink_of(&mut client, STREAM, 1).await.1, later);
+
+    // Two updates back, there's no telling what was visible then, so it moves nothing.
+    let last = send(&mut client, STREAM, b"last", 3).await;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    client
+        .sink_op(STREAM, commit(last, generation))
+        .await
+        .unwrap();
+    assert_eq!(sink_of(&mut client, STREAM, 1).await.1, later);
+    drop(client);
+    harness.finish();
+}

@@ -3243,7 +3243,11 @@ impl Core {
                     spec.gaps.clone_from(&existing.gaps);
                     spec.gap_count = existing.gap_count;
                     spec.epoch = existing.epoch;
+                    spec.update_count = existing.update_count + 1;
+                    spec.update_head_id = head;
                 } else {
+                    spec.update_count = 0;
+                    spec.update_head_id = 0;
                     // Past any deleted sink's, whose delivery may still be ending (D195).
                     spec.epoch = now_ms.max(delivery.deleted_sink_epoch.saturating_add(1));
                     delivery
@@ -3278,9 +3282,26 @@ impl Core {
                     .cursors
                     .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
             }
-            SinkOp::Commit { sink_id, id, epoch } => {
+            SinkOp::Commit {
+                sink_id,
+                id,
+                epoch,
+                update_count,
+            } => {
                 let spec = delivery.sinks.get(&sink_id).ok_or(ErrorCode::NotFound)?;
-                if spec.epoch == epoch {
+                // A spell that hasn't heard of the latest update may have read on under the old
+                // spec. What was visible at that update was the old spec's to pass; nothing
+                // after it is. Older still, there's no telling, and delivery is at-least-once.
+                let id = if update_count >= spec.update_count {
+                    Some(id)
+                } else if update_count + 1 == spec.update_count {
+                    Some(id.min(spec.update_head_id))
+                } else {
+                    None
+                };
+                if let Some(id) = id
+                    && spec.epoch == epoch
+                {
                     let name = sink_cursor_name(sink_id);
                     match delivery.cursors.get_mut(name.as_str()) {
                         Some(cursor) => *cursor = (*cursor).max(id),

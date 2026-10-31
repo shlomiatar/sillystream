@@ -433,6 +433,8 @@ impl<'a> Reading<'a> {
                 RETENTION_REFRESH_MS
             };
             tokio::select! {
+                // A change first, so that as little as possible is read under the old spec.
+                biased;
                 changed = self.worker.notes.changed() => {
                     return match changed {
                         Ok(()) => self.finish_in_flight(Spell::Reload).await,
@@ -693,6 +695,13 @@ impl<'a> Reading<'a> {
                 return Some(Spell::End(End::Killed));
             }
             let delivery = &mut self.deliveries[at];
+            if self.kind == Kind::Notify
+                && let Some(run) = self.unread.pop_front()
+            {
+                // `unread` is everything since the last success, retries included (D187).
+                delivery.last_id = run.last_id;
+                delivery.item_count += run.item_count;
+            }
             delivery.running = true;
             delivery.attempt += 1;
             let first_id = delivery.first_id;
@@ -808,8 +817,13 @@ impl<'a> Reading<'a> {
 
     async fn commit(&mut self, id: u64) {
         self.cursor = self.cursor.max(id);
-        let (sink_id, epoch) = (self.worker.key.1, self.spec.epoch);
-        let _ = self.worker.op(SinkOp::Commit { sink_id, id, epoch }).await;
+        let op = SinkOp::Commit {
+            sink_id: self.worker.key.1,
+            id,
+            epoch: self.spec.epoch,
+            update_count: self.spec.update_count,
+        };
+        let _ = self.worker.op(op).await;
     }
 
     /// Progress can move the cursor only with nothing read and not yet delivered before it.
@@ -914,18 +928,19 @@ impl<'a> Reading<'a> {
         self.skip_expired(now_ms).await
     }
 
-    /// Passes over what is first in line and has expired. A request in progress is let finish.
+    /// Passes over what is first in line once all of it has expired: a notify's run and an
+    /// archive's batch can hold younger ids, which aren't a gap (D208). A request in progress is
+    /// let finish.
     async fn skip_expired(&mut self, now_ms: u64) -> Option<Spell> {
-        let expired = |first_id: u64, retention_ms: u64| {
-            id_ms(first_id).saturating_add(retention_ms) <= now_ms
-        };
+        let expired =
+            |last_id: u64, retention_ms: u64| id_ms(last_id).saturating_add(retention_ms) <= now_ms;
         let retention_ms = self.retention_ms;
         let mut gap: Option<(u64, u64)> = None;
         let extend = |gap: &mut Option<(u64, u64)>, first_id: u64, last_id: u64| {
             *gap = Some(gap.map_or((first_id, last_id), |(first, _)| (first, last_id)));
         };
         while let Some(front) = self.deliveries.front() {
-            if front.running || front.done || !expired(front.first_id, retention_ms) {
+            if front.running || front.done || !expired(front.last_id, retention_ms) {
                 break;
             }
             let delivery = self.deliveries.pop_front()?;
@@ -934,7 +949,7 @@ impl<'a> Reading<'a> {
         }
         if self.deliveries.is_empty() {
             while let Some(front) = self.unread.front() {
-                if !expired(front.first_id, retention_ms) {
+                if !expired(front.last_id, retention_ms) {
                     break;
                 }
                 let unread = self.unread.pop_front()?;
