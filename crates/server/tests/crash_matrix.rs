@@ -366,5 +366,65 @@ fn of_two_binaries_on_one_set_of_disks_one_stays_up() {
     };
     assert!(!wait_for_exit(loser).success());
     let text = std::fs::read_to_string(files.path(&format!("{name}.stderr"))).unwrap();
-    assert!(text.contains("sillystream-server:"), "{text}");
+    // One set of disks: it can't have the local store, and never reaches the ownership record.
+    assert!(
+        text.contains("sillystream-server: metadata store:"),
+        "{text}"
+    );
+}
+
+/// The race itself, on real processes: separate disks and one bucket, as machines would have.
+/// Those that read after a claim go on with the next generation (section 8.1, Q31), so several
+/// may stay up. What must hold is one process per generation, and that any that stopped lost a
+/// conditional write.
+#[test]
+fn of_binaries_racing_on_one_bucket_each_generation_has_one_winner() {
+    const PROCESS_COUNT: usize = 6;
+    let mut lost_count = 0;
+    for round in 0..10 {
+        let files = Files::new();
+        let mut children: Vec<(Child, PathBuf)> = Vec::new();
+        let mut running: Vec<Running> = Vec::new();
+        for at in 0..PROCESS_COUNT {
+            let stderr = files.path(&format!("{at}.stderr"));
+            let mut command = files.command(&stderr);
+            let path = |name: String| files.path(&name).to_str().unwrap().to_owned();
+            // The parser takes the last of a repeated option.
+            command
+                .args(["--wal-dir", &path(format!("wal.{at}"))])
+                .args(["--data-dir", &path(format!("data.{at}"))]);
+            children.push((command.spawn().unwrap(), stderr));
+        }
+        let mut stopped = Vec::new();
+        for (mut child, stderr) in children {
+            let mut line = String::new();
+            let out = child.stdout.take().unwrap();
+            BufReader::new(out).read_line(&mut line).unwrap();
+            let port = line.trim().rsplit(':').next().and_then(|p| p.parse().ok());
+            if port.is_none() {
+                stopped.push(stderr.clone());
+            }
+            running.push(Running {
+                child,
+                port,
+                stderr,
+            });
+        }
+        let listening = running.iter().filter(|one| one.port.is_some()).count();
+        let generations = std::fs::read_dir(files.path("objects/ownership"))
+            .unwrap()
+            .count();
+        assert!(listening >= 1, "round {round}");
+        assert_eq!(listening, generations, "round {round}");
+        for stderr in &stopped {
+            let text = std::fs::read_to_string(stderr).unwrap();
+            assert!(text.contains("another process took generation"), "{text}");
+        }
+        lost_count += stopped.len();
+        drop(running);
+        if lost_count > 0 {
+            return;
+        }
+    }
+    panic!("no process lost the race in 10 rounds of {PROCESS_COUNT}");
 }
