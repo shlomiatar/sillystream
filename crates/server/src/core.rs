@@ -14,8 +14,8 @@ use bytes::Bytes;
 use format::{HEADER_BYTES, IdAllocator, ValidatedPublish, encode_system_record, validate_publish};
 use proto::ErrorCode;
 use storage::{
-    Section, SectionExtent, UploadEvent, UploadKey, UploadSendError, UploaderSender, WalEntry,
-    WalSendError, WalSender, stream_fits_dedicated_path,
+    MetaCursor, MetaDedupe, Section, SectionExtent, StreamMeta, UploadEvent, UploadKey,
+    UploadSendError, UploaderSender, WalEntry, WalSendError, WalSender, stream_fits_dedicated_path,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -32,6 +32,7 @@ use crate::message::{
     SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff,
     StreamInfo, SubRef, WriteMsg,
 };
+use crate::metadata::MetaMsg;
 use crate::placement::{ShardCounters, shard_of};
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
 use crate::state::{StreamState, apply_op, check_doc};
@@ -71,6 +72,8 @@ pub(crate) struct Links {
 pub(crate) enum CoreToNode {
     /// This core's share of the segment cap is used up (Q18).
     SealRequested,
+    /// A delete, to answer once a checkpoint holds its tombstone (D20).
+    DurableRequested(oneshot::Sender<bool>),
 }
 
 pub(crate) struct CoreConfig {
@@ -81,6 +84,11 @@ pub(crate) struct CoreConfig {
     pub segment_cap_share_bytes: u64,
     pub stream_buffer_bytes: u64,
     pub last_valid_id: u64,
+    /// How many unwatched streams this core keeps in RAM. `None` never evicts.
+    pub active_stream_limit: Option<usize>,
+    /// Writes waiting on loads, above which no more are read: this is what a full inbox is
+    /// to a publisher (D7).
+    pub write_park_cap_count: usize,
 }
 
 pub(crate) struct CoreInbox {
@@ -300,6 +308,18 @@ enum Route {
     Forward(usize),
 }
 
+/// A message for a stream being loaded, in the order it came (section 7.6).
+enum Parked {
+    Write(WriteMsg),
+    Control(ControlMsg),
+    Read(ReadMsg),
+}
+
+struct Loading {
+    ticket: u64,
+    parked: Vec<Parked>,
+}
+
 fn effective_level(asked: Option<u8>, config: &StreamConfig) -> u8 {
     asked
         .unwrap_or(config.default_ack_level)
@@ -414,6 +434,21 @@ pub(crate) struct Core {
     durable_owed: u64,
     filter_check_count: u64,
     spans: Vec<RecordSpan>,
+
+    loader: Option<mpsc::UnboundedSender<MetaMsg>>,
+    loading: HashMap<Arc<str>, Loading>,
+    load_count: u64,
+    /// While a load's parked messages run, that a stream it found no trace of is known new.
+    load_passed: Option<Arc<str>>,
+    parked_write_count: usize,
+    /// Tombstones no checkpoint has yet, with their last ids.
+    dirty_tombstones: Vec<(Arc<str>, u64)>,
+    /// `sent_ticket` when each seal not yet checkpointed reached this core.
+    seal_sent: HashMap<u64, u64>,
+    use_count: u64,
+    evicted_count: u64,
+    loaded_count: u64,
+    rebuilt_count: u64,
 }
 
 pub(crate) struct CoreParts {
@@ -428,6 +463,8 @@ pub(crate) struct CoreParts {
     pub settings: DeliverySettings,
     pub stores: Stores,
     pub accounts: Vec<SlabAccount>,
+    /// `None` on a node without a metadata store.
+    pub loader: Option<mpsc::UnboundedSender<MetaMsg>>,
 }
 
 impl Core {
@@ -495,6 +532,17 @@ impl Core {
             durable_owed: 0,
             filter_check_count: 0,
             spans: Vec::new(),
+            loader: parts.loader,
+            loading: HashMap::new(),
+            load_count: 0,
+            load_passed: None,
+            parked_write_count: 0,
+            dirty_tombstones: Vec::new(),
+            seal_sent: HashMap::new(),
+            use_count: 0,
+            evicted_count: 0,
+            loaded_count: 0,
+            rebuilt_count: 0,
         }
     }
 
@@ -504,7 +552,8 @@ impl Core {
         let mut stopping = false;
         while !stopping {
             // A stamped entry that doesn't fit stops new writes being read, and nothing else.
-            let can_write = !self.is_stalled();
+            let can_write =
+                !self.is_stalled() && self.parked_write_count < self.config.write_park_cap_count;
             let need_retry = (!self.outbound.is_empty() && !self.wal_stopped)
                 || (!self.uploads_out.is_empty() && !self.upload_stopped);
             let home_deadline = self.home.next_deadline();
@@ -585,6 +634,16 @@ impl Core {
     }
 
     fn on_read(&mut self, message: ReadMsg) {
+        if let ReadMsg::Step(step) = &message
+            && matches!(self.route(&step.stream), Route::Here(_))
+        {
+            let name = Arc::clone(&step.stream);
+            if self.needs_load(&name) {
+                self.park(&name, Parked::Read(message));
+                return;
+            }
+            self.touch(&name);
+        }
         match message {
             ReadMsg::Step(message) => self.on_read_step(*message),
             ReadMsg::Chain(chain) => self.on_read_chain(chain),
@@ -731,6 +790,10 @@ impl Core {
                         msg: WAL_STOPPED_MSG.to_owned(),
                     },
                 ),
+                Route::Here(_) if self.needs_load(&publish.stream) => {
+                    let name = Arc::clone(&publish.stream);
+                    self.park(&name, Parked::Write(WriteMsg::Publish(publish)));
+                }
                 Route::Here(shard) => self.on_publish(*publish, shard),
                 Route::Forward(to) => {
                     send_reply(
@@ -751,6 +814,10 @@ impl Core {
                         msg: WAL_STOPPED_MSG.to_owned(),
                     },
                 ),
+                Route::Here(_) if self.needs_load(&op.stream) => {
+                    let name = Arc::clone(&op.stream);
+                    self.park(&name, Parked::Write(WriteMsg::StateOp(op)));
+                }
                 Route::Here(shard) => self.on_state_op(*op, shard),
                 Route::Forward(to) => {
                     send_reply(
@@ -767,6 +834,16 @@ impl Core {
                 reply,
                 passed,
             } => match self.route(&stream) {
+                // Behind whatever of this client's is waiting for the load.
+                Route::Here(_) if self.loading.contains_key(&stream) => {
+                    let name = Arc::clone(&stream);
+                    let barrier = WriteMsg::Barrier {
+                        stream,
+                        reply,
+                        passed,
+                    };
+                    self.park(&name, Parked::Write(barrier));
+                }
                 Route::Here(_) => send_reply(
                     &reply,
                     Reply::RouteDone {
@@ -803,6 +880,8 @@ impl Core {
             let floor_id = self.tombstones.remove(&**name).unwrap_or(0);
             let mut delivery = StreamDelivery::new(self.config.core_count);
             delivery.floor_id = floor_id;
+            delivery.track_meta = self.loader.is_some();
+            delivery.meta_dirty = delivery.track_meta;
             self.streams.insert(
                 Arc::clone(name),
                 Stream {
@@ -1117,7 +1196,16 @@ impl Core {
                 last_id: ids.last_id,
                 bytes: bytes.clone(),
                 state: ids.state_after,
+                dedupe: (ids.producer_id != 0).then_some((
+                    ids.producer_id,
+                    ids.producer_seq,
+                    ids.first_id,
+                    (ids.last_id - ids.first_id + 1) as u32,
+                )),
             });
+            stream.delivery.meta_dirty = stream.delivery.track_meta;
+            self.use_count += 1;
+            stream.delivery.last_used = self.use_count;
         }
         let log = self.logs.entry(Arc::clone(name)).or_default();
         let mut batch = Batch {
@@ -1400,6 +1488,18 @@ impl Core {
             if let Some(state) = &entry.state {
                 stream.delivery.visible_state = state.clone();
             }
+            if stream.delivery.track_meta {
+                stream.delivery.meta_dirty = true;
+                if let Some((producer_id, producer_seq, first_id, count)) = entry.dedupe {
+                    stream.delivery.visible_dedupe.record(
+                        producer_id,
+                        producer_seq,
+                        first_id,
+                        count,
+                        self.clock.now_ms(),
+                    );
+                }
+            }
             let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
             fan_out(
                 stream,
@@ -1510,6 +1610,7 @@ impl Core {
                 .cursors
                 .entry(Arc::clone(name))
                 .or_insert(cursor);
+            stream.delivery.meta_dirty = stream.delivery.track_meta;
         }
         let (state_ver, visible_doc) = &stream.delivery.visible_state;
         let state_ver = *state_ver;
@@ -1726,6 +1827,11 @@ impl Core {
             let _ = self.links.reads[to].send(ReadMsg::Chain(chain));
             return;
         }
+        let name = Arc::clone(&chain.stream);
+        if self.needs_load(&name) {
+            self.park(&name, Parked::Read(ReadMsg::Chain(chain)));
+            return;
+        }
         let extent = self
             .streams
             .get(&*chain.stream)
@@ -1742,6 +1848,8 @@ impl Core {
             (Some(extent), memory_first)
                 if memory_first.is_none_or(|first| extent.extent.id_first < first) =>
             {
+                // An extent of a former generation ends at its last accepted record (D138).
+                let limit = limit.min(extent.extent.id_last);
                 CatchReply::Extent { extent, limit }
             }
             _ => CatchReply::Memory { batches, limit },
@@ -1792,6 +1900,7 @@ impl Core {
             return;
         };
         let head = stream.ids.last_id();
+        stream.delivery.meta_dirty = stream.delivery.track_meta;
         match op {
             CursorOp::Commit(id) if id > head => {
                 fail(ErrorCode::Malformed, "COMMIT above the stream's head");
@@ -1843,6 +1952,15 @@ impl Core {
                 self.note_batches(name, tag);
             } else if let Route::Forward(to) = self.route(name) {
                 let _ = self.links.control[to].send(ControlMsg::AddExtents {
+                    stream: Arc::clone(name),
+                    path: path.clone(),
+                    extents: own,
+                    origin: self.config.id,
+                    tag,
+                });
+            } else if self.loader.is_some() {
+                // It may only be out of RAM, and the extent must reach its metadata.
+                self.on_control(ControlMsg::AddExtents {
                     stream: Arc::clone(name),
                     path: path.clone(),
                     extents: own,
@@ -1934,6 +2052,9 @@ impl Core {
 
     fn on_seal(&mut self, seal: u64) {
         self.seal_requested = false;
+        if self.loader.is_some() {
+            self.seal_sent.insert(seal, self.sent_ticket);
+        }
         let tag = UploadTag::Seal(seal);
         let mut names = std::mem::take(&mut self.dirty);
         names.sort_unstable();
@@ -1995,7 +2116,13 @@ impl Core {
                 key, path, extents, ..
             } => (key, Some((path, extents))),
             UploadEvent::Failed { key, .. } => (key, None),
-            UploadEvent::Empty { .. } | UploadEvent::Retrying { .. } => return,
+            UploadEvent::Empty { key } => {
+                if let UploadKey::Seal(seal) = key {
+                    self.in_flight.remove(&UploadTag::Seal(seal));
+                }
+                return;
+            }
+            UploadEvent::Retrying { .. } => return,
         };
         let tag = match key {
             UploadKey::Seal(seal) => UploadTag::Seal(seal),
@@ -2021,6 +2148,16 @@ impl Core {
     }
 
     fn on_control(&mut self, message: ControlMsg) {
+        if self.loader.is_some()
+            && let Some(name) = control_stream(&message)
+            && matches!(self.route(&name), Route::Here(_))
+        {
+            if self.needs_load(&name) {
+                self.park(&name, Parked::Control(message));
+                return;
+            }
+            self.touch(&name);
+        }
         match message {
             ControlMsg::Run(work) => (work.0)(),
             ControlMsg::StreamInfo { stream, reply } => match self.route(&stream) {
@@ -2076,7 +2213,9 @@ impl Core {
                     if let Some(retention_ms) = patch.retention_ms {
                         config.retention_ms = retention_ms;
                     }
-                    let _ = reply.send(*config);
+                    let config = *config;
+                    self.mark_dirty(&stream);
+                    let _ = reply.send(config);
                 }
             },
             ControlMsg::DeleteStream { stream, reply } => match self.route(&stream) {
@@ -2084,7 +2223,12 @@ impl Core {
                     let _ = self.links.control[to].send(ControlMsg::DeleteStream { stream, reply });
                 }
                 Route::Here(shard) => {
-                    let _ = reply.send(self.on_delete_stream(&stream, shard));
+                    let deleted = self.on_delete_stream(&stream, shard);
+                    if deleted && self.loader.is_some() {
+                        let _ = self.to_node.send(CoreToNode::DurableRequested(reply));
+                    } else {
+                        let _ = reply.send(deleted);
+                    }
                 }
             },
             ControlMsg::Sink { stream, op, reply } => match self.route(&stream) {
@@ -2092,7 +2236,9 @@ impl Core {
                     let _ = self.links.control[to].send(ControlMsg::Sink { stream, op, reply });
                 }
                 Route::Here(_) => {
-                    let _ = reply.send(self.on_sink(&stream, op));
+                    let result = self.on_sink(&stream, op);
+                    self.mark_dirty(&stream);
+                    let _ = reply.send(result);
                 }
             },
             ControlMsg::Ping { reply } => {
@@ -2137,6 +2283,7 @@ impl Core {
                 }
                 Route::Here(shard) => {
                     self.stream_entry(&stream, shard).config = config;
+                    self.mark_dirty(&stream);
                     let _ = reply.send(());
                 }
             },
@@ -2177,6 +2324,9 @@ impl Core {
                     catch_up_memory_bytes: self.home.stats.memory_bytes,
                     catch_up_local_bytes: self.home.stats.local_bytes,
                     catch_up_object_bytes: self.home.stats.object_bytes,
+                    evicted_count: self.evicted_count,
+                    loaded_count: self.loaded_count,
+                    rebuilt_count: self.rebuilt_count,
                 });
             }
             ControlMsg::AckWhenReached {
@@ -2239,7 +2389,388 @@ impl Core {
             ControlMsg::WalSent { core, ticket } => {
                 self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
             }
+            ControlMsg::Restore(restored) => self.on_restore(*restored),
+            ControlMsg::CheckpointClean { seal, reply } => {
+                let _ = reply.send(self.is_clean(seal));
+            }
+            ControlMsg::CheckpointGather { gather, reply } => {
+                let _ = reply.send(self.gather(gather));
+            }
+            ControlMsg::CheckpointDone { gather } => self.evict_idle(gather),
+            ControlMsg::Loaded {
+                stream,
+                ticket,
+                meta,
+                rebuilt,
+            } => self.on_loaded(stream, ticket, meta, rebuilt),
             ControlMsg::Stop => {}
+        }
+    }
+
+    fn mark_dirty(&mut self, name: &str) {
+        if let Some(stream) = self.streams.get_mut(name) {
+            stream.delivery.meta_dirty = stream.delivery.track_meta;
+        }
+    }
+
+    fn touch(&mut self, name: &str) {
+        if let Some(stream) = self.streams.get_mut(name) {
+            self.use_count += 1;
+            stream.delivery.last_used = self.use_count;
+        }
+    }
+
+    /// Whether `name` could be out of RAM, on a core that owns it. Asks for it if nobody has.
+    /// Only the first touch of an idle stream pays for this, off the core (section 7.6).
+    fn needs_load(&mut self, name: &Arc<str>) -> bool {
+        let Some(loader) = &self.loader else {
+            return false;
+        };
+        if self.streams.contains_key(&**name)
+            || self.tombstones.contains_key(&**name)
+            || self.load_passed.as_deref() == Some(&**name)
+        {
+            return false;
+        }
+        if !self.loading.contains_key(&**name) {
+            self.load_count += 1;
+            let ticket = self.load_count;
+            let _ = loader.send(MetaMsg::Load {
+                core: self.config.id,
+                stream: Arc::clone(name),
+                ticket,
+            });
+            self.loading.insert(
+                Arc::clone(name),
+                Loading {
+                    ticket,
+                    parked: Vec::new(),
+                },
+            );
+        }
+        true
+    }
+
+    fn park(&mut self, name: &Arc<str>, message: Parked) {
+        if let Some(loading) = self.loading.get_mut(&**name) {
+            if matches!(message, Parked::Write(_)) {
+                self.parked_write_count += 1;
+            }
+            loading.parked.push(message);
+        }
+    }
+
+    fn on_loaded(
+        &mut self,
+        name: Arc<str>,
+        ticket: u64,
+        meta: Option<Box<StreamMeta>>,
+        rebuilt: bool,
+    ) {
+        if self
+            .loading
+            .get(&*name)
+            .is_none_or(|loading| loading.ticket != ticket)
+        {
+            // It moved away while this was out. Its new owner asks for itself.
+            return;
+        }
+        let loading = self.loading.remove(&*name).expect("just looked at it");
+        let shard = match self.route(&name) {
+            Route::Here(shard) => Some(shard),
+            Route::Forward(_) => None,
+        };
+        if let (Some(meta), Some(shard), false) = (meta, shard, self.streams.contains_key(&*name)) {
+            self.loaded_count += 1;
+            self.rebuilt_count += u64::from(rebuilt);
+            if meta.deleted {
+                self.tombstones.insert(Arc::clone(&name), meta.last_id);
+            } else {
+                self.install_meta(&name, *meta, shard);
+            }
+        }
+        self.run_parked(&name, loading.parked);
+    }
+
+    /// In the order they came. Writes go ahead of what is deferred, which came later.
+    fn run_parked(&mut self, name: &Arc<str>, parked: Vec<Parked>) {
+        self.load_passed = Some(Arc::clone(name));
+        let mut writes = Vec::new();
+        for message in parked {
+            match message {
+                Parked::Write(write) => {
+                    self.parked_write_count -= 1;
+                    writes.push(write);
+                }
+                Parked::Control(control) => self.on_control(control),
+                Parked::Read(read) => self.on_read(read),
+            }
+        }
+        for write in writes.into_iter().rev() {
+            self.deferred.push_front(write);
+        }
+        self.run_deferred();
+        self.load_passed = None;
+    }
+
+    /// A shard just left: what waited for its streams to load follows it, in order.
+    fn pass_on_parked(&mut self) {
+        let leaving: Vec<Arc<str>> = self
+            .loading
+            .keys()
+            .filter(|name| matches!(self.route(name), Route::Forward(_)))
+            .cloned()
+            .collect();
+        for name in leaving {
+            if let Some(loading) = self.loading.remove(&*name) {
+                self.run_parked(&name, loading.parked);
+            }
+        }
+    }
+
+    fn install_meta(&mut self, name: &Arc<str>, meta: StreamMeta, shard: u32) {
+        let mut delivery = StreamDelivery::new(self.config.core_count);
+        delivery.track_meta = true;
+        delivery.floor_id = meta.floor_id;
+        delivery.visible_through = meta.last_id;
+        delivery.visible_state = (meta.state_ver, meta.state.clone());
+        delivery.cursors = meta
+            .cursors
+            .iter()
+            .map(|cursor| (Arc::from(cursor.name.as_str()), cursor.id))
+            .collect();
+        delivery.extents = meta
+            .extents
+            .iter()
+            .map(|extent| crate::recovery::extent_ref(name, extent))
+            .collect();
+        delivery.sinks = meta
+            .sinks
+            .iter()
+            .map(|sink| (sink.sink_id, crate::recovery::sink_spec(sink)))
+            .collect();
+        let dedupe = DedupeTable::from_entries(meta.dedupe.iter().map(|entry| {
+            (
+                entry.producer_id,
+                entry.producer_seq,
+                entry.first_id,
+                entry.count,
+            )
+        }));
+        delivery.visible_dedupe = dedupe.clone();
+        self.use_count += 1;
+        delivery.last_used = self.use_count;
+        let mut state = StreamState::new();
+        state.install(meta.state, meta.state_ver);
+        self.shards
+            .entry(shard)
+            .or_default()
+            .streams
+            .insert(Arc::clone(name));
+        self.tombstones.remove(&**name);
+        self.streams.insert(
+            Arc::clone(name),
+            Stream {
+                name: Arc::clone(name),
+                shard,
+                ids: IdAllocator::new(meta.last_id.max(meta.floor_id), self.config.last_valid_id),
+                state,
+                dedupe,
+                config: StreamConfig {
+                    default_ack_level: meta.default_ack_level,
+                    min_ack_level: meta.min_ack_level,
+                    retention_ms: meta.retention_ms,
+                },
+                owners: Vec::new(),
+                delivery,
+            },
+        );
+    }
+
+    /// A stream as the startup put it back. What its WAL entries hold and no extent covers
+    /// goes into the next seal, under this generation (D16).
+    fn on_restore(&mut self, restored: crate::recovery::RestoredStream) {
+        let name: Arc<str> = Arc::from(restored.meta.name.as_str());
+        let shard = match self.route(&name) {
+            Route::Here(shard) => shard,
+            Route::Forward(_) => return,
+        };
+        self.install_meta(&name, restored.meta, shard);
+        let stream = self.streams.get_mut(&*name).expect("just installed");
+        stream.delivery.meta_dirty = true;
+        stream.delivery.new_extents = restored
+            .new_extents
+            .iter()
+            .map(|extent| crate::recovery::extent_ref(&name, extent))
+            .collect();
+        if restored.batches.is_empty() {
+            return;
+        }
+        let log = self.logs.entry(Arc::clone(&name)).or_default();
+        for batch in restored.batches {
+            let bytes = self.pool.copy_in(&batch.bytes).freeze();
+            log.unsealed_bytes += bytes.len() as u64;
+            self.unsealed_bytes += bytes.len() as u64;
+            log.batches.push_back(Batch {
+                bytes,
+                first_id: batch.first_id,
+                last_id: batch.last_id,
+                // Already durable, in a closed file: nothing waits on its ticket.
+                ticket: 0,
+                residency: log.residency,
+                upload: BatchUpload::Unsealed,
+                waiters: Vec::new(),
+            });
+        }
+        log.dirty = true;
+        self.dirty.push(name);
+    }
+
+    /// Whether everything sent to the WAL before this seal's rotation is uploaded, at its
+    /// owner, and visible. Only then may the files holding it go (D137).
+    fn is_clean(&mut self, seal: u64) -> bool {
+        // The uploader tells cores before it tells control, so this seal's event is here.
+        while let Ok(event) = self.inbox.uploads.try_recv() {
+            self.on_upload_event(event);
+        }
+        self.on_durable();
+        let Some(through) = self.seal_sent.remove(&seal) else {
+            return false;
+        };
+        if !self.foreign_visible.is_empty()
+            || self
+                .wal_visible
+                .front()
+                .is_some_and(|(ticket, _)| *ticket <= through)
+        {
+            return false;
+        }
+        !self.logs.values().any(|log| {
+            log.batches
+                .front()
+                .is_some_and(|batch| batch.ticket <= through)
+        })
+    }
+
+    /// What changed, as of each stream's last visible record. A change above that comes back
+    /// from the WAL, or never happened (D136).
+    fn gather(&mut self, gather: u64) -> Vec<StreamMeta> {
+        let mut metas = Vec::new();
+        for stream in self.streams.values_mut() {
+            let delivery = &mut stream.delivery;
+            if !delivery.meta_dirty {
+                continue;
+            }
+            delivery.meta_dirty = false;
+            delivery.saved_gather = gather;
+            metas.push(StreamMeta {
+                name: stream.name.to_string(),
+                deleted: false,
+                last_id: stream.ids.last_id(),
+                floor_id: delivery.floor_id,
+                applied_id: delivery.visible_through,
+                state_ver: delivery.visible_state.0,
+                state: delivery.visible_state.1.clone(),
+                default_ack_level: stream.config.default_ack_level,
+                min_ack_level: stream.config.min_ack_level,
+                retention_ms: stream.config.retention_ms,
+                cursors: delivery
+                    .cursors
+                    .iter()
+                    .map(|(name, id)| MetaCursor {
+                        name: name.to_string(),
+                        id: *id,
+                    })
+                    .collect(),
+                dedupe: delivery
+                    .visible_dedupe
+                    .entries()
+                    .iter()
+                    .map(|entry| MetaDedupe {
+                        producer_id: entry.producer_id(),
+                        producer_seq: entry.producer_seq(),
+                        first_id: entry.first_id(),
+                        count: entry.count(),
+                    })
+                    .collect(),
+                sinks: delivery
+                    .sinks
+                    .iter()
+                    .map(|(id, spec)| crate::recovery::meta_sink(*id, spec))
+                    .collect(),
+                extents: delivery
+                    .new_extents
+                    .drain(..)
+                    .map(|known| crate::recovery::meta_extent(&known))
+                    .collect(),
+            });
+        }
+        for (name, last_id) in self.dirty_tombstones.drain(..) {
+            metas.push(StreamMeta {
+                name: name.to_string(),
+                deleted: true,
+                last_id,
+                floor_id: last_id,
+                applied_id: last_id,
+                ..StreamMeta::default()
+            });
+        }
+        metas
+    }
+
+    /// Cold streams leave RAM, oldest first, once the store has all of what they hold. A live
+    /// subscriber, or anything still on its way, keeps one here (section 7.6).
+    fn evict_idle(&mut self, done_gather: u64) {
+        let Some(limit) = self.config.active_stream_limit else {
+            return;
+        };
+        let over = self.streams.len().saturating_sub(limit);
+        if over == 0 {
+            return;
+        }
+        let mut cold: Vec<(u64, Arc<str>)> = self
+            .streams
+            .values()
+            .filter(|stream| {
+                let delivery = &stream.delivery;
+                !delivery.meta_dirty
+                    && delivery.saved_gather <= done_gather
+                    && delivery.pending.is_empty()
+                    && delivery.table.is_unwatched()
+                    && self
+                        .logs
+                        .get(&stream.name)
+                        .is_none_or(|log| log.batches.is_empty())
+                    && !self.wal_waits.iter().any(|wait| wait.stream == stream.name)
+            })
+            .map(|stream| (stream.delivery.last_used, Arc::clone(&stream.name)))
+            .collect();
+        cold.sort_unstable();
+        for (_, name) in cold.into_iter().take(over) {
+            let Some(mut stream) = self.streams.remove(&*name) else {
+                continue;
+            };
+            self.logs.remove(&*name);
+            if let Some(shard) = self.shards.get_mut(&stream.shard) {
+                shard.streams.remove(&*name);
+            }
+            for home in 0..self.config.core_count {
+                if stream.delivery.seq_by_home[home] == 0 {
+                    continue;
+                }
+                let seq = next_seq(&mut stream.delivery, home);
+                if home == self.config.id {
+                    self.home
+                        .on_stream(Arc::clone(&name), seq, StreamBody::Evicted);
+                } else {
+                    let _ = self.links.delivery[home].send(DeliveryMsg::Stream {
+                        stream: Arc::clone(&name),
+                        seq,
+                        body: StreamBody::Evicted,
+                    });
+                }
+            }
+            self.evicted_count += 1;
         }
     }
 
@@ -2283,6 +2814,10 @@ impl Core {
         }
         self.tombstones
             .insert(Arc::clone(name), stream.ids.last_id());
+        if self.loader.is_some() {
+            self.dirty_tombstones
+                .push((Arc::clone(name), stream.ids.last_id()));
+        }
         for home in 0..self.config.core_count {
             let seq = next_seq(&mut stream.delivery, home);
             if home == self.config.id {
@@ -2400,6 +2935,7 @@ impl Core {
             done,
         })));
         self.pass_on_deferred();
+        self.pass_on_parked();
     }
 
     fn on_split_stream(
@@ -2446,6 +2982,7 @@ impl Core {
             done,
         })));
         self.pass_on_deferred();
+        self.pass_on_parked();
     }
 
     fn on_adopt(&mut self, handoff: ShardHandoff) {
@@ -2533,6 +3070,22 @@ impl Core {
             later: VecDeque::new(),
             done: handoff.done,
         });
+    }
+}
+
+/// The stream a message needs in RAM before it can be handled, if any.
+fn control_stream(message: &ControlMsg) -> Option<Arc<str>> {
+    match message {
+        ControlMsg::StreamInfo { stream, .. }
+        | ControlMsg::ConfigurePatch { stream, .. }
+        | ControlMsg::DeleteStream { stream, .. }
+        | ControlMsg::Sink { stream, .. }
+        | ControlMsg::Snapshot { stream, .. }
+        | ControlMsg::Configure { stream, .. }
+        | ControlMsg::Cursor { stream, .. }
+        | ControlMsg::AddExtents { stream, .. } => Some(Arc::clone(stream)),
+        ControlMsg::Attach(message) => Some(Arc::clone(&message.stream)),
+        _ => None,
     }
 }
 

@@ -5,20 +5,23 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use server::net::{Server, ServerConfig};
-use server::{LocalCacheConfig, NodeConfig, SystemClock};
-use storage::{DirVolume, ObjectStoreConfig, S3Config, build_store, list_wal_files};
+use server::{LocalCacheConfig, NodeConfig, RecoverConfig, SystemClock};
+use storage::{ObjectStoreConfig, S3Config, build_store};
 
 const USAGE: &str = "\
 sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key PEM \\
     --token-secret-file FILE --object-store local:DIR|memory|s3:BUCKET
   [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
+  [--active-stream-limit N]
 
 For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
 usual AWS variables. Real S3 has not been exercised.";
 
 /// Sparse on the file systems here (D51), so this costs only what is written.
 const WAL_PREALLOCATE_DEFAULT_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a clean stop waits for a last seal. A restart replays whatever this leaves.
+const LAST_SEAL_WAIT_MS: u64 = 10_000;
 
 fn main() -> ExitCode {
     match run() {
@@ -46,6 +49,7 @@ fn run() -> Result<(), String> {
     let mut cache_cap_bytes = 10 * 1024 * 1024 * 1024u64;
     let mut preallocate_bytes = WAL_PREALLOCATE_DEFAULT_BYTES;
     let mut max_frame_bytes = None;
+    let mut active_stream_limit = None;
     while let Some(flag) = args.next() {
         if flag == "--help" {
             println!("{USAGE}");
@@ -72,6 +76,7 @@ fn run() -> Result<(), String> {
             "--local-cache-cap-bytes" => cache_cap_bytes = number(&value)?,
             "--wal-preallocate-bytes" => preallocate_bytes = number(&value)?,
             "--max-frame-bytes" => max_frame_bytes = Some(number(&value)?),
+            "--active-stream-limit" => active_stream_limit = Some(number(&value)? as usize),
             _ => return Err(format!("unknown flag {flag}\n{USAGE}")),
         }
     }
@@ -98,14 +103,6 @@ fn run() -> Result<(), String> {
     std::fs::create_dir_all(&wal_dir).map_err(|error| format!("{}: {error}", wal_dir.display()))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|error| format!("{}: {error}", data_dir.display()))?;
-    // Replay comes with M7. Until then, starting over a WAL would ignore what it holds.
-    let old_files = list_wal_files(&wal_dir).map_err(|error| error.to_string())?;
-    if !old_files.is_empty() {
-        return Err(format!(
-            "{} holds WAL files, and this build doesn't replay them yet (M7)",
-            wal_dir.display()
-        ));
-    }
     let core_count = cores.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     });
@@ -120,6 +117,7 @@ fn run() -> Result<(), String> {
     if let Some(frame_bytes) = max_frame_bytes {
         node.max_frame_bytes = frame_bytes;
     }
+    node.active_stream_limit = active_stream_limit;
     node.local_cache = Some(LocalCacheConfig {
         dir: data_dir.join("cache"),
         cap_bytes: cache_cap_bytes,
@@ -131,17 +129,36 @@ fn run() -> Result<(), String> {
         key_pem,
         token_secret,
     };
-    let server = Server::start(
+    let (server, report) = Server::start_recovering(
         config,
-        DirVolume::new(&wal_dir, preallocate_bytes),
+        RecoverConfig {
+            wal_dir,
+            metadata_dir: data_dir.join("metadata"),
+            wal_preallocate_bytes: preallocate_bytes,
+        },
         store,
         Arc::new(SystemClock),
     )
     .map_err(|error| error.to_string())?;
+    if let Some(warning) = report.warning() {
+        eprintln!("sillystream-server: {warning}");
+    }
+    eprintln!(
+        "sillystream-server: generation {}, last valid id {}, {} WAL entries replayed, {} streams \
+         restored, {} objects looked at",
+        report.generation,
+        report.last_valid_id,
+        report.replayed_entry_count,
+        report.restored_stream_count,
+        report.scanned_object_count
+    );
     // A parent waiting for the port reads this line.
     println!("listening on {}", server.local_addr());
 
     wait_for_signal().map_err(|error| error.to_string())?;
+    if !server.seal_before_stop(LAST_SEAL_WAIT_MS) {
+        eprintln!("sillystream-server: the last seal didn't finish, and a restart replays it");
+    }
     let exit = server.shutdown();
     if let Err(error) = exit.wal {
         return Err(format!("the WAL stopped with an error: {error}"));

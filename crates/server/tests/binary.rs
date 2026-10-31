@@ -71,37 +71,11 @@ fn it_starts_says_where_and_stops_on_sigterm() {
 }
 
 #[test]
-fn it_refuses_a_short_secret_and_a_wal_it_cannot_replay() {
+fn it_refuses_a_short_secret() {
     let dir = tempfile::tempdir().unwrap();
     let short = Command::new(BIN)
         .args(write_files(dir.path(), b"short"))
         .output()
         .unwrap();
     assert!(!short.status.success());
-
-    let dir = tempfile::tempdir().unwrap();
-    let args = write_files(dir.path(), &[7u8; 32]);
-    std::fs::create_dir_all(dir.path().join("wal")).unwrap();
-    std::fs::write(dir.path().join("wal").join(storage::wal_file_name(1)), b"x").unwrap();
-    let mut child = Command::new(BIN)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if started.elapsed() > Duration::from_secs(20) {
-            let _ = child.kill();
-            panic!("it started over a WAL it can't replay");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(!status.success());
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut text).unwrap();
-    assert!(text.contains("WAL"), "{text}");
 }

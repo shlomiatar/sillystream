@@ -65,6 +65,25 @@ impl DedupeTable {
         DedupeTable::default()
     }
 
+    /// Entries as they were saved, in any order.
+    pub fn from_entries(entries: impl IntoIterator<Item = (u64, u64, u64, u32)>) -> DedupeTable {
+        let mut entries: Vec<DedupeEntry> = entries
+            .into_iter()
+            .map(|(producer_id, producer_seq, first_id, count)| DedupeEntry {
+                producer_id,
+                producer_seq,
+                first_id,
+                count,
+            })
+            .collect();
+        entries.sort_by_key(DedupeEntry::producer_id);
+        DedupeTable { entries }
+    }
+
+    pub fn entries(&self) -> &[DedupeEntry] {
+        &self.entries
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -2,12 +2,12 @@
 //! is node-wide: the seal window (section 7.1), rebalancing (section 6.1), and the
 //! in-process API that later milestones put sockets in front of.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,9 +16,9 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    DurableWatch, SegmentCache, StreamExtent, UploadEvent, UploadKey, Uploader, UploaderConfig,
-    WalConfig, WalError, WalHandle, WalSendError, WalSender, WalStats, WalVolume, durable_watches,
-    start_wal_writer,
+    CheckpointSet, DirVolume, DurableWatch, MetadataStore, SegmentCache, StreamExtent, UploadEvent,
+    UploadKey, Uploader, UploaderConfig, WalConfig, WalError, WalHandle, WalSendError, WalSender,
+    WalStats, WalVolume, durable_watches, start_wal_writer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -30,7 +30,11 @@ use crate::message::{
     ControlMsg, CoreStats, CursorOp, PublishMsg, Reply, RunOnCore, SinkOp, SnapshotReply,
     StateChange, StateOpMsg, StreamConfig, StreamConfigPatch, StreamInfo, WriteMsg,
 };
+use crate::metadata::{
+    CheckpointDone, CheckpointJob, Checkpointer, LocalMeta, run_checkpointer, run_loader,
+};
 use crate::placement::{ShardMove, plan_moves, shard_of};
+use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, prepare};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 use crate::state::StateOp;
 
@@ -87,6 +91,12 @@ pub struct NodeConfig {
     pub connection_window_bytes: u64,
     /// How much one catch-up read asks for.
     pub catch_up_read_bytes: u64,
+    /// With a metadata store, how many streams may stay in RAM with nobody on them, split over
+    /// the cores (section 7.6). `None` never evicts.
+    pub active_stream_limit: Option<usize>,
+    /// With a metadata store, every this many checkpoint files one holds everything, and older
+    /// ones can go (D20).
+    pub full_checkpoint_every_count: usize,
 }
 
 impl NodeConfig {
@@ -121,6 +131,8 @@ impl NodeConfig {
             fair_share_bytes: 256 * 1024,
             connection_window_bytes: 4 * 1024 * 1024,
             catch_up_read_bytes: 1024 * 1024,
+            active_stream_limit: None,
+            full_checkpoint_every_count: 64,
         }
     }
 }
@@ -152,10 +164,16 @@ enum NodeMsg {
     Seal {
         reply: oneshot::Sender<SealOutcome>,
     },
+    /// Asks for a seal, and answers true when a checkpoint has what it held. False if the
+    /// node has none or can no longer seal.
+    SealAndCheckpoint {
+        reply: oneshot::Sender<bool>,
+    },
+    CheckpointSaved(CheckpointDone),
     RetryRotate,
     Rotated {
         seal: u64,
-        ok: bool,
+        closed_seq: Option<u64>,
     },
     Rebalance {
         reply: oneshot::Sender<Vec<ShardMove>>,
@@ -190,6 +208,23 @@ struct Control {
     seal_wanted: bool,
     seal_waiters: Vec<oneshot::Sender<SealOutcome>>,
     waiters_by_seal: HashMap<u64, Vec<oneshot::Sender<SealOutcome>>>,
+    /// `None` on a node without a metadata store.
+    meta: Option<ControlMeta>,
+}
+
+/// Who waits for a checkpoint, and what each is told if none can come.
+type CheckpointWaiter = (oneshot::Sender<bool>, bool);
+
+/// What control tracks to save metadata at each seal (D18).
+struct ControlMeta {
+    jobs: mpsc::UnboundedSender<CheckpointJob>,
+    /// The WAL file each seal closed.
+    closed_seq_by_seal: HashMap<u64, u64>,
+    /// Objects no checkpoint has listed yet, which wait for their extents to reach a gather.
+    objects: Vec<String>,
+    gather_count: u64,
+    next_waiters: Vec<CheckpointWaiter>,
+    waiters_by_seal: BTreeMap<u64, Vec<CheckpointWaiter>>,
 }
 
 impl Control {
@@ -218,7 +253,7 @@ impl Control {
                 },
                 event = uploads.recv() => {
                     if let Some(event) = event {
-                        self.on_upload_event(event);
+                        self.on_upload_event(event).await;
                     }
                 },
                 _ = sleep_until_some(next_seal) => {
@@ -237,6 +272,7 @@ impl Control {
                 let _ = waiter.send(SealOutcome::NodeStopped);
             }
         }
+        self.fail_checkpoint_waiters();
     }
 
     async fn on_message(&mut self, message: NodeMsg) {
@@ -245,6 +281,13 @@ impl Control {
                 self.seal_wanted = true;
                 self.begin_seal();
             }
+            NodeMsg::FromCore(CoreToNode::DurableRequested(reply)) => {
+                // Already deleted here: a crash before the checkpoint is what's being waited
+                // out, so with no checkpoint to come it still answers that it was deleted.
+                self.wait_for_checkpoint((reply, true));
+            }
+            NodeMsg::SealAndCheckpoint { reply } => self.wait_for_checkpoint((reply, false)),
+            NodeMsg::CheckpointSaved(done) => self.on_checkpoint_saved(done),
             NodeMsg::Seal { reply } => {
                 self.seal_waiters.push(reply);
                 self.seal_wanted = true;
@@ -254,9 +297,13 @@ impl Control {
                 self.rotating = false;
                 self.begin_seal();
             }
-            NodeMsg::Rotated { seal, ok } => {
+            NodeMsg::Rotated { seal, closed_seq } => {
                 self.rotating = false;
-                if ok {
+                if let Some(closed_seq) = closed_seq {
+                    storage::crash_point("seal.after_rotate");
+                    if let Some(meta) = &mut self.meta {
+                        meta.closed_seq_by_seal.insert(seal, closed_seq);
+                    }
                     for control in &self.links.control {
                         let _ = control.send(ControlMsg::Seal { seal });
                     }
@@ -295,10 +342,14 @@ impl Control {
                 let seal = self.seal_count;
                 self.waiters_by_seal
                     .insert(seal, std::mem::take(&mut self.seal_waiters));
+                if let Some(meta) = &mut self.meta {
+                    let waiters = std::mem::take(&mut meta.next_waiters);
+                    meta.waiters_by_seal.insert(seal, waiters);
+                }
                 let tx = self.tx.clone();
                 tokio::spawn(async move {
-                    let ok = done.await.is_ok();
-                    let _ = tx.send(NodeMsg::Rotated { seal, ok });
+                    let closed_seq = done.await.ok().map(|rotated| rotated.closed_seq);
+                    let _ = tx.send(NodeMsg::Rotated { seal, closed_seq });
                 });
             }
             Err(WalSendError::Full(())) => {
@@ -314,6 +365,7 @@ impl Control {
                 for waiter in self.seal_waiters.drain(..) {
                     let _ = waiter.send(SealOutcome::WalStopped);
                 }
+                self.fail_checkpoint_waiters();
             }
         }
     }
@@ -322,9 +374,108 @@ impl Control {
         for waiter in self.waiters_by_seal.remove(&seal).unwrap_or_default() {
             let _ = waiter.send(SealOutcome::WalStopped);
         }
+        self.fail_checkpoint_waiters();
     }
 
-    fn on_upload_event(&mut self, event: UploadEvent) {
+    fn wait_for_checkpoint(&mut self, waiter: CheckpointWaiter) {
+        let Some(meta) = &mut self.meta else {
+            let (reply, when_stopped) = waiter;
+            let _ = reply.send(when_stopped);
+            return;
+        };
+        meta.next_waiters.push(waiter);
+        self.seal_wanted = true;
+        self.begin_seal();
+    }
+
+    fn fail_checkpoint_waiters(&mut self) {
+        let Some(meta) = &mut self.meta else {
+            return;
+        };
+        let by_seal = std::mem::take(&mut meta.waiters_by_seal);
+        let next = std::mem::take(&mut meta.next_waiters);
+        for (reply, when_stopped) in by_seal.into_values().flatten().chain(next) {
+            let _ = reply.send(when_stopped);
+        }
+    }
+
+    /// A seal's upload ended, one way or another. This is the seal's metadata step: it asks
+    /// every core what changed and sends that to be saved. Control waits for the cores, which
+    /// never wait for it, so moves can't interleave with a gather (D137).
+    async fn checkpoint_seal(&mut self, seal: u64) {
+        storage::crash_point("seal.after_upload");
+        let Some(meta) = &mut self.meta else {
+            return;
+        };
+        let closed_seq = meta.closed_seq_by_seal.remove(&seal);
+        meta.gather_count += 1;
+        let gather = meta.gather_count;
+        let mut clean = true;
+        for control in &self.links.control {
+            let (reply, answer) = oneshot::channel();
+            if control
+                .send(ControlMsg::CheckpointClean { seal, reply })
+                .is_err()
+            {
+                return;
+            }
+            let Ok(core_clean) = answer.await else {
+                return;
+            };
+            clean &= core_clean;
+        }
+        let mut metas = Vec::new();
+        for control in &self.links.control {
+            let (reply, answer) = oneshot::channel();
+            if control
+                .send(ControlMsg::CheckpointGather { gather, reply })
+                .is_err()
+            {
+                return;
+            }
+            let Ok(gathered) = answer.await else {
+                return;
+            };
+            metas.extend(gathered);
+        }
+        let objects = if clean {
+            std::mem::take(&mut meta.objects)
+        } else {
+            Vec::new()
+        };
+        let _ = meta.jobs.send(CheckpointJob {
+            seal,
+            gather,
+            metas,
+            objects,
+            recycle_seq: if clean { closed_seq } else { None },
+        });
+    }
+
+    fn on_checkpoint_saved(&mut self, done: CheckpointDone) {
+        storage::crash_point("checkpoint.after_put");
+        if let Some(seq) = done.recycle_seq {
+            // A full channel only leaves the file until the next seal's recycle covers it.
+            let _ = self.wal.try_recycle(seq);
+        }
+        for control in &self.links.control {
+            let _ = control.send(ControlMsg::CheckpointDone {
+                gather: done.gather,
+            });
+        }
+        if let Some(meta) = &mut self.meta {
+            let later = meta.waiters_by_seal.split_off(&(done.seal + 1));
+            let finished = std::mem::replace(&mut meta.waiters_by_seal, later);
+            for (reply, _) in finished.into_values().flatten() {
+                let _ = reply.send(true);
+            }
+        }
+    }
+
+    async fn on_upload_event(&mut self, event: UploadEvent) {
+        if let (Some(meta), UploadEvent::Uploaded { path, .. }) = (&mut self.meta, &event) {
+            meta.objects.push(path.to_string());
+        }
         let (seal, outcome) = match event {
             UploadEvent::Uploaded {
                 key: UploadKey::Seal(seal),
@@ -349,6 +500,7 @@ impl Control {
             } => (seal, SealOutcome::Failed { seal, error }),
             _ => return,
         };
+        self.checkpoint_seal(seal).await;
         for waiter in self.waiters_by_seal.remove(&seal).unwrap_or_default() {
             let _ = waiter.send(outcome.clone());
         }
@@ -528,6 +680,19 @@ pub struct Node {
     client_count: Arc<AtomicU64>,
     uploader: Option<Uploader<SlabBytes>>,
     wal: Option<WalHandle>,
+    /// The metadata threads, which go last since cores and control send to them.
+    meta_threads: Vec<JoinHandle<()>>,
+    meta_stop: Arc<AtomicBool>,
+}
+
+/// What a recovering start adds to a plain one.
+struct RecoveredParts {
+    local: Arc<LocalMeta>,
+    checkpoints: CheckpointSet,
+    max_id: u64,
+    first_seq: u64,
+    closed_seqs: Vec<u64>,
+    restored: Vec<RestoredStream>,
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
@@ -542,14 +707,73 @@ fn delivery_bound_bytes(config: &NodeConfig, bound_bytes: u64) -> u64 {
 }
 
 impl Node {
-    /// Starts the WAL writer on `volume`, the uploader on `store`, and every core.
+    /// Starts the WAL writer on `volume`, the uploader on `store`, and every core. Nothing is
+    /// replayed, and no metadata is kept: `recover` is what a real node starts with.
     pub fn start<V: WalVolume + 'static>(
         config: NodeConfig,
         volume: V,
         store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Node> {
+        Node::start_parts(config, volume, store, clock, None)
+    }
+
+    /// The startup of section 8.1, for a new node and a crashed one alike. Fails, having
+    /// changed nothing, if another process takes ownership first or the local store is held.
+    pub fn recover(
+        mut config: NodeConfig,
+        recover: RecoverConfig,
+        store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<(Node, RecoveryReport)> {
+        std::fs::create_dir_all(&recover.wal_dir)?;
+        std::fs::create_dir_all(&recover.metadata_dir)?;
+        let local_store = MetadataStore::open(&recover.metadata_dir).map_err(io::Error::other)?;
+        let now_ms = clock.now_ms();
+        let prepared = {
+            // On its own thread, since the caller may already be inside a runtime.
+            let (wal_dir, store) = (recover.wal_dir.clone(), Arc::clone(&store));
+            std::thread::spawn(move || {
+                runtime()?
+                    .block_on(prepare(&wal_dir, local_store, &store, now_ms))
+                    .map_err(io::Error::other)
+            })
+            .join()
+            .map_err(|_| io::Error::other("startup replay panicked"))??
+        };
+        let (prepared, local) = prepared;
+        config.generation = prepared.report.generation;
+        config.last_valid_id = prepared.report.last_valid_id;
+        let report = prepared.report;
+        let node = Node::start_parts(
+            config,
+            DirVolume::new(&recover.wal_dir, recover.wal_preallocate_bytes),
+            store,
+            clock,
+            Some(RecoveredParts {
+                local,
+                checkpoints: prepared.checkpoints,
+                max_id: prepared.max_id,
+                first_seq: prepared.first_seq,
+                closed_seqs: prepared.closed_seqs,
+                restored: prepared.restored,
+            }),
+        )?;
+        Ok((node, report))
+    }
+
+    fn start_parts<V: WalVolume + 'static>(
+        config: NodeConfig,
+        volume: V,
+        store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
+        recovered: Option<RecoveredParts>,
+    ) -> io::Result<Node> {
         let core_count = config.core_count;
+        let meta_stop = Arc::new(AtomicBool::new(false));
+        let (first_seq, closed_seqs) = recovered.as_ref().map_or((1, Vec::new()), |parts| {
+            (parts.first_seq, parts.closed_seqs.clone())
+        });
         let cache = match &config.local_cache {
             Some(local) => {
                 Some(SegmentCache::open(&local.dir, local.cap_bytes).map_err(io::Error::other)?)
@@ -568,8 +792,8 @@ impl Node {
             volume,
             notify,
             WalConfig {
-                first_seq: 1,
-                closed_seqs: Vec::new(),
+                first_seq,
+                closed_seqs,
                 channel_capacity: config.wal_channel_capacity,
             },
         )?;
@@ -584,7 +808,7 @@ impl Node {
         let (control_uploads_tx, control_uploads) = mpsc::unbounded_channel();
         upload_txs.push(control_uploads_tx);
         let (upload_sender, uploader) = Uploader::<SlabBytes>::start(UploaderConfig {
-            store,
+            store: Arc::clone(&store),
             node: config.node_name.clone(),
             generation: config.generation,
             section_count: core_count,
@@ -625,7 +849,6 @@ impl Node {
             });
         }
 
-        let (to_control, control_rx) = mpsc::unbounded_channel();
         let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let accounts: Vec<SlabAccount> = (0..core_count).map(|_| SlabAccount::new()).collect();
         let settings = DeliverySettings {
@@ -639,6 +862,11 @@ impl Node {
             memory_cap_bytes: config.memory_cap_bytes,
         };
         let mut threads = Vec::with_capacity(core_count + 1);
+        let (to_control, control_rx) = mpsc::unbounded_channel();
+        let loader = recovered.as_ref().map(|_| mpsc::unbounded_channel());
+        let core_limit = config
+            .active_stream_limit
+            .map(|limit| (limit / core_count).max(1));
         for (id, inbox) in inboxes.into_iter().enumerate() {
             let core = Core::new(CoreParts {
                 config: CoreConfig {
@@ -649,6 +877,8 @@ impl Node {
                     segment_cap_share_bytes: config.segment_cap_bytes / core_count as u64,
                     stream_buffer_bytes: config.stream_buffer_bytes,
                     last_valid_id: config.last_valid_id,
+                    active_stream_limit: core_limit,
+                    write_park_cap_count: config.write_inbox_capacity,
                 },
                 clock: Arc::clone(&clock),
                 links: links.clone(),
@@ -665,6 +895,7 @@ impl Node {
                 settings,
                 stores: stores.clone(),
                 accounts: accounts.clone(),
+                loader: loader.as_ref().map(|(tx, _)| tx.clone()),
             });
             let runtime = runtime()?;
             threads.push(
@@ -691,6 +922,60 @@ impl Node {
                 }
             })
             .collect();
+        let mut meta_threads = Vec::new();
+        let mut meta = None;
+        if let (Some(parts), Some((loader_tx, loader_rx))) = (recovered, loader) {
+            // Before anything can reach the cores: these come first in each one's control
+            // channel, and control is what a core reads first (D134).
+            for stream in parts.restored {
+                let shard = shard_of(&stream.meta.name, config.virtual_shard_count);
+                let core = shard as usize % core_count;
+                let _ = links.control[core].send(ControlMsg::Restore(Box::new(stream)));
+            }
+            let (jobs, job_rx) = mpsc::unbounded_channel();
+            let checkpointer = Checkpointer {
+                generation: config.generation,
+                local: Arc::clone(&parts.local),
+                store: Arc::clone(&store),
+                checkpoints: parts.checkpoints.clone(),
+                full_every_count: config.full_checkpoint_every_count,
+                max_id: parts.max_id,
+                loader: loader_tx,
+                stop: Arc::clone(&meta_stop),
+            };
+            let saved = to_control.clone();
+            meta_threads.push(
+                std::thread::Builder::new()
+                    .name("checkpointer".to_owned())
+                    .spawn(move || {
+                        run_checkpointer(checkpointer, job_rx, |done| {
+                            let _ = saved.send(NodeMsg::CheckpointSaved(done));
+                        });
+                    })?,
+            );
+            let (local, store, control, stop) = (
+                parts.local,
+                Arc::clone(&store),
+                links.control.clone(),
+                Arc::clone(&meta_stop),
+            );
+            let checkpoints = parts.checkpoints;
+            meta_threads.push(
+                std::thread::Builder::new()
+                    .name("meta-loader".to_owned())
+                    .spawn(move || {
+                        run_loader(loader_rx, local, store, checkpoints, control, stop);
+                    })?,
+            );
+            meta = Some(ControlMeta {
+                jobs,
+                closed_seq_by_seal: HashMap::new(),
+                objects: Vec::new(),
+                gather_count: 0,
+                next_waiters: Vec::new(),
+                waiters_by_seal: BTreeMap::new(),
+            });
+        }
         let control = Control {
             config: config.clone(),
             links: links.clone(),
@@ -703,6 +988,7 @@ impl Node {
             seal_wanted: false,
             seal_waiters: Vec::new(),
             waiters_by_seal: HashMap::new(),
+            meta,
         };
         let runtime = runtime()?;
         threads.push(
@@ -722,6 +1008,8 @@ impl Node {
             client_count: Arc::new(AtomicU64::new(0)),
             uploader: Some(uploader),
             wal: Some(wal_handle),
+            meta_threads,
+            meta_stop,
         })
     }
 
@@ -828,6 +1116,14 @@ impl Node {
         answer.await.unwrap_or(SealOutcome::NodeStopped)
     }
 
+    /// Seals now, and waits until the checkpoint with what it held is saved. False if this
+    /// node keeps no metadata or can't seal any more.
+    pub async fn seal_and_checkpoint(&self) -> bool {
+        let (reply, answer) = oneshot::channel();
+        let _ = self.to_control.send(NodeMsg::SealAndCheckpoint { reply });
+        answer.await.unwrap_or(false)
+    }
+
     /// Runs the periodic check now, and returns its moves once they have finished.
     pub async fn rebalance_now(&self) -> Vec<ShardMove> {
         let (reply, answer) = oneshot::channel();
@@ -866,7 +1162,13 @@ impl Node {
     /// Stops everything and waits. A WAL held in a `sync_data` has to be let go first.
     pub fn shutdown(mut self) -> NodeExit {
         self.request_stop();
+        self.meta_stop.store(true, Ordering::SeqCst);
         for thread in self.threads.drain(..) {
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        for thread in self.meta_threads.drain(..) {
             if let Err(panic) = thread.join() {
                 std::panic::resume_unwind(panic);
             }
@@ -891,6 +1193,7 @@ impl Drop for Node {
     /// A dropped node's threads end by themselves. The uploader's own drop stops it.
     fn drop(&mut self) {
         self.request_stop();
+        self.meta_stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1157,7 +1460,7 @@ impl Client {
         }
     }
 
-    pub(crate) async fn stream_info(&mut self, stream: &str) -> Result<StreamInfo, ErrorCode> {
+    pub async fn stream_info(&mut self, stream: &str) -> Result<StreamInfo, ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::StreamInfo { stream, reply });
@@ -1180,8 +1483,9 @@ impl Client {
         answer.await.ok()
     }
 
-    /// False if there was no such stream.
-    pub(crate) async fn delete_stream(&mut self, stream: &str) -> bool {
+    /// False if there was no such stream. On a node with a metadata store this answers once a
+    /// checkpoint holds the delete (D20).
+    pub async fn delete_stream(&mut self, stream: &str) -> bool {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::DeleteStream { stream, reply });

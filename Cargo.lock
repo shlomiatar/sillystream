@@ -1884,12 +1884,14 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "server",
  "sha1",
  "storage",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "xxhash-rust",
 ]
 
 [[package]]

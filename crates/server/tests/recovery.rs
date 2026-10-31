@@ -1,0 +1,766 @@
+//! Startup, ownership and stream metadata (SPEC sections 7.6, 8.1), on real files and a store
+//! the test can count. The crash matrix on the real binary is in `crash_matrix.rs`.
+
+mod common;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use common::*;
+use format::{RecordHeader, encode_record};
+use object_store::{ObjectStore, PutPayload};
+use server::{
+    ManualClock, Node, NodeConfig, RecoverConfig, RecoveryReport, StateOpRequest, Subscription,
+};
+use storage::{Ownership, SegmentBuilder, claim_generation, read_ownership, seal_path};
+
+struct Disk {
+    dir: tempfile::TempDir,
+    store: Arc<ScriptStore>,
+    clock: ManualClock,
+}
+
+impl Disk {
+    fn new() -> Disk {
+        Disk {
+            dir: tempfile::tempdir().unwrap(),
+            store: Arc::new(ScriptStore::new()),
+            clock: ManualClock::new(START_MS),
+        }
+    }
+
+    fn wal_dir(&self) -> PathBuf {
+        self.dir.path().join("wal")
+    }
+
+    fn metadata_dir(&self) -> PathBuf {
+        self.dir.path().join("metadata")
+    }
+
+    fn recover_config(&self) -> RecoverConfig {
+        RecoverConfig {
+            wal_dir: self.wal_dir(),
+            metadata_dir: self.metadata_dir(),
+            wal_preallocate_bytes: 1024 * 1024,
+        }
+    }
+
+    fn try_start(&self, config: NodeConfig) -> std::io::Result<(Node, RecoveryReport)> {
+        Node::recover(
+            config,
+            self.recover_config(),
+            self.store.clone(),
+            Arc::new(self.clock.clone()),
+        )
+    }
+
+    fn start(&self, config: NodeConfig) -> (Node, RecoveryReport) {
+        self.try_start(config).unwrap()
+    }
+}
+
+/// `(first_id, payload)` of every record a subscriber from 0 gets, stopping at `count`.
+async fn read_all(node: &Node, stream: &str, count: usize) -> Vec<(u64, Vec<u8>)> {
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, stream, 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() >= count
+    })
+    .await;
+    // Anything past `count` would be a duplicate or an old record come back.
+    hear_for(&mut connection, &mut heard, 100).await;
+    heard
+        .records(1)
+        .into_iter()
+        .map(|(id, _, _, data)| (id, data))
+        .collect()
+}
+
+async fn publish_one(
+    client: &mut server::Client,
+    stream: &str,
+    seq: u64,
+    data: &[u8],
+) -> (u64, u32) {
+    let records = record_with(0, data);
+    client
+        .publish(publish(stream, &records, seq, 2))
+        .await
+        .unwrap();
+    let (_, first_id, count) = expect_ack(client).await;
+    (first_id, count)
+}
+
+async fn set_state(client: &mut server::Client, stream: &str, doc: &ciborium::value::Value) {
+    client
+        .state_op(StateOpRequest {
+            stream,
+            req: 1,
+            author: AUTHOR,
+            expect_ver: 0,
+            op: server::StateOp::Set,
+            doc: cbor(doc),
+        })
+        .await
+        .unwrap();
+    match expect_reply(client).await {
+        server::Reply::StateResult { ok: true, .. } => {}
+        other => panic!("expected a state result, got {other:?}"),
+    }
+}
+
+async fn total_stats(node: &Node) -> server::CoreStats {
+    let mut total = server::CoreStats::default();
+    for core in 0..node.core_count() {
+        let stats = node.stats(core).await.unwrap();
+        total.evicted_count += stats.evicted_count;
+        total.loaded_count += stats.loaded_count;
+        total.rebuilt_count += stats.rebuilt_count;
+    }
+    total
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_restores_state_dedupe_and_cursors() {
+    let disk = Disk::new();
+    let (node, report) = disk.start(manual_config(2));
+    assert_eq!(report.generation, 1);
+    assert!(!report.wal_lost);
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    set_state(&mut client, "a", &map(&[("n", int(5))])).await;
+    let (second, _) = publish_one(&mut client, "a", 2, b"two").await;
+
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut named = Subscription::new(1, "a", 0);
+    named.name = Some("worker");
+    connection.subscribe(named);
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() >= 2
+    })
+    .await;
+    connection.commit(1, first);
+    assert_eq!(connection.read_cursor("a", "worker").await, Some(first));
+    assert!(node.seal_and_checkpoint().await);
+
+    // Above the seal: only the WAL has these.
+    let (third, count) = publish_one(&mut client, "a", 3, b"three").await;
+    let before = client.snapshot("a").await.unwrap();
+    drop((client, connection));
+    node.shutdown();
+
+    let (node, report) = disk.start(manual_config(2));
+    assert_eq!(report.generation, 2);
+    assert!(report.last_valid_id >= third);
+    let mut client = node.client(0).await;
+    let after = client.snapshot("a").await.unwrap();
+    assert_eq!(after.state_ver, before.state_ver);
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.head, before.head);
+
+    // A retry of the latest publish gets its first ack back, and writes nothing.
+    assert_eq!(
+        publish_one(&mut client, "a", 3, b"three").await,
+        (third, count)
+    );
+
+    let connection = node.connection(1).await.unwrap();
+    assert_eq!(connection.read_cursor("a", "worker").await, Some(first));
+
+    let records = read_all(&node, "a", 3).await;
+    let ids: Vec<u64> = records.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    assert_eq!((ids[0], ids[2]), (first, third));
+    assert!(second < third);
+
+    // New ids stay above everything earlier, including over another restart.
+    let (fourth, _) = publish_one(&mut client, "a", 4, b"four").await;
+    assert!(fourth > third);
+    drop((client, connection));
+    node.shutdown();
+    let (node, report) = disk.start(manual_config(2));
+    assert!(report.last_valid_id >= fourth);
+    assert_eq!(read_all(&node, "a", 4).await.len(), 4);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_empty_wal_warning_is_only_for_a_node_that_had_a_generation() {
+    let disk = Disk::new();
+    let (node, report) = disk.start(manual_config(1));
+    assert!(!report.wal_lost);
+    assert_eq!(report.warning(), None);
+    node.shutdown();
+
+    // A normal restart has files.
+    let (node, report) = disk.start(manual_config(1));
+    assert!(!report.wal_lost);
+    assert_eq!(report.warning(), None);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, report) = disk.start(manual_config(1));
+    assert!(report.wal_lost);
+    assert!(report.warning().unwrap().contains("wal_dir is empty"));
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_records_survive_a_lost_wal_and_ids_stay_above_them() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, report) = disk.start(manual_config(1));
+    assert!(report.wal_lost);
+    assert!(report.last_valid_id >= first);
+    assert_eq!(read_all(&node, "a", 1).await[0].0, first);
+    let mut client = node.client(0).await;
+    assert!(publish_one(&mut client, "a", 2, b"two").await.0 > first);
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_starts_at_once_have_one_winner() {
+    // At the claim itself: both read the same ownership, and one conditional create succeeds.
+    let store = ScriptStore::new();
+    let known = read_ownership(&store).await.unwrap();
+    assert_eq!(claim_generation(&store, &known, 5).await.unwrap(), (1, 5));
+    assert!(matches!(
+        claim_generation(&store, &known, 9).await,
+        Err(storage::OwnershipError::Lost { generation: 1 })
+    ));
+
+    // Two whole startups, each with its own disks and one store, held at the claim.
+    let (a, b) = (Disk::new(), Disk::new());
+    let store = Arc::new(ScriptStore::new());
+    store.hold();
+    let start = |disk: Disk| {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            Node::recover(
+                manual_config(1),
+                disk.recover_config(),
+                store,
+                Arc::new(disk.clock.clone()),
+            )
+            .map(|(node, report)| {
+                node.shutdown();
+                report.generation
+            })
+            .map_err(|error| error.to_string())
+        })
+    };
+    let (first, second) = (start(a), start(b));
+    while store.put_begun_count.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    store.release();
+    let (first, second) = (first.join().unwrap(), second.join().unwrap());
+    let mut results = [first, second];
+    results.sort_by_key(Result::is_err);
+    assert_eq!(results[0], Ok(1), "{results:?}");
+    let lost = results[1].as_ref().unwrap_err();
+    assert!(lost.contains("generation 1"), "{lost}");
+    let ownership = read_ownership(store.as_ref()).await.unwrap();
+    assert_eq!(ownership.current_generation(), Some(1));
+
+    // The same disks: the local store's lock turns the second away.
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    assert!(disk.try_start(manual_config(1)).is_err());
+    node.shutdown();
+}
+
+fn stamped(id: u64, count: u16, data: &[u8]) -> bytes::Bytes {
+    let mut out = Vec::new();
+    encode_record(
+        &mut out,
+        &RecordHeader {
+            id,
+            options: 0,
+            author: 7,
+            len: data.len() as u32,
+            count,
+            codec: 0,
+        },
+        data,
+    )
+    .unwrap();
+    out.into()
+}
+
+/// An object a former owner finished uploading after it lost the node.
+async fn put_late_object(
+    store: &ScriptStore,
+    generation: u64,
+    first_id: u64,
+    records: Vec<bytes::Bytes>,
+) {
+    let mut builder = SegmentBuilder::new();
+    builder.add_extent("late", records).unwrap();
+    let built = builder.finish().unwrap();
+    let body: Vec<u8> = built.parts.iter().flatten().copied().collect();
+    store
+        .put(
+            &seal_path("former", generation, first_id),
+            PutPayload::from(body),
+        )
+        .await
+        .unwrap();
+}
+
+/// Generations 1 and 2 with a known limit on generation 1, and nothing of `late`.
+async fn limit_on_first_generation(disk: &Disk) -> u64 {
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "anchor", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+    let (node, report) = disk.start(manual_config(1));
+    node.shutdown();
+    assert_eq!(report.generation, 2);
+    let ownership: Ownership = read_ownership(disk.store.as_ref()).await.unwrap();
+    assert_eq!(ownership.limit_for(1), Some(report.last_valid_id));
+    report.last_valid_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_object_is_accepted_up_to_the_last_valid_id_and_no_further() {
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit - 1,
+        vec![
+            stamped(limit - 1, 1, b"below"),
+            stamped(limit, 1, b"at"),
+            stamped(limit + 1, 1, b"above"),
+        ],
+    )
+    .await;
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.adopted_extent_count, 1);
+    assert_eq!(report.last_valid_id, limit);
+    let records = read_all(&node, "late", 2).await;
+    assert_eq!(
+        records,
+        vec![(limit - 1, b"below".to_vec()), (limit, b"at".to_vec())]
+    );
+    // New ids go where the ignored record was, so the two can never be confused.
+    let mut client = node.client(0).await;
+    let (next, _) = publish_one(&mut client, "late", 1, b"new").await;
+    assert!(next > limit);
+    assert_eq!(read_all(&node, "late", 3).await.len(), 3);
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_record_across_the_last_valid_id_is_ignored_whole() {
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit - 1,
+        vec![
+            stamped(limit - 1, 1, b"below"),
+            stamped(limit, 2, b"across"),
+        ],
+    )
+    .await;
+    let (node, _) = disk.start(manual_config(1));
+    assert_eq!(
+        read_all(&node, "late", 1).await,
+        vec![(limit - 1, b"below".to_vec())]
+    );
+    node.shutdown();
+
+    // Entirely above: nothing of it is taken, and the stream doesn't come to exist.
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit + 1,
+        vec![stamped(limit + 1, 1, b"above")],
+    )
+    .await;
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.adopted_extent_count, 0);
+    assert_eq!(report.ignored_extent_count, 1);
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("late").await.unwrap_err(),
+        proto::ErrorCode::NotFound
+    );
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_object_with_no_checkpoint_is_found_and_its_records_kept_without_the_wal() {
+    // The crash between upload and checkpoint, with the WAL gone as well: section 8.1 scans.
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (id, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(matches!(
+        node.seal().await,
+        server::SealOutcome::Uploaded { .. }
+    ));
+    drop(client);
+    node.shutdown();
+    // What the checkpoint held is forgotten too.
+    let paths = storage::CheckpointSet::read(
+        &(disk.store.clone() as Arc<dyn ObjectStore>),
+        read_ownership(disk.store.as_ref()).await.unwrap(),
+    )
+    .await
+    .unwrap();
+    for file in &paths.files {
+        disk.store
+            .delete(&storage::checkpoint_path(file.generation, file.seq))
+            .await
+            .unwrap();
+    }
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.scanned_object_count, 1);
+    assert_eq!(read_all(&node, "a", 1).await[0].0, id);
+    node.shutdown();
+}
+
+fn evicting_config(limit: usize) -> NodeConfig {
+    let mut config = manual_config(1);
+    config.active_stream_limit = Some(limit);
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_streams_leave_oldest_first_and_a_live_subscriber_keeps_one_here() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(evicting_config(2));
+    let mut client = node.client(0).await;
+    for (seq, stream) in ["watched", "s1", "s2", "s3", "s4"].iter().enumerate() {
+        publish_one(&mut client, stream, seq as u64 + 1, b"x").await;
+    }
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, "watched", 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() == 1
+    })
+    .await;
+
+    assert!(node.seal_and_checkpoint().await);
+    // The oldest three of what can go, which `watched` can't, though it is the oldest of all.
+    assert_eq!(total_stats(&node).await.evicted_count, 3);
+    assert_eq!(client.snapshot("watched").await.unwrap().state_ver, 0);
+    assert_eq!(client.snapshot("s4").await.unwrap().state_ver, 0);
+    assert_eq!(total_stats(&node).await.loaded_count, 0, "those two stayed");
+    for stream in ["s1", "s2", "s3"] {
+        client.snapshot(stream).await.unwrap();
+    }
+    assert_eq!(total_stats(&node).await.loaded_count, 3, "those went");
+
+    // Still live for a publish after everything else moved around it.
+    let (id, _) = publish_one(&mut client, "watched", 9, b"y").await;
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).last().is_some_and(|record| record.0 == id)
+    })
+    .await;
+    drop((client, connection));
+    node.shutdown();
+}
+
+/// All a stream has that a reader can see.
+struct Seen {
+    snapshot: server::SnapshotReply,
+    info: server::StreamInfo,
+    cursor: Option<u64>,
+    records: Vec<(u64, Vec<u8>)>,
+}
+
+async fn see(node: &Node, client: &mut server::Client, stream: &str, count: usize) -> Seen {
+    let connection = node.connection(0).await.unwrap();
+    let info = client.snapshot(stream).await.unwrap();
+    let records = read_all(node, stream, count).await;
+    Seen {
+        info: client.stream_info(stream).await.unwrap(),
+        snapshot: info,
+        cursor: connection.read_cursor(stream, "worker").await,
+        records,
+    }
+}
+
+fn assert_same(one: &Seen, other: &Seen) {
+    assert_eq!(one.snapshot.head, other.snapshot.head);
+    assert_eq!(one.snapshot.state_ver, other.snapshot.state_ver);
+    assert_eq!(one.snapshot.state, other.snapshot.state);
+    assert_eq!(format!("{:?}", one.info), format!("{:?}", other.info));
+    assert_eq!(one.cursor, other.cursor);
+    assert_eq!(one.records, other.records);
+}
+
+/// A stream with one of everything in its metadata, sealed.
+async fn make_full_stream(node: &Node, client: &mut server::Client, stream: &str) {
+    client
+        .configure(
+            stream,
+            server::StreamConfig {
+                default_ack_level: 1,
+                min_ack_level: 1,
+                retention_ms: 5_000,
+            },
+        )
+        .await;
+    let (first, _) = publish_one(client, stream, 1, b"one").await;
+    set_state(client, stream, &map(&[("n", int(5))])).await;
+    publish_one(client, stream, 2, b"two").await;
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    let mut named = Subscription::new(1, stream, 0);
+    named.name = Some("worker");
+    connection.subscribe(named);
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() >= 2
+    })
+    .await;
+    connection.commit(1, first);
+    assert_eq!(connection.read_cursor(stream, "worker").await, Some(first));
+    connection.unsubscribe(1);
+    drop(connection);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_stream_comes_back_identical_on_first_access() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(evicting_config(1));
+    let mut client = node.client(0).await;
+    make_full_stream(&node, &mut client, "cold").await;
+    assert!(node.seal_and_checkpoint().await);
+    let before = see(&node, &mut client, "cold", 2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    publish_one(&mut client, "newer", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    let stats = total_stats(&node).await;
+    assert_eq!(stats.evicted_count, 1);
+
+    let after = see(&node, &mut client, "cold", 2).await;
+    assert_same(&before, &after);
+    let stats = total_stats(&node).await;
+    assert_eq!(stats.loaded_count, 1);
+    assert_eq!(stats.rebuilt_count, 0);
+
+    // A retry after the reload still dedupes, and a write first in line works.
+    let last_seq_ack = publish_one(&mut client, "cold", 2, b"two").await;
+    assert_eq!(last_seq_ack.0, before.records[1].0);
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_local_store_gone_a_stream_is_rebuilt_from_checkpoints() {
+    let disk = Disk::new();
+    let mut config = manual_config(1);
+    config.full_checkpoint_every_count = 4;
+    let (node, _) = disk.start(config.clone());
+    let mut client = node.client(0).await;
+    make_full_stream(&node, &mut client, "old").await;
+    assert!(node.seal_and_checkpoint().await);
+    let before = see(&node, &mut client, "old", 2).await;
+
+    // The long gap: many seals, past several full checkpoints, that don't touch it.
+    let puts_before = disk.store.put_count.load(Ordering::SeqCst);
+    for seq in 0..10 {
+        publish_one(&mut client, "busy", seq + 1, b"x").await;
+        assert!(node.seal_and_checkpoint().await);
+    }
+    assert!(disk.store.put_count.load(Ordering::SeqCst) >= puts_before + 20);
+    drop(client);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, _) = disk.start(config.clone());
+    let mut client = node.client(0).await;
+    let after = see(&node, &mut client, "old", 2).await;
+    assert_same(&before, &after);
+    assert_eq!(total_stats(&node).await.rebuilt_count, 1);
+    assert_eq!(read_all(&node, "busy", 10).await.len(), 10);
+
+    // Older files were let go of, and what's left still has it all, including the new id.
+    let (next, _) = publish_one(&mut client, "old", 3, b"three").await;
+    assert!(next > before.snapshot.head);
+    drop(client);
+    node.shutdown();
+
+    // A name nobody ever used is still nobody's after a walk of the checkpoints.
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, _) = disk.start(config);
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("never").await.unwrap_err(),
+        proto::ErrorCode::NotFound
+    );
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_puts_per_seal_do_not_depend_on_how_many_streams_changed() {
+    async fn puts_for_a_seal(stream_count: usize) -> u64 {
+        let disk = Disk::new();
+        let (node, _) = disk.start(manual_config(2));
+        let mut client = node.client(0).await;
+        let records = record_with(0, b"x");
+        let mut waiting = 0usize;
+        for number in 0..stream_count {
+            let stream = format!("s.{number}");
+            client
+                .publish(publish(&stream, &records, 1, 1))
+                .await
+                .unwrap();
+            waiting += 1;
+            if waiting == 256 {
+                while waiting > 0 {
+                    expect_ack(&mut client).await;
+                    waiting -= 1;
+                }
+            }
+        }
+        while waiting > 0 {
+            expect_ack(&mut client).await;
+            waiting -= 1;
+        }
+        let before = disk.store.put_count.load(Ordering::SeqCst);
+        assert!(node.seal_and_checkpoint().await);
+        let puts = disk.store.put_count.load(Ordering::SeqCst) - before;
+        drop(client);
+        node.shutdown();
+        puts
+    }
+    let few = puts_for_a_seal(10).await;
+    let many = puts_for_a_seal(100_000).await;
+    assert_eq!(few, many);
+    assert_eq!(few, 2, "one object and one checkpoint");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleted_streams_stay_deleted_and_a_new_one_cannot_read_the_old() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(2));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "gone", 1, b"sealed").await;
+    assert!(node.seal_and_checkpoint().await);
+    let (old_id, _) = publish_one(&mut client, "gone", 2, b"unsealed").await;
+    // Answered once a checkpoint has it, so a crash right here can't bring it back.
+    assert!(client.delete_stream("gone").await);
+    drop(client);
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(2));
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("gone").await.unwrap_err(),
+        proto::ErrorCode::NotFound
+    );
+    drop(client);
+    node.shutdown();
+
+    // Rebuilt from checkpoints, with no local store and no WAL.
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, _) = disk.start(manual_config(2));
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("gone").await.unwrap_err(),
+        proto::ErrorCode::NotFound
+    );
+
+    // Made again: higher ids, and none of the old records.
+    let (new_id, _) = publish_one(&mut client, "gone", 1, b"new").await;
+    assert!(new_id > old_id);
+    assert_eq!(
+        read_all(&node, "gone", 1).await,
+        vec![(new_id, b"new".to_vec())]
+    );
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(2));
+    assert_eq!(
+        read_all(&node, "gone", 1).await,
+        vec![(new_id, b"new".to_vec())]
+    );
+    node.shutdown();
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, _) = disk.start(manual_config(2));
+    assert_eq!(
+        read_all(&node, "gone", 1).await,
+        vec![(new_id, b"new".to_vec())]
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_with_only_the_wal_is_not_lost_nor_a_later_recreate() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (old_id, _) = publish_one(&mut client, "gone", 1, b"old").await;
+    assert!(client.delete_stream("gone").await);
+    let (new_id, _) = publish_one(&mut client, "gone", 1, b"new").await;
+    assert!(new_id > old_id);
+    drop(client);
+    node.shutdown();
+    let (node, _) = disk.start(manual_config(1));
+    assert_eq!(
+        read_all(&node, "gone", 1).await,
+        vec![(new_id, b"new".to_vec())]
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_stream_loads_on_the_core_its_shard_moved_to() {
+    let disk = Disk::new();
+    let mut config = manual_config(2);
+    config.active_stream_limit = Some(2);
+    let (node, _) = disk.start(config);
+    let mut client = node.client(0).await;
+    let (id, _) = publish_one(&mut client, "wanderer", 1, b"x").await;
+    for seq in 0..16 {
+        publish_one(&mut client, &format!("filler.{seq}"), 1, b"y").await;
+    }
+    assert!(node.seal_and_checkpoint().await);
+    let shard = server::shard_of("wanderer", node.virtual_shard_count());
+    let at = (shard as usize) % 2;
+    let before = node.stats(at).await.unwrap().evicted_count;
+    assert!(before > 0);
+    assert!(node.move_shard(shard, 1 - at).await);
+
+    let mut fresh = node.client(1).await;
+    assert_eq!(fresh.snapshot("wanderer").await.unwrap().head, id);
+    assert_eq!(publish_one(&mut fresh, "wanderer", 1, b"x").await.0, id);
+    assert_eq!(read_all(&node, "wanderer", 1).await[0].0, id);
+    drop((client, fresh));
+    node.shutdown();
+}

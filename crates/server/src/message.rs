@@ -275,6 +275,11 @@ pub struct CoreStats {
     pub catch_up_memory_bytes: u64,
     pub catch_up_local_bytes: u64,
     pub catch_up_object_bytes: u64,
+    /// Streams this core has let go of, loaded back, and of those how many came from a
+    /// checkpoint because the local store didn't have them (section 7.6).
+    pub evicted_count: u64,
+    pub loaded_count: u64,
+    pub rebuilt_count: u64,
 }
 
 /// A stream on its way to another core. Its records stay with the old core until they
@@ -429,6 +434,29 @@ pub(crate) enum ControlMsg {
     WalSent {
         core: usize,
         ticket: u64,
+    },
+    /// Replayed at startup (section 8.1), before anything else reaches this core.
+    Restore(Box<crate::recovery::RestoredStream>),
+    /// Whether everything sent before this seal's rotation is sealed and at its owner (D137).
+    CheckpointClean {
+        seal: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// What changed since the last gather.
+    CheckpointGather {
+        gather: u64,
+        reply: oneshot::Sender<Vec<storage::StreamMeta>>,
+    },
+    /// That gather is in the local store and the object store, so what it took may leave RAM.
+    CheckpointDone {
+        gather: u64,
+    },
+    /// The metadata a load found, or `None` if there is no such stream (section 7.6).
+    Loaded {
+        stream: Arc<str>,
+        ticket: u64,
+        meta: Option<Box<storage::StreamMeta>>,
+        rebuilt: bool,
     },
     Stop,
 }
@@ -630,6 +658,8 @@ pub(crate) enum StreamBody {
     Fan(Arc<FanOut>),
     /// The stream is gone: its subscriptions end, and the next message is number 0.
     Deleted,
+    /// The stream left RAM, and the next message is number 0 (section 7.6).
+    Evicted,
 }
 
 /// What goes from owners to home cores.

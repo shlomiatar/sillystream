@@ -1438,6 +1438,7 @@ impl Home {
             } => self.on_attached(stream, sub, filter_id, head, cursor, state_ver, state),
             StreamBody::Fan(fan) => self.on_fan(stream, &fan),
             StreamBody::Deleted => self.on_deleted(stream),
+            StreamBody::Evicted => self.on_evicted(stream),
         }
     }
 
@@ -1468,6 +1469,14 @@ impl Home {
             home_stream.next_seq = 0;
             home_stream.groups.clear();
             home_stream.state_subs.clear();
+        }
+    }
+
+    /// The stream left RAM with no live subscriber, and its numbering starts over when it
+    /// comes back. A subscriber still catching up attaches then, as it would have.
+    fn on_evicted(&mut self, stream: &Arc<str>) {
+        if let Some(home_stream) = self.streams.get_mut(stream) {
+            home_stream.next_seq = 0;
         }
     }
 

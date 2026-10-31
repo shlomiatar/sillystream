@@ -119,6 +119,8 @@ pub struct ScriptStore {
     inner: InMemory,
     pub hold_put: Arc<AtomicBool>,
     pub put_count: Arc<AtomicU64>,
+    /// PUTs that have begun, whether or not held.
+    pub put_begun_count: Arc<AtomicU64>,
 }
 
 impl fmt::Display for ScriptStore {
@@ -133,6 +135,7 @@ impl ScriptStore {
             inner: InMemory::new(),
             hold_put: Arc::new(AtomicBool::new(false)),
             put_count: Arc::new(AtomicU64::new(0)),
+            put_begun_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -153,6 +156,7 @@ impl ObjectStore for ScriptStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
+        self.put_begun_count.fetch_add(1, Ordering::SeqCst);
         while self.hold_put.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

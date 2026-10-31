@@ -271,6 +271,10 @@ fn build_server(bin_dir: &Path) -> PathBuf {
             "server",
             "--bin",
             "sillystream-server",
+            // This overwrites the binary the crash matrix runs (`CARGO_BIN_EXE_...`), so it keeps
+            // the crash points, which do nothing unless their variable is set.
+            "--features",
+            "test-hooks",
         ])
         .status()
         .unwrap();

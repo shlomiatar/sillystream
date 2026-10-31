@@ -12,11 +12,16 @@ name = "sillystream-server"
 path = "src/bin/sillystream-server.rs"
 bench = false
 
+[features]
+# Crash points for the crash matrix. Never on in a release build.
+test-hooks = ["storage/test-hooks"]
+
 [dependencies]
 format.workspace = true
 proto.workspace = true
 auth.workspace = true
 storage.workspace = true
+xxhash-rust.workspace = true
 bytes.workspace = true
 ciborium.workspace = true
 object_store.workspace = true
@@ -27,6 +32,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signa
 tokio-rustls = { workspace = true }
 
 [dev-dependencies]
+# Turns the crash points on in the binary that `cargo test` builds for its tests.
+server = { path = ".", features = ["test-hooks"] }
 rcgen = { workspace = true }
 rustls = { workspace = true, features = ["tls12"] }
 tokio-tungstenite = { workspace = true }

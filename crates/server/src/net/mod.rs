@@ -28,6 +28,7 @@ use tokio::sync::Notify;
 
 use crate::clock::Clock;
 use crate::node::{Node, NodeConfig, NodeExit, NodeHandle};
+use crate::recovery::{RecoverConfig, RecoveryReport};
 use crate::slab::SlabPool;
 
 pub use tls::tls13_only_config;
@@ -124,6 +125,32 @@ impl Server {
         store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
     ) -> io::Result<Server> {
+        let start = move |node_config, clock| Node::start(node_config, volume, store, clock);
+        Server::start_with(config, clock, start)
+    }
+
+    /// As `start`, after the replay and ownership step of section 8.1. What that found comes
+    /// back with the server, for the caller to log.
+    pub fn start_recovering(
+        config: ServerConfig,
+        recover: RecoverConfig,
+        store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<(Server, RecoveryReport)> {
+        let mut report = None;
+        let server = Server::start_with(config, clock, |node_config, clock| {
+            let (node, found) = Node::recover(node_config, recover, store, clock)?;
+            report = Some(found);
+            Ok(node)
+        })?;
+        Ok((server, report.expect("a started server recovered first")))
+    }
+
+    fn start_with(
+        config: ServerConfig,
+        clock: Arc<dyn Clock>,
+        start: impl FnOnce(crate::NodeConfig, Arc<dyn Clock>) -> io::Result<Node>,
+    ) -> io::Result<Server> {
         if config.token_secret.len() < MIN_TOKEN_SECRET_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -139,7 +166,7 @@ impl Server {
         let partial_frame_timeout_ms = config.node.partial_frame_timeout_ms;
         let progress_interval_ms = config.node.progress_interval_ms;
         let core_count = config.node.core_count;
-        let node = Node::start(config.node, volume, store, Arc::clone(&clock))?;
+        let node = start(config.node, Arc::clone(&clock))?;
         let shared = Arc::new(Shared {
             secret: config.token_secret,
             clock,
@@ -200,6 +227,23 @@ impl Server {
         (0..self.shared.node.core_count())
             .map(|core| self.shared.node.account(core).pinned_bytes())
             .sum()
+    }
+
+    /// Seals what's open and saves its metadata, waiting up to `wait_ms`, so a clean stop leaves
+    /// little to replay. False if that didn't finish, which a restart makes up for.
+    pub fn seal_before_stop(&self, wait_ms: u64) -> bool {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+        else {
+            return false;
+        };
+        runtime.block_on(async {
+            let wait = std::time::Duration::from_millis(wait_ms);
+            tokio::time::timeout(wait, self.node().seal_and_checkpoint())
+                .await
+                .unwrap_or(false)
+        })
     }
 
     /// Stops listening, then stops the node. Connections end with their cores.

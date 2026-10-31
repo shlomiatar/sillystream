@@ -13,6 +13,7 @@ use format::{Filter, RecordHeader, make_id};
 use object_store::path::Path;
 use storage::StreamExtent;
 
+use crate::dedupe::DedupeTable;
 use crate::slab::SlabBytes;
 
 /// The record bytes a delivery shares: slab memory while they are recent, and what a read
@@ -225,6 +226,12 @@ impl FilterTable {
         }
     }
 
+    /// Nobody is subscribed from any core, so the stream may leave RAM (section 7.6).
+    pub fn is_unwatched(&self) -> bool {
+        self.subs_by_core.iter().all(|count| *count == 0)
+            && self.state_subs_by_core.iter().all(|count| *count == 0)
+    }
+
     pub fn wants(&self, home: usize, has_state: bool) -> bool {
         self.subs_by_core[home] > 0 || (has_state && self.state_subs_by_core[home] > 0)
     }
@@ -262,6 +269,8 @@ pub(crate) struct PendingVisible {
     pub last_id: u64,
     pub bytes: SlabBytes,
     pub state: Option<(u64, Bytes)>,
+    /// `(producer_id, producer_seq, first_id, count)`, if it has a producer.
+    pub dedupe: Option<(u64, u64, u64, u32)>,
 }
 
 /// A stream's sealed records in one object.
@@ -291,6 +300,18 @@ pub(crate) struct StreamDelivery {
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
+    /// Dedupe entries as of `visible_through`, which is what a checkpoint may save: an entry
+    /// for a publish a crash can erase would ack it on the retry, unwritten (D136).
+    pub visible_dedupe: DedupeTable,
+    /// Whether this stream's metadata is saved at seals. Off on a node without a store.
+    pub track_meta: bool,
+    pub meta_dirty: bool,
+    /// The last checkpoint gather that took this stream's changes.
+    pub saved_gather: u64,
+    /// Extents no checkpoint has yet.
+    pub new_extents: Vec<ExtentRef>,
+    /// When it was last used, on its core's own count, for eviction.
+    pub last_used: u64,
 }
 
 impl StreamDelivery {
@@ -305,6 +326,12 @@ impl StreamDelivery {
             extents: Vec::new(),
             floor_id: 0,
             sinks: std::collections::BTreeMap::new(),
+            visible_dedupe: DedupeTable::new(),
+            track_meta: false,
+            meta_dirty: false,
+            saved_gather: 0,
+            new_extents: Vec::new(),
+            last_used: 0,
         }
     }
 
@@ -330,13 +357,15 @@ impl StreamDelivery {
         {
             return;
         }
-        self.extents.insert(
-            at,
-            ExtentRef {
-                path: path.clone(),
-                extent: extent.clone(),
-            },
-        );
+        let extent_ref = ExtentRef {
+            path: path.clone(),
+            extent: extent.clone(),
+        };
+        if self.track_meta {
+            self.meta_dirty = true;
+            self.new_extents.push(extent_ref.clone());
+        }
+        self.extents.insert(at, extent_ref);
     }
 
     /// An id known to be above `after` in the extents, and the lowest one if the extent
