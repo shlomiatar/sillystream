@@ -217,3 +217,49 @@ async fn a_held_upload_keeps_a_seal_pending_and_the_core_serving() {
     assert_eq!(exit.unfinished_upload_count, 0);
     assert!(exit.wal.is_ok());
 }
+
+/// With the uploader's channel at its smallest and its PUT held, seals pile up behind it. The
+/// cores go on taking level 2 writes, and once the store is back everything is uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_upload_channel_at_a_seal_doesnt_stop_writes_or_lose_anything() {
+    const CORE_COUNT: usize = 2;
+    const ROUND_COUNT: u64 = 6;
+    let mut config = manual_config(CORE_COUNT);
+    config.upload_channel_capacity = 1;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    let records = record_with(1, b"x");
+    harness.store.hold();
+    let mut seq = 0;
+    let mut seals = Vec::new();
+    for _ in 0..ROUND_COUNT {
+        for stream in ["a", "b", "c", "d"] {
+            seq += 1;
+            client
+                .publish(publish(stream, &records, seq, 2))
+                .await
+                .unwrap();
+            expect_ack(&mut client).await;
+        }
+        seals.push(Box::pin(harness.node().seal()));
+        // A seal is asked for by polling it for a moment. It stays pending.
+        let seal = seals.last_mut().unwrap();
+        tokio::select! {
+            outcome = seal.as_mut() => panic!("a held upload finished: {outcome:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert_eq!(harness.node().ping(0).await, Some(0));
+    assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 0);
+    harness.store.release();
+    for seal in seals {
+        assert!(!matches!(seal.await, SealOutcome::Failed { .. }));
+    }
+    assert!(matches!(
+        harness.node().seal().await,
+        SealOutcome::Uploaded { .. } | SealOutcome::Empty { .. }
+    ));
+    let exit = harness.finish();
+    assert_eq!(exit.unfinished_upload_count, 0);
+    assert!(exit.wal.is_ok());
+}

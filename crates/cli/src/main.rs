@@ -17,6 +17,7 @@ sillystream token issue --secret-file FILE --author N --grant PATTERN:PERM[,PERM
                         --ttl-ms N
 sillystream stream create|config NAME [--retention R] [--default-ack N] [--min-ack N]
 sillystream stream info|delete NAME
+sillystream stream core NAME --core N      (give the stream its own shard on core N)
 sillystream sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filter F]
                         [--on-expire E] [--concurrency N] [--start S] [--secret K]
                         [--interval-ms N] [--budget-bytes N]
@@ -255,6 +256,13 @@ async fn stream_command(args: &Args, action: &str, name: &str) -> Result<(), Str
                 }
             }
             let body = format!("{{{}}}", fields.join(","));
+            client.request("PUT", &path, &[], body.as_bytes()).await
+        }
+        "core" => {
+            args.only(&["--core"])?;
+            let core = args.number("--core")?.ok_or("--core is required")?;
+            let body = format!("{{\"core\":{core}}}");
+            let path = format!("{path}/core");
             client.request("PUT", &path, &[], body.as_bytes()).await
         }
         "info" => {

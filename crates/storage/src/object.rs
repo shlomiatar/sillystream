@@ -50,7 +50,14 @@ pub fn build_store(config: &ObjectStoreConfig) -> object_store::Result<Arc<dyn O
         ObjectStoreConfig::Local { root } => Ok(Arc::new(LocalFileSystem::new_with_prefix(root)?)),
         ObjectStoreConfig::S3(s3) => {
             // Conditional create is how seals and ownership records refuse to overwrite.
-            let mut builder = AmazonS3Builder::from_env()
+            // With its own keys, nothing comes from the environment: a session token or endpoint
+            // meant for another destination would otherwise go along with them.
+            let base = if s3.access_key_id.is_some() {
+                AmazonS3Builder::new()
+            } else {
+                AmazonS3Builder::from_env()
+            };
+            let mut builder = base
                 .with_bucket_name(&s3.bucket)
                 .with_region(&s3.region)
                 .with_allow_http(s3.allow_http)
@@ -67,6 +74,49 @@ pub fn build_store(config: &ObjectStoreConfig) -> object_store::Result<Arc<dyn O
             Ok(Arc::new(builder.build()?))
         }
     }
+}
+
+/// Reads `local:DIR`, `memory` or `s3:BUCKET`. For `s3:`, `env` is asked for `<prefix>S3_REGION`,
+/// `<prefix>S3_ENDPOINT`, `<prefix>AWS_ACCESS_KEY_ID` and `<prefix>AWS_SECRET_ACCESS_KEY`. With an
+/// empty prefix, keys left out come from the usual AWS variables in `build_store` (D250).
+pub fn parse_store_config(
+    text: &str,
+    prefix: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<ObjectStoreConfig, String> {
+    if text == "memory" {
+        return Ok(ObjectStoreConfig::Memory);
+    }
+    if let Some(root) = text.strip_prefix("local:") {
+        return Ok(ObjectStoreConfig::Local { root: root.into() });
+    }
+    let Some(bucket) = text.strip_prefix("s3:") else {
+        return Err(format!(
+            "a store is local:DIR, memory or s3:BUCKET, not {text}"
+        ));
+    };
+    let var = |name: &str| env(&format!("{prefix}{name}"));
+    let (access_key_id, secret_access_key) = if prefix.is_empty() {
+        (None, None)
+    } else {
+        match (var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY")) {
+            (Some(id), Some(secret)) => (Some(id), Some(secret)),
+            (None, None) => (None, None),
+            _ => {
+                return Err(format!(
+                    "{prefix}AWS_ACCESS_KEY_ID and {prefix}AWS_SECRET_ACCESS_KEY go together"
+                ));
+            }
+        }
+    };
+    Ok(ObjectStoreConfig::S3(S3Config {
+        bucket: bucket.to_owned(),
+        region: var("S3_REGION").unwrap_or_else(|| "us-east-1".to_owned()),
+        endpoint: var("S3_ENDPOINT"),
+        access_key_id,
+        secret_access_key,
+        allow_http: false,
+    }))
 }
 
 const HOUR_MS: u64 = 3_600_000;

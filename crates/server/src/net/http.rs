@@ -205,6 +205,7 @@ enum Route {
     Cursor(String),
     Put,
     Delete,
+    Core,
     SinkPut(u64),
     SinkDelete(u64),
     SinkPause(u64),
@@ -266,6 +267,10 @@ fn route(method: &str, path: &str) -> Result<(String, Route), Response> {
             "GET" => Route::Info,
             "PUT" => Route::Put,
             "DELETE" => Route::Delete,
+            _ => return Err(method_wrong()),
+        },
+        ["core"] => match method {
+            "PUT" => Route::Core,
             _ => return Err(method_wrong()),
         },
         ["publish"] => match method {
@@ -692,6 +697,7 @@ impl<'a> HttpConn<'a> {
             }
             Route::Cursor(name) => self.cursor(&stream, &name, &request, &body).await,
             Route::Put => self.stream_put(&stream, &body).await,
+            Route::Core => self.stream_core(&stream, &body).await,
             Route::Delete => {
                 if self.client().delete_stream(&stream).await {
                     Response::json(200, "{\"deleted\":true}".to_owned())
@@ -1089,6 +1095,34 @@ impl<'a> HttpConn<'a> {
         }
     }
 
+    /// Gives a stream its own shard on a core, or moves the one it has (section 6.1, D249).
+    async fn stream_core(&mut self, stream: &str, body: &[u8]) -> Response {
+        let fields = match object_fields(body) {
+            Ok(fields) => fields,
+            Err(response) => return response,
+        };
+        let core = match fields.as_slice() {
+            [(name, value)] if name == "core" => value.as_u64(),
+            _ => None,
+        };
+        let core_count = self.shared.node.core_count();
+        let Some(core) = core
+            .and_then(|core| usize::try_from(core).ok())
+            .filter(|core| *core < core_count)
+        else {
+            return malformed(&format!(
+                "the body is {{\"core\": N}}, with N below {core_count}"
+            ));
+        };
+        if let Err(code) = self.client().stream_info(stream).await {
+            return error(code, "no such stream");
+        }
+        match self.shared.node.set_override(stream, core).await {
+            Some(shard) => Response::json(200, format!("{{\"shard\":{shard},\"core\":{core}}}")),
+            None => error(ErrorCode::RateLimited, "the override table is full"),
+        }
+    }
+
     async fn stream_put(&mut self, stream: &str, body: &[u8]) -> Response {
         let patch = match parse_config(body) {
             Ok(patch) => patch,
@@ -1251,7 +1285,9 @@ async fn collect_read(
         }
     };
     let mut out = Vec::new();
-    let mut through = 0;
+    // Where a read from `x-through` carries on: with nothing read, where this one started, since
+    // 0 would mean the start of retention (D247).
+    let mut through = if from == u64::MAX { head } else { from };
     let mut got_count = 0;
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     if from != u64::MAX && from < head && !caught_up {
@@ -1586,6 +1622,7 @@ mod tests {
         ok("GET", "/v1/stream/a.b", Route::Info);
         ok("PUT", "/v1/stream/a.b", Route::Put);
         ok("DELETE", "/v1/stream/a.b", Route::Delete);
+        ok("PUT", "/v1/stream/a.b/core", Route::Core);
         ok("POST", "/v1/stream/a.b/publish", Route::Publish);
         ok("GET", "/v1/stream/a.b/read", Route::Read);
         ok("GET", "/v1/stream/a.b/state", Route::StateGet);

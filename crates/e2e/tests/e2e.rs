@@ -51,6 +51,10 @@ const TESTS: &[(&str, TestFn)] = tests![
     retention_and_compaction,
     normal_build_has_no_hooks,
     a_publisher_cannot_skew_other_streams_through_a_restart,
+    forward_sinks_leave_publishers_running,
+    stream_config_survives_kill9_before_a_seal,
+    read_at_the_head_keeps_the_clients_place,
+    a_hot_stream_gets_its_own_shard_on_a_running_server,
 ];
 
 fn main() {
@@ -2388,4 +2392,179 @@ async fn sinks_leave_the_node_able_to_take_connections() {
         http.call("PUT", path, &[], huge.as_bytes()).await.status,
         400
     );
+}
+
+/// More forward sinks than the memory cap has slabs, each with one record forwarded, and homed on
+/// the one core. A publish to another stream still answers, at once and after many seals.
+async fn forward_sinks_leave_publishers_running() {
+    const SINK_COUNT: u64 = 8;
+    let node = Node::started(NodeOptions {
+        cores: 1,
+        extra: vec!["--memory-cap-bytes".to_owned(), "16777216".to_owned()],
+        ..NodeOptions::default()
+    });
+    let admin = node.admin_token(ADMIN_AUTHOR);
+    let http = node.http(&admin);
+    for sink in 0..SINK_COUNT {
+        let source = format!("cap.source.{sink}");
+        let id = (sink + 1).to_string();
+        let target = format!("cap.target.{sink}");
+        node.cli(&admin, &["stream", "create", &source]);
+        node.cli(
+            &admin,
+            &[
+                "sink", "create", &source, &id, "--kind", "forward", "--target", &target,
+                "--start", "earliest",
+            ],
+        );
+        http.publish_records(&source, &record(1, 0, b"forwarded"))
+            .await;
+    }
+    for sink in 0..SINK_COUNT {
+        let target = format!("cap.target.{sink}");
+        let started = Instant::now();
+        while http.info(&target).await.is_none_or(|(head, _)| head == 0) {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "{target} empty"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    for wait_ms in [0u64, 2_500, 2_500] {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            http.publish_records("cap.unrelated", &record(1, 0, b"x")),
+        )
+        .await
+        .expect("a publish to an unrelated stream answers");
+        println!("    publish after {wait_ms} ms: {:?}", started.elapsed());
+    }
+}
+
+/// PUT answered 200, so a crash before the next timed seal doesn't take the class back.
+async fn stream_config_survives_kill9_before_a_seal() {
+    const STREAM: &str = "config.kept";
+    let mut node = Node::started(NodeOptions {
+        // No timed seal comes between the PUT and the kill.
+        seal_window_ms: 120_000,
+        ..NodeOptions::default()
+    });
+    let admin = node.admin_token(ADMIN_AUTHOR);
+    let path = format!("/v1/stream/{STREAM}");
+    let body = br#"{"retention":"7d","min_ack":1,"default_ack":3}"#;
+    {
+        let http = node.http(&admin);
+        let reply = http.call("PUT", &path, &[], body).await;
+        assert_eq!(reply.status, 200, "{}", reply.text());
+        http.publish_records(STREAM, &record(1, 0, b"x")).await;
+    }
+    node.kill9();
+    node.start();
+    let http = node.http(&admin);
+    let reply = http.call("GET", &path, &[], b"").await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let text = reply.text();
+    assert!(text.contains(r#""retention":"7d""#), "{text}");
+    assert!(text.contains(r#""min_ack":1"#), "{text}");
+    assert!(text.contains(r#""default_ack":3"#), "{text}");
+    assert_eq!(http.read_all(STREAM).await.len(), 1);
+}
+
+/// A caught-up client that polls from `x-through` must not go back to the start of retention.
+async fn read_at_the_head_keeps_the_clients_place() {
+    const STREAM: &str = "poll.head";
+    let node = Node::started(NodeOptions::default());
+    let admin = node.admin_token(ADMIN_AUTHOR);
+    let http = node.http(&admin);
+    let mut from = 0;
+    let mut seen_count = 0;
+    for round in 0..3 {
+        http.publish_records(STREAM, &record(1, 0, b"x")).await;
+        for _ in 0..2 {
+            let path = format!("/v1/stream/{STREAM}/read?from={from}");
+            let reply = http.call("GET", &path, &[], b"").await;
+            assert_eq!(reply.status, 200, "{}", reply.text());
+            seen_count += parse_records(&reply.body).len();
+            let through: u64 = reply.header("x-through").unwrap().parse().unwrap();
+            assert!(through >= from, "round {round}: {through} is below {from}");
+            from = through;
+        }
+    }
+    assert_eq!(seen_count, 3, "each record is read once");
+    let (head, _) = http.info(STREAM).await.unwrap();
+    assert_eq!(from, head);
+    let live = format!("/v1/stream/{STREAM}/read?from={}", u64::MAX);
+    let reply = http.call("GET", &live, &[], b"").await;
+    assert_eq!(reply.header("x-through").unwrap(), head.to_string());
+}
+
+/// Section 6.1's override, reached as an operator would: a shard above the hashed ones, moved
+/// between cores under publishes, with nothing lost or out of order, and refused when asked badly.
+async fn a_hot_stream_gets_its_own_shard_on_a_running_server() {
+    const STREAM: &str = "hot.stream";
+    let mut node = Node::started(NodeOptions {
+        cores: 2,
+        ..NodeOptions::default()
+    });
+    let admin = node.admin_token(ADMIN_AUTHOR);
+    let path = format!("/v1/stream/{STREAM}/core");
+    let mut sent_count = 0;
+    {
+        let http = node.http(&admin);
+        let missing = http
+            .call("PUT", "/v1/stream/hot.none/core", &[], br#"{"core":0}"#)
+            .await;
+        assert_eq!(missing.status, 404, "{}", missing.text());
+        http.publish_records(STREAM, &record(1, 0, b"before")).await;
+        sent_count += 1;
+        let too_high = http.call("PUT", &path, &[], br#"{"core":2}"#).await;
+        assert_eq!(too_high.status, 400, "{}", too_high.text());
+        let reader = node.token(5, &[&format!("{STREAM}:read")], 3_600_000);
+        let refused = node
+            .http(&reader)
+            .call("PUT", &path, &[], br#"{"core":1}"#)
+            .await;
+        assert_eq!(refused.status, 403, "{}", refused.text());
+        let mut first_shard = None;
+        for core in [0, 1, 0, 1] {
+            let body = format!("{{\"core\":{core}}}");
+            let reply = http.call("PUT", &path, &[], body.as_bytes()).await;
+            assert_eq!(reply.status, 200, "{}", reply.text());
+            let text = reply.text();
+            assert!(text.contains(&format!("\"core\":{core}")), "{text}");
+            first_shard.get_or_insert(text.clone());
+            let shard = |text: &str| text.split(',').next().map(str::to_owned);
+            assert_eq!(shard(&text), shard(first_shard.as_ref().unwrap()), "{text}");
+            http.publish_records(STREAM, &record(1, 0, b"after")).await;
+            sent_count += 1;
+        }
+        // 4,096 hashed shards come first (D72), so this one is from the override table.
+        let shard_text = first_shard.unwrap();
+        let shard_id: u32 = json_number(&shard_text, "shard");
+        assert!(shard_id >= 4_096, "{shard_text}");
+    }
+    let cli_reply = node.cli(&admin, &["stream", "core", STREAM, "--core", "0"]);
+    assert!(cli_reply.contains("\"core\":0"), "{cli_reply}");
+    let check = |stored: &[Stored]| {
+        assert_eq!(stored.len(), sent_count);
+        assert!(stored.windows(2).all(|pair| pair[0].id < pair[1].id));
+    };
+    check(&node.http(&admin).read_all(STREAM).await);
+    node.kill9();
+    node.start();
+    check(&node.http(&admin).read_all(STREAM).await);
+    let later = node.http(&admin);
+    assert!(later.publish_records(STREAM, &record(1, 0, b"later")).await > 0);
+}
+
+fn json_number(text: &str, name: &str) -> u32 {
+    let at = text.find(&format!("\"{name}\":")).expect(name) + name.len() + 3;
+    let digits: String = text[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().expect(name)
 }

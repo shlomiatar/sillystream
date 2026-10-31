@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
 use server::{ClientError, SealOutcome};
@@ -239,4 +239,44 @@ async fn a_clean_stop_writes_level_1_acked_records_still_waiting_for_the_wal() {
     release.join().unwrap();
     exit.wal.unwrap();
     assert_eq!(harness.wal.stream_entries("s").len() as u64, acked);
+}
+
+/// A writer that never comes back can't hold a stopping core past D241's 5 s. What it couldn't
+/// offer is lost, which is why the release here comes only after the bound has passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopping_core_gives_up_on_a_stalled_wal_after_its_bound() {
+    const BOUND: Duration = Duration::from_secs(5);
+    let mut harness = Harness::new(stalled_config());
+    let mut client = harness.node().client(0).await;
+    let records = record_with(1, b"hello");
+
+    harness.wal.hold();
+    let mut acked = 0;
+    let mut seq = 1;
+    while harness.node().stats(0).await.unwrap().outbound_count == 0 {
+        client
+            .publish(publish("s", &records, seq, 1))
+            .await
+            .unwrap();
+        seq += 1;
+        expect_ack(&mut client).await;
+        acked += 1;
+        assert!(acked < 1_000, "the channel never filled");
+    }
+    let wal = harness.wal.clone();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(BOUND + Duration::from_secs(2));
+        wal.release();
+    });
+    let started = Instant::now();
+    let exit = harness.node.take().unwrap().shutdown();
+    let stop_took = started.elapsed();
+    release.join().unwrap();
+    exit.wal.unwrap();
+    assert!(stop_took >= BOUND, "stopped in {stop_took:?}");
+    let written = harness.wal.stream_entries("s").len() as u64;
+    assert!(
+        written < acked,
+        "the core waited past its bound: {written} of {acked} written"
+    );
 }

@@ -727,3 +727,35 @@ fn a_rotation_with_another_error_still_stops_the_writer() {
     drop(sender);
     assert!(matches!(handle.join(), Err(WalError::Rotate(_))));
 }
+
+/// A sender that never pauses can't hold one group open: a group is the entry that woke the
+/// writer and at most one channel's worth more.
+#[test]
+fn a_flood_cannot_grow_one_group_past_the_channel() {
+    const CAPACITY: usize = 4;
+    const ENTRY_COUNT: u64 = 200_000;
+    let script = Script::default();
+    let log = Arc::clone(&script.log);
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _>(script, LogNotify(log), config(CAPACITY)).unwrap();
+    let mut sent = 0;
+    let mut ticket = 0;
+    while sent < ENTRY_COUNT {
+        ticket += 1;
+        match sender.try_append(entry(0, ticket)) {
+            Ok(_) => sent += 1,
+            Err(_) => {
+                ticket -= 1;
+                std::thread::yield_now();
+            }
+        }
+    }
+    drop(sender);
+    let stats = handle.join().unwrap();
+    assert_eq!(stats.entry_count, ENTRY_COUNT);
+    assert!(
+        stats.largest_group_count <= CAPACITY as u64 + 1,
+        "{stats:?}"
+    );
+    assert!(stats.largest_group_count > 1, "nothing grouped: {stats:?}");
+}

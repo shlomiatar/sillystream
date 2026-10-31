@@ -726,6 +726,7 @@ pub struct NodeExit {
 #[derive(Clone)]
 pub(crate) struct NodeHandle {
     links: Arc<Links>,
+    to_control: mpsc::UnboundedSender<NodeMsg>,
     virtual_shard_count: u32,
     location_hint: Arc<Vec<u16>>,
     accounts: Vec<SlabAccount>,
@@ -740,6 +741,17 @@ pub(crate) struct NodeHandle {
 impl NodeHandle {
     pub(crate) fn core_count(&self) -> usize {
         self.core_count
+    }
+
+    /// `Node::set_override`, for a socket task.
+    pub(crate) async fn set_override(&self, stream: &str, to: usize) -> Option<u32> {
+        let (reply, answer) = oneshot::channel();
+        let _ = self.to_control.send(NodeMsg::SetOverride {
+            stream: Arc::from(stream),
+            to,
+            reply,
+        });
+        answer.await.ok().flatten()
     }
 
     pub(crate) fn account(&self, core: usize) -> &SlabAccount {
@@ -1255,6 +1267,7 @@ impl Node {
         let shards = self.config.virtual_shard_count + self.config.override_shard_count;
         NodeHandle {
             links: Arc::new(self.links.clone()),
+            to_control: self.to_control.clone(),
             virtual_shard_count: self.config.virtual_shard_count,
             // The start's placement. A hint that has aged just gets forwarded (D65).
             location_hint: Arc::new(
@@ -1756,11 +1769,13 @@ impl Client {
         answer.await.unwrap_or(false)
     }
 
-    /// A forward sink's publish, whose records already carry their authors (section 9.1).
+    /// A forward sink's publish, whose records already carry their authors (section 9.1). The
+    /// id goes back to 0, being the target's to give. A sink can idle for good, so this keeps no
+    /// slab partly filled against the memory cap (D246).
     pub(crate) async fn publish_forward(
         &mut self,
         target: &str,
-        records: &[u8],
+        record: &[u8],
         producer_id: u64,
         producer_seq: u64,
         ack_level: u8,
@@ -1770,7 +1785,8 @@ impl Client {
         }
         self.wait_for_barrier(target).await?;
         let (stream, core) = self.route(target);
-        let records = self.pool.copy_in(records);
+        let mut records = self.pool.copy_in_exact(record);
+        records[format::ID_OFFSET..format::ID_OFFSET + 8].fill(0);
         let message = WriteMsg::Publish(Box::new(PublishMsg {
             stream,
             handle: 0,

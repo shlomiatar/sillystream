@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use format::{Clause, RecordHeader, id_ms};
 use object_store::path::Path;
 use object_store::{PutMode, PutOptions, PutPayload};
@@ -1106,15 +1106,12 @@ impl Attempt {
         let Some(target) = self.spec.target.as_deref() else {
             return Outcome::Permanent("the sink has no target".to_owned());
         };
-        // The id is the target's to give. Everything else stays as it was, data unopened.
-        let mut copy = BytesMut::from(&record[..]);
-        copy[format::ID_OFFSET..format::ID_OFFSET + 8].fill(0);
         let wait = Duration::from_millis(self.context.config.request_timeout_ms);
         let mut client = self.client.lock().await;
         match client
             .publish_forward(
                 target,
-                &copy,
+                record,
                 self.sink_id,
                 self.first_id,
                 FORWARD_ACK_LEVEL,

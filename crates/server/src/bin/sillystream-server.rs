@@ -8,7 +8,7 @@ use server::net::{Server, ServerConfig};
 use server::{
     Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SinkConfig, SystemClock,
 };
-use storage::{ObjectStoreConfig, S3Config, build_store};
+use storage::{ObjectStoreConfig, build_store, parse_store_config};
 
 const USAGE: &str = "\
 sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key PEM \\
@@ -20,8 +20,17 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
   [--sink-pool-threads N] [--sink-max-in-flight N] [--trace-catch-up true|false]
 
-For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
-usual AWS variables. Real S3 has not been exercised.";
+--wal-dir decides what a level 2 ack survives: an acked record survives machine loss only if
+EBS is mounted there. On local disk, machine loss can take up to one seal window. See
+docs/DEPLOYMENT.md.
+
+For --object-store s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys
+from the usual AWS variables. For --sink-archive-store s3:BUCKET, the same names with the prefix
+SINK_ARCHIVE_ are read: SINK_ARCHIVE_S3_REGION, SINK_ARCHIVE_S3_ENDPOINT,
+SINK_ARCHIVE_AWS_ACCESS_KEY_ID and SINK_ARCHIVE_AWS_SECRET_ACCESS_KEY, so that an archive to R2
+can sit beside a node on AWS. Real S3 and R2 have not been exercised.";
+
+const ARCHIVE_ENV_PREFIX: &str = "SINK_ARCHIVE_";
 
 /// Sparse on the file systems here (D51), so this costs only what is written.
 const WAL_PREALLOCATE_DEFAULT_BYTES: u64 = 64 * 1024 * 1024;
@@ -131,7 +140,7 @@ fn run() -> Result<(), String> {
     while token_secret.last().is_some_and(u8::is_ascii_whitespace) {
         token_secret.pop();
     }
-    let store_config = parse_store(&object_store.ok_or_else(|| need("--object-store"))?)?;
+    let store_config = parse_store(&object_store.ok_or_else(|| need("--object-store"))?, "")?;
     let store = build_store(&store_config).map_err(|error| error.to_string())?;
 
     std::fs::create_dir_all(&wal_dir).map_err(|error| format!("{}: {error}", wal_dir.display()))?;
@@ -166,7 +175,7 @@ fn run() -> Result<(), String> {
             Some(std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?);
     }
     if let Some(text) = sink_archive_store {
-        let config = parse_store(&text)?;
+        let config = parse_store(&text, ARCHIVE_ENV_PREFIX)?;
         sink.archive_store = Some(build_store(&config).map_err(|error| error.to_string())?);
     }
     node.sink = sink;
@@ -244,25 +253,12 @@ fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
 }
 
-fn parse_store(text: &str) -> Result<ObjectStoreConfig, String> {
-    if text == "memory" {
-        return Ok(ObjectStoreConfig::Memory);
+fn parse_store(text: &str, prefix: &str) -> Result<ObjectStoreConfig, String> {
+    let config = parse_store_config(text, prefix, |name| std::env::var(name).ok())?;
+    if let ObjectStoreConfig::Local { root } = &config {
+        std::fs::create_dir_all(root).map_err(|error| format!("{}: {error}", root.display()))?;
     }
-    if let Some(root) = text.strip_prefix("local:") {
-        std::fs::create_dir_all(root).map_err(|error| format!("{root}: {error}"))?;
-        return Ok(ObjectStoreConfig::Local { root: root.into() });
-    }
-    if let Some(bucket) = text.strip_prefix("s3:") {
-        return Ok(ObjectStoreConfig::S3(S3Config {
-            bucket: bucket.to_owned(),
-            region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
-            endpoint: std::env::var("S3_ENDPOINT").ok(),
-            access_key_id: None,
-            secret_access_key: None,
-            allow_http: false,
-        }));
-    }
-    Err(format!("--object-store isn't one of the forms: {text}"))
+    Ok(config)
 }
 
 fn wait_for_signal() -> std::io::Result<()> {

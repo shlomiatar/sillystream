@@ -261,6 +261,19 @@ impl SlabPool {
         .truncated(len_bytes)
     }
 
+    /// A region holding a copy of `bytes` in a slab of exactly its own size, shared with nothing
+    /// and leaving nothing partly filled. For a writer that may sit idle for a long time, whose
+    /// part of a shared slab would count whole against the memory cap for as long as it idles.
+    pub(crate) fn copy_in_exact(&mut self, bytes: &[u8]) -> SlabRegion {
+        let slab = self.new_slab(bytes.len());
+        let mut region = SlabRegion {
+            bytes: slab.rest,
+            tracker: slab.tracker,
+        };
+        region.copy_from_slice(bytes);
+        region
+    }
+
     /// A region holding a copy of `bytes`: what reading from a socket does.
     pub fn copy_in(&mut self, bytes: &[u8]) -> SlabRegion {
         let mut region = self.alloc(bytes.len());

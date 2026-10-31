@@ -494,3 +494,91 @@ async fn reading_before_retention_by_explicit_id_is_error_7() {
     drop((connection, client));
     harness.finish();
 }
+
+/// A store outage costs a reader time, not its subscription, and it reads on from where it was
+/// with nothing missed (D87).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_read_that_fails_is_retried_until_it_works() {
+    const FAILURE_COUNT: i64 = 5;
+    let harness = Harness::new(manual_config(1));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let records = record_with(1, b"sealed");
+    client
+        .publish(publish(STREAM, &records, 1, 3))
+        .await
+        .unwrap();
+    assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
+    expect_ack(&mut client).await;
+    wait_for_memory_to_empty(node, STREAM).await;
+
+    harness
+        .store
+        .failing_get_count
+        .store(FAILURE_COUNT, std::sync::atomic::Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, STREAM, 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() == 1
+    })
+    .await;
+    assert_eq!(heard.error_code(1), None);
+    assert_eq!(
+        harness
+            .store
+            .failing_get_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "every scripted failure was met"
+    );
+    // At least one wait of 100 ms between tries.
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    drop((connection, client));
+    harness.finish();
+}
+
+/// The local tier is only a cache: a copy that fails its CRC falls through to the object store,
+/// whose bytes are what the reader gets (D87).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
+    let cache = tempfile::tempdir().unwrap();
+    let harness = Harness::new(cached_config(1, cache.path()));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let records = record_with(1, &[0x42; 4096]);
+    client
+        .publish(publish(STREAM, &records, 1, 3))
+        .await
+        .unwrap();
+    let SealOutcome::Uploaded { path, .. } = node.seal().await else {
+        panic!("the seal should have uploaded");
+    };
+    expect_ack(&mut client).await;
+    wait_for_memory_to_empty(node, STREAM).await;
+    let local = cache.path().join(path.as_ref());
+    let mut bytes = std::fs::read(&local).unwrap();
+    // Every byte, so that the block, the footer or both fail whichever is read first.
+    for byte in &mut bytes {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&local, &bytes).unwrap();
+
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, STREAM, 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() == 1
+    })
+    .await;
+    assert_eq!(heard.error_code(1), None);
+    assert_eq!(heard.records(1)[0].3, vec![0x42; 4096]);
+    let stats = node.stats(0).await.unwrap();
+    assert!(stats.catch_up_object_bytes > 0, "{stats:?}");
+    assert_eq!(stats.catch_up_local_bytes, 0, "{stats:?}");
+    drop((connection, client));
+    harness.finish();
+}

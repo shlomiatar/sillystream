@@ -2468,6 +2468,7 @@ impl Core {
                     let _ = reply.send(config.unwrap_or_default());
                 }
                 Route::Here(shard) => {
+                    let before = self.streams.get(&*stream).map(|known| known.config);
                     let config = &mut self.stream_entry(&stream, shard).config;
                     if let Some(level) = patch.default_ack_level {
                         config.default_ack_level = level;
@@ -2480,7 +2481,9 @@ impl Core {
                     }
                     let config = *config;
                     self.mark_dirty(&stream);
-                    let _ = reply.send(config);
+                    self.answer_config_change(before != Some(config), move || {
+                        let _ = reply.send(config);
+                    });
                 }
             },
             ControlMsg::DeleteStream { stream, reply } => match self.route(&stream) {
@@ -2580,9 +2583,12 @@ impl Core {
                     let _ = reply.send(());
                 }
                 Route::Here(shard) => {
+                    let before = self.streams.get(&*stream).map(|known| known.config);
                     self.stream_entry(&stream, shard).config = config;
                     self.mark_dirty(&stream);
-                    let _ = reply.send(());
+                    self.answer_config_change(before != Some(config), move || {
+                        let _ = reply.send(());
+                    });
                 }
             },
             ControlMsg::Seal { seal } => self.on_seal(seal),
@@ -2769,6 +2775,22 @@ impl Core {
             } => self.on_loaded(stream, ticket, meta, rebuilt),
             ControlMsg::Stop => {}
         }
+    }
+
+    /// Answers a config change once a checkpoint holds it, on a node with a store, so that a crash
+    /// can't take back what the caller was told (D248). The core doesn't wait. A change that
+    /// changed nothing is answered at once.
+    fn answer_config_change(&self, changed: bool, answer: impl FnOnce() + Send + 'static) {
+        if !changed || self.loader.is_none() {
+            answer();
+            return;
+        }
+        let (saved, checkpoint) = oneshot::channel();
+        let _ = self.to_node.send(CoreToNode::DurableRequested(saved));
+        tokio::spawn(async move {
+            let _ = checkpoint.await;
+            answer();
+        });
     }
 
     fn mark_dirty(&mut self, name: &str) {

@@ -127,6 +127,8 @@ pub struct ScriptStore {
     pub put_begun_count: Arc<AtomicU64>,
     /// How many more PUTs under `checkpoints/` may succeed. Negative: no limit.
     pub checkpoint_put_budget: Arc<AtomicI64>,
+    /// So many `GET`s fail with a store error that is worth retrying, whatever their path.
+    pub failing_get_count: Arc<AtomicI64>,
     /// Every delete, in order.
     pub deleted: Arc<Mutex<Vec<Path>>>,
     /// `GET`s of a path ending in this wait this long, once each.
@@ -149,6 +151,7 @@ impl ScriptStore {
             put_count: Arc::new(AtomicU64::new(0)),
             put_begun_count: Arc::new(AtomicU64::new(0)),
             checkpoint_put_budget: Arc::new(AtomicI64::new(-1)),
+            failing_get_count: Arc::new(AtomicI64::new(0)),
             deleted: Arc::new(Mutex::new(Vec::new())),
             slow_get_once: Arc::new(Mutex::new(Vec::new())),
             slow_put: Arc::new(Mutex::new(Vec::new())),
@@ -220,6 +223,18 @@ impl ObjectStore for ScriptStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if self
+            .failing_get_count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                (left > 0).then(|| left - 1)
+            })
+            .is_ok()
+        {
+            return Err(object_store::Error::Generic {
+                store: "ScriptStore",
+                source: "scripted GET failure".into(),
+            });
+        }
         let slow = {
             let mut armed = self.slow_get_once.lock().unwrap();
             armed

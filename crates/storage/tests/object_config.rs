@@ -8,7 +8,7 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
     ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig, build_store,
-    dedicated_path, seal_path,
+    dedicated_path, parse_store_config, seal_path,
 };
 
 fn fake_s3(endpoint: String) -> ObjectStoreConfig {
@@ -160,4 +160,78 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     assert_eq!(content_length as u64, len_bytes);
     drop(sender);
     uploader.finish();
+}
+
+fn pretend_env(pairs: &[(&str, &str)], name: &str) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| (*value).to_owned())
+}
+
+/// A node on AWS and an archive to R2 read different variables, so neither takes the other's.
+#[test]
+fn the_archive_store_reads_its_own_endpoint_and_keys() {
+    let pairs = [
+        ("S3_REGION", "eu-west-1"),
+        ("S3_ENDPOINT", "https://aws.example"),
+        ("SINK_ARCHIVE_S3_REGION", "auto"),
+        ("SINK_ARCHIVE_S3_ENDPOINT", "https://r2.example"),
+        ("SINK_ARCHIVE_AWS_ACCESS_KEY_ID", "r2-id"),
+        ("SINK_ARCHIVE_AWS_SECRET_ACCESS_KEY", "r2-secret"),
+    ];
+    let ObjectStoreConfig::S3(node) =
+        parse_store_config("s3:node", "", |name| pretend_env(&pairs, name)).unwrap()
+    else {
+        panic!("not s3");
+    };
+    assert_eq!(node.bucket, "node");
+    assert_eq!(node.region, "eu-west-1");
+    assert_eq!(node.endpoint.as_deref(), Some("https://aws.example"));
+    assert_eq!(node.access_key_id, None);
+    let ObjectStoreConfig::S3(archive) =
+        parse_store_config("s3:logs", "SINK_ARCHIVE_", |name| pretend_env(&pairs, name)).unwrap()
+    else {
+        panic!("not s3");
+    };
+    assert_eq!(archive.bucket, "logs");
+    assert_eq!(archive.region, "auto");
+    assert_eq!(archive.endpoint.as_deref(), Some("https://r2.example"));
+    assert_eq!(archive.access_key_id.as_deref(), Some("r2-id"));
+    assert_eq!(archive.secret_access_key.as_deref(), Some("r2-secret"));
+}
+
+#[test]
+fn half_of_a_key_pair_is_refused() {
+    let pairs = [("SINK_ARCHIVE_AWS_ACCESS_KEY_ID", "id")];
+    let refused = parse_store_config("s3:logs", "SINK_ARCHIVE_", |name| pretend_env(&pairs, name));
+    assert!(refused.unwrap_err().contains("go together"));
+    assert!(parse_store_config("nope", "", |_| None).is_err());
+}
+
+/// The request goes to the configured endpoint, signed with the configured key. A stub answers.
+#[tokio::test]
+async fn a_store_with_its_own_keys_signs_with_them() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let heard = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !bytes.windows(4).any(|end| end == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).unwrap();
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\netag: \"e\"\r\n\r\n")
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_lowercase()
+    });
+    let store = build_store(&fake_s3(endpoint)).unwrap();
+    store
+        .put(&Path::from("a.seg"), vec![1, 2, 3].into())
+        .await
+        .unwrap();
+    let request = heard.join().unwrap();
+    assert!(request.contains("credential=fake-key-id/"), "{request}");
 }
