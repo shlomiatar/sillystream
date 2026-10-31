@@ -2783,3 +2783,37 @@ async fn a_sink_recreated_in_the_same_millisecond_ignores_the_old_ones_commit() 
     drop(client);
     harness.finish();
 }
+
+/// Whatever a sink asks for, it can't hold more than the node allows: its copies are outside the
+/// memory cap, so a higher figure would hand one stream's admin the node's memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sinks_budget_cant_pass_the_nodes() {
+    let receiver = Receiver::start().await;
+    receiver.answer(Answer::Hold);
+    let hook = KillScript::with(&[]);
+    let mut config = config();
+    config.sink.hook = Some(hook.clone());
+    config.sink.budget_bytes = 1024 * 1024;
+    config.subscriber_queue_bytes = 64 * 1024;
+    config.connection_window_bytes = 64 * 1024;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.budget_bytes = u64::MAX;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    let data = vec![7u8; 64 * 1024];
+    for seq in 1..=100 {
+        send(&mut client, STREAM, &data, seq).await;
+    }
+    receiver.wait_for_count(1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let peak = hook.peak_held_bytes.load(Ordering::SeqCst);
+    // One frame can pass it (D191), and a frame is at most the fair share.
+    assert!(peak <= 1024 * 1024 + 256 * 1024, "held {peak} bytes");
+    receiver.answer(Answer::Status(200));
+    receiver.release();
+    receiver.wait_for_count(100).await;
+    drop(client);
+    harness.finish();
+}

@@ -42,7 +42,7 @@ pub struct SinkConfig {
     pub request_timeout_ms: u64,
     /// `webhook.notify`'s least time between sends, unless the sink sets its own.
     pub notify_interval_ms: u64,
-    /// What one sink may hold, unless it sets its own. One frame can pass it.
+    /// What one sink may hold. It can set less, not more. One frame can pass it.
     pub budget_bytes: u64,
     /// How long before unread data expires the sink warns.
     pub expire_warn_ms: u64,

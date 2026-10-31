@@ -361,9 +361,11 @@ impl<'a> Reading<'a> {
             0 => config.notify_interval_ms,
             own => own,
         };
+        // A sink can ask for less than the node's, never more: what it holds is outside the
+        // memory cap (D185), so the node's figure is what isolates the others from it.
         let budget_bytes = match spec.budget_bytes {
             0 => config.budget_bytes,
-            own => own,
+            own => own.min(config.budget_bytes),
         };
         Ok(Reading {
             home,
