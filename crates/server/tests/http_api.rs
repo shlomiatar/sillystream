@@ -1269,3 +1269,52 @@ async fn a_stream_holds_a_limited_number_of_sinks() {
     assert_code(&call("PUT", 1).await, 429, 5);
 }
 
+/// D6a: a publish below the minimum is raised to it, and that takes in what the caller is told.
+#[tokio::test]
+async fn an_http_publish_below_the_minimum_waits_for_the_minimum() {
+    let server = start();
+    let text = token(ALL);
+    let make = async |stream: &str, min_ack: u8| {
+        let path = format!("/v1/stream/{stream}");
+        let body = format!(r#"{{"min_ack":{min_ack}}}"#);
+        let reply = server
+            .http(&Http::new("PUT", &path, &text).body(body.into_bytes()))
+            .await;
+        assert_eq!(reply.status, 200, "{}", reply.text());
+    };
+    let publish = async |stream: &str, ack: u8| {
+        let path = format!("/v1/stream/{stream}/publish?ack={ack}");
+        server
+            .http(&Http::new("POST", &path, &text).body(&b"hello"[..]))
+            .await
+    };
+
+    // With no minimum, level 0 is what it always was.
+    make("none", 0).await;
+    assert_eq!(publish("none", 0).await.status, 202);
+    assert_eq!(publish("no.such.stream.yet", 0).await.status, 202);
+
+    make("one", 1).await;
+    let raised = publish("one", 0).await;
+    assert_eq!(raised.status, 200, "{}", raised.text());
+    assert!(raised.field("first_id").is_some(), "{}", raised.text());
+
+    // Level 3 needs an upload, and nothing seals until this test says so.
+    make("three", 3).await;
+    let waiting = publish("three", 0);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+            .await
+            .is_err(),
+        "answered before the record could be in the object store"
+    );
+    let seal = server.server.node().seal().await;
+    assert!(
+        matches!(seal, server::SealOutcome::Uploaded { .. }),
+        "{seal:?}"
+    );
+    let done = waiting.await;
+    assert_eq!(done.status, 200, "{}", done.text());
+    assert!(done.field("first_id").is_some(), "{}", done.text());
+}

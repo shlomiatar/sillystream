@@ -770,14 +770,22 @@ impl<'a> HttpConn<'a> {
             Err(response) => return self.refuse(request, response).await,
         };
         let ack_level = match shape.ack_level {
-            Some(level) => level,
-            // Level 0 sends nothing, so waiting needs to know before it starts.
-            None => self
-                .client()
-                .stream_info(stream)
-                .await
-                .map(|info| effective_default(&info.config))
-                .unwrap_or_else(|_| effective_default(&StreamConfig::default())),
+            // The owner raises it if it has to, and this waits for whatever that brings.
+            Some(level @ 1..) => level,
+            // Level 0 sends nothing, so waiting needs to know before it starts. A minimum set
+            // after this look still raises the commit, but not this answer (D223).
+            asked => {
+                let config = self
+                    .client()
+                    .stream_info(stream)
+                    .await
+                    .map(|info| info.config)
+                    .unwrap_or_default();
+                asked.map_or_else(
+                    || effective_default(&config),
+                    |level| level.max(config.min_ack_level).min(3),
+                )
+            }
         };
         let mut records = if shape.simple {
             let length = request.content_length as usize;
