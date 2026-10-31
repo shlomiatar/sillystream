@@ -338,7 +338,7 @@ impl Connection {
         self.send(ConnCmd::Unsubscribe {
             conn: self.conn,
             sub,
-            ticket: CommandTicket::new(&self.out),
+            _ticket: CommandTicket::new(&self.out),
         });
     }
 
@@ -1067,7 +1067,7 @@ impl Home {
             with_state,
             state_only,
             walk: None,
-            ticket,
+            _ticket: ticket,
         })));
     }
 

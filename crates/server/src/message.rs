@@ -485,7 +485,7 @@ pub(crate) enum ConnCmd {
     Unsubscribe {
         conn: usize,
         sub: u32,
-        ticket: CommandTicket,
+        _ticket: CommandTicket,
     },
     Commit {
         conn: usize,
@@ -544,7 +544,7 @@ pub(crate) struct AttachMsg {
     /// Set while the check of an explicit id is asking earlier owners (D100).
     pub walk: Option<AttachWalk>,
     /// Ends with this message, on whichever core finishes with it.
-    pub ticket: CommandTicket,
+    pub _ticket: CommandTicket,
 }
 
 /// Which of a stream's earlier owners still have to say what they hold above `cursor`.
