@@ -152,6 +152,47 @@ async fn a_fragmented_frame_is_one_frame() {
     server.server.shutdown();
 }
 
+/// RFC 6455 5.4: fragments of one message can't have another message between them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_text_frame_inside_a_fragmented_message_ends_the_connection() {
+    let server = start();
+    let mut ws = server.ws(&token(ALL)).await;
+    ws.open(1, "frag").await;
+    let records = record(1, b"x");
+    let frame = publish_frame(1, 1, &records);
+    let (a, b) = frame.split_at(3);
+    for raw in [
+        Frame::message(a.to_vec(), OpCode::Data(Data::Binary), false),
+        Frame::message(b"hi".to_vec(), OpCode::Data(Data::Text), true),
+        Frame::message(b.to_vec(), OpCode::Data(Data::Continue), true),
+    ] {
+        // The server may have closed already by the last one.
+        let _ = ws.socket.send(Message::Frame(raw)).await;
+    }
+    let mut closed = false;
+    while let Ok(Some(message)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures_util::StreamExt::next(&mut ws.socket),
+    )
+    .await
+    {
+        match message {
+            Ok(Message::Close(Some(close))) => {
+                assert_eq!(u16::from(close.code), 1002);
+                closed = true;
+                break;
+            }
+            Ok(Message::Binary(body)) => {
+                assert!(body.first() != Some(&0x84), "the message completed");
+            }
+            _ => {}
+        }
+    }
+    assert!(closed);
+    drop(ws);
+    server.server.shutdown();
+}
+
 /// A frame split over the socket's own reads: a byte at a time for the header, and in pieces
 /// for the payload. A raw socket is the only way to choose where those fall.
 #[tokio::test(flavor = "multi_thread")]

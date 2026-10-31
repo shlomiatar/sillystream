@@ -698,8 +698,13 @@ impl WsConn<'_> {
                 self.close(code);
             }
             OP_TEXT => {
-                self.send_error(0, ErrorCode::Malformed, "frames are binary");
-                self.dropping_fragments = !header.fin;
+                // RFC 6455 5.4: a data frame can't start inside a fragmented message.
+                if self.fragments.is_some() || self.dropping_fragments {
+                    self.protocol_error("a new message inside a fragmented one");
+                } else {
+                    self.send_error(0, ErrorCode::Malformed, "frames are binary");
+                    self.dropping_fragments = !header.fin;
+                }
             }
             OP_BINARY => {
                 if self.fragments.is_some() || self.dropping_fragments {

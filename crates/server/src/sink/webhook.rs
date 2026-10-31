@@ -41,12 +41,12 @@ pub fn parse_url(url: &str) -> Option<WebhookUrl> {
     if !url.bytes().all(|byte| byte.is_ascii_graphic()) {
         return None;
     }
+    let rest = rest.split('#').next()?;
     let (authority, path) = match rest.find(['/', '?']) {
         Some(at) if rest.as_bytes()[at] == b'/' => (&rest[..at], rest[at..].to_owned()),
         Some(at) => (&rest[..at], format!("/{}", &rest[at..])),
         None => (rest, "/".to_owned()),
     };
-    let path = path.split('#').next()?.to_owned();
     if authority.contains('@') {
         return None;
     }
@@ -353,6 +353,19 @@ pub fn tls_client_config(extra_roots_pem: Option<&[u8]>) -> std::io::Result<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fragment_isnt_part_of_the_host() {
+        let url = parse_url("http://example.com#frag").unwrap();
+        assert_eq!((&*url.host, &*url.path), ("example.com", "/"));
+        let url = parse_url("https://example.com:8443/a?b=c#frag").unwrap();
+        assert_eq!(
+            (&*url.host, url.port, &*url.path),
+            ("example.com", 8443, "/a?b=c")
+        );
+        let url = parse_url("http://example.com?x=1").unwrap();
+        assert_eq!(&*url.path, "/?x=1");
+    }
 
     #[test]
     fn urls_parse_or_are_refused() {
