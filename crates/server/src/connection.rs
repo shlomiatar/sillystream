@@ -1801,17 +1801,22 @@ impl Home {
                 };
                 let mut matched = Vec::new();
                 let mut spans = std::mem::take(&mut self.spans);
+                let mut memory_bytes = 0;
                 for batch in batches {
                     let bytes = SharedBytes::Slab(batch);
                     walk_records(&bytes, &mut spans);
                     self.stats.memory_bytes += bytes.len() as u64;
-                    self.trace_read("memory", key, bytes.len());
+                    memory_bytes += bytes.len();
                     if let Some(last) = spans.last() {
                         position = position.max(last.header.last_id());
                     }
                     matched.extend(Matched::select(&bytes, &spans, &filter, &mut 0));
                 }
                 self.spans = spans;
+                // One line per read, as the other tiers have, not one per batch (D213).
+                if memory_bytes != 0 {
+                    self.trace_read("memory", key, memory_bytes);
+                }
                 for one in matched {
                     self.account_read(key, one.total_bytes);
                     self.enqueue_read(key, Some(one));

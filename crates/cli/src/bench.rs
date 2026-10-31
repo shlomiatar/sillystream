@@ -196,11 +196,12 @@ impl ServerChild {
             if parts.next() != Some("trace") || parts.next() != Some("catch_up") {
                 continue;
             }
-            let (Some(tier), Some(name), Some(bytes)) = (parts.next(), parts.next(), parts.next())
+            // `tier=<tier> bytes=<n> stream="<id>"` (D226).
+            let (Some(tier), Some(bytes), Some(name)) = (parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
-            if name.strip_prefix("stream=") != Some(stream) {
+            if name.strip_prefix("stream=") != Some(&format!("{stream:?}")) {
                 continue;
             }
             let at = match tier {
