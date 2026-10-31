@@ -1190,3 +1190,82 @@ async fn level_0_is_refused_what_any_other_level_is_refused() {
     }
     server.server.shutdown();
 }
+
+/// Sinks last as long as their stream, and `admin` on one stream is enough to make them, so what
+/// one can hold is limited as named cursors are (D218, D222).
+#[tokio::test]
+async fn a_sinks_text_fields_are_limited_in_size() {
+    let server = start();
+    let text = token(ALL);
+    seed(&server, "k", &[b"1"]).await;
+    let put = async |body: String| {
+        server
+            .http(&Http::new("PUT", "/v1/stream/k/sink/1", &text).body(body.into_bytes()))
+            .await
+    };
+    let url_of = |len: usize| format!("http://example.invalid/{}", "u".repeat(len - 23));
+    let at_limit = server::SINK_TEXT_MAX_BYTES;
+    let over = at_limit + 1;
+    let fits = [
+        format!(
+            r#"{{"kind":"webhook.deliver","url":"{}","secret":"{}"}}"#,
+            url_of(at_limit),
+            "s".repeat(at_limit)
+        ),
+        format!(
+            r#"{{"kind":"forward","target":"{}"}}"#,
+            "t".repeat(at_limit)
+        ),
+    ];
+    for body in fits {
+        let reply = put(body).await;
+        assert_eq!(reply.status, 200, "{}", reply.text());
+    }
+    let too_long = [
+        format!(
+            r#"{{"kind":"webhook.deliver","url":"http://x/","secret":"{}"}}"#,
+            "s".repeat(over)
+        ),
+        format!(
+            r#"{{"kind":"webhook.deliver","url":"{}","secret":"s"}}"#,
+            url_of(over)
+        ),
+        format!(r#"{{"kind":"forward","target":"{}"}}"#, "t".repeat(over)),
+        // A field its kind doesn't use is stored too.
+        format!(r#"{{"kind":"archive","secret":"{}"}}"#, "s".repeat(over)),
+        format!(r#"{{"kind":"archive","url":"{}"}}"#, "u".repeat(over)),
+        format!(r#"{{"kind":"archive","target":"{}"}}"#, "t".repeat(over)),
+        format!(
+            r#"{{"kind":"archive","filter":"any:1{}"}}"#,
+            " ".repeat(over)
+        ),
+    ];
+    for body in too_long {
+        assert_code(&put(body).await, 400, 8);
+    }
+}
+
+#[tokio::test]
+async fn a_stream_holds_a_limited_number_of_sinks() {
+    let server = start();
+    let text = token(ALL);
+    seed(&server, "k", &[b"1"]).await;
+    let call = async |method: &str, id: usize| {
+        let path = format!("/v1/stream/k/sink/{id}");
+        server
+            .http(&Http::new(method, &path, &text).body(br#"{"kind":"archive"}"#.to_vec()))
+            .await
+    };
+    for id in 1..=server::SINK_CAP_COUNT {
+        let reply = call("PUT", id).await;
+        assert_eq!(reply.status, 200, "sink {id}: {}", reply.text());
+    }
+    let extra = server::SINK_CAP_COUNT + 1;
+    assert_code(&call("PUT", extra).await, 429, 5);
+    // One it already has can still change, and deleting one makes room.
+    assert_eq!(call("PUT", 1).await.status, 200);
+    assert_eq!(call("DELETE", 1).await.status, 200);
+    assert_eq!(call("PUT", extra).await.status, 200);
+    assert_code(&call("PUT", 1).await, 429, 5);
+}
+

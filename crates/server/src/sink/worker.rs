@@ -592,8 +592,14 @@ impl<'a> Reading<'a> {
         }
     }
 
+    /// What the sink asked for, up to the node's figure, as with the byte budget (D209, D222).
+    fn concurrency_limit(&self) -> usize {
+        let max_count = self.worker.context.config.concurrency_max_count;
+        self.spec.concurrency.min(max_count).max(1) as usize
+    }
+
     fn form_deliveries(&mut self, now_ms: u64) {
-        let limit = self.spec.concurrency.max(1) as usize;
+        let limit = self.concurrency_limit();
         while self.deliveries.len() < limit {
             let Some(first) = self.unread.front() else {
                 return;
@@ -679,7 +685,7 @@ impl<'a> Reading<'a> {
     }
 
     async fn start_due(&mut self, now_ms: u64) -> Option<Spell> {
-        let limit = self.spec.concurrency.max(1) as usize;
+        let limit = self.concurrency_limit();
         let mut starts = Vec::new();
         for (at, delivery) in self.deliveries.iter().enumerate() {
             if self.tasks.len() + starts.len() >= limit {
@@ -989,6 +995,12 @@ struct Attempt {
 
 impl Attempt {
     async fn run(self) -> Outcome {
+        // Before the attempt's own timeout starts, and held for all of it. A forward only waits
+        // on a core and holds no socket, so a stalled webhook has no reason to hold it up.
+        let _turn = match self.kind {
+            Kind::Forward => None,
+            _ => self.context.in_flight.acquire().await.ok(),
+        };
         match self.kind {
             Kind::Deliver => self.deliver().await,
             Kind::Notify => self.notify().await,

@@ -39,7 +39,7 @@ use crate::message::{
 };
 use crate::metadata::MetaMsg;
 use crate::placement::{ShardCounters, shard_of};
-use crate::sink::SinkNote;
+use crate::sink::{SINK_CAP_COUNT, SinkNote};
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
 use crate::state::{StreamState, apply_op, check_doc};
 
@@ -3293,6 +3293,9 @@ impl Core {
                     spec.update_count = existing.update_count + 1;
                     spec.update_head_id = head;
                 } else {
+                    if delivery.sinks.len() >= SINK_CAP_COUNT {
+                        return Err(ErrorCode::TooManySubscriptions);
+                    }
                     spec.update_count = 0;
                     spec.update_head_id = 0;
                     // Past any deleted sink's, whose delivery may still be ending (D195).

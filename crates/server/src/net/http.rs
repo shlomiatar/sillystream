@@ -28,6 +28,7 @@ use crate::message::{
     Reply, SinkOp, SinkSpec, SinkStart, StateChange, StreamConfig, StreamConfigPatch, StreamInfo,
 };
 use crate::node::{Client, ClientError, OwnedStateOp, RegionPublish};
+use crate::sink::SINK_TEXT_MAX_BYTES;
 use crate::state::StateOp;
 
 const CONTENT_TYPE_RECORDS: &str = "application/x-sillystream-records";
@@ -1034,6 +1035,9 @@ impl<'a> HttpConn<'a> {
                 code,
                 "a forward needs a non-zero id and a target other than its source",
             ),
+            Err(code) if code == ErrorCode::TooManySubscriptions => {
+                error(code, "the stream holds as many sinks as it can")
+            }
             Err(code) => error(code, "no such stream or sink"),
         }
     }
@@ -1341,10 +1345,15 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
     };
     let mut start = SinkStart::Now;
     let text = |value: &Json, name: &str| -> Result<String, Response> {
-        value
+        let text = value
             .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| malformed(&format!("{name} is a string")))
+            .ok_or_else(|| malformed(&format!("{name} is a string")))?;
+        if text.len() > SINK_TEXT_MAX_BYTES {
+            return Err(malformed(&format!(
+                "{name} is over {SINK_TEXT_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(text.to_owned())
     };
     for (key, value) in object_fields(body)? {
         match key.as_str() {

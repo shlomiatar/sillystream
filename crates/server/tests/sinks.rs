@@ -473,6 +473,66 @@ async fn opt_in_concurrency_respects_its_limit_and_the_cursor_waits_for_the_olde
     harness.finish();
 }
 
+/// A stream admin asks for what it likes, and the node's figure is what isolates the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sinks_concurrency_stops_at_the_nodes_limit() {
+    let receiver = Receiver::start().await;
+    receiver.answer(Answer::Hold);
+    let mut config = config();
+    config.sink.concurrency_max_count = 4;
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.concurrency = 1_000_000;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    for seq in 1..=20 {
+        send(&mut client, STREAM, b"x", seq).await;
+    }
+    receiver.wait_for_count(4).await;
+    receiver.stays_at(4).await;
+    receiver.answer(Answer::Status(200));
+    receiver.release();
+    receiver.wait_for_count(20).await;
+    drop(client);
+    harness.finish();
+}
+
+/// Many sinks can't add up to more sockets than the node allows, and what waits still goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sinks_together_stay_within_the_nodes_in_flight_limit() {
+    let receiver = Receiver::start().await;
+    receiver.answer(Answer::Hold);
+    let mut config = config();
+    config.sink.concurrency_max_count = 4;
+    config.sink.in_flight_max_count = 5;
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    for stream in ["limit.a", "limit.b", "limit.c"] {
+        make_stream(&mut client, stream).await;
+        let mut spec = deliver_spec(&receiver.url());
+        spec.concurrency = 4;
+        put_sink(&mut client, stream, 1, spec, SinkStart::Earliest).await;
+        for seq in 1..=6 {
+            send(&mut client, stream, b"x", seq).await;
+        }
+    }
+    receiver.wait_for_count(5).await;
+    receiver.stays_at(5).await;
+    assert_eq!(receiver.peak_in_flight.load(Ordering::SeqCst), 5);
+    receiver.answer(Answer::Status(200));
+    receiver.release();
+    receiver.wait_for_count(18).await;
+    for stream in ["limit.a", "limit.b", "limit.c"] {
+        let (spec, _) = sink_of(&mut client, stream, 1).await;
+        assert_eq!(spec.failure_count, 0, "waiting for a turn isn't a failure");
+    }
+    drop(client);
+    harness.finish();
+}
+
 // ---------- failures ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

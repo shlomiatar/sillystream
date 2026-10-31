@@ -34,6 +34,7 @@ macro_rules! tests {
 }
 
 const TESTS: &[(&str, TestFn)] = tests![
+    sinks_leave_the_node_able_to_take_connections,
     publish_to_live,
     filters,
     catch_up_memory,
@@ -2203,4 +2204,74 @@ async fn a_publisher_cannot_skew_other_streams_through_a_restart() {
         lead_of(id)
     );
     node.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// What sinks can hold
+// ---------------------------------------------------------------------------------------------
+
+/// `admin` on some streams, a receiver that never answers, and sinks asking for all they can:
+/// the node's default limits hold on the real binary, and another client still gets in.
+async fn sinks_leave_the_node_able_to_take_connections() {
+    const SINK_COUNT: usize = 6;
+    const PER_SINK_MAX_COUNT: usize = 64;
+    const NODE_MAX_COUNT: usize = 256;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let holding = Arc::clone(&held);
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            holding.lock().unwrap().push(socket);
+        }
+    });
+    let node = Node::started(NodeOptions::default());
+    let root = node.admin_token(ADMIN_AUTHOR);
+    let token = node.token(AUTHOR, &[&format!("tenant.*:{ALL_PERMS}")], 3_600_000);
+    let http = node.http(&token);
+    let one = record(0, 0, b"");
+    let body = format!(
+        r#"{{"kind":"webhook.deliver","url":"http://127.0.0.1:{port}/","secret":"s",
+             "concurrency":1000000,"start":"earliest"}}"#
+    );
+
+    http.publish_records("tenant.0", &one.repeat(PER_SINK_MAX_COUNT * 2))
+        .await;
+    let path = "/v1/stream/tenant.0/sink/1";
+    let reply = http.call("PUT", path, &[], body.as_bytes()).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    let count = || held.lock().unwrap().len();
+    wait_until("one sink's connections", async || {
+        count() >= PER_SINK_MAX_COUNT
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(), PER_SINK_MAX_COUNT, "one sink's own limit");
+
+    for at in 1..SINK_COUNT {
+        let stream = format!("tenant.{at}");
+        http.publish_records(&stream, &one.repeat(PER_SINK_MAX_COUNT * 2))
+            .await;
+        let path = format!("/v1/stream/{stream}/sink/1");
+        let reply = http.call("PUT", &path, &[], body.as_bytes()).await;
+        assert_eq!(reply.status, 200, "{}", reply.text());
+    }
+    wait_until("the node's connections", async || count() >= NODE_MAX_COUNT).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count(), NODE_MAX_COUNT, "the node's limit");
+
+    let mut other = node.ws(&root).await;
+    other.send(&ClientFrame::Ping { nonce: 7 }).await;
+    assert!(matches!(other.recv().await, Owned::Pong { nonce: 7 }));
+
+    // A size no real sink needs, which once grew the server by 60 times what was sent.
+    let huge = format!(
+        r#"{{"kind":"webhook.deliver","url":"http://127.0.0.1:9/","secret":"{}"}}"#,
+        "s".repeat(999_800)
+    );
+    let path = "/v1/stream/tenant.0/sink/2";
+    assert_eq!(
+        http.call("PUT", path, &[], huge.as_bytes()).await.status,
+        400
+    );
 }

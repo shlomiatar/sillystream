@@ -18,7 +18,7 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
   [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
   [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
-  [--sink-pool-threads N] [--trace-catch-up true|false]
+  [--sink-pool-threads N] [--sink-max-in-flight N] [--trace-catch-up true|false]
 
 For s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys from the
 usual AWS variables. Real S3 has not been exercised.";
@@ -100,6 +100,10 @@ fn run() -> Result<(), String> {
             "--sink-ca-file" => sink_ca_file = Some(PathBuf::from(value)),
             "--sink-archive-store" => sink_archive_store = Some(value),
             "--sink-pool-threads" => sink.pool_thread_count = number(&value)? as usize,
+            "--sink-max-in-flight" => {
+                sink.in_flight_max_count =
+                    u32::try_from(number(&value)?).map_err(|_| format!("{flag} is too large"))?;
+            }
             "--trace-catch-up" => {
                 trace_catch_up = match value.as_str() {
                     "true" => true,

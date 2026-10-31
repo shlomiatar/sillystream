@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use object_store::ObjectStore;
 use rustls::ClientConfig;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use crate::clock::Clock;
 use crate::node::NodeHandle;
@@ -25,6 +25,11 @@ pub use webhook::{
     SinkResolver, StatusClass, WebhookUrl, classify_status, is_private_address, parse_url,
     signature_hex,
 };
+
+/// The most sinks one stream holds (D222).
+pub const SINK_CAP_COUNT: usize = 100;
+/// The longest `url`, `secret`, `filter` or `target` a sink can be given (D222).
+pub const SINK_TEXT_MAX_BYTES: usize = 4096;
 
 /// Node settings for sinks (D13). Each is a plain starting value.
 #[derive(Clone)]
@@ -44,6 +49,12 @@ pub struct SinkConfig {
     pub notify_interval_ms: u64,
     /// What one sink may hold. It can set less, not more. One frame can pass it.
     pub budget_bytes: u64,
+    /// The most deliveries one sink has in flight. Its `concurrency` can be less, not more.
+    pub concurrency_max_count: u32,
+    /// The most webhook and archive attempts in flight across the node, whatever the number of
+    /// sinks, since each can hold a socket. It has to stay well under the process's descriptor
+    /// limit. Attempts past it wait their turn, and waiting isn't a failure.
+    pub in_flight_max_count: u32,
     /// How long before unread data expires the sink warns.
     pub expire_warn_ms: u64,
     /// `archive`: records of one such window go in one object, up to the byte budget.
@@ -71,6 +82,8 @@ impl Default for SinkConfig {
             request_timeout_ms: 30_000,
             notify_interval_ms: 1_000,
             budget_bytes: 8 * 1024 * 1024,
+            concurrency_max_count: 64,
+            in_flight_max_count: 256,
             expire_warn_ms: 3_600_000,
             archive_window_ms: 10_000,
             tick_ms: 50,
@@ -129,6 +142,9 @@ pub(crate) struct PoolContext {
     pub handle: NodeHandle,
     pub archive: Arc<dyn ObjectStore>,
     pub tls: Arc<ClientConfig>,
+    /// A turn for each attempt that can hold a socket, so that sinks can't use up the node's
+    /// file descriptors between them (D222). Tokio's semaphore serves in order.
+    pub in_flight: Semaphore,
     /// `(target, sink id)` → the source that forwards under it. A sink id is unique per stream
     /// only, and two sources with one id would share a producer id at the target, where one's
     /// records would be dropped as the other's duplicates. The target's dedupe entry outlasts a
@@ -263,6 +279,7 @@ impl SinkPool {
         let context = Arc::new(PoolContext {
             archive: config.archive_store.clone().unwrap_or(store),
             tls: webhook::tls_client_config(config.extra_roots_pem.as_deref())?,
+            in_flight: Semaphore::new(config.in_flight_max_count.max(1) as usize),
             config,
             clock,
             handle: handle.clone(),
