@@ -410,6 +410,11 @@ impl std::fmt::Debug for RunOnCore {
 #[derive(Debug)]
 pub(crate) enum ControlMsg {
     Run(RunOnCore),
+    /// A load that retried and gave up (D243).
+    LoadFailed {
+        stream: Arc<str>,
+        ticket: u64,
+    },
     StreamInfo {
         stream: Arc<str>,
         reply: oneshot::Sender<Result<StreamInfo, ErrorCode>>,

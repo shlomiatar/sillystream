@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use common::*;
 use format::{RecordHeader, encode_record};
+use futures::StreamExt;
 use object_store::{ObjectStore, PutPayload};
 use server::{
     ManualClock, Node, NodeConfig, RecoverConfig, RecoveryReport, StateOpRequest, Subscription,
@@ -1687,6 +1688,58 @@ async fn a_rotation_with_no_room_still_seals_and_frees_a_file() {
     assert!(next_id > first_id);
     let got = read_all(&node, "full", 2).await;
     assert_eq!(got.len(), 2);
+    drop(client);
+    node.shutdown();
+}
+
+/// With the local store gone and a checkpoint that stays bad, what needs the stream is refused
+/// with the retryable code rather than waiting for ever, and other streams aren't held up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_that_stays_bad_refuses_what_waits_for_it() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "kept", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    // Long enough that the WAL no longer holds it, so that only a checkpoint can bring it back.
+    for seq in 0..10 {
+        publish_one(&mut client, "busy", seq + 1, b"x").await;
+        assert!(node.seal_and_checkpoint().await);
+    }
+    drop(client);
+    node.shutdown();
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let prefix = object_store::path::Path::from("checkpoints");
+    let files: Vec<_> = disk
+        .store
+        .list(Some(&prefix))
+        .map(|meta| meta.unwrap().location)
+        .collect()
+        .await;
+    assert!(!files.is_empty());
+
+    let (node, _) = disk.start(manual_config(1));
+    // Removed only after the start has listed them, so that lookups find them gone for good.
+    for file in &files {
+        disk.store.inner_delete(file).await;
+    }
+    let mut client = node.client(0).await;
+    let records = record_with(0, b"y");
+    client
+        .publish(publish("kept", &records, 2, 2))
+        .await
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(30), client.recv()).await {
+        Ok(Some(server::Reply::Nack { code, .. })) => {
+            assert_eq!(code, proto::ErrorCode::RateLimited);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // Another stream the WAL does hold still answers.
+    let busy = tokio::time::timeout(Duration::from_secs(30), client.stream_info("busy")).await;
+    assert!(busy.unwrap().is_ok());
+    let info = tokio::time::timeout(Duration::from_secs(30), client.stream_info("kept")).await;
+    assert_eq!(info.unwrap().err(), Some(proto::ErrorCode::RateLimited));
     drop(client);
     node.shutdown();
 }

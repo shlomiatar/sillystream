@@ -145,6 +145,8 @@ enum Outcome {
     Killed,
 }
 
+const LOAD_RETRY_MS: u64 = 1_000;
+
 struct Worker {
     context: Arc<PoolContext>,
     key: SinkKey,
@@ -203,9 +205,15 @@ impl Worker {
         loop {
             *seen_note_count = *self.notes.borrow_and_update();
             let info = self.client.lock().await.stream_info(&self.key.0).await;
-            let Ok(info) = info else {
+            let info = match info {
+                Ok(info) => info,
+                // Its metadata can't be read just now (D243).
+                Err(ErrorCode::RateLimited) => {
+                    tokio::time::sleep(Duration::from_millis(LOAD_RETRY_MS)).await;
+                    continue;
+                }
                 // No such stream, which a note or a restart can find, or the node stopping.
-                return End::Done;
+                Err(_) => return End::Done,
             };
             let Some((_, spec, cursor)) = info
                 .sinks

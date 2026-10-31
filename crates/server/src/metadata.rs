@@ -243,6 +243,9 @@ pub(crate) enum MetaMsg {
 /// Brings a stream back: the local store, then the checkpoints (section 7.6). A failed read is
 /// retried, not reported as "no such stream", since that would make a new stream over an old
 /// one's name.
+/// About 3 s of retries at `retry_delay`, which covers a brief store error.
+const LOAD_ATTEMPT_MAX_COUNT: u32 = 5;
+
 pub(crate) fn run_loader(
     mut rx: mpsc::UnboundedReceiver<MetaMsg>,
     local: Arc<LocalMeta>,
@@ -263,7 +266,7 @@ pub(crate) fn run_loader(
             Arc::clone(&store),
             std::mem::take(&mut checkpoints.superseded),
         ));
-        while let Some(message) = rx.recv().await {
+        'messages: while let Some(message) = rx.recv().await {
             match message {
                 MetaMsg::Installed(file) => {
                     checkpoints.add_newest(*file);
@@ -280,6 +283,17 @@ pub(crate) fn run_loader(
                             Err(error) if stop.load(Ordering::SeqCst) => {
                                 eprintln!("loading stream metadata: {error}");
                                 break None;
+                            }
+                            // This thread loads every stream, and a checkpoint that stays bad would
+                            // hold up all of them. Whoever is waiting is refused, and the next
+                            // access tries again (D243).
+                            Err(error) if attempt + 1 >= LOAD_ATTEMPT_MAX_COUNT => {
+                                eprintln!("loading stream metadata of {stream}: {error}");
+                                let _ = control[core].send(ControlMsg::LoadFailed {
+                                    stream: Arc::clone(&stream),
+                                    ticket,
+                                });
+                                continue 'messages;
                             }
                             Err(error) => {
                                 eprintln!("loading stream metadata, will retry: {error}");

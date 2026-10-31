@@ -48,6 +48,7 @@ use crate::state::{StreamState, apply_op, check_doc};
 const RETRY_FULL_MS: u64 = 1;
 /// How long a stopping core keeps offering stamped entries to a full WAL channel.
 const STOP_DRAIN_MS: u64 = 5_000;
+const LOAD_FAILED_MSG: &str = "this stream's metadata can't be read for now";
 /// `actor u64` of a system record, then its doc (section 2.2).
 const ACTOR_BYTES: usize = 8;
 /// What a client hears once nothing more can be made durable (D79).
@@ -2748,6 +2749,7 @@ impl Core {
                 self.drain_foreign_visible();
             }
             ControlMsg::ProbeBack => self.on_probe_back(),
+            ControlMsg::LoadFailed { stream, ticket } => self.on_load_failed(stream, ticket),
             ControlMsg::WalSent { core, ticket } => {
                 self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
             }
@@ -2852,6 +2854,86 @@ impl Core {
             }
         }
         self.run_parked(&name, loading.parked);
+    }
+
+    /// The metadata can't be read for now. Everything waiting is refused with the retryable
+    /// code, as with a stopped WAL, and the next access asks again (D243).
+    fn on_load_failed(&mut self, name: Arc<str>, ticket: u64) {
+        if self
+            .loading
+            .get(&*name)
+            .is_none_or(|loading| loading.ticket != ticket)
+        {
+            return;
+        }
+        let loading = self.loading.remove(&*name).expect("just looked at it");
+        for message in loading.parked {
+            match message {
+                Parked::Write(write) => {
+                    self.parked_write_count -= 1;
+                    self.refuse_for_load(write);
+                }
+                Parked::Read(ReadMsg::Step(step)) => self.fail_catch_for_load(step.sub),
+                Parked::Read(ReadMsg::Chain(chain)) => self.fail_catch_for_load(chain.sub),
+                Parked::Read(read @ ReadMsg::Done { .. }) => self.on_read(read),
+                Parked::Control(ControlMsg::Attach(attach)) => self.fail_catch_for_load(attach.sub),
+                Parked::Control(ControlMsg::StreamInfo { reply, .. }) => {
+                    let _ = reply.send(Err(ErrorCode::RateLimited));
+                }
+                Parked::Control(ControlMsg::Snapshot { reply, .. }) => {
+                    let _ = reply.send(Err(ErrorCode::RateLimited));
+                }
+                Parked::Control(ControlMsg::Sink { reply, .. }) => {
+                    let _ = reply.send(Err(ErrorCode::RateLimited));
+                }
+                Parked::Control(ControlMsg::Cursor {
+                    op: CursorOp::Put { reply, .. },
+                    ..
+                }) => {
+                    let _ = reply.send(Err(ErrorCode::RateLimited));
+                }
+                // A seal's manifest has nobody to refuse it to: it asks again.
+                Parked::Control(manifest @ ControlMsg::PublishManifest { .. }) => {
+                    self.on_control(manifest);
+                }
+                // Dropping the rest closes their replies, which is how they learn of it.
+                Parked::Control(_) => {}
+            }
+        }
+    }
+
+    fn refuse_for_load(&mut self, write: WriteMsg) {
+        match write {
+            WriteMsg::Publish(publish) => send_reply(
+                &publish.reply,
+                Reply::Nack {
+                    handle: publish.handle,
+                    producer_seq: publish.producer_seq,
+                    code: ErrorCode::RateLimited,
+                    msg: LOAD_FAILED_MSG.to_owned(),
+                },
+            ),
+            WriteMsg::StateOp(op) => send_reply(
+                &op.reply,
+                Reply::Error {
+                    reference: op.req,
+                    code: ErrorCode::RateLimited,
+                    msg: LOAD_FAILED_MSG.to_owned(),
+                },
+            ),
+            // Nothing of its client's is behind it now.
+            other => self.on_write(other),
+        }
+    }
+
+    fn fail_catch_for_load(&mut self, sub: SubRef) {
+        self.send_catch(
+            sub,
+            CatchReply::Fail {
+                code: ErrorCode::RateLimited,
+                msg: LOAD_FAILED_MSG.to_owned(),
+            },
+        );
     }
 
     /// In the order they came. Writes go ahead of what is deferred, which came later.
