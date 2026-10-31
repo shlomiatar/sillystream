@@ -196,3 +196,82 @@ async fn ids_stay_above_what_a_crash_erased_after_being_delivered() {
     drop(client);
     node.shutdown();
 }
+
+/// Q15: a flipped bit in a closed file loses that file's later entries while later files replay.
+/// That can't be repaired, but the start says so, and a torn newest file doesn't (D252).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_in_a_closed_wal_file_is_reported_and_a_torn_newest_file_is_not() {
+    let _turn = TURN.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ScriptStore::new());
+    let clock = ManualClock::new(START_MS);
+    let (node, _) = start(dir.path(), &store, &clock, manual_config(1));
+    let mut client = node.client(0).await;
+    for seq in 1..=3 {
+        publish_at(&mut client, seq, &[seq as u8; 64], 2).await;
+    }
+    // The upload is held, so the file the seal closed stays.
+    store.hold();
+    let seal = tokio::spawn({
+        let wal = dir.path().join("wal");
+        async move {
+            while storage::list_wal_files(&wal).unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
+    let mut sealing = Box::pin(node.seal());
+    tokio::select! {
+        _ = sealing.as_mut() => panic!("the upload is held"),
+        _ = seal => {}
+    }
+    publish_at(&mut client, 4, &[4; 64], 2).await;
+    let image = tempfile::tempdir().unwrap();
+    copy_dir(&dir.path().join("wal"), &image.path().join("wal"));
+    copy_dir(&dir.path().join("metadata"), &image.path().join("metadata"));
+    let files = storage::list_wal_files(&image.path().join("wal")).unwrap();
+    assert_eq!(files.len(), 2);
+
+    // With the newest file torn, nothing is said.
+    let torn_image = tempfile::tempdir().unwrap();
+    copy_dir(&image.path().join("wal"), &torn_image.path().join("wal"));
+    copy_dir(
+        &image.path().join("metadata"),
+        &torn_image.path().join("metadata"),
+    );
+    let newest = torn_image
+        .path()
+        .join("wal")
+        .join(files[1].path.file_name().unwrap());
+    let mut bytes = std::fs::read(&newest).unwrap();
+    let end = storage::replay_file(&files[1]).unwrap().valid_end_bytes;
+    bytes[end - 1] ^= 1;
+    std::fs::write(&newest, &bytes).unwrap();
+
+    // The middle of the closed file: the second entry's data.
+    let closed = &files[0].path;
+    let mut bytes = std::fs::read(closed).unwrap();
+    let at = bytes.windows(64).position(|run| run == [2u8; 64]).unwrap();
+    bytes[at] ^= 1;
+    std::fs::write(closed, &bytes).unwrap();
+
+    store.release();
+    drop(client);
+    let _ = sealing.await;
+    node.shutdown();
+
+    let isolated = Arc::new(ScriptStore::new());
+    let (node, report) = start(image.path(), &isolated, &clock, manual_config(1));
+    assert_eq!(report.damaged_wal_seqs, [files[0].seq]);
+    let warning = report.damaged_warning().unwrap();
+    assert!(warning.contains("gap"), "{warning}");
+    // What the damage hid is gone, and the later file still replayed: the gap Q15 describes.
+    assert_eq!(report.replayed_entry_count, 2);
+    node.shutdown();
+
+    let isolated = Arc::new(ScriptStore::new());
+    let (node, report) = start(torn_image.path(), &isolated, &clock, manual_config(1));
+    assert_eq!(report.damaged_wal_seqs, Vec::<u64>::new());
+    assert_eq!(report.damaged_warning(), None);
+    node.shutdown();
+}

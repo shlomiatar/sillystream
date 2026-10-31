@@ -201,9 +201,13 @@ fn run() -> Result<(), String> {
         clock(),
     )
     .map_err(|error| error.to_string())?;
-    for warning in [report.warning(), report.fenced_warning()]
-        .into_iter()
-        .flatten()
+    for warning in [
+        report.warning(),
+        report.fenced_warning(),
+        report.damaged_warning(),
+    ]
+    .into_iter()
+    .flatten()
     {
         eprintln!("sillystream-server: {warning}");
     }

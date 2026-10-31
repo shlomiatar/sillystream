@@ -25,6 +25,9 @@ pub struct ReplayedFile {
     pub valid_end_bytes: usize,
     /// The generation that opened the file. 0 if it had none, or the header isn't valid.
     pub generation: u64,
+    /// Bytes other than zeros lie past the prefix. A reused file is emptied first (D60), so these
+    /// are a torn write or damage, and anything after them in this file can't be read (D252).
+    pub damaged_tail: bool,
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
@@ -88,6 +91,7 @@ pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
         entries: Vec::new(),
         valid_end_bytes: 0,
         generation: 0,
+        damaged_tail: false,
     };
     if file.len() < WAL_FILE_HEADER_BYTES
         || read_u64(file, 0) != WAL_MAGIC
@@ -95,6 +99,7 @@ pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
         || read_u32(file, 24) != crc32c(&file[..24])
         || read_u32(file, 28) != 0
     {
+        replayed.damaged_tail = file.iter().any(|byte| *byte != 0);
         return replayed;
     }
     replayed.generation = read_u64(file, 16);
@@ -104,6 +109,7 @@ pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
         offset = next;
     }
     replayed.valid_end_bytes = offset;
+    replayed.damaged_tail = file[offset..].iter().any(|byte| *byte != 0);
     replayed
 }
 
@@ -157,8 +163,8 @@ pub fn replay_file(file: &WalFileInfo) -> io::Result<ReplayedFile> {
 }
 
 /// The valid prefix of every file, oldest file first. The end of one file's prefix
-/// doesn't stop the next file, because a closed file always ends in stale bytes or
-/// zeros (Q15).
+/// doesn't stop the next file, because a closed file ends in zeros, or in damage that
+/// recovery warns about (Q15, D252).
 pub fn replay_dir(dir: &Path) -> io::Result<Vec<ReplayedEntry>> {
     let mut entries = Vec::new();
     for file in list_wal_files(dir)? {

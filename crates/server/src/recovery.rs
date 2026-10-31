@@ -47,6 +47,8 @@ pub struct RecoveryReport {
     pub ignored_entry_count: u64,
     /// The files holding those. Never recycled, since no segment covers them (D228).
     pub kept_wal_seqs: Vec<u64>,
+    /// Closed WAL files with something other than zeros after their valid entries (D252).
+    pub damaged_wal_seqs: Vec<u64>,
     pub restored_stream_count: u64,
     /// Objects no checkpoint knew of, whose extents were looked at.
     pub scanned_object_count: u64,
@@ -70,6 +72,19 @@ impl RecoveryReport {
     /// What a former generation's limit ruled out (section 8.1). A former owner still running
     /// wrote it, or a start with `wal_dir` empty, say before its volume was mounted, fenced off
     /// what was on that volume. In the second case acked records are among it (D228).
+    /// A closed file's later entries may be gone while later files replay (Q15, D252).
+    pub fn damaged_warning(&self) -> Option<String> {
+        (!self.damaged_wal_seqs.is_empty()).then(|| {
+            format!(
+                "warning: WAL files {:?} have unreadable bytes after their valid entries. Entries \
+                 after that point were not replayed, so a stream can have a gap in its unsealed \
+                 records. This is bit rot, or a torn write left by an earlier crash, and they \
+                 can't be told apart.",
+                self.damaged_wal_seqs
+            )
+        })
+    }
+
     pub fn fenced_warning(&self) -> Option<String> {
         (self.ignored_entry_count > 0 || self.ignored_extent_count > 0).then(|| {
             format!(
@@ -535,6 +550,10 @@ pub(crate) async fn prepare(
         closed_seqs.push(file.seq);
         first_seq = first_seq.max(file.seq + 1);
         let replayed = replay_file(file).map_err(|error| error.to_string())?;
+        // The newest file's tail is the torn write the CRC is for.
+        if replayed.damaged_tail && wal_files.last().is_some_and(|last| last.seq != file.seq) {
+            report.damaged_wal_seqs.push(file.seq);
+        }
         if replayed.entries.is_empty() {
             empty_files.push(file);
         }
