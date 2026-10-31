@@ -325,6 +325,9 @@ pub(crate) struct StreamDelivery {
     pub extents: Vec<ExtentRef>,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
+    /// The highest id in an extent taken away with nothing in its place. A position below this
+    /// has lost records. Not saved, so a restart or an eviction forgets it (D178, Q32).
+    pub expired_through: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
     /// What a checkpoint may save: the stream as of its last record in the WAL. An entry for a
     /// publish a crash can erase would ack it on the retry, unwritten (D136, D154).
@@ -360,6 +363,7 @@ impl StreamDelivery {
             cursors: HashMap::new(),
             extents: Vec::new(),
             floor_id: 0,
+            expired_through: 0,
             sinks: std::collections::BTreeMap::new(),
             saved_through: 0,
             saved_state: (0, Bytes::new()),
@@ -419,11 +423,13 @@ impl StreamDelivery {
     /// Takes away every extent in the object at `path`. How many there were.
     pub fn drop_path(&mut self, path: &Path) -> usize {
         let dropped = &mut self.dropped_extents;
+        let expired_through = &mut self.expired_through;
         let before = self.extents.len();
         self.extents.retain(|known| {
             let keep = known.extent_path() != path;
             if !keep {
                 dropped.push(known.extent.id_first);
+                *expired_through = (*expired_through).max(known.extent.id_last);
             }
             keep
         });

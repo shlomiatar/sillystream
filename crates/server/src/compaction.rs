@@ -41,8 +41,8 @@ const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 /// How long `sealed/` keeps an hour after it has ended: section 7.4's "about 2 days".
 pub const SEALED_EXPIRY_MS: u64 = 2 * DAY_MS;
-/// What a class's prefix keeps past its length. A prefix is named for its lowest id's hour, and
-/// a record in it can be a seal window later than that (120 s at most).
+/// What a class's prefix keeps past its length. A prefix is named for its highest id's hour
+/// (D175), so nothing needs this today; it is a margin for a clock that steps back.
 pub const CLASS_GRACE_MS: u64 = HOUR_MS;
 /// How long a worker waits for an owner to hear of an object it was told of.
 const NOT_READY_RETRY_MS: u64 = 20;
@@ -212,6 +212,8 @@ struct Batch {
     through: Option<u64>,
     hour: u64,
     first_manifest_id: u64,
+    /// What couldn't be read and was gone past, to report.
+    skipped: Vec<String>,
 }
 
 enum Planned {
@@ -255,6 +257,20 @@ fn is_not_found(error: &SegmentError) -> bool {
         error,
         SegmentError::Store(object_store::Error::NotFound { .. })
     )
+}
+
+/// Bytes that are in the store and wrong, which no retry changes. Anything from the store itself
+/// may be an outage.
+fn is_corrupt(error: &SegmentError) -> bool {
+    !matches!(error, SegmentError::Store(_))
+}
+
+/// How a footer read went.
+enum FooterRead {
+    Found(Vec<StreamExtent>),
+    /// The object isn't there.
+    Missing,
+    Corrupt(String),
 }
 
 impl Compactor {
@@ -483,8 +499,9 @@ impl Compactor {
                     }
                     tokio::time::sleep(Duration::from_millis(NOT_READY_RETRY_MS)).await;
                 }
-                Planned::Ready(batch) => {
+                Planned::Ready(mut batch) => {
                     let through = batch.through.expect("a ready batch covers a manifest");
+                    report.errors.append(&mut batch.skipped);
                     match self.run_batch(class, batch, forced, &mut report).await {
                         Ok(true) => cursor = through,
                         Ok(false) => {
@@ -503,15 +520,16 @@ impl Compactor {
         }
     }
 
-    async fn read_footer(&self, path: &Path) -> Result<Option<Vec<StreamExtent>>, String> {
+    async fn read_footer(&self, path: &Path) -> Result<FooterRead, String> {
         let reader = SegmentReader::new(Arc::clone(&self.store), path.clone());
         let extents = async {
             let top = reader.read_top_index().await?;
             reader.all_extents(&top).await
         };
         match extents.await {
-            Ok(extents) => Ok(Some(extents)),
-            Err(error) if is_not_found(&error) => Ok(None),
+            Ok(extents) => Ok(FooterRead::Found(extents)),
+            Err(error) if is_not_found(&error) => Ok(FooterRead::Missing),
+            Err(error) if is_corrupt(&error) => Ok(FooterRead::Corrupt(format!("{path}: {error}"))),
             Err(error) => Err(format!("{path}: {error}")),
         }
     }
@@ -591,10 +609,20 @@ impl Compactor {
                 closed = true;
                 break;
             }
-            let Some(footer) = self.read_footer(path).await? else {
+            let footer = match self.read_footer(path).await? {
+                FooterRead::Found(footer) => footer,
                 // Expired: whatever it held went with it, or lives on in a compacted object.
-                batch.through = Some(*id);
-                continue;
+                FooterRead::Missing => {
+                    batch.through = Some(*id);
+                    continue;
+                }
+                // Nothing else waits for it. The delete job can't read it either, so the object
+                // and its hour stay, and owners go on listing what's in it (D177).
+                FooterRead::Corrupt(error) => {
+                    batch.skipped.push(error);
+                    batch.through = Some(*id);
+                    continue;
+                }
             };
             let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
             let mut found = Vec::new();
@@ -662,11 +690,19 @@ impl Compactor {
     }
 
     /// One source's records, as stored. If the object has gone from under its extent, the owner
-    /// is told, this batch stops, and the next run goes without it.
-    async fn read_source(&self, stream: &Arc<str>, source: &Source) -> Result<Bytes, String> {
+    /// is told, this batch stops, and the next run goes without it. `Err` of a corrupt source
+    /// comes back as `Ok(Err)`: only that source is left behind (D177).
+    async fn read_source(
+        &self,
+        stream: &Arc<str>,
+        source: &Source,
+    ) -> Result<Result<Bytes, String>, String> {
         let reader = SegmentReader::new(Arc::clone(&self.store), source.path.clone());
         let bytes = match reader.read_extent(&source.extent).await {
             Ok(bytes) => bytes,
+            Err(error) if is_corrupt(&error) => {
+                return Ok(Err(format!("{}: {error}", source.path)));
+            }
             Err(error) => {
                 if is_not_found(&error) {
                     self.drop_extents(stream, &source.path).await?;
@@ -675,14 +711,17 @@ impl Compactor {
             }
         };
         let Some(limit) = source.limit else {
-            return Ok(bytes);
+            return Ok(Ok(bytes));
         };
         // An extent of a former generation stops at its last accepted record (D17, D138).
-        Ok(accepted_prefix(&bytes, limit.min(source.extent.id_last))
-            .map_or_else(Bytes::new, |(_, accepted)| accepted))
+        Ok(Ok(accepted_prefix(
+            &bytes,
+            limit.min(source.extent.id_last),
+        )
+        .map_or_else(Bytes::new, |(_, accepted)| accepted)))
     }
 
-    /// True if the cursor may now pass this batch.
+    /// True if the cursor may now pass this batch, which it has if the batch covers a manifest.
     async fn run_batch(
         &self,
         class: RetentionClass,
@@ -690,7 +729,7 @@ impl Compactor {
         forced: bool,
         report: &mut CompactReport,
     ) -> Result<bool, String> {
-        let through = batch.through.expect("a ready batch covers a manifest");
+        let through = batch.through;
         let mut builder = SegmentBuilder::new();
         let mut runs = Vec::new();
         for (stream, (mut sources, merge_below)) in batch.streams {
@@ -707,8 +746,20 @@ impl Compactor {
                     end += 1;
                 }
                 let mut pieces = Vec::with_capacity(end - start);
+                let mut corrupt = false;
                 for source in &sources[start..end] {
-                    pieces.push(self.read_source(&stream, source).await?);
+                    match self.read_source(&stream, source).await? {
+                        Ok(piece) => pieces.push(piece),
+                        Err(error) => {
+                            report.errors.push(error);
+                            corrupt = true;
+                        }
+                    }
+                }
+                // Left where they are. The delete job tries again before their hour can go.
+                if corrupt {
+                    start = end;
+                    continue;
                 }
                 pieces.retain(|piece| !piece.is_empty());
                 if let Some(first) = pieces.first() {
@@ -787,7 +838,9 @@ impl Compactor {
             }
         }
         storage::crash_point("compact.before_cursor");
-        self.commit_cursor(class, through).await?;
+        if let Some(through) = through {
+            self.commit_cursor(class, through).await?;
+        }
         Ok(true)
     }
 
@@ -843,22 +896,68 @@ impl Compactor {
         if holds_unread_manifests {
             return Ok(false);
         }
-        if manifest_ids
+        let manifest_passed = manifest_ids
             .get(path)
-            .is_some_and(|id| *id <= slowest_cursor)
-        {
-            return Ok(true);
-        }
+            .is_some_and(|id| *id <= slowest_cursor);
         let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
+        let mut passed = true;
         for (stream, ranges) in self.footer_by_stream(extents, limit) {
             let Some(view) = self.view(&stream, path, ranges).await? else {
                 continue;
             };
-            if view.unnoted || !view.sources.is_empty() {
-                return Ok(false);
+            if !manifest_passed {
+                if view.unnoted || !view.sources.is_empty() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            // Every worker has gone past, each deciding when it got there. A stream of a longer
+            // class still here slipped between them: this is its last chance to be copied.
+            let Some(class) = RetentionClass::of_retention(view.retention_ms) else {
+                continue;
+            };
+            if !view.sources.is_empty() {
+                self.copy_passed_over(class, stream, path, view, limit)
+                    .await?;
+                passed = false;
             }
         }
-        Ok(true)
+        Ok(passed)
+    }
+
+    /// What every worker went past copied into its class's prefix, for the next run of the
+    /// delete job to find gone from `sealed/` (D176).
+    async fn copy_passed_over(
+        &self,
+        class: RetentionClass,
+        stream: Arc<str>,
+        path: &Path,
+        view: CompactView,
+        limit: Option<u64>,
+    ) -> Result<(), String> {
+        let mut batch = Batch {
+            hour: object_hour(path).ok_or_else(|| format!("{path}: no hour in the path"))?,
+            ..Batch::default()
+        };
+        let sources = view
+            .sources
+            .into_iter()
+            .map(|source| Source {
+                path: path.clone(),
+                extent: source.extent,
+                next_id_first: source.next_id_first,
+                limit,
+            })
+            .collect();
+        batch.streams.insert(stream, (sources, view.merge_below));
+        let mut report = CompactReport::default();
+        if !self.run_batch(class, batch, false, &mut report).await? {
+            return Err("an owner couldn't take a compacted extent yet".to_owned());
+        }
+        match report.errors.pop() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// The delete job (section 7.4). Only whole hours under a prefix, once expired, and for
@@ -912,7 +1011,13 @@ impl Compactor {
                 }
             };
             for hour in hours {
-                if now_ms < (hour + 1) * HOUR_MS + expiry_ms {
+                // The hour comes from a listing, so any stray key can make it huge. Saturating
+                // puts that one far in the future, where it stays.
+                let expires_ms = hour
+                    .saturating_add(1)
+                    .saturating_mul(HOUR_MS)
+                    .saturating_add(expiry_ms);
+                if now_ms < expires_ms {
                     continue;
                 }
                 let prefix = format!("{root}/{hour}");
@@ -976,12 +1081,13 @@ impl Compactor {
         let mut footers = Vec::with_capacity(objects.len());
         for object in objects {
             let path = object.location;
-            let extents = match self.read_footer(&path).await {
-                Ok(extents) => extents.unwrap_or_default(),
+            let extents = match self.read_footer(&path).await? {
+                FooterRead::Found(extents) => extents,
+                FooterRead::Missing => Vec::new(),
                 // A compacted object nobody could read: its time is up all the same. A sealed
                 // one may hold what was never copied.
-                Err(_) if root != SEALED_PREFIX => Vec::new(),
-                Err(error) => return Err(error),
+                FooterRead::Corrupt(_) if root != SEALED_PREFIX => Vec::new(),
+                FooterRead::Corrupt(error) => return Err(error),
             };
             if root == SEALED_PREFIX
                 && !self

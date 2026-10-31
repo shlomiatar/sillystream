@@ -1591,12 +1591,25 @@ impl Core {
             .and_then(|name| stream.delivery.cursors.get(name).copied());
         let from = stored.unwrap_or(message.from);
         let cursor = match from {
-            0 => retention_start.saturating_sub(1),
+            // The start of retention is what's left, whatever class the stream has now.
+            0 => retention_start
+                .saturating_sub(1)
+                .max(stream.delivery.expired_through),
             u64::MAX => head,
             id => id,
         }
         .max(stream.delivery.floor_id);
         if from != 0 && from != u64::MAX {
+            if cursor < stream.delivery.expired_through {
+                self.send_catch(
+                    sub,
+                    CatchReply::Fail {
+                        code: ErrorCode::RetentionExpired,
+                        msg: "records after that id have expired".to_owned(),
+                    },
+                );
+                return;
+            }
             // Only a record below the start can be missed, and only earlier owners may
             // hold one in memory, so most subscribers ask nobody (D100).
             if message.walk.is_none() && cursor.saturating_add(1) < retention_start {
@@ -1811,7 +1824,8 @@ impl Core {
             shard.counters.catch_up_bytes += message.read_bytes;
         }
         // Still listed, with the object gone: these records are lost to this reader. A list
-        // that has moved on means compaction has them, and the read carries on from there.
+        // that has moved on means compaction has them, and the read carries on from there,
+        // unless what moved it on was their expiry (D178).
         if let Some(gone) = &message.gone
             && stream.delivery.drop_path(gone) > 0
         {
@@ -1820,6 +1834,16 @@ impl Core {
                 CatchReply::Fail {
                     code: ErrorCode::RetentionExpired,
                     msg: "the object holding these records is gone".to_owned(),
+                },
+            );
+            return;
+        }
+        if message.after < stream.delivery.expired_through {
+            self.send_catch(
+                message.sub,
+                CatchReply::Fail {
+                    code: ErrorCode::RetentionExpired,
+                    msg: "records this read hadn't reached have expired".to_owned(),
                 },
             );
             return;

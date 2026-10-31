@@ -20,6 +20,8 @@ pub struct BuiltSegment {
     pub len_bytes: u64,
     /// The lowest id in the segment, for its path. `None` if it holds no records.
     pub first_id: Option<u64>,
+    /// The highest id in the segment, for the hour in its path. `None` if it holds no records.
+    pub last_id: Option<u64>,
     /// The stream index, sorted by `(hash, name, offset)`.
     pub extents: Vec<StreamExtent>,
 }
@@ -170,11 +172,14 @@ impl SegmentBuilder {
             &mut self.parts,
         )?;
         self.offset = end_offset;
+        let extents: Vec<StreamExtent> =
+            self.extents.into_iter().map(|(_, extent)| extent).collect();
         Ok(BuiltSegment {
             parts: self.parts,
             len_bytes: self.offset,
             first_id: self.first_id,
-            extents: self.extents.into_iter().map(|(_, extent)| extent).collect(),
+            last_id: extents.iter().map(|extent| extent.id_last).max(),
+            extents,
         })
     }
 }

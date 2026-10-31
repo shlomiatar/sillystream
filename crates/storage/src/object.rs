@@ -72,10 +72,11 @@ pub fn build_store(config: &ObjectStoreConfig) -> object_store::Result<Arc<dyn O
 const HOUR_MS: u64 = 3_600_000;
 
 /// `sealed/<ingest_hour>/<node-or-stream>/<generation>-<first_id>.seg` (section 7.3).
-/// `ingest_hour` is hours since the epoch, from `first_id` (D53). `PathPart` encodes
-/// anything in a stream id that isn't safe in a path.
-fn sealed_path(owner: &str, generation: u64, first_id: u64) -> Path {
-    let hour = (id_ms(first_id) / HOUR_MS).to_string();
+/// `ingest_hour` is hours since the epoch, from the object's highest id (D175), so nothing in
+/// it is newer than its hour and the delete job can go by the name. `PathPart` encodes anything
+/// in a stream id that isn't safe in a path.
+pub fn sealed_path(owner: &str, generation: u64, first_id: u64, last_id: u64) -> Path {
+    let hour = (id_ms(last_id) / HOUR_MS).to_string();
     let name = format!("{generation:020}-{first_id:020}.seg");
     Path::from_iter([
         PathPart::from("sealed"),
@@ -102,14 +103,14 @@ pub fn stream_fits_dedicated_path(stream: &str) -> bool {
     PathPart::from(stream).as_ref().len() <= MAX_PATH_PART_BYTES
 }
 
-/// The path of a node's shared object for one seal.
+/// The path of a node's shared object for one seal whose records are all in `first_id`'s hour.
 pub fn seal_path(node: &str, generation: u64, first_id: u64) -> Path {
-    sealed_path(node, generation, first_id)
+    sealed_path(node, generation, first_id, first_id)
 }
 
-/// The path of a dedicated object for one busy stream.
+/// The path of a dedicated object whose records are all in `first_id`'s hour.
 pub fn dedicated_path(stream: &str, generation: u64, first_id: u64) -> Path {
-    sealed_path(stream, generation, first_id)
+    sealed_path(stream, generation, first_id, first_id)
 }
 
 /// The generation in an object's name (section 7.3).

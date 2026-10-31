@@ -1094,3 +1094,415 @@ async fn a_full_checkpoint_forgets_objects_that_have_expired() {
     );
     assert!(set.recorded_objects().next().is_some());
 }
+
+/// After long downtime, restored records go up in the first seal with records from just after
+/// the restart. Those are fresh, so the object mustn't count as old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seal_mixing_restored_and_fresh_records_expires_by_its_newest() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "old", 1, b"old").await;
+    drop(client);
+    node.shutdown();
+
+    disk.clock.advance(3 * DAY_MS);
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    let fresh = publish_one(&mut client, "fresh", 1, b"just now").await;
+    seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+
+    let report = node.expire_now().await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.deleted_prefixes, Vec::<String>::new());
+    assert_eq!(
+        read_all(&node, "fresh", 1).await,
+        vec![(fresh, b"just now".to_vec())]
+    );
+
+    // It goes when the fresh record's own time is up.
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    assert!(node.seal_and_checkpoint().await);
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    let report = node.expire_now().await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+    drop(client);
+    node.shutdown();
+}
+
+/// The same for a compacted class: the output's prefix is its sources' hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compacted_mixed_seal_keeps_its_class_from_the_newest_record() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("old", class_config(7 * DAY_MS)).await;
+    client.configure("fresh", class_config(7 * DAY_MS)).await;
+    assert!(node.seal_and_checkpoint().await);
+    publish_one(&mut client, "old", 1, b"old").await;
+    drop(client);
+    node.shutdown();
+
+    disk.clock.advance(8 * DAY_MS);
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    let fresh = publish_one(&mut client, "fresh", 1, b"just now").await;
+    seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert!(!disk.objects("7d").await.is_empty());
+
+    let report = node.expire_now().await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert_eq!(report.deleted_prefixes, Vec::<String>::new());
+    assert_eq!(
+        read_all(&node, "fresh", 1).await,
+        vec![(fresh, b"just now".to_vec())]
+    );
+    drop(client);
+    node.shutdown();
+}
+
+/// Workers are at different manifests, so a class raised between them is seen by neither as
+/// its own. The delete job finds the stream still listing the object and copies it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_class_raised_between_workers_still_gets_its_records_copied() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("grow", class_config(7 * DAY_MS)).await;
+    let id = publish_one(&mut client, "grow", 1, b"keep me").await;
+    let source = seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+
+    node.compact_now(&[RetentionClass::Days365, RetentionClass::Days30])
+        .await
+        .unwrap();
+    client.configure("grow", class_config(365 * DAY_MS)).await;
+    node.compact_now(&[RetentionClass::Days7]).await.unwrap();
+    assert!(disk.objects("7d").await.is_empty());
+    assert!(disk.objects("365d").await.is_empty());
+    assert!(node.seal_and_checkpoint().await);
+
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    let report = node.expire_now().await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert!(
+        !report
+            .deleted_prefixes
+            .contains(&"sealed/500000".to_owned())
+    );
+    assert_eq!(disk.extents("365d").await.len(), 1, "{report:?}");
+    assert_eq!(
+        read_all(&node, "grow", 1).await,
+        vec![(id, b"keep me".to_vec())]
+    );
+
+    // With its copy made, the hour can go, and the record stays.
+    let report = node.expire_now().await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert!(disk.deleted().contains(&source), "{report:?}");
+    assert_eq!(
+        read_all(&node, "grow", 1).await,
+        vec![(id, b"keep me".to_vec())]
+    );
+    drop(client);
+    node.shutdown();
+}
+
+/// The object of a stream with nothing to replace it goes while a reader is partway through.
+async fn expire_under_a_paused_reader(publish_later_first: bool) {
+    let disk = Disk::new();
+    let mut settings = config(1);
+    settings.connection_window_bytes = 16 * 1024;
+    settings.catch_up_read_bytes = 4 * 1024;
+    let node = disk.start(settings);
+    let mut client = node.client(0).await;
+    let data = vec![9u8; 8 * 1024];
+    for at in 0..40u64 {
+        publish_one(&mut client, "gap", at + 1, &data).await;
+    }
+    seal_path_of(&node).await;
+
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, "gap", 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        !heard.records(1).is_empty()
+    })
+    .await;
+    let taken = heard.records(1).len();
+    assert!(taken < 40, "the read should still be going");
+
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    if publish_later_first {
+        publish_one(&mut client, "gap", 100, b"later").await;
+        seal_path_of(&node).await;
+    }
+    let expired = node.expire_now().await.unwrap();
+    assert!(!expired.deleted_prefixes.is_empty(), "{expired:?}");
+    if !publish_later_first {
+        publish_one(&mut client, "gap", 100, b"later").await;
+        seal_path_of(&node).await;
+    }
+
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(1).is_some()
+            || heard
+                .records(1)
+                .iter()
+                .any(|record| record.3 == b"later".to_vec())
+    })
+    .await;
+    assert_eq!(
+        heard.error_code(1),
+        Some(ErrorCode::RetentionExpired),
+        "taken {taken}, heard {}",
+        heard.records(1).len()
+    );
+    drop((connection, client));
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_reader_whose_object_expired_gets_error_7() {
+    expire_under_a_paused_reader(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_overtaken_by_the_delete_job_gets_error_7() {
+    expire_under_a_paused_reader(true).await;
+}
+
+/// Records `a`, `b` expire, and `c` comes after them. `(a, b, c)`.
+async fn expired_then_one_more(disk: &Disk, node: &Node) -> (u64, u64, u64) {
+    let mut client = node.client(0).await;
+    let a = publish_one(&mut client, "gone", 11, b"a").await;
+    let b = publish_one(&mut client, "gone", 12, b"b").await;
+    seal_path_of(node).await;
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    let report = node.expire_now().await.unwrap();
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+    let c = publish_one(&mut client, "gone", 13, b"c").await;
+    seal_path_of(node).await;
+    (a, b, c)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_position_with_expired_records_after_it_gets_error_7() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let (a, b, c) = expired_then_one_more(&disk, &node).await;
+
+    let heard = hear_all(&node, "gone", a - 1, 1).await;
+    assert_eq!(heard.error_code(1), Some(ErrorCode::RetentionExpired));
+    let heard = hear_all(&node, "gone", a, 1).await;
+    assert_eq!(heard.error_code(1), Some(ErrorCode::RetentionExpired));
+
+    // Having read all that expired misses nothing, and neither does starting at retention.
+    let heard = hear_all(&node, "gone", b, 1).await;
+    assert_eq!(heard.error_code(1), None);
+    assert_eq!(heard.records(1)[0].0, c);
+    assert_eq!(read_all(&node, "gone", 1).await[0].0, c);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_cursor_with_expired_records_after_it_gets_error_7() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    let first = publish_one(&mut client, "gone", 1, b"first").await;
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    let mut named = Subscription::new(1, "gone", 0);
+    named.name = Some("worker");
+    connection.subscribe(named);
+    hear_until(&mut connection, &mut heard, |heard| {
+        !heard.records(1).is_empty()
+    })
+    .await;
+    connection.commit(1, first);
+    assert_eq!(connection.read_cursor("gone", "worker").await, Some(first));
+    drop(connection);
+    expired_then_one_more(&disk, &node).await;
+
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    let mut named = Subscription::new(2, "gone", 0);
+    named.name = Some("worker");
+    connection.subscribe(named);
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(2).is_some() || !heard.records(2).is_empty()
+    })
+    .await;
+    assert_eq!(heard.error_code(2), Some(ErrorCode::RetentionExpired));
+    drop((connection, client));
+    node.shutdown();
+}
+
+/// **Q32, not fixed: this pins the limit and changes with the decision.** What expired is known
+/// only while the stream is in memory, so after a restart this cursor is served with a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn q32_after_a_restart_a_position_before_expired_records_still_resumes_silently() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let (a, _, c) = expired_then_one_more(&disk, &node).await;
+    assert!(node.seal_and_checkpoint().await);
+    node.shutdown();
+
+    let node = disk.start(config(1));
+    let heard = hear_all(&node, "gone", a, 1).await;
+    assert_eq!(heard.error_code(1), None);
+    assert_eq!(heard.records(1)[0].0, c);
+    node.shutdown();
+}
+
+/// One flipped byte in a footer stops nothing else. Its own hour stays, since it can't be
+/// shown safe to delete, and what the owner lists in it can still be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_footer_holds_only_its_own_hour() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("mine", class_config(7 * DAY_MS)).await;
+    client.configure("other", class_config(7 * DAY_MS)).await;
+    assert!(node.seal_and_checkpoint().await);
+    let bad_id = publish_one(&mut client, "mine", 1, b"bad").await;
+    let bad = seal_path_of(&node).await;
+    let good_id = publish_one(&mut client, "other", 1, b"good").await;
+    seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+
+    let bytes = disk.store.get(&bad).await.unwrap().bytes().await.unwrap();
+    let mut flipped = bytes.to_vec();
+    let at = flipped.len() - 3;
+    flipped[at] ^= 0xFF;
+    disk.store
+        .put(&bad, PutPayload::from(flipped))
+        .await
+        .unwrap();
+
+    let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert!(!report.errors.is_empty(), "{report:?}");
+    assert!(
+        report.cursors.iter().all(|(_, cursor)| *cursor > 0),
+        "{report:?}"
+    );
+    assert_eq!(disk.extents("7d").await[0].1, good_id, "{report:?}");
+    assert_eq!(read_all(&node, "other", 1).await[0].0, good_id);
+    assert_eq!(read_all(&node, "mine", 1).await[0].0, bad_id);
+
+    // The record in that object was never copied, so it isn't deleted.
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    let report = node.expire_now().await.unwrap();
+    assert!(!disk.deleted().contains(&bad), "{report:?}");
+    assert!(
+        report
+            .blocked_prefixes
+            .contains(&"sealed/500000".to_owned())
+    );
+    assert_eq!(read_all(&node, "mine", 1).await[0].0, bad_id);
+    drop(client);
+    node.shutdown();
+}
+
+/// A corrupt record range doesn't stop a worker either, and stays where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_records_hold_only_their_own_hour() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("mine", class_config(7 * DAY_MS)).await;
+    client.configure("other", class_config(7 * DAY_MS)).await;
+    assert!(node.seal_and_checkpoint().await);
+    publish_one(&mut client, "mine", 1, b"bad").await;
+    let bad = seal_path_of(&node).await;
+    let good_id = publish_one(&mut client, "other", 1, b"good").await;
+    seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+
+    let bytes = disk.store.get(&bad).await.unwrap().bytes().await.unwrap();
+    let mut flipped = bytes.to_vec();
+    flipped[40] ^= 0xFF;
+    disk.store
+        .put(&bad, PutPayload::from(flipped))
+        .await
+        .unwrap();
+
+    let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert!(!report.errors.is_empty(), "{report:?}");
+    assert_eq!(disk.extents("7d").await[0].1, good_id, "{report:?}");
+    assert!(
+        report.cursors.iter().all(|(_, cursor)| *cursor > 0),
+        "{report:?}"
+    );
+
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    let report = node.expire_now().await.unwrap();
+    assert!(!disk.deleted().contains(&bad), "{report:?}");
+    assert!(
+        report
+            .blocked_prefixes
+            .contains(&"sealed/500000".to_owned())
+    );
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stray_huge_hour_prefix_is_left_alone_and_stops_nothing() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let stray =
+        Path::from("sealed/18446744073709551615/n/00000000000000000001-00000000000000000001.seg");
+    disk.store
+        .put(&stray, PutPayload::from_static(b"stray"))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let report = node.expire_now().await.expect("the compactor is running");
+        assert_eq!(report.deleted_prefixes, Vec::<String>::new());
+    }
+    assert!(disk.store.head(&stray).await.is_ok());
+    assert!(node.compact_now(&RetentionClass::ALL).await.is_some());
+    node.shutdown();
+}
+
+/// At expiry the class now decides, whichever way it moved after the workers went past (D176).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("lowered", class_config(30 * DAY_MS)).await;
+    let raised = publish_one(&mut client, "raised", 1, b"up").await;
+    publish_one(&mut client, "lowered", 1, b"down").await;
+    seal_path_of(&node).await;
+    assert!(node.seal_and_checkpoint().await);
+    node.compact_now(&[RetentionClass::Days7, RetentionClass::Days365])
+        .await
+        .unwrap();
+    client.configure("lowered", class_config(DAY_MS)).await;
+    client.configure("raised", class_config(7 * DAY_MS)).await;
+    node.compact_now(&[RetentionClass::Days30]).await.unwrap();
+    assert!(node.seal_and_checkpoint().await);
+
+    disk.clock.advance(SEALED_EXPIRY_MS + 2 * HOUR_MS);
+    node.expire_now().await.unwrap();
+    let copied = disk.extents("7d").await;
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    assert_eq!((copied[0].0.as_str(), copied[0].1), ("raised", raised));
+    assert!(disk.extents("30d").await.is_empty());
+
+    let report = node.expire_now().await.unwrap();
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+    assert_eq!(read_all(&node, "raised", 1).await[0].0, raised);
+    drop(client);
+    node.shutdown();
+}

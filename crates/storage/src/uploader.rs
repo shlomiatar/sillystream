@@ -21,7 +21,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::cache::SegmentCache;
-use crate::object::{dedicated_path, path_fits_stores, seal_path};
+use crate::object::{path_fits_stores, sealed_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
 
@@ -513,7 +513,8 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     return;
                 };
                 let (node, generation) = (self.config.node.clone(), self.config.generation);
-                let path = |first_id| seal_path(&node, generation, first_id);
+                let last_id = built.last_id.unwrap_or(first_id);
+                let path = |first_id| sealed_path(&node, generation, first_id, last_id);
                 self.upload(key, &path, first_id, built).await
             }
             Err(error) => {
@@ -548,7 +549,8 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     return;
                 };
                 let generation = self.config.generation;
-                let path = |first_id| dedicated_path(&stream, generation, first_id);
+                let last_id = built.last_id.unwrap_or(first_id);
+                let path = |first_id| sealed_path(&stream, generation, first_id, last_id);
                 self.upload(key, &path, first_id, built).await
             }
             Err(error) => {
