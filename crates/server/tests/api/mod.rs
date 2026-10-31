@@ -224,6 +224,8 @@ impl TestServer {
     pub async fn http(&self, request: &Http<'_>) -> HttpReply {
         let mut tls = self.tls().await;
         tls.write_all(&request.bytes()).await.unwrap();
+        // What the socket had no room for stays in rustls until this.
+        tls.flush().await.unwrap();
         read_http_reply(&mut tls).await
     }
 }
