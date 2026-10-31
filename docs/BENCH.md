@@ -503,3 +503,26 @@ target/release/sillystream bench idle-streams --cores 4 --idle-streams 20000
 | `LocalFileSystem` object store | 1024, 1640, 1854 | 1148, 1644, 1555 |
 
 The bench's tier columns also read 0 since D226 changed the trace line. That is fixed, and all three tiers above were confirmed by the bytes each reported. Without the trace flag, ordinary nodes never paid this cost. Other tables in this file weren't re-run.
+
+## WAL preallocation on the fsync path
+
+`cargo bench -p storage --bench wal_prealloc`, release, one run, macOS on the laptop's internal disk, temp dir. One 4 KiB append and `sync_data` per iteration, into a 256 MiB file that is sparse (what `set_len` gives, D51) or whose blocks were written and synced first.
+
+| file | time per append and sync |
+|---|---|
+| sparse | 4.38 ms |
+| blocks written first | 4.40 ms |
+
+No difference here, so D51 stays. On macOS `sync_data` is a full flush, which likely hides any cost of allocating. This says nothing about EBS or ext4 or XFS on Linux, where unwritten extents can cost more, and that is the case section 6.3 cares about. Not measured.
+
+## Stalled sinks, later runs
+
+`crates/server/tests/sink_stall.rs` in release on macOS, at the commit after D253. It reaches about 800,000 records a second with a scripted WAL, well above what a real fsync allows.
+
+| run | records in steady phase | baseline rec/s | stalled rec/s | ratio | filling, baseline rec/s | filling, stalled rec/s |
+|---|---|---|---|---|---|---|
+| 5 rounds | 30,000 | 857,141 | 670,726 | 0.783 | 1,006,546 | 395,632 |
+| 5 rounds | 30,000 | 783,835 | 627,341 | 0.800 | 1,027,514 | 401,643 |
+| 1 round | 3,000,000 | 980,060 | 713,129 | 0.728 | 1,025,938 | 244,263 |
+
+M9's acceptance still isn't met and no cause was isolated. A 2 s `sample` of the long run showed no sink or delivery function as a hot spot on the owning core. It did show the core spending about 15% of its samples re-arming its timer through `mio::Waker::wake`, but with or without sinks wasn't compared.
