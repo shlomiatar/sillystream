@@ -329,6 +329,8 @@ pub(crate) struct StreamDelivery {
     /// has lost records. Not saved, so a restart or an eviction forgets it (D178, Q32).
     pub expired_through: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
+    /// The highest epoch of a sink deleted here. Not saved: no delivery outlives a restart.
+    pub deleted_sink_epoch: u64,
     /// What a checkpoint may save: the stream as of its last record in the WAL. An entry for a
     /// publish a crash can erase would ack it on the retry, unwritten (D136, D154).
     pub saved_through: u64,
@@ -365,6 +367,7 @@ impl StreamDelivery {
             floor_id: 0,
             expired_through: 0,
             sinks: std::collections::BTreeMap::new(),
+            deleted_sink_epoch: 0,
             saved_through: 0,
             saved_state: (0, Bytes::new()),
             saved_dedupe: DedupeTable::new(),

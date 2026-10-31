@@ -353,7 +353,7 @@ impl<'a> Reading<'a> {
                 .ok_or_else(|| "the sink's filter isn't valid".to_owned())?,
             None => (Vec::new(), None),
         };
-        if kind == Kind::Deliver && spec.secret.is_none() {
+        if kind == Kind::Deliver && spec.secret.as_deref().is_none_or(str::is_empty) {
             return Err("webhook.deliver needs a secret".to_owned());
         }
         let config = &worker.context.config;

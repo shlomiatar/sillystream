@@ -2676,3 +2676,110 @@ fn only_global_unicast_passes_the_private_address_check() {
         assert!(!server::is_private_address(address), "{public}");
     }
 }
+
+// ---------- second M9 review ----------
+
+/// A key anyone can guess signs nothing, so a sink that got one by another way than HTTP stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliver_with_an_empty_secret_pauses_and_sends_nothing() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    send(&mut client, STREAM, b"one", 1).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.secret = Some(String::new());
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    let reason = wait_for_pause(&mut client, STREAM, 1).await;
+    assert!(reason.contains("secret"), "{reason}");
+    receiver.stays_at(0).await;
+    drop(client);
+    harness.finish();
+}
+
+/// A warning is about a position. A reset leaves that position, so a paused sink warns anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_sink_warns_about_its_new_position_after_a_reset() {
+    let (harness, _receiver, mut client, first) = stuck_sink("stop").await;
+    harness.clock.advance(DAY_MS - 3_600_000 + 1_000);
+    assert_eq!(wait_for_warning(&mut client).await, first);
+    set_paused(&mut client, STREAM, 1, true).await;
+    let second = send(&mut client, STREAM, b"second", 2).await;
+    send(&mut client, STREAM, b"third", 3).await;
+    client
+        .sink_op(
+            STREAM,
+            SinkOp::Reset {
+                sink_id: 1,
+                start: SinkStart::Id(second),
+            },
+        )
+        .await
+        .unwrap();
+    harness.clock.advance(DAY_MS - 3_600_000 + 1_000);
+    wait_until_warning_is(&mut client, second).await;
+    drop(client);
+    harness.finish();
+}
+
+async fn set_paused(client: &mut Client, stream: &str, sink_id: u64, paused: bool) {
+    client
+        .sink_op(stream, SinkOp::SetPaused { sink_id, paused })
+        .await
+        .unwrap();
+}
+
+async fn wait_until_warning_is(client: &mut Client, id: u64) {
+    let started = Instant::now();
+    loop {
+        let (spec, _) = sink_of(client, STREAM, 1).await;
+        if spec.expiry_warning_id == Some(id) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(WAIT_MS),
+            "the warning stayed at {:?}, not {id}",
+            spec.expiry_warning_id
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The old sink's delivery ends after the new one exists. Its commit is the old sink's, even
+/// with both made in one millisecond.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sink_recreated_in_the_same_millisecond_ignores_the_old_ones_commit() {
+    let (old, new) = (Receiver::start().await, Receiver::start().await);
+    old.answer(Answer::Hold);
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    put_sink(
+        &mut client,
+        STREAM,
+        1,
+        deliver_spec(&old.url()),
+        SinkStart::Earliest,
+    )
+    .await;
+    send(&mut client, STREAM, b"a", 1).await;
+    old.wait_for_count(1).await;
+    client
+        .sink_op(STREAM, SinkOp::Delete { sink_id: 1 })
+        .await
+        .unwrap();
+    put_sink(
+        &mut client,
+        STREAM,
+        1,
+        deliver_spec(&new.url()),
+        SinkStart::Earliest,
+    )
+    .await;
+    old.answer(Answer::Status(200));
+    old.release();
+    let seen = new.wait_for_count(1).await;
+    assert_eq!(seen[0].data(), b"a", "earliest includes it");
+    drop(client);
+    harness.finish();
+}

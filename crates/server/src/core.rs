@@ -3244,7 +3244,8 @@ impl Core {
                     spec.gap_count = existing.gap_count;
                     spec.epoch = existing.epoch;
                 } else {
-                    spec.epoch = now_ms;
+                    // Past any deleted sink's, whose delivery may still be ending (D195).
+                    spec.epoch = now_ms.max(delivery.deleted_sink_epoch.saturating_add(1));
                     delivery
                         .cursors
                         .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
@@ -3252,7 +3253,8 @@ impl Core {
                 delivery.sinks.insert(sink_id, spec);
             }
             SinkOp::Delete { sink_id } => {
-                delivery.sinks.remove(&sink_id).ok_or(ErrorCode::NotFound)?;
+                let spec = delivery.sinks.remove(&sink_id).ok_or(ErrorCode::NotFound)?;
+                delivery.deleted_sink_epoch = delivery.deleted_sink_epoch.max(spec.epoch);
                 delivery.cursors.remove(sink_cursor_name(sink_id).as_str());
             }
             SinkOp::SetPaused { sink_id, paused } => {
@@ -3270,6 +3272,8 @@ impl Core {
                     .get_mut(&sink_id)
                     .ok_or(ErrorCode::NotFound)?;
                 spec.epoch = now_ms.max(spec.epoch + 1);
+                // A warning is about the position just left.
+                spec.expiry_warning_id = None;
                 delivery
                     .cursors
                     .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));

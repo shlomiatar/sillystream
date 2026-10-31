@@ -1363,7 +1363,14 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
                     .filter(|count| *count > 0)
                     .ok_or_else(|| malformed("concurrency is a count above 0"))?;
             }
-            "secret" => spec.secret = Some(text(&value, "secret")?),
+            "secret" => {
+                let secret = text(&value, "secret")?;
+                if secret.is_empty() {
+                    // Anyone can compute an HMAC under an empty key.
+                    return Err(malformed("secret can't be empty"));
+                }
+                spec.secret = Some(secret);
+            }
             "interval_ms" => {
                 spec.interval_ms = value
                     .as_u64()
@@ -1414,6 +1421,14 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn an_empty_sink_secret_is_refused() {
+        let deliver = br#"{"kind":"webhook.deliver","url":"http://x/","secret":""}"#;
+        assert_eq!(parse_sink(deliver).err().map(|r| r.status), Some(400));
+        let notify = br#"{"kind":"webhook.notify","url":"http://x/","secret":""}"#;
+        assert_eq!(parse_sink(notify).err().map(|r| r.status), Some(400));
+    }
 
     #[test]
     fn a_stream_id_past_what_the_formats_hold_is_refused() {

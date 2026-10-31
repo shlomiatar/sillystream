@@ -784,6 +784,8 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
     assert_code(&call("PUT", "/v1/stream/k/sink/1", sink).await, 404, 2);
 
     let ids = seed(&server, "k", &[b"1", b"2"]).await;
+    let no_key = r#"{"kind":"webhook.deliver","url":"http://example.invalid/x","secret":""}"#;
+    assert_code(&call("PUT", "/v1/stream/k/sink/1", no_key).await, 400, 8);
     let created = call("PUT", "/v1/stream/k/sink/1", sink).await;
     assert_eq!(created.status, 200, "{}", created.text());
     let text_info = info().await.text();
