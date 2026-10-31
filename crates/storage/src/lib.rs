@@ -55,7 +55,7 @@ pub use wal_format::{
 };
 pub use wal_replay::{
     ReplayedEntry, ReplayedFile, WalFileInfo, list_wal_files, replay_bytes, replay_dir,
-    replay_file, wal_file_name,
+    replay_file, sync_wal_files, wal_file_name,
 };
 pub use wal_writer::{
     DirVolume, DurableNotify, DurableWatch, WalConfig, WalError, WalFile, WalHandle, WalRotated,

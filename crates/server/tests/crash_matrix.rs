@@ -336,6 +336,99 @@ matrix! {
     crash_after_the_ownership_write => "ownership.after_write",
 }
 
+/// An entry written and never synced stays in the page cache through a process crash, and a
+/// retry gets a level 2 ack for it: the restart has to make it durable first (section 7.2).
+/// `abort` can't show the power loss itself, so this checks the sync is done and reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_syncs_what_a_crash_left_unsynced_before_acking_it() {
+    let files = Files::new();
+    let mut producer = Producer::new(&files);
+    let mut doomed = start(&files, "doomed", Some("wal.before_fsync:3"));
+    let port = doomed.port.expect("it listens");
+    while producer.publish_next(port).await {}
+    let status = wait_for_exit(&mut doomed);
+    assert_eq!(status.signal(), Some(6), "{status}");
+    drop(doomed);
+    let unsynced_seq = *producer
+        .unknown
+        .last()
+        .expect("the crash left one unanswered");
+
+    let restarted_ms = now_ms();
+    let survivor = start(&files, "survivor", None);
+    let port = survivor.port.expect("a restart listens");
+    let first_id = producer
+        .publish(port, unsynced_seq)
+        .await
+        .expect("a retry is acked");
+    // From before the restart, so this is the replayed entry and not a new stamp.
+    assert!(first_id >> 16 < restarted_ms, "{first_id} is a new id");
+    let text = std::fs::read_to_string(&survivor.stderr).unwrap();
+    assert!(text.contains(", 1 WAL files synced"), "{text}");
+}
+
+fn run_to_kill(files: &Files, name: &str) {
+    let running = start(files, name, None);
+    assert!(running.port.is_some());
+    drop(running);
+}
+
+/// A start before the WAL volume is mounted fences the WAL's entries off for good (section 8.1).
+/// Nothing here gets them back, but the start that drops them says so, and their file stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn entries_a_generation_fenced_off_are_warned_of_and_their_file_is_kept() {
+    let files = Files::new();
+    let mut producer = Producer::new(&files);
+    let first = start(&files, "first", None);
+    let port = first.port.expect("it listens");
+    for _ in 0..3 {
+        assert!(producer.publish_next(port).await);
+    }
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    for _ in 0..7 {
+        assert!(producer.publish_next(port).await);
+    }
+    drop(first);
+
+    let (wal, aside) = (files.path("wal"), files.path("wal.aside"));
+    std::fs::rename(&wal, &aside).unwrap();
+    std::fs::create_dir(&wal).unwrap();
+    run_to_kill(&files, "unmounted");
+    std::fs::remove_dir_all(&wal).unwrap();
+    std::fs::rename(&aside, &wal).unwrap();
+    let wal_files_before: Vec<u64> = storage::list_wal_files(&wal)
+        .unwrap()
+        .iter()
+        .map(|file| file.seq)
+        .collect();
+
+    let mounted = start(&files, "mounted", None);
+    let port = mounted.port.expect("it listens");
+    let text = std::fs::read_to_string(&mounted.stderr).unwrap();
+    assert!(text.contains(" WAL entries are above"), "{text}");
+    // More than one seal window, for a recycle to have happened if one was going to.
+    assert!(producer.publish_next(port).await);
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    drop(mounted);
+    let holding_entries: Vec<u64> = storage::list_wal_files(&wal)
+        .unwrap()
+        .into_iter()
+        .filter(|file| wal_files_before.contains(&file.seq))
+        .filter(|file| {
+            let replayed = storage::replay_file(file).unwrap();
+            replayed.entries.iter().any(|entry| entry.stream == STREAM)
+        })
+        .map(|file| file.seq)
+        .collect();
+    assert!(!holding_entries.is_empty(), "the fenced entries are gone");
+
+    // It goes on saying so, for as long as those entries are there.
+    let again = start(&files, "again", None);
+    assert!(again.port.is_some());
+    let text = std::fs::read_to_string(&again.stderr).unwrap();
+    assert!(text.contains(" WAL entries are above"), "{text}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binary_warns_of_an_empty_wal_only_when_a_generation_exists() {
     let files = Files::new();

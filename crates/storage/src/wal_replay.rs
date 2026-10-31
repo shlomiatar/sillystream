@@ -141,6 +141,16 @@ pub fn list_wal_files(dir: &Path) -> io::Result<Vec<WalFileInfo>> {
     Ok(files)
 }
 
+/// Makes every file in `files`, and `dir` itself, durable. A crashed process's writes may reach
+/// no further than the page cache, and a replayed entry can be acked at level 2 (section 7.2).
+/// A read-only handle is enough, since a sync covers the file and not the handle's own writes.
+pub fn sync_wal_files(dir: &Path, files: &[WalFileInfo]) -> io::Result<()> {
+    for file in files {
+        std::fs::File::open(&file.path)?.sync_data()?;
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
 pub fn replay_file(file: &WalFileInfo) -> io::Result<ReplayedFile> {
     let bytes = Bytes::from(std::fs::read(&file.path)?);
     Ok(replay_bytes(&bytes, file.seq))

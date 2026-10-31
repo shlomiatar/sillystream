@@ -13,7 +13,7 @@ use object_store::path::Path;
 use storage::{
     CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership, SegmentReader,
     StreamExtent, StreamMeta, claim_generation, list_sealed_objects, list_wal_files,
-    object_generation, read_ownership, replay_file,
+    object_generation, read_ownership, replay_file, sync_wal_files,
 };
 
 use crate::compaction::MANIFEST_STREAM;
@@ -41,8 +41,12 @@ pub struct RecoveryReport {
     /// there is no telling how many (section 8.1).
     pub wal_lost: bool,
     pub replayed_entry_count: u64,
+    /// WAL files found and made durable before anything could be acked from them (D227).
+    pub synced_wal_file_count: u64,
     /// WAL entries above their former generation's limit, left out of replay (section 8.1).
     pub ignored_entry_count: u64,
+    /// The files holding those. Never recycled, since no segment covers them (D228).
+    pub kept_wal_seqs: Vec<u64>,
     pub restored_stream_count: u64,
     /// Objects no checkpoint knew of, whose extents were looked at.
     pub scanned_object_count: u64,
@@ -59,6 +63,22 @@ impl RecoveryReport {
                 "warning: wal_dir is empty but generation {} already existed: the WAL was lost, \
                  and unsealed records may be gone. It can't tell how many.",
                 self.generation.saturating_sub(1)
+            )
+        })
+    }
+
+    /// What a former generation's limit ruled out (section 8.1). A former owner still running
+    /// wrote it, or a start with `wal_dir` empty, say before its volume was mounted, fenced off
+    /// what was on that volume. In the second case acked records are among it (D228).
+    pub fn fenced_warning(&self) -> Option<String> {
+        (self.ignored_entry_count > 0 || self.ignored_extent_count > 0).then(|| {
+            format!(
+                "warning: {} WAL entries are above their generation's last valid id, and so are \
+                 {} object extents. They were left out and can't be read, and any acked records \
+                 among them are gone from the stream. An earlier start with an empty wal_dir, \
+                 such as one before its volume was mounted, causes this. WAL files {:?} are kept \
+                 and not recycled; remove them by hand when they are not wanted.",
+                self.ignored_entry_count, self.ignored_extent_count, self.kept_wal_seqs
             )
         })
     }
@@ -474,6 +494,9 @@ pub(crate) async fn prepare(
         .map_err(|error| error.to_string())?;
     let wal_files = list_wal_files(wal_dir).map_err(|error| error.to_string())?;
     report.wal_lost = wal_files.is_empty() && ownership.current_generation().is_some();
+    // A crash can leave entries no sync covered, and they count as durable from here on (D227).
+    sync_wal_files(wal_dir, &wal_files).map_err(|error| error.to_string())?;
+    report.synced_wal_file_count = wal_files.len() as u64;
 
     put_owed_checkpoint(&local_store, store).await?;
     let mut checkpoints = CheckpointSet::read(store, ownership.clone())
@@ -522,6 +545,10 @@ pub(crate) async fn prepare(
         for entry in replayed.entries {
             if limit.is_some_and(|limit| entry_is_above(&entry, limit)) {
                 report.ignored_entry_count += 1;
+                if report.kept_wal_seqs.last() != Some(&file.seq) {
+                    report.kept_wal_seqs.push(file.seq);
+                    closed_seqs.retain(|seq| *seq != file.seq);
+                }
                 continue;
             }
             report.replayed_entry_count += 1;

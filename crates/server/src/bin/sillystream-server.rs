@@ -185,14 +185,18 @@ fn run() -> Result<(), String> {
         clock(),
     )
     .map_err(|error| error.to_string())?;
-    if let Some(warning) = report.warning() {
+    for warning in [report.warning(), report.fenced_warning()]
+        .into_iter()
+        .flatten()
+    {
         eprintln!("sillystream-server: {warning}");
     }
     eprintln!(
-        "sillystream-server: generation {}, last valid id {}, {} WAL entries replayed, {} streams \
-         restored, {} objects looked at",
+        "sillystream-server: generation {}, last valid id {}, {} WAL files synced, {} WAL entries \
+         replayed, {} streams restored, {} objects looked at",
         report.generation,
         report.last_valid_id,
+        report.synced_wal_file_count,
         report.replayed_entry_count,
         report.restored_stream_count,
         report.scanned_object_count
