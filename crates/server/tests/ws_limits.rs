@@ -720,3 +720,129 @@ async fn a_ping_flood_doesnt_outlive_the_hello_deadline() {
     );
     server.server.shutdown();
 }
+
+/// Frames a connection has taken for its socket are out of the core's reach, and each can keep
+/// a whole slab alive for one matching byte. A client that stops reading must not keep them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_that_stops_cant_keep_the_memory_cap_pinned() {
+    const CAP_BYTES: u64 = 8 * 1024 * 1024;
+    let mut node = node_config(1);
+    node.slab_bytes = 64 * 1024;
+    node.memory_cap_bytes = CAP_BYTES;
+    let server = start_node(node);
+    let mut writer = server.ws(&token(ALL)).await;
+    writer.open(1, "pin").await;
+    writer
+        .publish(1, 1, AckLevel::WalFsync, &record(0, b"first"))
+        .await;
+    assert!(matches!(writer.recv_owned().await, Owned::Ack { .. }));
+
+    // A small receive buffer, and a token that can do nothing but read.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let socket = socket.connect(server.server.local_addr()).await.unwrap();
+    let tls = server
+        .connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    let url = format!(
+        "wss://localhost:{}/v1/ws",
+        server.server.local_addr().port()
+    );
+    let (socket, _) = tokio_tungstenite::client_async(url, tls).await.unwrap();
+    let mut stalled = Ws { socket };
+    let reader = token_at(START_MS + 3_600_000, 5, &[("pin", READ)]);
+    stalled
+        .send(&ClientFrame::Hello {
+            ver: 1,
+            token: &reader,
+        })
+        .await;
+    assert!(matches!(stalled.recv_owned().await, Owned::Welcome { .. }));
+    let clauses = proto::WireClauses::new(&[proto::WireClause {
+        mask: 1,
+        value: 1,
+        op: 0,
+    }])
+    .unwrap();
+    stalled
+        .send(&ClientFrame::Subscribe(proto::Subscribe {
+            sub: 1,
+            from: u64::MAX,
+            linger_ms: 0,
+            author: None,
+            clauses,
+            stream: "pin",
+            name: None,
+            with_state: false,
+            state_only: false,
+            include_system: false,
+        }))
+        .await;
+    assert!(matches!(
+        stalled.recv_owned().await,
+        Owned::Subscribed { .. }
+    ));
+
+    // A small match beside a big miss, so that nearly every match is on its own slab.
+    let matching = record(1, &[7u8; 1_000]);
+    let missing = record(0, &vec![0u8; 60 * 1024]);
+    let mut seq = 1;
+    for round in 0..250 {
+        for _ in 0..16 {
+            seq += 1;
+            writer.publish(1, seq, AckLevel::WalFsync, &matching).await;
+            seq += 1;
+            writer.publish(1, seq, AckLevel::WalFsync, &missing).await;
+        }
+        for _ in 0..32 {
+            let got = writer.recv_within(8_000).await;
+            assert!(
+                matches!(got, Some(Owned::Ack { .. })),
+                "round {round}: {got:?}, pinned {}",
+                server.server.pinned_bytes()
+            );
+        }
+        server.server.node().seal().await;
+    }
+    // Everything is sealed and the client still hasn't read: nothing should be held for it.
+    let mut pinned_bytes = u64::MAX;
+    for _ in 0..200 {
+        server.server.node().seal().await;
+        pinned_bytes = server.server.pinned_bytes();
+        if pinned_bytes < CAP_BYTES / 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(pinned_bytes < CAP_BYTES / 2, "pinned {pinned_bytes}");
+
+    // It can still start reading again: frames arrive whole, in order, ending in `BEHIND`.
+    let mut last_id = 0;
+    let mut behind = false;
+    while let Some(frame) = stalled.recv_within(1_000).await {
+        match frame {
+            Owned::Data { records, .. } => {
+                for (id, options, _, data) in parse_records(&records) {
+                    assert!(id > last_id);
+                    assert_eq!((options, data.len()), (1, 1_000));
+                    last_id = id;
+                }
+            }
+            Owned::Progress { id, .. } => {
+                assert!(id >= last_id);
+                last_id = id;
+            }
+            Owned::Behind { resume_from, .. } => {
+                assert_eq!(resume_from, last_id);
+                behind = true;
+                break;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(last_id > 0 && behind);
+    drop((writer, stalled));
+    server.server.shutdown();
+}

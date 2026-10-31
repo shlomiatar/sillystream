@@ -43,6 +43,10 @@ const CLOSE_TIMEOUT_MS: u64 = 1_000;
 /// More frames from the node wait when this many `DATA` bytes wait for the socket. So the
 /// connection's window sees a slow client (D91).
 const OUT_DATA_HIGH_BYTES: u64 = 256 * 1024;
+/// Frames on their way to the socket keep whole slabs alive for bytes that may be few, out of the
+/// reach of the core's take-back. After this long what they hold is copied out, so a client not
+/// reading keeps only `OUT_DATA_HIGH_BYTES` of its own heap and no slab (D132).
+const OUT_PART_HOLD_MS: u64 = 50;
 /// Commands stop being read when this many reply bytes wait for the socket, which bounds
 /// what a client can make the server hold by never reading (D102).
 const OUT_REPLY_HIGH_BYTES: u64 = 1024 * 1024;
@@ -75,6 +79,9 @@ struct OutQueue {
     chunks: VecDeque<Chunk>,
     reply_bytes: u64,
     data_bytes: u64,
+    /// `Chunk::Part`s waiting, and since when any have been.
+    part_count: usize,
+    parts_since: Option<Instant>,
 }
 
 impl OutQueue {
@@ -114,6 +121,10 @@ impl OutQueue {
             at: 0,
             reply: false,
         });
+        if self.part_count == 0 && !parts.is_empty() {
+            self.parts_since = Some(Instant::now());
+        }
+        self.part_count += parts.len();
         for part in parts {
             self.data_bytes += part.as_bytes().len() as u64;
             self.chunks.push_back(Chunk::Part {
@@ -140,13 +151,51 @@ impl OutQueue {
             } else {
                 self.data_bytes -= taken_bytes as u64;
             }
-            if *at == chunk_bytes {
-                self.chunks.pop_front();
+            if *at == chunk_bytes
+                && let Some(Chunk::Part { .. }) = self.chunks.pop_front()
+            {
+                self.part_count -= 1;
+                if self.part_count == 0 {
+                    self.parts_since = None;
+                }
             }
         }
         if self.chunks.is_empty() && self.chunks.capacity() > 16 {
             self.chunks = VecDeque::new();
         }
+    }
+
+    /// Copies what `DATA` chunks have left to write into owned ones, which lets go of their slabs.
+    /// The bytes and their order don't change.
+    fn release_parts(&mut self) {
+        let mut chunks = VecDeque::with_capacity(self.chunks.len().min(16));
+        for chunk in self.chunks.drain(..) {
+            let left: &[u8] = match &chunk {
+                Chunk::Owned { reply: true, .. } => {
+                    chunks.push_back(chunk);
+                    continue;
+                }
+                Chunk::Owned { bytes, at, .. } => &bytes[*at..],
+                Chunk::Part { part, at } => &part.as_bytes()[*at..],
+            };
+            if let Some(Chunk::Owned {
+                bytes,
+                reply: false,
+                ..
+            }) = chunks.back_mut()
+            {
+                bytes.extend_from_slice(left);
+            } else {
+                chunks.push_back(Chunk::Owned {
+                    bytes: left.to_vec(),
+                    at: 0,
+                    reply: false,
+                });
+            }
+        }
+        self.chunks = chunks;
+        self.part_count = 0;
+        self.parts_since = None;
     }
 
     /// Writes until the socket has no room. Rustls copies what it encrypts, so this is the one
@@ -233,6 +282,7 @@ enum Wake {
     Retry,
     Readable(io::Result<()>),
     Expiry,
+    ReleaseParts,
     HelloTimeout,
     PartialTimeout,
 }
@@ -336,6 +386,10 @@ impl WsConn<'_> {
             let partial_deadline = self.update_partial_deadline();
             let no_session = self.session.is_none();
             let hello_deadline = self.hello_deadline;
+            let release_parts_at = self
+                .out
+                .parts_since
+                .map(|since| since + Duration::from_millis(OUT_PART_HOLD_MS));
             let expiry = self.expiry_wait();
             let close_wait = self.closing;
             let read_again = self.read_again;
@@ -349,6 +403,7 @@ impl WsConn<'_> {
                 // Timers first: a steady flow below is always ready, and must not starve them.
                 _ = sleep_until_some(retry_at) => Wake::Retry,
                 _ = sleep_until_some(partial_deadline) => Wake::PartialTimeout,
+                _ = sleep_until_some(release_parts_at) => Wake::ReleaseParts,
                 _ = tokio::time::sleep_until(hello_deadline), if no_session => Wake::HelloTimeout,
                 _ = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => Wake::Expiry,
                 ready = tcp.writable(), if want_write => Wake::Writable(ready),
@@ -405,6 +460,7 @@ impl WsConn<'_> {
                     self.on_readable().await?;
                 }
                 Wake::Expiry => self.on_expiry(),
+                Wake::ReleaseParts => self.out.release_parts(),
                 Wake::HelloTimeout => {
                     self.send_error(0, ErrorCode::Unauthorized, "no HELLO in time");
                     self.close(1008);
