@@ -177,5 +177,100 @@ fn one_at_a_time(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, free_running, one_at_a_time);
+/// Group commit: `publisher_count` publishers, each waiting for its entry to be durable before
+/// sending the next, as a level 2 producer with one outstanding does. Each has its own wake-up.
+fn group_commit(c: &mut Criterion) {
+    const ENTRY_BYTES: usize = 256;
+    let mut group = c.benchmark_group("wal_group_commit");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(4));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .build()
+        .unwrap();
+    for publisher_count in [1usize, 4, 16, 64, 256, 1024] {
+        group.throughput(Throughput::Elements(1));
+        let totals = Arc::new(Mutex::new(Totals::default()));
+        let run_totals = Arc::clone(&totals);
+        let handle = runtime.handle().clone();
+        group.bench_function(format!("{publisher_count}p"), move |b| {
+            b.iter_custom(|iters| {
+                let dir = tempfile::tempdir_in(bench_dir()).unwrap();
+                let (notify, receivers) = durable_watches(publisher_count);
+                let (sender, writer) = start_wal_writer::<Bytes, _, _>(
+                    DirVolume::new(dir.path(), PREALLOCATE_BYTES),
+                    notify,
+                    WalConfig {
+                        first_seq: 1,
+                        closed_seqs: Vec::new(),
+                        channel_capacity: CHANNEL_CAPACITY,
+                    },
+                )
+                .unwrap();
+                let records = Bytes::from(vec![0xABu8; ENTRY_BYTES]);
+                let stream: Arc<str> = Arc::from("bench.stream");
+                let per_publisher = iters.div_ceil(publisher_count as u64);
+                let start = Instant::now();
+                let tasks: Vec<_> = receivers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(core, mut receiver)| {
+                        let sender = sender.clone();
+                        let records = records.clone();
+                        let stream = Arc::clone(&stream);
+                        handle.spawn(async move {
+                            for ticket in 1..=per_publisher {
+                                let entry = WalEntry::new(
+                                    Arc::clone(&stream),
+                                    core as u64,
+                                    ticket,
+                                    records.clone(),
+                                    core,
+                                    ticket,
+                                )
+                                .unwrap();
+                                assert!(sender.try_append(entry).is_ok());
+                                while *receiver.borrow_and_update() < ticket {
+                                    receiver.changed().await.unwrap();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                drop(sender);
+                handle.block_on(async {
+                    for task in tasks {
+                        task.await.unwrap();
+                    }
+                });
+                let elapsed = start.elapsed();
+                let stats = writer.join().unwrap();
+                let mut totals = run_totals.lock().unwrap();
+                totals.elapsed += elapsed;
+                totals.stats.entry_count += stats.entry_count;
+                totals.stats.sync_count += stats.sync_count;
+                totals.stats.largest_group_count = totals
+                    .stats
+                    .largest_group_count
+                    .max(stats.largest_group_count);
+                // Criterion's count is per entry, and rounding up to a whole round sent a few more.
+                elapsed.mul_f64(iters as f64 / stats.entry_count.max(1) as f64)
+            })
+        });
+        let totals = totals.lock().unwrap();
+        let seconds = totals.elapsed.as_secs_f64();
+        println!(
+            "GROUP {publisher_count}p: {:.0} entries/s, {:.0} fsyncs/s, mean group {:.1}, \
+             largest group {}",
+            totals.stats.entry_count as f64 / seconds,
+            totals.stats.sync_count as f64 / seconds,
+            totals.stats.entry_count as f64 / totals.stats.sync_count.max(1) as f64,
+            totals.stats.largest_group_count,
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, free_running, one_at_a_time, group_commit);
 criterion_main!(benches);

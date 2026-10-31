@@ -19,7 +19,7 @@ use storage::{WalFile, WalVolume};
 const AUTHOR: NonZeroU64 = NonZeroU64::new(9).unwrap();
 const DATA_BYTES: usize = 256;
 const SUBSCRIBER_COUNTS: [usize; 3] = [1, 100, 10_000];
-const FILTER_COUNTS: [usize; 3] = [1, 10, 100];
+const FILTER_COUNTS: [usize; 4] = [1, 10, 100, 10_000];
 const CORE_COUNTS: [usize; 2] = [1, 8];
 const CONNECTION_COUNT: usize = 16;
 const OUTSTANDING_COUNT: u64 = 64;

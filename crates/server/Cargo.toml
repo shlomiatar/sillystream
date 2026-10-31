@@ -59,3 +59,7 @@ harness = false
 [[bench]]
 name = "fan_out"
 harness = false
+
+[[bench]]
+name = "slab_alloc"
+harness = false

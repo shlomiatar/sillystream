@@ -138,5 +138,85 @@ fn bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench);
+/// One buffer of `count` records with options, authors and lengths from a small generator, so
+/// that the branch in each filter isn't predictable. Ids count up by one.
+fn kinds_buffer(count: usize) -> Vec<u8> {
+    const FIRST_ID: u64 = 1_800_000_000_000 << 16;
+    let mut bytes = Vec::with_capacity(count * (32 + DATA.len()));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for at in 0..count {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let header = RecordHeader {
+            id: FIRST_ID + at as u64,
+            options: state,
+            author: 1 + (state >> 60),
+            len: DATA.len() as u32,
+            count: 1,
+            codec: 0,
+        };
+        encode_record(&mut bytes, &header, &DATA).unwrap();
+    }
+    bytes
+}
+
+/// Section 4's kinds, each scanned over 1,000 and 100,000 headers one at a time: nothing here
+/// looks at a summary. Match rates come from random options and are printed, not chosen.
+fn kinds(c: &mut Criterion) {
+    let mut group = c.benchmark_group("filter_kinds");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(200));
+    group.measurement_time(Duration::from_secs(1));
+    for count in [1_000usize, 100_000] {
+        let bytes = kinds_buffer(count);
+        let first_id = 1_800_000_000_000u64 << 16;
+        let eq = Clause::Eq {
+            mask: 0xF000_0000,
+            value: 0x3000_0000,
+        };
+        let any = Clause::Any { mask: 0xF000_0000 };
+        let miss = |bit: u32| Clause::Eq {
+            mask: 0xFFFF << bit,
+            value: 0x1234 << bit,
+        };
+        let all_records = Filter::new(&[]).unwrap();
+        let mut author = all_records;
+        author.author = Some(3);
+        let mut time = all_records;
+        time.id_first = first_id + count as u64 / 4;
+        time.id_last = first_id + count as u64 / 2;
+        let mut combined = Filter::new(&[eq, any]).unwrap();
+        combined.author = Some(3);
+        combined.id_first = time.id_first;
+        combined.id_last = time.id_last;
+        let cases = [
+            ("no_clause", all_records),
+            ("eq", Filter::new(&[eq]).unwrap()),
+            ("any", Filter::new(&[any]).unwrap()),
+            ("author", author),
+            ("time_range", time),
+            (
+                "four_clauses",
+                Filter::new(&[miss(0), miss(16), miss(32), eq]).unwrap(),
+            ),
+            ("all_kinds", combined),
+        ];
+        group.throughput(Throughput::Elements(count as u64));
+        for (name, filter) in cases {
+            let scan = |filter: &Filter, bytes: &[u8]| {
+                Records::new(bytes)
+                    .filter(|record| filter.matches(&record.as_ref().unwrap().header))
+                    .count()
+            };
+            println!("MATCHES {name} over {count}: {}", scan(&filter, &bytes));
+            group.bench_function(BenchmarkId::new(name, count), |b| {
+                b.iter(|| black_box(scan(black_box(&filter), black_box(&bytes))))
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench, kinds);
 criterion_main!(benches);

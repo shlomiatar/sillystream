@@ -8,7 +8,7 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use format::{RecordHeader, encode_record, validate_publish};
 
-const RECORD_COUNTS: [u64; 3] = [1, 100, 10_000];
+const RECORD_COUNTS: [u64; 5] = [1, 12, 100, 1_000, 10_000];
 const DATA_BYTES: [usize; 3] = [8, 256, 4096];
 const AUTHOR: NonZeroU64 = NonZeroU64::new(7).unwrap();
 const FIRST_ID: u64 = 1_800_000_000_000 << 16;

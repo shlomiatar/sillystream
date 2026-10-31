@@ -322,6 +322,14 @@ fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
         "50",
         "--cores",
         "1",
+        "--seal-windows",
+        "1000",
+        "--subscribers",
+        "1",
+        "--wal-mib",
+        "0,1",
+        "--runs",
+        "1",
     ]);
     for row in [
         "| 0 | publish to delivery",
@@ -334,6 +342,13 @@ fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
     assert!(output.contains("### Throughput"), "{output}");
     assert!(output.contains("| 2 | 4 | 65536 |"), "{output}");
     assert!(output.contains("| 50 |"), "{output}");
+    assert!(output.contains("### Ack levels by seal window"), "{output}");
+    assert!(output.contains("| 1000 | 3 | 1 stream, 50/s |"), "{output}");
+    assert!(output.contains("### Fan-out"), "{output}");
+    assert!(output.contains("| 1 | 1 | flat out |"), "{output}");
+    // 256 records of 4,096 bytes, all acked, then all read back after the crash.
+    assert!(output.contains("### Recovery"), "{output}");
+    assert!(output.contains("| 1 | 1 | 256 |"), "{output}");
     drop(fixture.dir);
     drop(fixture.server.shutdown());
 }

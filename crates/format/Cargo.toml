@@ -21,3 +21,7 @@ harness = false
 [[bench]]
 name = "stamping"
 harness = false
+
+[[bench]]
+name = "record_codec"
+harness = false

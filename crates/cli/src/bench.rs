@@ -41,6 +41,7 @@ struct ServerSettings {
     cores: u64,
     seal_window_ms: u64,
     active_stream_limit: Option<u64>,
+    memory_cap_bytes: Option<u64>,
 }
 
 fn server_bin(args: &Args) -> Result<PathBuf, String> {
@@ -66,6 +67,7 @@ fn start_server(bin: &Path, cores: u64) -> Result<ServerChild, String> {
             cores,
             seal_window_ms: SEAL_WINDOW_MS,
             active_stream_limit: None,
+            memory_cap_bytes: None,
         },
     )
 }
@@ -141,6 +143,9 @@ fn spawn_server(
         .stderr(stderr);
     if let Some(limit) = settings.active_stream_limit {
         command.args(["--active-stream-limit", &limit.to_string()]);
+    }
+    if let Some(cap_bytes) = settings.memory_cap_bytes {
+        command.args(["--memory-cap-bytes", &cap_bytes.to_string()]);
     }
     let mut child = command
         .spawn()
@@ -603,6 +608,7 @@ async fn catch_up(args: &Args, bin: &Path) -> Result<(), String> {
             // The longest window, so that the first reads find it all still in memory.
             seal_window_ms: 120_000,
             active_stream_limit: None,
+            memory_cap_bytes: None,
         },
     )?;
     let stream = "catchup";
@@ -794,6 +800,7 @@ async fn idle_streams(args: &Args, bin: &Path) -> Result<(), String> {
                 cores,
                 seal_window_ms: SEAL_WINDOW_MS,
                 active_stream_limit: limit,
+                memory_cap_bytes: None,
             },
         )?;
         let client = server.client().await?;
@@ -843,6 +850,757 @@ async fn idle_streams(args: &Args, bin: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Log-spaced buckets, 32 per doubling of µs, so that about 2% is the resolution and a sample
+/// costs one atomic add, which is what lets a run take every delivery as a sample.
+struct Histogram {
+    buckets: Vec<AtomicU64>,
+    sample_count: AtomicU64,
+}
+
+impl Histogram {
+    fn new() -> Histogram {
+        Histogram {
+            buckets: (0..32 * 40).map(|_| AtomicU64::new(0)).collect(),
+            sample_count: AtomicU64::new(0),
+        }
+    }
+
+    fn add(&self, micros: f64) {
+        let at = (micros.max(1.0).log2() * 32.0) as usize;
+        self.buckets[at.min(self.buckets.len() - 1)].fetch_add(1, Ordering::Relaxed);
+        self.sample_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The top of the bucket holding that sample, so slightly over and never under.
+    fn percentile_us(&self, fraction: f64) -> f64 {
+        let total = self.sample_count.load(Ordering::Relaxed);
+        let rank = ((total as f64 * fraction).ceil() as u64).max(1);
+        let mut seen = 0;
+        for (at, bucket) in self.buckets.iter().enumerate() {
+            seen += bucket.load(Ordering::Relaxed);
+            if seen >= rank {
+                return 2f64.powf((at + 1) as f64 / 32.0);
+            }
+        }
+        f64::NAN
+    }
+
+    fn cells(&self) -> String {
+        if self.sample_count.load(Ordering::Relaxed) == 0 {
+            return "none | none | none".to_owned();
+        }
+        format!(
+            "{:.0} | {:.0} | {:.0}",
+            self.percentile_us(0.50),
+            self.percentile_us(0.99),
+            self.percentile_us(0.999),
+        )
+    }
+}
+
+/// The record's data is `DATA_OFFSET` into it, and starts with µs since `zero`, for the far end.
+const DATA_OFFSET: usize = 32;
+
+fn stamp_sent_at(body: &mut [u8], zero: Instant) {
+    let micros = zero.elapsed().as_micros() as u64;
+    body[DATA_OFFSET..DATA_OFFSET + 8].copy_from_slice(&micros.to_le_bytes());
+}
+
+fn take_sent_at(bytes: &[u8], zero: Instant) -> Result<f64, String> {
+    let head: [u8; 8] = bytes
+        .get(..8)
+        .and_then(|head| head.try_into().ok())
+        .ok_or("an item shorter than its time")?;
+    let sent = u64::from_le_bytes(head);
+    let now = zero.elapsed().as_micros() as u64;
+    // A wrong offset would otherwise read as a very odd latency instead of as a bug here.
+    if sent > now {
+        return Err(format!("an item sent at {sent} µs, and it is {now} µs"));
+    }
+    Ok((now - sent) as f64)
+}
+
+struct LoadRun {
+    sent_count: u64,
+    acked_count: u64,
+    failed_count: u64,
+    seconds: f64,
+    delivered_count: u64,
+    delivered_seconds: f64,
+    acks: Arc<Histogram>,
+    deliveries: Arc<Histogram>,
+}
+
+#[derive(Clone, Copy)]
+struct LoadShape {
+    ack: AckLevel,
+    stream_count: u64,
+    /// Answers waited for per stream, and past it the sender waits.
+    outstanding_count: usize,
+    /// Publishes per second per stream, spaced evenly and not waiting for acks. 0 is as fast as
+    /// `outstanding_count` lets it.
+    rate_per_second: u64,
+    data_bytes: usize,
+    seconds: u64,
+    /// A subscriber on each stream, for level 0, which has nothing else to show what arrived.
+    with_subscriber: bool,
+}
+
+/// `stream_count` streams with a connection each, for `seconds`. At a set rate an ack is timed
+/// from when its publish was due, so a stall counts against everything it delayed. In a closed
+/// window it is timed from taking a slot: waiting for one is waiting for the publish before it,
+/// and a stall can hide in the samples the window held back.
+async fn load_run(server: &ServerChild, shape: LoadShape) -> Result<LoadRun, String> {
+    let acks = Arc::new(Histogram::new());
+    let deliveries = Arc::new(Histogram::new());
+    let (sent, acked, failed) = (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let delivered = Arc::new(AtomicU64::new(0));
+    let zero = Instant::now();
+    let mut body = record(shape.data_bytes.max(8))?;
+    let bytes_each = body.len();
+    let mut publishers = Vec::new();
+    let mut readers = Vec::new();
+    for at in 0..shape.stream_count {
+        let client = server.client().await?;
+        let stream = format!("load.{at}");
+        let mut publisher = client
+            .publisher(
+                &stream,
+                PublisherConfig {
+                    ack: shape.ack,
+                    max_inflight_bytes: (64 * 1024 * 1024)
+                        .max(bytes_each * shape.outstanding_count.max(16)),
+                    ..PublisherConfig::default()
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        // The stream has to exist before a subscriber can be on it. Level 1 for this one, since
+        // level 0 wouldn't say when it does.
+        let mut opener = client
+            .publisher(&stream, publisher_config(AckLevel::Memory))
+            .map_err(|error| error.to_string())?;
+        stamp_sent_at(&mut body, zero);
+        opener
+            .send_records(&body, None)
+            .await
+            .map_err(|error| error.to_string())?
+            .wait()
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(opener);
+        if shape.with_subscriber {
+            let reader = server.client().await?;
+            let mut subscription = reader
+                .subscribe(Subscribe::new(&stream, FROM_LIVE))
+                .map_err(|error| error.to_string())?;
+            wait_subscribed(&mut subscription).await?;
+            let (delivered, deliveries) = (Arc::clone(&delivered), Arc::clone(&deliveries));
+            readers.push(tokio::spawn(async move {
+                let _reader = reader;
+                while let Some(Ok(event)) = subscription.next().await {
+                    if let Event::Items(items) = event {
+                        for item in &items {
+                            if let Ok(micros) = take_sent_at(&item.bytes, zero) {
+                                deliveries.add(micros);
+                            }
+                        }
+                        delivered.fetch_add(items.len() as u64, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        let mut body = body.clone();
+        let (sent, acked, failed, acks) = (
+            Arc::clone(&sent),
+            Arc::clone(&acked),
+            Arc::clone(&failed),
+            Arc::clone(&acks),
+        );
+        let slots = Arc::new(Semaphore::new(shape.outstanding_count));
+        let seconds = shape.seconds;
+        let rate = shape.rate_per_second;
+        let track_acks = shape.ack != AckLevel::None;
+        let outstanding_count = shape.outstanding_count as u32;
+        publishers.push(tokio::spawn(async move {
+            let _client = client;
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(seconds);
+            let mut sent_here = 0u64;
+            while Instant::now() < deadline {
+                let due = (rate > 0)
+                    .then(|| started + Duration::from_secs_f64(sent_here as f64 / rate as f64));
+                if let Some(due) = due {
+                    tokio::time::sleep_until(due.into()).await;
+                }
+                let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+                let begun = due.unwrap_or_else(Instant::now);
+                stamp_sent_at(&mut body, zero);
+                let wait = publisher
+                    .send_records(&body, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                sent_here += 1;
+                sent.fetch_add(1, Ordering::Relaxed);
+                let (acked, failed, acks) =
+                    (Arc::clone(&acked), Arc::clone(&failed), Arc::clone(&acks));
+                tokio::spawn(async move {
+                    let result = wait.wait().await;
+                    drop(permit);
+                    if result.is_err() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        acked.fetch_add(1, Ordering::Relaxed);
+                        if track_acks {
+                            acks.add(begun.elapsed().as_secs_f64() * 1e6);
+                        }
+                    }
+                });
+            }
+            let _all_answered = slots.acquire_many(outstanding_count).await;
+            Ok::<f64, String>(started.elapsed().as_secs_f64())
+        }));
+    }
+    let mut seconds: f64 = 0.0;
+    for task in publishers {
+        seconds = seconds.max(task.await.map_err(|error| error.to_string())??);
+    }
+    // Whatever arrives after the last send still counts, until it has all come or it goes quiet.
+    let delivered_seconds = if shape.with_subscriber {
+        let want = sent.load(Ordering::Relaxed);
+        let delivered_seconds = wait_delivered(&delivered, want, seconds).await;
+        for reader in readers {
+            reader.abort();
+        }
+        delivered_seconds
+    } else {
+        0.0
+    };
+    Ok(LoadRun {
+        sent_count: sent.load(Ordering::Relaxed),
+        acked_count: acked.load(Ordering::Relaxed),
+        failed_count: failed.load(Ordering::Relaxed),
+        seconds,
+        delivered_count: delivered.load(Ordering::Relaxed),
+        delivered_seconds,
+        acks,
+        deliveries,
+    })
+}
+
+/// Until `delivered` reaches `want` or stays put for 45 s, which is past the stalls of an
+/// overloaded loopback socket seen on macOS (docs/BENCH.md). Returns seconds from the load's start
+/// to the last change seen, given that `load_seconds` of it have passed.
+async fn wait_delivered(delivered: &AtomicU64, want: u64, load_seconds: f64) -> f64 {
+    let started = Instant::now();
+    let mut last_change = started;
+    let mut last = delivered.load(Ordering::Relaxed);
+    while last < want && last_change.elapsed() < Duration::from_secs(45) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let now = delivered.load(Ordering::Relaxed);
+        if now != last {
+            last = now;
+            last_change = Instant::now();
+        }
+    }
+    load_seconds + last_change.duration_since(started).as_secs_f64()
+}
+
+async fn wait_subscribed(subscription: &mut sdk::Subscription) -> Result<(), String> {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(120), subscription.next()).await {
+            Ok(Some(Ok(Event::Subscribed { .. }))) => return Ok(()),
+            Ok(Some(Ok(_))) => {}
+            other => return Err(format!("no SUBSCRIBED: {other:?}")),
+        }
+    }
+}
+
+fn number_list(args: &Args, flag: &str, default: &str) -> Result<Vec<u64>, String> {
+    args.one(flag)
+        .unwrap_or(default)
+        .split(',')
+        .map(|text| {
+            text.parse()
+                .map_err(|_| format!("{flag}: {text} isn't a number"))
+        })
+        .collect()
+}
+
+/// Publishes per second and ack latency, for each level and seal window, unloaded and saturated.
+async fn ack_matrix(args: &Args, bin: &Path) -> Result<(), String> {
+    let cores = args.number("--cores")?.unwrap_or(8);
+    let at_least_seconds = args.number("--seconds")?.unwrap_or(15);
+    let levels = args.one("--levels").unwrap_or("0,1,2,3");
+    const DATA_BYTES: usize = 256;
+    const STREAM_COUNT: u64 = 4;
+    println!(
+        "### Ack levels by seal window, {DATA_BYTES}-byte record, {cores} cores, a new server per row\n"
+    );
+    println!(
+        "| seal window ms | level | load | seconds | publishes/s | ack p50 µs | ack p99 µs | ack p99.9 µs | samples | delivered/s | delivery p50 µs | delivery p99 µs | delivery p99.9 µs | failed |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for window_ms in number_list(args, "--seal-windows", "1000,10000,60000")? {
+        // Long enough to hold at least two seals of this window in every row.
+        let seconds = at_least_seconds.max(window_ms * 5 / 2 / 1000);
+        let shapes: [(&str, &str, LoadShape); 8] = {
+            let one = |ack, stream_count, outstanding_count, rate_per_second, with_subscriber| {
+                LoadShape {
+                    ack,
+                    stream_count,
+                    outstanding_count,
+                    rate_per_second,
+                    data_bytes: DATA_BYTES,
+                    seconds,
+                    with_subscriber,
+                }
+            };
+            [
+                (
+                    "0",
+                    "1 stream, 100/s, with a subscriber",
+                    one(AckLevel::None, 1, 1, 100, true),
+                ),
+                (
+                    "0",
+                    "4 streams, flat out, with a subscriber each",
+                    one(AckLevel::None, STREAM_COUNT, 256, 0, true),
+                ),
+                (
+                    "1",
+                    "1 stream, 1 outstanding",
+                    one(AckLevel::Memory, 1, 1, 0, false),
+                ),
+                (
+                    "1",
+                    "4 streams, 256 outstanding each",
+                    one(AckLevel::Memory, STREAM_COUNT, 256, 0, false),
+                ),
+                (
+                    "2",
+                    "1 stream, 1 outstanding",
+                    one(AckLevel::WalFsync, 1, 1, 0, false),
+                ),
+                (
+                    "2",
+                    "4 streams, 256 outstanding each",
+                    one(AckLevel::WalFsync, STREAM_COUNT, 256, 0, false),
+                ),
+                (
+                    "3",
+                    "1 stream, 50/s",
+                    one(AckLevel::SegmentInS3, 1, 65_536, 50, false),
+                ),
+                (
+                    "3",
+                    "4 streams, 65,536 outstanding each",
+                    one(AckLevel::SegmentInS3, STREAM_COUNT, 65_536, 0, false),
+                ),
+            ]
+        };
+        for (level, load, shape) in shapes {
+            if !levels.split(',').any(|wanted| wanted == level) {
+                continue;
+            }
+            let server = start_server_with(
+                bin,
+                ServerSettings {
+                    cores,
+                    seal_window_ms: window_ms,
+                    active_stream_limit: None,
+                    memory_cap_bytes: None,
+                },
+            )?;
+            let run = load_run(&server, shape).await?;
+            let delivered = if shape.with_subscriber {
+                format!(
+                    "{:.0}",
+                    run.delivered_count as f64 / run.delivered_seconds.max(f64::MIN_POSITIVE)
+                )
+            } else {
+                "not run".to_owned()
+            };
+            let delivery_cells = if shape.with_subscriber {
+                run.deliveries.cells()
+            } else {
+                "not run | not run | not run".to_owned()
+            };
+            let ack_cells = if shape.ack == AckLevel::None {
+                "no ack | no ack | no ack".to_owned()
+            } else {
+                run.acks.cells()
+            };
+            println!(
+                "| {window_ms} | {level} | {load} | {:.1} | {:.0} | {ack_cells} | {} | {delivered} | {delivery_cells} | {} |",
+                run.seconds,
+                run.sent_count as f64 / run.seconds,
+                run.acked_count,
+                run.failed_count,
+            );
+            std::io::stdout()
+                .flush()
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Connects with the gate and retries `idle` uses, since a run opens thousands at once.
+async fn connect_many(server: &ServerChild, count: u64) -> Result<Vec<Client>, String> {
+    let gate = Arc::new(Semaphore::new(64));
+    let mut tasks = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let config = ClientConfig::new(&server.url, &server.ca_pem, &server.token);
+        let gate = Arc::clone(&gate);
+        tasks.push(tokio::spawn(async move {
+            let _permit = gate.acquire_owned().await.unwrap();
+            let mut tries = 0;
+            loop {
+                match Client::connect(config.clone()).await {
+                    Err(_) if tries < 100 => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    other => break other,
+                }
+            }
+        }));
+    }
+    let mut clients = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        clients.push(
+            task.await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(clients)
+}
+
+/// One stream to `subscriber_count` subscribers on `connection_count` connections.
+async fn fan_out_row(
+    server: &ServerChild,
+    subscriber_count: u64,
+    connection_count: u64,
+    rate_per_second: u64,
+    ack: AckLevel,
+    seconds: u64,
+) -> Result<(), String> {
+    const DATA_BYTES: usize = 256;
+    let zero = Instant::now();
+    let writer = server.client().await?;
+    let stream = "fan";
+    let mut opener = writer
+        .publisher(stream, publisher_config(AckLevel::Memory))
+        .map_err(|error| error.to_string())?;
+    let mut body = record(DATA_BYTES)?;
+    stamp_sent_at(&mut body, zero);
+    opener
+        .send_records(&body, None)
+        .await
+        .map_err(|error| error.to_string())?
+        .wait()
+        .await
+        .map_err(|error| error.to_string())?;
+    drop(opener);
+
+    let readers = connect_many(server, connection_count).await?;
+    let delivered = Arc::new(AtomicU64::new(0));
+    let behind = Arc::new(AtomicU64::new(0));
+    let bad = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(Histogram::new());
+    let mut tasks = Vec::with_capacity(subscriber_count as usize);
+    let mut subscriptions = Vec::with_capacity(subscriber_count as usize);
+    for at in 0..subscriber_count {
+        let client = &readers[(at % connection_count) as usize];
+        subscriptions.push(
+            client
+                .subscribe(Subscribe::new(stream, FROM_LIVE))
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    for mut subscription in subscriptions {
+        let (delivered, behind, bad, latencies) = (
+            Arc::clone(&delivered),
+            Arc::clone(&behind),
+            Arc::clone(&bad),
+            Arc::clone(&latencies),
+        );
+        let (ready, ready_wait) = tokio::sync::oneshot::channel();
+        tasks.push((
+            ready_wait,
+            tokio::spawn(async move {
+                let subscribed = wait_subscribed(&mut subscription).await;
+                let _ = ready.send(subscribed);
+                while let Some(Ok(event)) = subscription.next().await {
+                    match event {
+                        Event::Items(items) => {
+                            for item in &items {
+                                match take_sent_at(&item.bytes, zero) {
+                                    Ok(micros) => latencies.add(micros),
+                                    Err(_) => {
+                                        bad.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            delivered.fetch_add(items.len() as u64, Ordering::Relaxed);
+                        }
+                        Event::Behind { .. } => {
+                            behind.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        ));
+    }
+    let mut handles = Vec::with_capacity(tasks.len());
+    for (ready, handle) in tasks {
+        ready
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("{subscriber_count} subscribers: {error}"))?;
+        handles.push(handle);
+    }
+
+    let outstanding_count = if rate_per_second > 0 { 65_536 } else { 64 };
+    let mut publisher = writer
+        .publisher(
+            stream,
+            PublisherConfig {
+                ack,
+                max_inflight_bytes: 64 * 1024 * 1024,
+                ..PublisherConfig::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let slots = Arc::new(Semaphore::new(outstanding_count));
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    let mut sent = 0u64;
+    while Instant::now() < deadline {
+        if rate_per_second > 0 {
+            let due = started + Duration::from_secs_f64(sent as f64 / rate_per_second as f64);
+            tokio::time::sleep_until(due.into()).await;
+        }
+        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+        stamp_sent_at(&mut body, zero);
+        let wait = publisher
+            .send_records(&body, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        sent += 1;
+        tokio::spawn(async move {
+            let _ = wait.wait().await;
+            drop(permit);
+        });
+    }
+    let send_seconds = started.elapsed().as_secs_f64();
+    let want = sent * subscriber_count;
+    let total_seconds = wait_delivered(&delivered, want, send_seconds).await;
+    let got = delivered.load(Ordering::Relaxed);
+    println!(
+        "| {subscriber_count} | {connection_count} | {} | {:.0} | {:.0} | {} | {} | {got} | {want} | {} |",
+        if rate_per_second > 0 {
+            rate_per_second.to_string()
+        } else {
+            "flat out".to_owned()
+        },
+        sent as f64 / send_seconds,
+        got as f64 / total_seconds.max(f64::MIN_POSITIVE),
+        latencies.cells(),
+        behind.load(Ordering::Relaxed),
+        bad.load(Ordering::Relaxed),
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|error| error.to_string())?;
+    for handle in handles {
+        handle.abort();
+    }
+    Ok(())
+}
+
+/// Delivered records per second and publish-to-delivery latency, by subscribers.
+async fn fan_out(args: &Args, bin: &Path) -> Result<(), String> {
+    let cores = args.number("--cores")?.unwrap_or(8);
+    let seconds = args.number("--seconds")?.unwrap_or(15);
+    let wanted = number_list(args, "--subscribers", "1,100,10000")?;
+    println!(
+        "### Fan-out, level 1, 256-byte record, one stream, {cores} cores, {seconds} s, a new server per row\n"
+    );
+    println!(
+        "| subscribers | connections | publishes/s asked | publishes/s sent | delivered/s | p50 µs | p99 µs | p99.9 µs | BEHIND | delivered | expected | bad samples |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
+    for subscriber_count in wanted {
+        // (connections, rate), with 0 flat out.
+        let rows: Vec<(u64, u64)> = match subscriber_count {
+            1 => vec![(1, 1_000), (1, 0)],
+            100 => vec![(100, 100), (100, 1_000), (100, 0), (4, 1_000)],
+            10_000 => vec![
+                (10_000, 1),
+                (10_000, 10),
+                (10_000, 30),
+                (10_000, 100),
+                (10_000, 0),
+                (16, 10),
+                (16, 100),
+            ],
+            other => vec![(other, 10)],
+        };
+        for (connection_count, rate) in rows {
+            let server = start_server(bin, cores)?;
+            fan_out_row(
+                &server,
+                subscriber_count,
+                connection_count,
+                rate,
+                AckLevel::Memory,
+                seconds,
+            )
+            .await?;
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Every directory under `dir`, to `mode`, which is how a run makes uploads fail.
+fn set_dir_modes(dir: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let text = |error: std::io::Error| error.to_string();
+    // Children first going down to a closed mode, and the parent first coming back.
+    if mode & 0o200 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).map_err(text)?;
+    }
+    for entry in std::fs::read_dir(dir).map_err(text)? {
+        let path = entry.map_err(text)?.path();
+        if path.is_dir() {
+            set_dir_modes(&path, mode)?;
+        }
+    }
+    if mode & 0o200 == 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).map_err(text)?;
+    }
+    Ok(())
+}
+
+fn replayed_entries(dir: &Path) -> Result<u64, String> {
+    let log = std::fs::read_to_string(dir.join("server.stderr")).map_err(|e| e.to_string())?;
+    let Some(line) = log.lines().rev().find(|line| line.contains("WAL entries")) else {
+        return Err("no replay line in the server's stderr".to_owned());
+    };
+    line.split(" WAL files synced, ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| format!("can't read {line:?}"))
+}
+
+/// Time from starting the binary to its port, after `kill -9`, by how much WAL it has to replay.
+///
+/// Normally a seal empties the WAL. So that it holds a chosen amount the run closes the local
+/// object store's directories to writes once the server is up, as an upload outage would, and
+/// opens them again before the restart. Records are confirmed afterwards by reading them all.
+async fn recovery(args: &Args, bin: &Path) -> Result<(), String> {
+    const DATA_BYTES: u64 = 4096;
+    const STREAM_COUNT: u64 = 16;
+    let cores = args.number("--cores")?.unwrap_or(8);
+    println!(
+        "### Recovery after `kill -9`, {cores} cores, {STREAM_COUNT} streams, {DATA_BYTES}-byte records\n"
+    );
+    println!(
+        "| WAL asked MiB | run | acked at level 2 | entries replayed | MiB of records replayed | start to port s | read back s | records read back |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for wal_mib in number_list(args, "--wal-mib", "0,16,256,1024,4096")? {
+        for run in 1..=args.number("--runs")?.unwrap_or(3) {
+            let mut server = start_server_with(
+                bin,
+                ServerSettings {
+                    cores,
+                    seal_window_ms: 120_000,
+                    active_stream_limit: None,
+                    // Above the largest size here, so that this isn't what stops a run.
+                    memory_cap_bytes: Some(32 * 1024 * 1024 * 1024),
+                },
+            )?;
+            let objects = server.dir.path().join("objects");
+            set_dir_modes(&objects, 0o500)?;
+            let per_stream = wal_mib * 1024 * 1024 / DATA_BYTES / STREAM_COUNT;
+            let body = Arc::new(record(DATA_BYTES as usize)?);
+            let mut tasks = Vec::new();
+            let mut names = Vec::new();
+            for at in 0..STREAM_COUNT {
+                let client = server.client().await?;
+                let stream = format!("recover.{at}");
+                names.push(stream.clone());
+                let body = Arc::clone(&body);
+                tasks.push(tokio::spawn(async move {
+                    let mut publisher = client
+                        .publisher(&stream, publisher_config(AckLevel::WalFsync))
+                        .map_err(|error| error.to_string())?;
+                    let slots = Arc::new(Semaphore::new(256));
+                    for _ in 0..per_stream {
+                        let permit = Arc::clone(&slots).acquire_owned().await.unwrap();
+                        let wait = publisher
+                            .send_records(&body, None)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        tokio::spawn(async move {
+                            let _ = wait.wait().await;
+                            drop(permit);
+                        });
+                    }
+                    let _all = slots.acquire_many(256).await;
+                    Ok::<(), String>(())
+                }));
+            }
+            for task in tasks {
+                task.await.map_err(|error| error.to_string())??;
+            }
+            let acked = per_stream * STREAM_COUNT;
+
+            // `Child::kill` is SIGKILL, to this child's own PID.
+            server.child.kill().map_err(|error| error.to_string())?;
+            server.child.wait().map_err(|error| error.to_string())?;
+            set_dir_modes(&objects, 0o700)?;
+
+            let started = Instant::now();
+            let (child, port) = spawn_server(bin, server.settings, server.dir.path())?;
+            let start_seconds = started.elapsed().as_secs_f64();
+            server.child = child;
+            server.url = format!("localhost:{port}");
+            let replayed = replayed_entries(server.dir.path())?;
+
+            let started = Instant::now();
+            let mut read_back = 0;
+            if per_stream > 0 {
+                for name in &names {
+                    read_to_head(&server, name, per_stream).await?;
+                    read_back += per_stream;
+                }
+            }
+            println!(
+                "| {wal_mib} | {run} | {acked} | {replayed} | {:.0} | {start_seconds:.3} | {:.2} | {read_back} |",
+                replayed as f64 * (DATA_BYTES as f64 + 32.0) / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64(),
+            );
+            std::io::stdout()
+                .flush()
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    println!();
+    Ok(())
+}
+
 pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
     args.only(&[
         "--server-bin",
@@ -853,8 +1611,23 @@ pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
         "--cores",
         "--catch-up-mib",
         "--idle-streams",
+        "--seal-windows",
+        "--subscribers",
+        "--wal-mib",
+        "--runs",
+        "--timeout-seconds",
     ])?;
     let bin = server_bin(args)?;
+    // Dropping the future kills whichever server it holds, which a signal to this process
+    // wouldn't. So this is what bounds a run.
+    let limit = Duration::from_secs(args.number("--timeout-seconds")?.unwrap_or(24 * 3600));
+    tokio::time::timeout(limit, run_one(args, what, &bin))
+        .await
+        .map_err(|_| format!("bench {what} ran out of time"))?
+}
+
+async fn run_one(args: &Args, what: &str, bin: &Path) -> Result<(), String> {
+    let bin = bin.to_owned();
     match what {
         "latency" => latency(args, &bin).await,
         "throughput" => throughput(args, &bin).await,
@@ -863,6 +1636,9 @@ pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
         "many-streams" => many_streams(args, &bin).await,
         "puts" => puts_per_seal(args, &bin).await,
         "idle-streams" => idle_streams(args, &bin).await,
+        "ack-matrix" => ack_matrix(args, &bin).await,
+        "fan-out" => fan_out(args, &bin).await,
+        "recovery" => recovery(args, &bin).await,
         "all" => {
             latency(args, &bin).await?;
             throughput(args, &bin).await?;
@@ -870,7 +1646,10 @@ pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
             catch_up(args, &bin).await?;
             many_streams(args, &bin).await?;
             puts_per_seal(args, &bin).await?;
-            idle_streams(args, &bin).await
+            idle_streams(args, &bin).await?;
+            ack_matrix(args, &bin).await?;
+            fan_out(args, &bin).await?;
+            recovery(args, &bin).await
         }
         other => Err(format!("bench {other}?")),
     }
