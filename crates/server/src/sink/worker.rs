@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
 
 use super::webhook::{self, PostError, PostParts, StatusClass, WebhookUrl};
-use super::{PoolContext, SinkAction, SinkKey, SinkStep, WorkerExit, backoff_ms};
+use super::{ForwardClaim, PoolContext, SinkAction, SinkKey, SinkStep, WorkerExit, backoff_ms};
 use crate::connection::{Connection, Event, Subscription};
 use crate::delivery::retention_start_id;
 use crate::message::{Reply, SinkOp, SinkReport, SinkSpec};
@@ -60,10 +60,9 @@ pub(crate) async fn run(
         client,
         send_client,
         notes,
-        claim: None,
+        next_notify_ms: 0,
     };
     let end = worker.run(home, &mut guard.seen_note_count).await;
-    worker.release_claim();
     guard.restart = end == End::Killed;
 }
 
@@ -153,7 +152,8 @@ struct Worker {
     /// What deliveries use: a forward holds it until its ack.
     send_client: Arc<Mutex<Client>>,
     notes: watch::Receiver<u64>,
-    claim: Option<(String, u64)>,
+    /// `webhook.notify`'s next allowed send. Held here so an update or a resume doesn't forget it.
+    next_notify_ms: u64,
 }
 
 impl Worker {
@@ -164,34 +164,20 @@ impl Worker {
         }
     }
 
-    fn release_claim(&mut self) {
-        if let Some(claim) = self.claim.take() {
-            let mut claims = self
-                .context
-                .forward_claims
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            claims.remove(&claim);
-        }
-    }
-
     /// Takes `(target, sink id)` for this source. False if another source holds it.
-    fn take_claim(&mut self, target: &str) -> bool {
-        let claim = (target.to_owned(), self.key.1);
+    fn take_claim(&self, target: &str) -> bool {
         let mut claims = self
             .context
             .forward_claims
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match claims.get(&claim) {
-            Some(source) if **source != *self.key.0 => false,
-            _ => {
-                claims.insert(claim.clone(), self.key.0.to_string());
-                drop(claims);
-                self.claim = Some(claim);
-                true
-            }
-        }
+        let claim = claims
+            .entry((target.to_owned(), self.key.1))
+            .or_insert_with(|| ForwardClaim {
+                source: self.key.0.to_string(),
+                acked_seq: 0,
+            });
+        *claim.source == *self.key.0
     }
 
     async fn op(&self, op: SinkOp) -> Result<(), ErrorCode> {
@@ -224,15 +210,11 @@ impl Worker {
                 return End::Done;
             };
             let spell = if spec.paused {
-                self.release_claim();
                 self.wait_paused(&spec, cursor, info.head, retention_ms)
                     .await
             } else {
                 if kind == Kind::Forward {
                     let target = spec.target.clone().unwrap_or_default();
-                    if self.claim.as_ref().is_none_or(|(held, _)| *held != target) {
-                        self.release_claim();
-                    }
                     if !self.take_claim(&target) {
                         let reason = format!(
                             "another stream forwards to {target} with sink id {}, so one's \
@@ -340,10 +322,12 @@ struct Reading<'a> {
     held_bytes: u64,
     failure_count: u32,
     warned: bool,
-    next_notify_ms: u64,
     next_retention_refresh_ms: u64,
     /// Where a gap starts, if reading had to jump past what expired.
     gap_from: Option<u64>,
+    /// `archive`: a window the clock has closed, and the last id given out once it had. Nothing
+    /// more can join that window, so it is fully read when reading reaches this id.
+    closed_window: Option<(u64, u64)>,
 }
 
 impl<'a> Reading<'a> {
@@ -392,7 +376,15 @@ impl<'a> Reading<'a> {
             interval_ms,
             budget_bytes,
             sub: 0,
-            read_id: cursor,
+            read_id: match cursor {
+                // Nothing committed yet is still a position: what retention held when the sink
+                // began. Asking for 0 would be "whatever is left", and pass over what expires
+                // while it is paused or failing with no word to `on_expire` (D201).
+                0 => retention_start_id(spec.epoch, retention_ms)
+                    .saturating_sub(1)
+                    .max(1),
+                cursor => cursor,
+            },
             progress_id: cursor,
             unread: VecDeque::new(),
             deliveries: VecDeque::new(),
@@ -400,9 +392,9 @@ impl<'a> Reading<'a> {
             held_bytes: 0,
             failure_count: spec.failure_count,
             warned: spec.expiry_warning_id.is_some(),
-            next_notify_ms: 0,
             next_retention_refresh_ms: 0,
             gap_from: None,
+            closed_window: None,
             spec,
             worker,
         })
@@ -420,9 +412,10 @@ impl<'a> Reading<'a> {
         let Some(mut connection) = self.worker.context.handle.connection(self.home).await else {
             return Spell::End(End::Done);
         };
-        self.subscribe(&connection, self.cursor);
+        self.subscribe(&connection, self.read_id);
         loop {
             let now_ms = self.worker.context.clock.now_ms();
+            self.note_closed_window(now_ms).await;
             self.form_deliveries(now_ms);
             if let Some(spell) = self.start_due(now_ms).await {
                 return spell;
@@ -604,10 +597,10 @@ impl<'a> Reading<'a> {
             let delivery = match self.kind {
                 Kind::Deliver | Kind::Forward => self.new_delivery(first, now_ms),
                 Kind::Notify => {
-                    if !self.deliveries.is_empty() || now_ms < self.next_notify_ms {
+                    if !self.deliveries.is_empty() || now_ms < self.worker.next_notify_ms {
                         return;
                     }
-                    self.next_notify_ms = now_ms.saturating_add(self.interval_ms);
+                    self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
                     self.new_delivery(first, now_ms)
                 }
                 Kind::Archive => match self.archive_batch(now_ms) {
@@ -624,14 +617,46 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// Everything unread in one window, up to the budget, once no more can join it: a later
-    /// window has begun, by a record or by the clock (D190).
+    /// Once the clock has passed the window of what is first in line, asks how far the stream
+    /// has got. Ids never go back, so nothing given out after this can join that window.
+    async fn note_closed_window(&mut self, now_ms: u64) {
+        if self.kind != Kind::Archive {
+            return;
+        }
+        let Some(first) = self.unread.front() else {
+            return;
+        };
+        let window_ms = self.worker.context.config.archive_window_ms.max(1);
+        let window = id_ms(first.first_id) / window_ms;
+        if now_ms / window_ms <= window
+            || self.closed_window.is_some_and(|(known, _)| known == window)
+        {
+            return;
+        }
+        let info = self
+            .worker
+            .client
+            .lock()
+            .await
+            .stream_info(&self.worker.key.0)
+            .await;
+        if let Ok(info) = info {
+            self.closed_window = Some((window, info.stamped_id));
+        }
+    }
+
+    /// Everything unread in one window, up to the budget, once no more can join it and all of it
+    /// has been read: a later record has arrived, or the clock has passed the window and reading
+    /// has reached what was given out by then. So the batch doesn't depend on how the records
+    /// happened to be framed, and a repeat has the same `{first_id, last_id}` (D190).
     fn archive_batch(&self, now_ms: u64) -> Option<Delivery> {
         let window_ms = self.worker.context.config.archive_window_ms.max(1);
         let first = self.unread.front()?;
         let window = id_ms(first.first_id) / window_ms;
         let mut delivery = self.new_delivery(first, now_ms);
-        let mut closed = now_ms / window_ms > window;
+        let mut closed = self
+            .closed_window
+            .is_some_and(|(known, stamped_id)| known == window && self.read_id >= stamped_id);
         for next in self.unread.iter().skip(1) {
             if id_ms(next.first_id) / window_ms != window {
                 closed = true;
@@ -722,11 +747,17 @@ impl<'a> Reading<'a> {
                 let now_ms = self.worker.context.clock.now_ms();
                 let config = &self.worker.context.config;
                 let delivery = &mut self.deliveries[at];
-                delivery.next_try_ms = now_ms.saturating_add(backoff_ms(
+                let mut wait_ms = backoff_ms(
                     config.retry_initial_ms,
                     config.retry_max_ms,
                     delivery.attempt,
-                ));
+                );
+                if self.kind == Kind::Notify {
+                    // A retry is a send, and the rate is on sends.
+                    wait_ms = wait_ms.max(self.interval_ms);
+                    self.worker.next_notify_ms = now_ms.saturating_add(wait_ms);
+                }
+                delivery.next_try_ms = now_ms.saturating_add(wait_ms);
                 let max_count = config.max_failure_count;
                 let count = self.failure_count;
                 self.worker
@@ -1048,7 +1079,27 @@ impl Attempt {
                 Ok(None) => return Outcome::Retry("the node has stopped".to_owned()),
                 // An answer to an earlier try that timed out.
                 Ok(Some(Reply::Ack { producer_seq, .. })) if producer_seq == self.first_id => {
+                    self.note_acked(target);
                     return Outcome::Delivered;
+                }
+                Ok(Some(Reply::ForwardOlder {
+                    producer_seq,
+                    latest_seq,
+                })) if producer_seq == self.first_id => {
+                    let head = match client.stream_info(&self.stream).await {
+                        Ok(info) => info.head,
+                        Err(code) => return Outcome::Retry(format!("reading the head: {code:?}")),
+                    };
+                    return if self.older_is_our_own(target, latest_seq, head) {
+                        Outcome::Delivered
+                    } else {
+                        Outcome::Permanent(format!(
+                            "{target} already has seq {latest_seq} from producer id {}, which \
+                             isn't this sink's, so this record ({}) would be dropped as a \
+                             duplicate; use another sink id",
+                            self.sink_id, self.first_id
+                        ))
+                    };
                 }
                 Ok(Some(Reply::Nack {
                     producer_seq,
@@ -1071,6 +1122,35 @@ impl Attempt {
         }
     }
 
+    fn note_acked(&self, target: &str) {
+        let mut claims = self
+            .context
+            .forward_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(claim) = claims.get_mut(&(target.to_owned(), self.sink_id)) {
+            claim.acked_seq = claim.acked_seq.max(self.first_id);
+        }
+    }
+
+    /// Whether a drop as older can be a repeat of what this sink sent, after a restart whose
+    /// cursor was behind, or a reset. It can't be if the target's latest seq is one the source
+    /// hasn't reached, or if since this node started the target has taken this sink's seqs only
+    /// up to below this one. Anything else passes: it can't be told apart (D200, Q37).
+    fn older_is_our_own(&self, target: &str, latest_seq: u64, head: u64) -> bool {
+        if latest_seq > head {
+            return false;
+        }
+        let claims = self
+            .context
+            .forward_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        claims
+            .get(&(target.to_owned(), self.sink_id))
+            .is_none_or(|claim| claim.acked_seq == 0 || self.first_id <= claim.acked_seq)
+    }
+
     async fn archive(&self) -> Outcome {
         let path = Path::from_iter([
             "archive".to_owned(),
@@ -1086,14 +1166,41 @@ impl Attempt {
         let wait = Duration::from_millis(self.context.config.request_timeout_ms);
         let put = self.context.archive.put_opts(&path, payload, options);
         match tokio::time::timeout(wait, put).await {
-            // Taken already: this delivery got there and its response was lost, and one
-            // `{first_id, last_id}` has one set of bytes.
-            Ok(Ok(_) | Err(object_store::Error::AlreadyExists { .. })) => Outcome::Delivered,
+            Ok(Ok(_)) => Outcome::Delivered,
+            Ok(Err(object_store::Error::AlreadyExists { .. })) => self.archive_taken(&path).await,
             Ok(Err(object_store::Error::InvalidPath { source })) => {
                 Outcome::Permanent(format!("archive path: {source}"))
             }
             Ok(Err(error)) => Outcome::Retry(format!("archive: {error}")),
             Err(_) => Outcome::Retry("the archive put timed out".to_owned()),
+        }
+    }
+
+    /// The name is taken. By these same bytes, a repeat whose response was lost. By others, the
+    /// same ends under a different filter, and these records would go nowhere (D202).
+    async fn archive_taken(&self, path: &Path) -> Outcome {
+        let wait = Duration::from_millis(self.context.config.request_timeout_ms);
+        let read = async { self.context.archive.get(path).await?.bytes().await };
+        let existing = match tokio::time::timeout(wait, read).await {
+            Ok(Ok(existing)) => existing,
+            Ok(Err(error)) => return Outcome::Retry(format!("archive: {error}")),
+            Err(_) => return Outcome::Retry("reading the archive object timed out".to_owned()),
+        };
+        let mut left = &existing[..];
+        let same = self.bytes.iter().all(|part| {
+            let matches = left.starts_with(part);
+            if matches {
+                left = &left[part.len()..];
+            }
+            matches
+        }) && left.is_empty();
+        if same {
+            Outcome::Delivered
+        } else {
+            Outcome::Permanent(format!(
+                "{path} already holds different records for this range, as a changed filter \
+                 can make; use another sink id to archive these"
+            ))
         }
     }
 }

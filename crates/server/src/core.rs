@@ -1010,12 +1010,22 @@ impl Core {
                         }),
                         first_id + u64::from(count) - 1,
                     ),
-                    DedupeCheck::Older { latest_last_id } => (
-                        Some(Reply::Ack {
-                            handle: msg.handle,
-                            producer_seq: msg.producer_seq,
-                            first_id: 0,
-                            count: 0,
+                    DedupeCheck::Older {
+                        latest_last_id,
+                        latest_seq,
+                    } => (
+                        Some(if msg.forward {
+                            Reply::ForwardOlder {
+                                producer_seq: msg.producer_seq,
+                                latest_seq,
+                            }
+                        } else {
+                            Reply::Ack {
+                                handle: msg.handle,
+                                producer_seq: msg.producer_seq,
+                                first_id: 0,
+                                count: 0,
+                            }
                         }),
                         latest_last_id,
                     ),
@@ -2303,6 +2313,7 @@ impl Core {
                         .get(&*stream)
                         .map(|stream| StreamInfo {
                             head: stream.delivery.visible_head(stream.ids.last_id()),
+                            stamped_id: stream.ids.last_id(),
                             state_ver: stream.delivery.visible_state.0,
                             config: stream.config,
                             sinks: stream
@@ -3208,6 +3219,8 @@ impl Core {
         let cursor_at = |start: SinkStart| match start {
             SinkStart::Now => head,
             SinkStart::Earliest => 0,
+            // Section 5.1: live only.
+            SinkStart::Id(u64::MAX) => head,
             SinkStart::Id(id) => id,
         };
         let delivery = &mut stream.delivery;

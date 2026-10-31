@@ -1094,7 +1094,8 @@ impl WsConn<'_> {
                 code,
                 msg,
             } => self.send_error(reference, code, &msg),
-            Reply::Moved { .. } | Reply::RouteDone { .. } => {}
+            // Only a forward sink publishes so as to get this one.
+            Reply::ForwardOlder { .. } | Reply::Moved { .. } | Reply::RouteDone { .. } => {}
         }
     }
 

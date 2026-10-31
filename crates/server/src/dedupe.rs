@@ -49,8 +49,12 @@ pub enum DedupeCheck {
     /// A retry of the latest publish: send the original `ACK`.
     Latest { first_id: u64, count: u32 },
     /// A retry of an older publish: `ACK` with `first_id = 0`. `latest_last_id` is the
-    /// last id of the producer's latest publish, which came after the older one.
-    Older { latest_last_id: u64 },
+    /// last id of the producer's latest publish, which came after the older one, and
+    /// `latest_seq` is that publish's seq.
+    Older {
+        latest_last_id: u64,
+        latest_seq: u64,
+    },
 }
 
 /// Sorted by `producer_id`, so a lookup is a binary search over at most 1,000 entries,
@@ -117,6 +121,7 @@ impl DedupeTable {
         } else {
             DedupeCheck::Older {
                 latest_last_id: entry.first_id() + u64::from(entry.count()) - 1,
+                latest_seq: entry.producer_seq(),
             }
         }
     }

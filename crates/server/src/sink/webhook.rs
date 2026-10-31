@@ -109,6 +109,7 @@ fn is_private_v4(address: Ipv4Addr) -> bool {
         // Shared address space, and the protocol, benchmark and documentation ranges.
         || (a == 100 && (64..128).contains(&b))
         || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 192 && b == 88 && c == 99) // the old 6to4 relay
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
@@ -135,12 +136,14 @@ fn is_private_v6(address: Ipv6Addr) -> bool {
     if segments[0] == 0x2002 {
         return is_private_v4(embedded(2));
     }
-    segments[0] & 0xfe00 == 0xfc00 // unique local
-        || segments[0] & 0xffc0 == 0xfe80 // link local
-        || segments[0] & 0xffc0 == 0xfec0 // site local, now deprecated
-        || segments[0] & 0xff00 == 0xff00 // multicast
-        || (segments[0] == 0x2001 && segments[1] == 0xdb8) // documentation
-        || (segments[0] == 0x0100 && segments[1..4] == [0, 0, 0]) // discard
+    // Only 2000::/3 is global unicast. This takes in unique local, link local, multicast,
+    // discard, the IPv4-translated form, local NAT64 and SRv6, whatever is added to them.
+    segments[0] & 0xe000 != 0x2000
+        // IETF special purpose, with Teredo, benchmarking and ORCHID.
+        || (segments[0] == 0x2001 && segments[1] < 0x200)
+        // Documentation.
+        || (segments[0] == 0x2001 && segments[1] == 0xdb8)
+        || (segments[0] == 0x3fff && segments[1] < 0x1000)
 }
 
 /// How one attempt ended, before the status is judged.

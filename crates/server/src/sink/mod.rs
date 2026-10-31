@@ -129,10 +129,17 @@ pub(crate) struct PoolContext {
     pub handle: NodeHandle,
     pub archive: Arc<dyn ObjectStore>,
     pub tls: Arc<ClientConfig>,
-    /// `(target, sink id)` → source of each running forward sink. A sink id is unique per stream
+    /// `(target, sink id)` → the source that forwards under it. A sink id is unique per stream
     /// only, and two sources with one id would share a producer id at the target, where one's
-    /// records would be dropped as the other's duplicates (D193).
-    pub forward_claims: Mutex<HashMap<(String, u64), String>>,
+    /// records would be dropped as the other's duplicates. The target's dedupe entry outlasts a
+    /// pause or a delete, so a claim does too, for as long as the node runs (D193).
+    pub forward_claims: Mutex<HashMap<(String, u64), ForwardClaim>>,
+}
+
+pub(crate) struct ForwardClaim {
+    pub source: String,
+    /// The highest seq the target took from this source since the node started (D200).
+    pub acked_seq: u64,
 }
 
 type SinkKey = (Arc<str>, u64);
@@ -261,6 +268,7 @@ impl SinkPool {
             handle: handle.clone(),
             forward_claims: Mutex::new(HashMap::new()),
         });
+        let claims_context = Arc::clone(&context);
         let (exits_tx, exits) = mpsc::unbounded_channel();
         let registry = Registry {
             context,
@@ -272,15 +280,33 @@ impl SinkPool {
         first.spawn(registry.run(notes, exits));
         first.spawn(async move {
             let mut client = handle.client(0);
+            let mut found = Vec::new();
             for stream in streams {
                 // Asking loads the stream, and its load is retried until it works (D140).
                 if let Ok(info) = client.stream_info(&stream).await {
                     let stream: Arc<str> = Arc::from(stream);
-                    for (sink_id, _, _) in info.sinks {
-                        let stream = Arc::clone(&stream);
-                        let _ = notes_tx.send(SinkNote { stream, sink_id });
+                    for (sink_id, spec, _) in info.sinks {
+                        if spec.kind == "forward"
+                            && let Some(target) = spec.target
+                        {
+                            let mut claims = claims_context
+                                .forward_claims
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            claims
+                                .entry((target, sink_id))
+                                .or_insert_with(|| ForwardClaim {
+                                    source: stream.to_string(),
+                                    acked_seq: 0,
+                                });
+                        }
+                        found.push((Arc::clone(&stream), sink_id));
                     }
                 }
+            }
+            // Every sink's claim is in before any of them runs, paused ones included.
+            for (stream, sink_id) in found {
+                let _ = notes_tx.send(SinkNote { stream, sink_id });
             }
         });
         Ok(SinkPool { stops, threads })

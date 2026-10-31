@@ -32,6 +32,12 @@ pub enum Reply {
         code: ErrorCode,
         msg: String,
     },
+    /// To a forward sink, in place of the `ACK` with `first_id = 0`: dropped as older than the
+    /// producer's `latest_seq`. Only the sink can judge whether that seq was its own (D200).
+    ForwardOlder {
+        producer_seq: u64,
+        latest_seq: u64,
+    },
     StateResult {
         req: u32,
         ok: bool,
@@ -130,6 +136,8 @@ pub(crate) const SINK_GAPS_KEPT_COUNT: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamInfo {
     pub head: u64,
+    /// The last id given out, visible yet or not.
+    pub stamped_id: u64,
     pub state_ver: u64,
     pub config: StreamConfig,
     /// `(sink id, spec, cursor)`, in id order.
