@@ -145,6 +145,9 @@ impl WalVolume for DirVolume {
     fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<File> {
         let old_path = self.path(old_seq);
         let mut file = OpenOptions::new().read(true).write(true).open(&old_path)?;
+        // Both descriptors before anything changes, so that running out of them leaves the old
+        // file there for a retry (D234).
+        let dir = File::open(&self.dir)?;
         let size_bytes = file.metadata()?.len();
         // Durably empty before it has the new name, so that a crash at any point
         // here leaves no old bytes under it. Its entries are already uploaded (D16).
@@ -157,7 +160,7 @@ impl WalVolume for DirVolume {
         crash_point("recycle.after_rename");
         file.set_len(size_bytes)?;
         self.write_header(&mut file, new_seq)?;
-        self.sync_dir()?;
+        dir.sync_all()?;
         Ok(file)
     }
 
@@ -357,7 +360,7 @@ where
 struct Writer<V: WalVolume, N> {
     volume: V,
     notify: N,
-    /// `None` while the volume has no room for the file `active_seq` names (D233).
+    /// `None` while the file `active_seq` names can't be opened yet (D233, D234).
     file: Option<V::File>,
     no_file: Arc<AtomicBool>,
     active_seq: u64,
@@ -421,7 +424,7 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
         Ok(self.stats)
     }
 
-    /// Tries again for the file `active_seq` names. Still no room isn't an error.
+    /// Tries again for the file `active_seq` names. Still none to be had isn't an error.
     fn open_active(&mut self) -> io::Result<()> {
         let opened = match self.free_seqs.front().copied() {
             Some(old_seq) => self.volume.reuse(old_seq, self.active_seq),
@@ -434,7 +437,7 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                 self.no_file.store(false, Ordering::Release);
                 Ok(())
             }
-            Err(error) if error.kind() == io::ErrorKind::StorageFull => Ok(()),
+            Err(error) if can_pass(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -514,20 +517,24 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
         }
         let closed_seq = self.active_seq;
         let new_seq = closed_seq + 1;
-        self.file = match self.free_seqs.pop_front() {
-            Some(old_seq) => Some(self.volume.reuse(old_seq, new_seq)?),
-            None => match self.volume.create(new_seq) {
-                Ok(file) => Some(file),
-                Err(error) if error.kind() == io::ErrorKind::StorageFull => {
-                    eprintln!(
-                        "the WAL volume has no room for a new file: {error}. Writes wait until \
-                         this seal has uploaded and freed a file."
-                    );
-                    self.no_file.store(true, Ordering::Release);
-                    None
-                }
-                Err(error) => return Err(error),
-            },
+        let opened = match self.free_seqs.front().copied() {
+            Some(old_seq) => self.volume.reuse(old_seq, new_seq),
+            None => self.volume.create(new_seq),
+        };
+        self.file = match opened {
+            Ok(file) => {
+                self.free_seqs.pop_front();
+                Some(file)
+            }
+            Err(error) if can_pass(&error) => {
+                eprintln!(
+                    "the WAL can't open a new file: {error}. Writes wait for a later seal to \
+                     open it."
+                );
+                self.no_file.store(true, Ordering::Release);
+                None
+            }
+            Err(error) => return Err(error),
         };
         self.closed_seqs.push_back(closed_seq);
         self.active_seq = new_seq;
@@ -536,6 +543,15 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
             new_seq,
         })
     }
+}
+
+/// An open that failed for want of room or descriptors, which pass: a seal frees a file, and a
+/// connection's end frees a descriptor. Neither says anything is wrong with the disk (D233, D234).
+fn can_pass(error: &io::Error) -> bool {
+    const ENFILE: i32 = 23;
+    const EMFILE: i32 = 24;
+    error.kind() == io::ErrorKind::StorageFull
+        || matches!(error.raw_os_error(), Some(ENFILE | EMFILE))
 }
 
 fn write_all_vectored<F: WalFile>(file: &mut F, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {

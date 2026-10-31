@@ -616,3 +616,114 @@ fn reuse_keeps_the_size_and_nothing_of_the_old_contents() {
     );
     assert!(!dir.path().join(storage::wal_file_name(1)).exists());
 }
+
+/// A `Script` whose next opens fail with this OS error, as a descriptor limit would make them.
+struct FailingOpens {
+    script: Script,
+    os_error: Arc<std::sync::atomic::AtomicI32>,
+}
+
+impl FailingOpens {
+    fn check(&self) -> io::Result<()> {
+        match self.os_error.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => Ok(()),
+            code => Err(io::Error::from_raw_os_error(code)),
+        }
+    }
+}
+
+impl WalVolume for FailingOpens {
+    type File = ScriptFile;
+
+    fn create(&mut self, seq: u64) -> io::Result<ScriptFile> {
+        self.check()?;
+        self.script.create(seq)
+    }
+
+    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<ScriptFile> {
+        self.check()?;
+        self.script.reuse(old_seq, new_seq)
+    }
+
+    fn remove(&mut self, seq: u64) -> io::Result<()> {
+        self.script.remove(seq)
+    }
+}
+
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+const EIO: i32 = 5;
+
+fn start_failing_opens() -> (
+    storage::WalSender<Bytes>,
+    storage::WalHandle,
+    Arc<std::sync::atomic::AtomicI32>,
+    Arc<Log>,
+) {
+    let script = Script::default();
+    let log = Arc::clone(&script.log);
+    let os_error = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let volume = FailingOpens {
+        script,
+        os_error: Arc::clone(&os_error),
+    };
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _>(volume, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+    (sender, handle, os_error, log)
+}
+
+/// Running out of descriptors passes when connections end, so it stops no writer for good.
+#[test]
+fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
+    for code in [EMFILE, ENFILE] {
+        let (sender, handle, os_error, log) = start_failing_opens();
+        sender.try_append(entry(0, 1)).unwrap();
+        os_error.store(code, std::sync::atomic::Ordering::SeqCst);
+        // The old file is closed, as with a full volume, so the seal can still upload it.
+        let rotated = sender.try_rotate().unwrap().blocking_recv().unwrap();
+        assert_eq!(rotated.closed_seq, 1);
+        assert!(matches!(
+            sender.try_append(entry(0, 2)),
+            Err(WalSendError::Full(_))
+        ));
+        // Still out: another seal is no worse.
+        sender.try_rotate().unwrap().blocking_recv().unwrap();
+        sender.try_recycle(0).unwrap();
+
+        os_error.store(0, std::sync::atomic::Ordering::SeqCst);
+        sender.try_rotate().unwrap().blocking_recv().unwrap();
+        sender.try_append(entry(0, 2)).unwrap();
+        drop(sender);
+        handle.join().unwrap();
+        assert!(log.calls().contains(&Call::Durable(0, 2)));
+    }
+}
+
+/// A failed reuse leaves the spare in place, so that the retry can still use it.
+#[test]
+fn a_reuse_out_of_descriptors_keeps_its_file_for_the_retry() {
+    let (sender, handle, os_error, log) = start_failing_opens();
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    sender.try_recycle(1).unwrap();
+    os_error.store(EMFILE, std::sync::atomic::Ordering::SeqCst);
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    os_error.store(0, std::sync::atomic::Ordering::SeqCst);
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    sender.try_append(entry(0, 1)).unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let calls = log.calls();
+    assert!(calls.contains(&Call::Reuse(1, 3)), "{calls:?}");
+    assert!(calls.contains(&Call::Durable(0, 1)), "{calls:?}");
+}
+
+/// Anything else is what it was: a disk that can't be trusted, which ends the writer.
+#[test]
+fn a_rotation_with_another_error_still_stops_the_writer() {
+    let (sender, handle, os_error, _log) = start_failing_opens();
+    os_error.store(EIO, std::sync::atomic::Ordering::SeqCst);
+    let done = sender.try_rotate().unwrap();
+    assert!(done.blocking_recv().is_err());
+    drop(sender);
+    assert!(matches!(handle.join(), Err(WalError::Rotate(_))));
+}
