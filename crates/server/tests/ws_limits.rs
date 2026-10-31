@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use api::*;
 use proto::{AckLevel, ClientFrame, ErrorCode};
 use server::{Clock, ManualClock, SystemClock};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const READ: u8 = auth::PERM_READ;
 
@@ -664,5 +664,59 @@ async fn http_bodies_in_pieces_arrive_intact() {
         assert_eq!(bytes, data);
     }
     drop(reader);
+    server.server.shutdown();
+}
+
+/// `HELLO`'s deadline has to fire with bytes arriving and replies going, or no token is needed
+/// to keep a connection and its work for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ping_flood_doesnt_outlive_the_hello_deadline() {
+    let server = start_node(node_config(1));
+    let mut tls = server.tls().await;
+    tls.write_all(
+        b"GET /v1/ws HTTP/1.1\r\nhost: l\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\
+          sec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(tls.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    let (mut read_half, mut write_half) = tokio::io::split(tls);
+    // Masked empty PINGs, which a connection answers before any HELLO.
+    let batch: Vec<u8> = [0x89u8, 0x80, 1, 2, 3, 4].repeat(2_000);
+    let writer = tokio::spawn(async move {
+        while write_half.write_all(&batch).await.is_ok() {
+            if write_half.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let closed = loop {
+        let waited = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(started + Duration::from_secs(15)),
+            read_half.read(&mut buffer),
+        )
+        .await;
+        match waited {
+            Err(_) => break false,
+            Ok(Ok(0)) | Ok(Err(_)) => break true,
+            Ok(Ok(_)) => {}
+        }
+    };
+    writer.abort();
+    assert!(
+        closed,
+        "an unauthenticated connection was still open at 15 s"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "closed before the deadline: {:?}",
+        started.elapsed()
+    );
     server.server.shutdown();
 }

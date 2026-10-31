@@ -348,6 +348,7 @@ impl WsConn<'_> {
                 // Timers first: a steady flow below is always ready, and must not starve them.
                 _ = sleep_until_some(retry_at) => Wake::Retry,
                 _ = sleep_until_some(partial_deadline) => Wake::PartialTimeout,
+                _ = tokio::time::sleep_until(hello_deadline), if no_session => Wake::HelloTimeout,
                 _ = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => Wake::Expiry,
                 ready = tcp.writable(), if want_write => Wake::Writable(ready),
                 reply = recv_reply(client) => Wake::Reply(reply),
@@ -355,7 +356,6 @@ impl WsConn<'_> {
                 // rustls may hold plaintext the socket no longer says anything about.
                 _ = std::future::ready(()), if read_again && may_read => Wake::Readable(Ok(())),
                 ready = tcp.readable(), if may_read => Wake::Readable(ready),
-                _ = tokio::time::sleep_until(hello_deadline), if no_session => Wake::HelloTimeout,
                 _ = tokio::time::sleep(Duration::from_millis(CLOSE_TIMEOUT_MS)), if close_wait => {
                     return Ok(());
                 }
