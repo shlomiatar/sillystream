@@ -61,6 +61,7 @@ pub(crate) async fn run(
         send_client,
         notes,
         next_notify_ms: 0,
+        epoch: 0,
     };
     let end = worker.run(home, &mut guard.seen_note_count).await;
     guard.restart = end == End::Killed;
@@ -154,6 +155,8 @@ struct Worker {
     notes: watch::Receiver<u64>,
     /// `webhook.notify`'s next allowed send. Held here so an update or a resume doesn't forget it.
     next_notify_ms: u64,
+    /// The sink's epoch as last read, which its reports carry.
+    epoch: u64,
 }
 
 impl Worker {
@@ -186,7 +189,14 @@ impl Worker {
 
     async fn report(&self, report: SinkReport) {
         let sink_id = self.key.1;
-        let _ = self.op(SinkOp::Report { sink_id, report }).await;
+        let epoch = self.epoch;
+        let _ = self
+            .op(SinkOp::Report {
+                sink_id,
+                epoch,
+                report,
+            })
+            .await;
     }
 
     async fn run(&mut self, home: usize, seen_note_count: &mut u64) -> End {
@@ -204,13 +214,14 @@ impl Worker {
             else {
                 return End::Done;
             };
+            self.epoch = spec.epoch;
             let cursor = cursor.unwrap_or(0);
             let retention_ms = info.config.retention_ms;
             let Some(kind) = kind_of(&spec) else {
                 return End::Done;
             };
             let spell = if spec.paused {
-                self.wait_paused(&spec, cursor, info.head, retention_ms)
+                self.wait_paused(&spec, cursor, info.head, info.earliest_id, retention_ms)
                     .await
             } else {
                 if kind == Kind::Forward {
@@ -248,17 +259,28 @@ impl Worker {
         spec: &SinkSpec,
         mut cursor: u64,
         mut head: u64,
+        mut earliest_id: u64,
         mut retention_ms: u64,
     ) -> Spell {
         let check = Duration::from_millis(self.context.config.paused_check_ms);
         let mut warned = spec.expiry_warning_id.is_some();
         loop {
             let now_ms = self.context.clock.now_ms();
-            if !warned && cursor != 0 && cursor < head {
-                let expires_ms = id_ms(cursor).saturating_add(retention_ms);
+            // At cursor 0 nothing has been read, so the oldest unread record is the oldest there
+            // is, leaving out what had already expired when the sink began (D201, D239).
+            let oldest_id = match cursor {
+                0 => earliest_id.max(retention_start_id(spec.epoch, retention_ms)),
+                cursor => cursor,
+            };
+            let unread = match cursor {
+                0 => earliest_id != 0 && oldest_id <= head,
+                cursor => cursor < head,
+            };
+            if !warned && unread {
+                let expires_ms = id_ms(oldest_id).saturating_add(retention_ms);
                 if now_ms.saturating_add(self.context.config.expire_warn_ms) >= expires_ms {
                     warned = true;
-                    self.warn(cursor, expires_ms).await;
+                    self.warn(oldest_id, expires_ms).await;
                 }
             }
             tokio::select! {
@@ -275,6 +297,7 @@ impl Worker {
                 return Spell::Reload;
             };
             head = info.head;
+            earliest_id = info.earliest_id;
             retention_ms = info.config.retention_ms;
             cursor = info
                 .sinks

@@ -143,6 +143,9 @@ pub struct StreamInfo {
     pub head: u64,
     /// The last id given out, visible yet or not.
     pub stamped_id: u64,
+    /// The lowest id this stream's extents and memory hold, or 0 with none. A sink at cursor 0
+    /// warns from it (D239).
+    pub earliest_id: u64,
     pub state_ver: u64,
     pub config: StreamConfig,
     /// `(sink id, spec, cursor)`, in id order.
@@ -180,6 +183,8 @@ pub enum SinkOp {
     /// From the sink's worker.
     Report {
         sink_id: u64,
+        /// The spell's sink: a report from before a reset or a delete is ignored.
+        epoch: u64,
         report: SinkReport,
     },
 }

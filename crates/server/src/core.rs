@@ -46,6 +46,8 @@ use crate::state::{StreamState, apply_op, check_doc};
 /// How often a core retries what didn't fit in a full channel. Crossbeam gives nothing
 /// to await, and the writer's wake-ups only cover this core's own entries (D62).
 const RETRY_FULL_MS: u64 = 1;
+/// How long a stopping core keeps offering stamped entries to a full WAL channel.
+const STOP_DRAIN_MS: u64 = 5_000;
 /// `actor u64` of a system record, then its doc (section 2.2).
 const ACTOR_BYTES: usize = 8;
 /// What a client hears once nothing more can be made durable (D79).
@@ -683,6 +685,39 @@ impl Core {
             self.flush_outbound();
             self.flush_uploads();
             self.run_deferred();
+        }
+        self.drain_outbound_for_stop().await;
+    }
+
+    /// A clean stop isn't one of the things section 7.2 lists level 1 as lost on, so what is
+    /// stamped goes to the WAL before the core ends (D241). Only an entry waiting on another
+    /// core's can need that core's word, and every core is doing the same. The writer can stall
+    /// for good, so this has a bound, and what is left is reported.
+    async fn drain_outbound_for_stop(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(STOP_DRAIN_MS);
+        loop {
+            self.flush_outbound();
+            if self.outbound.is_empty() || self.wal_stopped {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::select! {
+                Some(message) = self.inbox.control.recv() => {
+                    if matches!(message, ControlMsg::WalSent { .. }) {
+                        self.on_control(message);
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_millis(RETRY_FULL_MS)) => {}
+            }
+        }
+        if !self.outbound.is_empty() {
+            eprintln!(
+                "core {}: stopped with {} stamped entries not in the WAL",
+                self.config.id,
+                self.outbound.len()
+            );
         }
     }
 
@@ -2091,6 +2126,9 @@ impl Core {
             CursorOp::Commit(id) if id > head => {
                 fail(ErrorCode::Malformed, "COMMIT above the stream's head");
             }
+            CursorOp::Reset(id) if id > head => {
+                fail(ErrorCode::Malformed, "cursor reset above the stream's head");
+            }
             CursorOp::Commit(_) | CursorOp::Reset(_) if !room => {
                 fail(ErrorCode::TooManySubscriptions, NO_CURSOR_ROOM);
             }
@@ -2106,7 +2144,7 @@ impl Core {
                 let _ = reply.send(stream.delivery.cursors.get(&cursor).copied());
             }
             CursorOp::Put { id, reset, reply } => {
-                if !reset && id > head {
+                if id > head {
                     let _ = reply.send(Err(ErrorCode::Malformed));
                     return;
                 }
@@ -2372,12 +2410,26 @@ impl Core {
                     let _ = self.links.control[to].send(ControlMsg::StreamInfo { stream, reply });
                 }
                 Route::Here(_) => {
+                    let memory_first_id = self
+                        .logs
+                        .get(&*stream)
+                        .and_then(|log| log.batches.front())
+                        .map(|batch| batch.first_id);
                     let result = self
                         .streams
                         .get(&*stream)
                         .map(|stream| StreamInfo {
                             head: stream.delivery.visible_head(stream.ids.last_id()),
                             stamped_id: stream.ids.last_id(),
+                            earliest_id: stream
+                                .delivery
+                                .extents
+                                .first()
+                                .map(|known| known.extent.id_first)
+                                .into_iter()
+                                .chain(memory_first_id)
+                                .min()
+                                .unwrap_or(0),
                             state_ver: stream.delivery.visible_state.0,
                             config: stream.config,
                             sinks: stream
@@ -3388,11 +3440,19 @@ impl Core {
                     }
                 }
             }
-            SinkOp::Report { sink_id, report } => {
+            SinkOp::Report {
+                sink_id,
+                epoch,
+                report,
+            } => {
                 let spec = delivery
                     .sinks
                     .get_mut(&sink_id)
                     .ok_or(ErrorCode::NotFound)?;
+                // A spell before a reset or a delete has nothing to say about this one.
+                if spec.epoch != epoch {
+                    return Ok(());
+                }
                 match report {
                     SinkReport::Failure { count, error } => {
                         spec.failure_count = count;

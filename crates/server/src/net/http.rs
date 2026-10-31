@@ -348,6 +348,11 @@ fn parse_request(head: &[u8], leftover: Vec<u8>) -> Result<Request, Response> {
     let bad = || malformed("the request can't be parsed");
     let text = std::str::from_utf8(head).map_err(|_| bad())?;
     let mut lines = text.split("\r\n");
+    // A bare CR or LF would end a line for some other parser, and hide a header from the
+    // framing check below.
+    if lines.clone().any(|line| line.contains(['\r', '\n'])) {
+        return Err(bad());
+    }
     let mut request_line = lines.next().ok_or_else(bad)?.split(' ');
     let (Some(method), Some(target), Some(version), None) = (
         request_line.next(),
@@ -672,7 +677,10 @@ impl<'a> HttpConn<'a> {
             self.read_small_body(&mut request).await?
         };
         let shape = match route {
-            Route::Info => self.info(&stream).await,
+            Route::Info => {
+                let is_admin = token.check(&stream, auth::PERM_ADMIN, now_ms).is_ok();
+                self.info(&stream, is_admin).await
+            }
             Route::Publish => {
                 return self.publish(&stream, &mut request, token.author).await;
             }
@@ -954,10 +962,10 @@ impl<'a> HttpConn<'a> {
         }
     }
 
-    async fn info(&mut self, stream: &str) -> Response {
+    async fn info(&mut self, stream: &str, is_admin: bool) -> Response {
         match self.client().stream_info(stream).await {
             Err(code) => error(code, "no such stream"),
-            Ok(info) => Response::json(200, info_json(stream, &info)),
+            Ok(info) => Response::json(200, info_json(stream, &info, is_admin)),
         }
     }
 
@@ -1325,8 +1333,13 @@ fn config_json(config: &StreamConfig) -> String {
 }
 
 /// How a sink is doing. Its secret is never shown, and neither is its URL, which often holds one.
-fn sink_status_json(spec: &SinkSpec) -> String {
-    let text = |value: &Option<String>| value.as_deref().map_or("null".to_owned(), quoted);
+/// `pause_reason` and `last_error` are raw error text, which can name the destination's host and
+/// address, so only `admin` sees them, like the URL (D188, D240).
+fn sink_status_json(spec: &SinkSpec, is_admin: bool) -> String {
+    let text = |value: &Option<String>| match value.as_deref() {
+        Some(_) if !is_admin => "\"hidden\"".to_owned(),
+        value => value.map_or("null".to_owned(), quoted),
+    };
     let gaps: Vec<String> = spec
         .gaps
         .iter()
@@ -1350,7 +1363,7 @@ fn sink_status_json(spec: &SinkSpec) -> String {
     )
 }
 
-fn info_json(stream: &str, info: &StreamInfo) -> String {
+fn info_json(stream: &str, info: &StreamInfo, is_admin: bool) -> String {
     let mut sinks = String::new();
     for (id, spec, cursor) in &info.sinks {
         if !sinks.is_empty() {
@@ -1361,7 +1374,7 @@ fn info_json(stream: &str, info: &StreamInfo) -> String {
             quoted(&spec.kind),
             spec.paused,
             cursor.unwrap_or(0),
-            sink_status_json(spec)
+            sink_status_json(spec, is_admin)
         ));
     }
     format!(

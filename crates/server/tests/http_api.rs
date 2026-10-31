@@ -531,6 +531,61 @@ async fn state_get_and_patch_with_if_match() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reset_above_the_head_is_refused() {
+    let server = start();
+    let text = token(ALL);
+    let ids = seed(&server, "c", &[b"1"]).await;
+    let path = "/v1/stream/c/cursor/mine?reset=true";
+    let reply = server
+        .http(&Http::new("PUT", path, &text).body((ids[0] + 1).to_string().into_bytes()))
+        .await;
+    assert_eq!(reply.status, 400, "{}", reply.text());
+    server.server.shutdown();
+}
+
+/// `read` can see a sink's health, not what its errors say about the destination (D188).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_admin_sees_a_sinks_error_text() {
+    let mut node = node_config(2);
+    node.sink.pool_thread_count = 2;
+    let server = start_node(node);
+    let text = token(ALL);
+    let reader = token(auth::PERM_READ);
+    seed(&server, "h", &[b"1"]).await;
+    // Nothing listens here, and the worker's report is what puts the text in the status.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let body = format!(
+        r#"{{"kind":"webhook.deliver","url":"http://{address}/x","secret":"s","start":"earliest"}}"#
+    );
+    let created = server
+        .http(&Http::new("PUT", "/v1/stream/h/sink/1", &text).body(body.into_bytes()))
+        .await;
+    assert_eq!(created.status, 200, "{}", created.text());
+    let started = std::time::Instant::now();
+    let info = loop {
+        let info = server
+            .http(&Http::new("GET", "/v1/stream/h", &text))
+            .await
+            .text();
+        if !info.contains("\"last_error\":null") || !info.contains("\"pause_reason\":null") {
+            break info;
+        }
+        assert!(started.elapsed().as_secs() < 10, "{info}");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    };
+    assert!(!info.contains("\"hidden\""), "{info}");
+    let seen = server
+        .http(&Http::new("GET", "/v1/stream/h", &reader))
+        .await
+        .text();
+    assert!(seen.contains("\"hidden\""), "{seen}");
+    assert!(!seen.contains(&address.ip().to_string()), "{seen}");
+    server.server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursors_move_forward_and_reset_goes_back() {
     let server = start();
     let text = token(ALL);

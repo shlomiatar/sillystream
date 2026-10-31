@@ -208,3 +208,35 @@ async fn a_memory_cap_makes_publishers_wait_until_uploads_free_slabs() {
     assert_eq!(seqs.len() as u64, seq);
     harness.finish();
 }
+
+/// Section 7.2 lists level 1 as lost on a process crash. A clean stop isn't one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_stop_writes_level_1_acked_records_still_waiting_for_the_wal() {
+    let mut harness = Harness::new(stalled_config());
+    let mut client = harness.node().client(0).await;
+    let records = record_with(1, b"hello");
+
+    harness.wal.hold();
+    let mut acked = 0;
+    let mut seq = 1;
+    // Until the channel and the writer's own group can take no more, and the core holds one.
+    while harness.node().stats(0).await.unwrap().outbound_count == 0 {
+        client
+            .publish(publish("s", &records, seq, 1))
+            .await
+            .unwrap();
+        seq += 1;
+        expect_ack(&mut client).await;
+        acked += 1;
+        assert!(acked < 1_000, "the channel never filled");
+    }
+    let wal = harness.wal.clone();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        wal.release();
+    });
+    let exit = harness.node.take().unwrap().shutdown();
+    release.join().unwrap();
+    exit.wal.unwrap();
+    assert_eq!(harness.wal.stream_entries("s").len() as u64, acked);
+}

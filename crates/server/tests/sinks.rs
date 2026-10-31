@@ -1585,6 +1585,69 @@ async fn a_paused_sink_warns_too_and_a_skip_acts_on_resume() {
     harness.finish();
 }
 
+/// A sink that never delivered anything is the one the warning exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_sink_at_cursor_0_warns_of_its_oldest_record() {
+    let receiver = Receiver::start().await;
+    let mut config = config();
+    config.sink.expire_warn_ms = 3_600_000;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.paused = true;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    let first = send(&mut client, STREAM, b"unread", 1).await;
+    harness.clock.advance(DAY_MS - 3_600_000 - 1_000);
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
+    let (spec, cursor) = sink_of(&mut client, STREAM, 1).await;
+    assert_eq!(cursor, 0);
+    assert_eq!(spec.expiry_warning_id, None, "too early");
+    harness.clock.advance(1_000);
+    assert_eq!(wait_for_warning(&mut client).await, first);
+    drop(client);
+    harness.finish();
+}
+
+/// A report from a spell before a reset is about a position the sink has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_from_an_older_epoch_is_ignored() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.paused = true;
+    put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
+    let old_epoch = sink_of(&mut client, STREAM, 1).await.0.epoch;
+    client
+        .sink_op(STREAM, SinkOp::Delete { sink_id: 1 })
+        .await
+        .unwrap();
+    spec.paused = false;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    let (now, _) = sink_of(&mut client, STREAM, 1).await;
+    assert!(now.epoch > old_epoch);
+    client
+        .sink_op(
+            STREAM,
+            SinkOp::Report {
+                sink_id: 1,
+                epoch: old_epoch,
+                report: SinkReport::Paused {
+                    reason: "late".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let (spec, _) = sink_of(&mut client, STREAM, 1).await;
+    assert!(!spec.paused);
+    assert_eq!(spec.pause_reason, None);
+    drop(client);
+    harness.finish();
+}
+
 // ---------- lifecycle ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1997,11 +2060,13 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
         .await
         .unwrap();
     // A gap reported, and a stream that has since lost its sink, which stays gone.
+    let epoch = sink_of(&mut client, "keep.b", 3).await.0.epoch;
     client
         .sink_op(
             "keep.b",
             SinkOp::Report {
                 sink_id: 3,
+                epoch,
                 report: SinkReport::Gap {
                     first_id: 5,
                     last_id: 6,

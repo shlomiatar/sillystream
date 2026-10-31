@@ -257,3 +257,30 @@ async fn a_subscribe_cant_make_a_named_cursor_above_the_head() {
     assert_eq!(heard.records(8)[0].0, later[0]);
     drop((connection, client));
 }
+
+/// A cursor past the head would attach past future records with no word of it (section 5.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_above_the_head_is_refused_and_leaves_the_cursor() {
+    let harness = Harness::new(manual_config(1));
+    let mut connection = harness.node().connection(0).await.unwrap();
+    let mut client = harness.node().client(0).await;
+    let records = record_with(1, b"one");
+    client
+        .publish(publish(STREAM, &records, 1, 2))
+        .await
+        .unwrap();
+    let id = expect_ack(&mut client).await.1;
+    connection.reset_cursor(STREAM, "worker", id);
+    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(id));
+
+    let mut heard = Heard::default();
+    connection.reset_cursor(STREAM, "worker", u64::MAX);
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.error_code(0).is_some()
+    })
+    .await;
+    assert_eq!(heard.error_code(0), Some(ErrorCode::Malformed));
+    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(id));
+    drop((connection, client));
+    harness.finish();
+}
