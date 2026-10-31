@@ -1523,6 +1523,233 @@ async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     node.shutdown();
 }
 
+/// The manifest stream's read stops at a slow GET, partway, with the workers' saved cursors
+/// already ahead of it. Once the job has deleted what they passed, that position is expired, and
+/// the read has to start again from what's left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_read_left_below_expired_records_starts_again() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("seven", class_config(7 * DAY_MS)).await;
+    publish_one(&mut client, "seven", 1, b"one").await;
+    seal_path_of(&node).await;
+    seal_path_of(&node).await;
+    publish_one(&mut client, "seven", 2, b"two").await;
+    seal_path_of(&node).await;
+    let last_holder = seal_path_of(&node).await;
+    let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    disk.clock.advance(3 * DAY_MS);
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    disk.store.slow_get_once.lock().unwrap().push((
+        last_holder.filename().unwrap().to_owned(),
+        std::time::Duration::from_secs(6),
+    ));
+    let report = node.expire_now().await.unwrap();
+    assert!(report.deleted_object_count > 0, "{report:?}");
+
+    let fresh = publish_one(&mut client, "seven", 3, b"three").await;
+    seal_path_of(&node).await;
+    seal_path_of(&node).await;
+    for _ in 0..3 {
+        let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+        assert_eq!(report.errors, Vec::<String>::new());
+    }
+    let copied = disk.extents("7d").await;
+    assert!(
+        copied.iter().any(|extent| extent.2 >= fresh),
+        "{fresh} wasn't compacted: {copied:?}"
+    );
+    drop(client);
+    node.shutdown();
+}
+
+/// Two seals overlap, and the later one's slower upload lets the earlier one's manifest be
+/// stamped into a WAL file neither object holds. Losing the machine loses that WAL (section 8.1),
+/// so nothing may have recorded the object yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_only_in_the_wal_leaves_its_object_unrecorded() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    client.configure("seven", class_config(7 * DAY_MS)).await;
+    assert!(node.seal_and_checkpoint().await);
+
+    disk.store.hold();
+    let first_id = publish_one(&mut client, "seven", 1, b"r1").await;
+    disk.store.slow_put.lock().unwrap().push((
+        format!("{:020}.seg", first_id + 1),
+        std::time::Duration::from_millis(300),
+    ));
+    let (seal_a, (second_id, seal_b)) = tokio::join!(node.seal(), async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second_id = publish_one(&mut client, "seven", 2, b"r2").await;
+        let (seal_b, ()) = tokio::join!(node.seal(), async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            disk.store.release();
+        });
+        (second_id, seal_b)
+    });
+    assert_eq!(second_id, first_id + 1);
+    assert!(matches!(seal_a, SealOutcome::Uploaded { .. }), "{seal_a:?}");
+    assert!(matches!(seal_b, SealOutcome::Uploaded { .. }), "{seal_b:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    drop(client);
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.dir.path().join("wal")).unwrap();
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let node = disk.start(config(1));
+    let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    let copied = disk.extents("7d").await;
+    for id in [first_id, second_id] {
+        assert!(
+            copied.iter().any(|extent| extent.1 <= id && id <= extent.2),
+            "{id} wasn't copied: {copied:?}"
+        );
+    }
+
+    disk.clock.advance(3 * DAY_MS);
+    let report = node.expire_now().await.unwrap();
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+    assert_eq!(report.blocked_prefixes, Vec::<String>::new());
+    assert_eq!(disk.objects("sealed").await, Vec::<Path>::new());
+    node.shutdown();
+}
+
+/// Recovery leaves out a former generation's multi-item record crossing its limit, while the
+/// footer can't show where records begin. That mustn't look like an owner not having heard yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_former_generations_record_crossing_its_limit_does_not_stop_the_worker() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "anchor", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+    let node = disk.start(config(1));
+    node.shutdown();
+    let limit = storage::read_ownership(disk.store.as_ref())
+        .await
+        .unwrap()
+        .limit_for(1)
+        .unwrap();
+
+    let mut crossing = Vec::new();
+    format::encode_record(
+        &mut crossing,
+        &format::RecordHeader {
+            id: limit,
+            options: 0,
+            author: 7,
+            len: 1,
+            count: 3,
+            codec: 0,
+        },
+        b"c",
+    )
+    .unwrap();
+    let mut builder = SegmentBuilder::new();
+    builder
+        .add_extent("crossing", vec![Bytes::from(crossing)])
+        .unwrap();
+    builder
+        .add_extent("below", vec![stamped(limit - 1, b"below")])
+        .unwrap();
+    let body: Vec<u8> = builder
+        .finish()
+        .unwrap()
+        .parts
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    disk.store
+        .put(&seal_path("former", 1, limit - 1), PutPayload::from(body))
+        .await
+        .unwrap();
+
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    for stream in ["crossing", "below", "fresh"] {
+        client.configure(stream, class_config(7 * DAY_MS)).await;
+    }
+    let fresh = publish_one(&mut client, "fresh", 1, b"fresh").await;
+    seal_path_of(&node).await;
+    let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
+    assert_eq!(report.errors, Vec::<String>::new());
+    let copied = disk.extents("7d").await;
+    assert!(
+        copied.iter().any(|extent| extent.0 == "below"),
+        "{copied:?}"
+    );
+    assert!(
+        copied
+            .iter()
+            .any(|extent| extent.0 == "fresh" && extent.1 == fresh),
+        "{copied:?}"
+    );
+    assert!(
+        copied.iter().all(|extent| extent.0 != "crossing"),
+        "{copied:?}"
+    );
+    drop(client);
+    node.shutdown();
+}
+
+/// Hour H's last manifest went with hour H+1 while something else held H back. After a restart
+/// no manifest names H's object, and every cursor is long past where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_hour_whose_manifest_has_expired_can_still_go() {
+    let disk = Disk::new();
+    let node = disk.start(config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "d1", 1, b"x").await;
+    let object = seal_path_of(&node).await;
+    let hour = object.parts().nth(1).unwrap().as_ref().to_owned();
+    let stray = Path::from(format!("sealed/{hour}/stray/1-1.seg"));
+    disk.store
+        .put(&stray, PutPayload::from_static(b"garbage"))
+        .await
+        .unwrap();
+    disk.clock.advance(HOUR_MS);
+    publish_one(&mut client, "d1", 2, b"y").await;
+    seal_path_of(&node).await;
+    seal_path_of(&node).await;
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    disk.clock.advance(3 * DAY_MS);
+    let report = node.expire_now().await.unwrap();
+    assert!(
+        report.blocked_prefixes.contains(&format!("sealed/{hour}")),
+        "{report:?}"
+    );
+    assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    disk.store.inner_delete(&stray).await;
+    let node = disk.start(config(1));
+    node.compact_now(&RetentionClass::ALL).await.unwrap();
+    let mut gone = false;
+    for _ in 0..3 {
+        let report = node.expire_now().await.unwrap();
+        assert_eq!(report.errors, Vec::<String>::new());
+        gone |= report.deleted_prefixes.contains(&format!("sealed/{hour}"));
+    }
+    assert!(gone, "still there: {:?}", disk.objects("sealed").await);
+    assert!(!disk.objects("sealed").await.contains(&object));
+    node.shutdown();
+}
+
 /// Retention applies to records only: state lasts until the stream is deleted (section 7.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_state_only_subscribe_from_before_what_expired_gets_the_state() {

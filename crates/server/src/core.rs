@@ -2718,7 +2718,8 @@ impl Core {
                 state_after: None,
             },
             region.freeze(),
-            2,
+            // Acked once it is in an object, which is what lets a checkpoint record the path.
+            3,
             Waiter {
                 reply: Reply::Ack {
                     handle: 0,

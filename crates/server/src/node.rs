@@ -181,10 +181,6 @@ pub(crate) enum NodeMsg {
     NextCheckpoint {
         reply: oneshot::Sender<bool>,
     },
-    /// An object's manifest is in the WAL, so a checkpoint may record it (section 7.5).
-    ManifestDurable {
-        path: String,
-    },
     CheckpointSaved(CheckpointDone),
     RetryRotate,
     Rotated {
@@ -242,6 +238,9 @@ struct ControlMeta {
     closed_seq_by_seal: HashMap<u64, u64>,
     /// Objects no checkpoint has listed yet, which wait for their extents to reach a gather.
     objects: Vec<String>,
+    /// Uploaded objects whose manifest isn't in an uploaded object yet, each with where that
+    /// manifest's level 3 ack arrives (D180).
+    unsaved_manifests: Vec<(String, mpsc::UnboundedReceiver<Reply>)>,
     gather_count: u64,
     next_waiters: Vec<CheckpointWaiter>,
     waiters_by_seal: BTreeMap<u64, Vec<CheckpointWaiter>>,
@@ -316,11 +315,6 @@ impl Control {
                     let _ = reply.send(false);
                 }
             },
-            NodeMsg::ManifestDurable { path } => {
-                if let Some(meta) = &mut self.meta {
-                    meta.objects.push(path);
-                }
-            }
             NodeMsg::CheckpointSaved(done) => self.on_checkpoint_saved(done),
             NodeMsg::Seal { reply } => {
                 self.seal_waiters.push(reply);
@@ -472,6 +466,21 @@ impl Control {
             };
             metas.extend(gathered);
         }
+        // The cores have read this seal's upload event by now, so its acks are here.
+        let ControlMeta {
+            objects,
+            unsaved_manifests,
+            ..
+        } = &mut *meta;
+        unsaved_manifests.retain_mut(|(path, answer)| match answer.try_recv() {
+            Ok(Reply::Ack { .. }) => {
+                objects.push(std::mem::take(path));
+                false
+            }
+            Err(mpsc::error::TryRecvError::Empty) => true,
+            // The next startup looks at this object again.
+            Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => false,
+        });
         let objects = if clean {
             std::mem::take(&mut meta.objects)
         } else {
@@ -555,22 +564,20 @@ impl Control {
         }
     }
 
-    /// The manifest of an uploaded object. Only once it is in the WAL does a checkpoint record
-    /// the object: a startup looks at any object no checkpoint records and publishes again, so
-    /// a crash can't leave an object the compactor will never hear of (section 7.5).
+    /// The manifest of an uploaded object. Only once it is in an uploaded object does a
+    /// checkpoint record the object: a startup looks at any object no checkpoint records and
+    /// publishes again, so a crash or a lost WAL can't leave an object the compactor will never
+    /// hear of (section 7.5, D180).
     fn publish_manifest(&mut self, path: String, len_bytes: u64) {
         storage::crash_point("manifest.before_publish");
-        let (reply, mut answer) = mpsc::unbounded_channel();
+        let (reply, answer) = mpsc::unbounded_channel();
         let shard = shard_of(MANIFEST_STREAM, self.config.virtual_shard_count);
         let core = self.location[shard as usize] as usize;
         let doc = format::encode_manifest_doc(len_bytes, &path);
         let _ = self.links.control[core].send(ControlMsg::PublishManifest { doc, reply });
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            if let Some(Reply::Ack { .. }) = answer.recv().await {
-                let _ = tx.send(NodeMsg::ManifestDurable { path });
-            }
-        });
+        if let Some(meta) = &mut self.meta {
+            meta.unsaved_manifests.push((path, answer));
+        }
     }
 
     /// What the API can ask for, unlike the rebalancer's plan, may not exist: a core that
@@ -1083,6 +1090,7 @@ impl Node {
                 jobs,
                 closed_seq_by_seal: HashMap::new(),
                 objects: known_objects,
+                unsaved_manifests: Vec::new(),
                 gather_count: 0,
                 next_waiters: Vec::new(),
                 waiters_by_seal: BTreeMap::new(),

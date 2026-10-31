@@ -339,34 +339,50 @@ impl Compactor {
     }
 
     /// Reads whatever the stream has past what `log` has. Stopping early is fine: the next run
-    /// carries on, and a worker only moves past what it has read.
-    async fn refresh(&self, log: &mut ManifestLog) {
+    /// carries on, and a worker only moves past what it has read. True if it reached the head,
+    /// so a manifest not in `log` is one that has expired.
+    async fn refresh(&self, log: &mut ManifestLog) -> bool {
         let Some(mut connection) =
             Connection::open(self.links.control[0].clone(), self.window_bytes).await
         else {
-            return;
+            return false;
         };
-        let mut subscription = Subscription::new(1, MANIFEST_STREAM, log.through);
-        subscription.include_system = true;
-        connection.subscribe(subscription);
+        let mut from = log.through;
+        let subscribe = |connection: &mut Connection, from: u64| {
+            let mut subscription = Subscription::new(1, MANIFEST_STREAM, from);
+            subscription.include_system = true;
+            connection.subscribe(subscription);
+        };
+        subscribe(&mut connection, from);
         let mut head = None;
         while let Some(event) = connection.recv_within(LOG_QUIET_MS).await {
             match event {
                 Event::Subscribed { head: at, .. } => head = Some(at),
                 Event::Data { records, .. } => log.add(&records.to_vec()),
                 Event::Progress { id, .. } => log.through = log.through.max(id),
+                // An earlier read stopped short, and the cursors were already ahead of it, so
+                // what it hadn't got to has gone. What's left is where to read from (D179).
+                Event::Error {
+                    code: ErrorCode::RetentionExpired,
+                    ..
+                } if from != 0 => {
+                    from = 0;
+                    subscribe(&mut connection, from);
+                }
                 Event::Error { code, msg, .. } => {
-                    if code != ErrorCode::NotFound {
-                        eprintln!("reading the manifest stream: {msg}");
+                    if code == ErrorCode::NotFound {
+                        return true;
                     }
-                    return;
+                    eprintln!("reading the manifest stream: {msg}");
+                    return false;
                 }
                 Event::Behind { .. } | Event::State { .. } => {}
             }
             if head.is_some_and(|head| log.through >= head) {
-                return;
+                return true;
             }
         }
+        false
     }
 
     async fn read_cursor(&self, class: RetentionClass) -> Result<u64, String> {
@@ -633,7 +649,9 @@ impl Compactor {
                 if RetentionClass::of_retention(view.retention_ms) != Some(class) {
                     continue;
                 }
-                if view.unnoted {
+                // Only this generation's uploads can still be on their way to an owner. A former
+                // one's were all read at startup, and what is unlisted was left out (D181).
+                if view.unnoted && object_generation(path) == Some(self.generation) {
                     not_ready = true;
                     break 'manifests;
                 }
@@ -882,12 +900,13 @@ impl Compactor {
 
     /// Whether an expired `sealed/` object may go: every worker has passed its manifest and the
     /// manifest records it holds. An object with no manifest passes only if no stream points at
-    /// it. Everything here errs towards keeping it.
+    /// it, or its manifest has expired. Everything here errs towards keeping it.
     async fn sealed_object_passed(
         &self,
         path: &Path,
         extents: &[StreamExtent],
         manifest_ids: &HashMap<&Path, u64>,
+        log_complete: bool,
         slowest_cursor: u64,
     ) -> Result<bool, String> {
         let holds_unread_manifests = extents
@@ -896,9 +915,13 @@ impl Compactor {
         if holds_unread_manifests {
             return Ok(false);
         }
-        let manifest_passed = manifest_ids
-            .get(path)
-            .is_some_and(|id| *id <= slowest_cursor);
+        let manifest_passed = match manifest_ids.get(path) {
+            Some(id) => *id <= slowest_cursor,
+            // A recorded object's manifest was saved in an object (D180). With all of the stream
+            // read and no sign of it, that object has gone, which takes every worker passing it
+            // (D182). A longer class left behind is still copied below.
+            None => log_complete && self.is_noted(path),
+        };
         let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
         let mut passed = true;
         for (stream, ranges) in self.footer_by_stream(extents, limit) {
@@ -978,7 +1001,7 @@ impl Compactor {
                 return report;
             }
         }
-        self.refresh(log).await;
+        let log_complete = self.refresh(log).await;
         let mut slowest_cursor = u64::MAX;
         for class in RetentionClass::ALL {
             match self.read_cursor(class).await {
@@ -1022,7 +1045,14 @@ impl Compactor {
                 }
                 let prefix = format!("{root}/{hour}");
                 match self
-                    .check_hour(root, hour, &manifest_ids, slowest_cursor, &mut any_dropped)
+                    .check_hour(
+                        root,
+                        hour,
+                        &manifest_ids,
+                        log_complete,
+                        slowest_cursor,
+                        &mut any_dropped,
+                    )
                     .await
                 {
                     Ok(Some(paths)) => going.push((prefix, paths)),
@@ -1071,6 +1101,7 @@ impl Compactor {
         root: &str,
         hour: u64,
         manifest_ids: &HashMap<&Path, u64>,
+        log_complete: bool,
         slowest_cursor: u64,
         any_dropped: &mut bool,
     ) -> Result<Option<Vec<Path>>, String> {
@@ -1091,7 +1122,13 @@ impl Compactor {
             };
             if root == SEALED_PREFIX
                 && !self
-                    .sealed_object_passed(&path, &extents, manifest_ids, slowest_cursor)
+                    .sealed_object_passed(
+                        &path,
+                        &extents,
+                        manifest_ids,
+                        log_complete,
+                        slowest_cursor,
+                    )
                     .await?
             {
                 return Ok(None);
