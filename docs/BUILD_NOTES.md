@@ -296,6 +296,11 @@ These follow the delivery decisions and change them where they say so. Tests: `c
 - **M9: known limits, none fixed (see the M9 review below for what has been since).** After a restart a sink past expired records can't record the gap, the Q32 consequence. A paused sink's stream reloads periodically after eviction (`paused_check_ms`, 60 s), for D192. Reset doesn't re-forward (Q33); dedupe caps bound forward's guarantee (Q34); cycles aren't detected (Q35).
 - **M9: the API test harness turns the runtime off.** `crates/server/tests/api/mod.rs` sets `sink.pool_thread_count = 0`, so route tests see the cursors they recorded rather than a worker's. `a_sink_made_over_http_runs_and_reports_why_it_paused` covers the routes with a running sink, on its own config.
 
+- **D213.** `--trace-catch-up true` on the server prints `trace catch_up tier=memory|local|object stream=<id> bytes=<n>` on stderr for each catch-up read, off by default. Reason: M10 asserts the tier "through server tracing output", no tracing existed, and a line on stderr is the smallest thing that does it. It is in the normal build, because only retention and crash points may use `test-hooks`. A `tracing` crate would be a new dependency for one line.
+- **D214.** `crates/e2e/tests/e2e.rs` has its own `main` (`harness = false`) and runs its tests one at a time. Reason: the check that no server remains has to come after every test, which the standard harness can't promise.
+- **D215.** The suite builds its binaries itself, with `cargo build`, into `$CARGO_TARGET_DIR/e2e`, and keeps copies in `e2e/bin/plain` and `e2e/bin/hooks`. Reason: a test can't name another package's binary on stable, and in a shared target directory `cargo test --workspace` hands everything the `test-hooks` form. `normal_build_has_no_hooks` checks the plain form.
+- **D216.** A blocked compactor is made by creating `objects/7d` read-only before the server starts, and "only whole prefixes" is checked by sampling `sealed/` every 5 ms during expiry, with the delete job at a 1 s period. A prefix's objects must all go within one period. Reason: the suite can't reach the job from outside, and comparing before and after can't tell a whole prefix from one taken bit by bit: a mutation that deleted one object per pass passed that check and fails this one.
+
 ## Review findings not fixed
 
 From the review of `aceb637`. Each is confirmed by the reproduction given, and each is **not fixed** unless it says otherwise. None has a regression test yet.
@@ -423,6 +428,10 @@ Each has a regression test in `crates/server/tests/sinks.rs` (and `http.rs`, `ht
 - **Fixed (D207), with a limit: an update widening a filter could lose the next record.** The test holds the pool thread as the report did, 12 rounds, none lost. The limit is in D207: an old spell can still send one such record to the old destination.
 - **Open. Low, read and not run: a deleted sink's task can still report on its recreated successor.** `SinkOp::Report` has no epoch check, so a late `Failure` or `Paused` from the old delivery would land on the new sink. A pause there is visible and a resume clears it.
 
+### Findings from the M10 benches
+
+- **Catch-up from memory is slower than from disk, not explained. Not fixed.** `sillystream bench catch-up` at `0681e76`: 319 to 353 MB/s from memory with 8 MiB, against about 2,000 MB/s from the local tier and `LocalFileSystem` on the same records. The numbers are in `docs/BENCH.md`. Section 5.1 reads memory first, so this is the common case for a reader close to the head. The cause wasn't looked for.
+
 ## Known test gaps
 
 **Mutation testing: several storage behaviours can be broken with every test still green. Not fixed.** The production code is correct in each case; the tests don't hold it there. Each mutation was a one-line change of `crates/storage/src`, run against the relevant test binaries, at commit e5e598c.
@@ -450,6 +459,19 @@ Separately, the temp file cleanup in `SegmentCache::put` is tested through a fai
 
 - **The manifest-per-seal test's fix wasn't shown failing first.** `each_seal_publishes_one_manifest_and_the_manifest_stream_none_for_itself` failed about once in 10 runs under load, and that couldn't be reproduced on demand. It now waits for the expected count (`manifests_reaching`). The cause, its 150 ms quiet window, was inferred from the code and never proven directly.
 - **`a_manifest_only_in_the_wal_leaves_its_object_unrecorded` depends on timing.** It failed each time it ran alone on the old code, but one full-workspace run on that code didn't list it among the panics. Passing doesn't by itself prove the ordering happened. Measured during M9, still not fixed: at `270514e` without M9 it failed 1 of 30 runs alone (line 1613, the object not yet copied). With M9 it failed 1 of 12 and 0 of 30 alone, and 1 of 4 runs of the whole binary (line 1601, `Empty { seal: 3 }`, where the test's 50 ms sleeps lost the race). The test file is unchanged by M9, and the node it starts runs no sinks. So it predates M9, though the sample is too small to say M9 leaves the rate unchanged.
+
+**M10: what the suite doesn't reach.** Real S3 and R2, EBS, power loss, machine loss and Linux aren't exercised. `kill -9` proves process crashes only, since the page cache survives it. Everything runs on one macOS laptop against `LocalFileSystem`, whose file-based conditional writes are D14's and aren't S3's. The webhook receiver is plain HTTP on loopback with `--sink-allow-private-addresses true`, so private address blocking and TLS to a receiver aren't exercised here (M9's tests cover them). In `sink_webhook_outage`, all three runs saw no redelivered record, because the cursor had been saved by the time of the kill, so that test shows no loss and full order and doesn't show redelivery (`sink_crash.rs` does). The kill rounds are random and the seed is printed, but the run isn't replayable from it, since timing decides what is in flight. Producers retry in order and stop on any `NACK`, so Q30 isn't exercised.
+
+**M10: mutations tried against the suite.** One-line changes at `63d0985` and later, each on its named test, all reverted: dedupe entries not restored (`kill9_mid_load` fails in round 0), the delete job's compaction check removed (`retention_and_compaction`), one object deleted per pass (survived the first form of the check, fails since D216), `any` inverted (`filters`), a webhook signed over the wrong bytes (`sink_webhook_outage`). Nothing broader was tried, and `sink_forward`, `state_cas`, `atomic_publish` and `token_rejection` had no mutation run at all.
+
+**M10: `sink_forward` restarts during load.** It does `kill -9` while source publishes are still flowing, so forwarding is usually in progress, though the suite can't see that from outside.
+
+**M10: two older tests failed in full workspace runs. Neither is fixed, weakened or skipped, and neither is in the e2e suite.** Both are timing failures seen with \`cargo test --workspace --no-fail-fast\` on the code at \`0681e76\`:
+
+- \`server --test compaction a_manifest_only_in_the_wal_leaves_its_object_unrecorded\`, line 1601, one of two workspace runs. Already listed above as depending on timing.
+- \`server --test sinks on_expire_stop_warns_then_halts\`, line 176, "more requests arrived than expected", 4 against 3, one of two workspace runs. Measured: 1 of 15 alone, 0 of 6 runs of the whole binary. The test takes its count once the sink reports paused, so a delivery already in flight could arrive after that, which section 9 allows. That cause is inferred from reading the test, and wasn't shown. If it's wrong, a paused sink is sending a request.
+
+So \`cargo test --workspace\` isn't reliably green, though all other tests passed on those runs (705 passed, 1 failed on the second).
 
 ## Process
 

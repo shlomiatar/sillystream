@@ -309,7 +309,7 @@ target/release/sillystream bench all --count 5000 --seconds 10 --idle-count 1000
 - **Level 3** goes out at 50 per second so that the spread of a 1 s seal window shows, and its target is `LocalFileSystem`, which doesn't fsync objects. It measures the wait for the window, not S3.
 - **Throughput** rows are one stream, so one owning core, whatever `--cores` says. The window is 8 MiB unanswered per connection, or 16 records if larger. Each row has its own server. Rows include the client's own cost on the same machine, so the server may not be the limit.
 - **Memory per idle connection** is the server's RSS after minus before over the connection count, from `ps`. It counts what the process itself holds for a connection, such as the rustls state, the task and its channels, and not the kernel's socket buffers. The read buffer isn't in it, which `crates/server/tests/idle_connections.rs` asserts on the pool's counters: 10,000 connections, `held_buffer_count = 0`.
-- **Not measured:** real S3 and EBS (unmeasured estimates remain as section 7.2's table has them), many streams on 16 cores, catch-up rate, memory per idle stream, and object PUTs per seal. Those belong to M10.
+- **Not measured here:** real S3 and EBS (unmeasured estimates remain as section 7.2's table has them). The other load generator numbers are under M10 below.
 
 ## Caveats
 
@@ -318,9 +318,7 @@ target/release/sillystream bench all --count 5000 --seconds 10 --idle-count 1000
 - One laptop, under whatever else it was running. Treat differences under about 2× as noise.
 - M1 and M2 are single-threaded CPU measurements with no I/O, and no latency figure in SPEC.md section 7.2 is confirmed or refuted by those two.
 
-## Not run yet
-
-The rest of the load generator numbers (M10): many streams on 16 cores, catch-up rate, memory per idle stream, PUTs per seal. Real S3 and EBS have not been exercised at all.
+## Later re-runs
 
 ### Throughput after D121
 
@@ -369,3 +367,125 @@ Working tree on top of `270514e`, committed together with this file. Same machin
 | While sinks fill their budgets, records/s | 129,812 | 67,489 (0.52) |
 
 Caveats: one run on a shared laptop. The test asserts a steady ratio above 0.7, a bound picked for noise. The steady cost isn't explained (see BUILD_NOTES), and filling costs about half while it lasts. A real fsync would likely hide some of this, which wasn't measured.
+
+## M10: the load generator, complete
+
+All of it at commit `0681e76`, release build, the real server binary as a child process and a client in another process, TLS 1.3 and WebSocket over loopback, through the SDK. Machine as above (Apple M4 Max, 16 cores, macOS 27.0.1, cargo 1.98.1), a shared laptop, load average between 2 and 6. One run of each command, except that each catch-up tier is read three times.
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo build --release -p server -p cli
+target/release/sillystream bench latency --count 5000 --cores 4
+target/release/sillystream bench throughput --seconds 10 --cores 4
+target/release/sillystream bench idle --idle-count 10000 --cores 4
+target/release/sillystream bench catch-up --cores 4 --catch-up-mib 8
+target/release/sillystream bench catch-up --cores 4 --catch-up-mib 256
+target/release/sillystream bench many-streams --cores 16 --seconds 10
+target/release/sillystream bench puts --cores 4
+target/release/sillystream bench idle-streams --cores 4 --idle-streams 20000
+```
+
+#### Latency, 256-byte record, one publisher, 4 cores
+
+| level | measures | samples | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|---|---|---|
+| 0 | publish to delivery | 5000 | 33 | 144 | 297 |
+| 1 | ack, closed loop | 5000 | 34 | 47 | 81 |
+| 2 | ack, closed loop, local disk | 5000 | 4694 | 12845 | 66714 |
+| 3 | ack at 50 per second, `LocalFileSystem`, 1 s window | 1000 | 508994 | 995747 | 1009146 |
+
+#### Throughput, one stream, 4 cores, 10 s each
+
+| ack | connections | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 334770 | 342.8 |
+| 1 | 1 | 65536 | 12122 | 794.4 |
+| 1 | 4 | 1024 | 449716 | 460.5 |
+| 1 | 4 | 65536 | 23753 | 1556.7 |
+| 2 | 1 | 1024 | 188602 | 193.1 |
+| 2 | 1 | 65536 | 5683 | 372.4 |
+| 2 | 4 | 1024 | 473112 | 484.5 |
+| 2 | 4 | 65536 | 12137 | 795.4 |
+
+#### Memory per idle connection, 4 cores
+
+| connections | server RSS before | server RSS after | bytes per connection |
+|---|---|---|---|
+| 10000 | 12664832 | 227721216 | 21506 |
+
+#### Catch-up rate, 2048 records of 4096 bytes, 4 cores
+
+| tier | run | MB/s of data | bytes from memory | bytes from local | bytes from object store |
+|---|---|---|---|---|---|
+| memory | 1 | 319 | 8454144 | 0 | 0 |
+| memory | 2 | 319 | 8454144 | 0 | 0 |
+| memory | 3 | 353 | 8454144 | 0 | 0 |
+| local disk | 1 | 1813 | 0 | 8454144 | 0 |
+| local disk | 2 | 2459 | 0 | 8454144 | 0 |
+| local disk | 3 | 2538 | 0 | 8454144 | 0 |
+| `LocalFileSystem` object store | 1 | 1743 | 0 | 0 | 8454144 |
+| `LocalFileSystem` object store | 2 | 2141 | 0 | 0 | 8454144 |
+| `LocalFileSystem` object store | 3 | 2068 | 0 | 0 | 8454144 |
+
+#### Catch-up rate, 65536 records of 4096 bytes, 4 cores
+
+| tier | run | MB/s of data | bytes from memory | bytes from local | bytes from object store |
+|---|---|---|---|---|---|
+| memory | 1 | 488 | 100000800 | 170531808 | 0 |
+| memory | 2 | 2386 | 0 | 270532608 | 0 |
+| memory | 3 | 2545 | 0 | 270532608 | 0 |
+| local disk | 1 | 2522 | 0 | 270532608 | 0 |
+| local disk | 2 | 2507 | 0 | 270532608 | 0 |
+| local disk | 3 | 2517 | 0 | 270532608 | 0 |
+| `LocalFileSystem` object store | 1 | 2075 | 0 | 0 | 270532608 |
+| `LocalFileSystem` object store | 2 | 2071 | 0 | 0 | 270532608 |
+| `LocalFileSystem` object store | 3 | 2062 | 0 | 0 | 270532608 |
+
+#### Throughput, many streams, 16 cores, 10 s each
+
+| ack | streams | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 261960 | 268.2 |
+| 1 | 16 | 1024 | 408276 | 418.1 |
+| 1 | 64 | 1024 | 460702 | 471.8 |
+| 2 | 1 | 1024 | 164303 | 168.2 |
+| 2 | 16 | 1024 | 364602 | 373.4 |
+| 2 | 64 | 1024 | 399761 | 409.4 |
+
+#### Objects per seal, 4 cores, 1 s window, every stream written in every window
+
+| streams | windows | new objects in `sealed/` per window | other new objects per window |
+|---|---|---|---|
+| 10 | 8.0 | 1.00 | 1.00 |
+| 1000 | 8.0 | 1.00 | 1.00 |
+| 10000 | 8.0 | 0.87 | 0.87 |
+
+#### Memory per idle stream, 4 cores
+
+| streams | active limit | server RSS before | server RSS after | bytes per stream |
+|---|---|---|---|---|
+| 20000 | none | 13172736 | 201703424 | 9427 |
+| 20000 | 1000 | 13139968 | 201932800 | 9440 |
+
+#### Against section 7.2
+
+| level | spec's estimate | measured here (p50 / p99 / p99.9) | target |
+|---|---|---|---|
+| 1 | under 0.1 ms, slow case under 1 ms | 34 µs / 47 µs / 81 µs | memory |
+| 2, local NVMe | 0.1–2 ms, slow case about 5 ms | not comparable: 4.7 ms / 12.8 ms / 66.7 ms with `F_FULLFSYNC` on this laptop's SSD | macOS, not Linux NVMe |
+| 2, EBS | 1–4 ms, slow case 10+ ms | **unmeasured** | not exercised |
+| 3, real S3 | half a window + 20–100 ms, slow case one window + 200 ms | **unmeasured** | not exercised |
+| 3, `LocalFileSystem` | none | 509 ms / 996 ms / 1009 ms, 1 s window | not a durability figure |
+
+#### Catch-up from real S3 and PUTs on real S3
+
+**Unmeasured.** The object store row is `LocalFileSystem` on the same SSD, whose reads come from the page cache, so it says nothing about S3 latency or cost.
+
+#### What to make of these
+
+- **Memory is the slowest tier in these runs, and that isn't explained.** 319 to 353 MB/s from memory against 1,743 to 2,538 MB/s from the other two, on the same records. The 256 MiB run's first read, mostly local with 100 MB from memory, is also the slow one at 488 MB/s. Nothing here measured why. Recorded in BUILD_NOTES as a finding, not fixed.
+- **Tier columns come from the server's own trace** (`--trace-catch-up`, D213). The trace was on in all of these runs, at one line on stderr per read. The bench tempdir is on the same SSD as everything else.
+- **The 256 MiB run's "memory" rows aren't all memory:** a stream that fills its buffer gets a dedicated object before the window ends (section 7.3), so its records were already on disk even with a 120 s window. The 8 MiB run is the one that reads only memory. Records read are through the SDK, which copies them out, so these are client-side rates.
+- **Many streams:** the client shares the machine and uses one Tokio runtime, and 64 streams on 16 cores gives 1.2 to 2.4 times one stream, so this shows the client or the machine as much as section 6.1's limit. Maximum ingest across 16 cores wasn't reached, and this can't say what it is. The one-stream rows here run with 16 cores and the throughput table's with 4, and that difference is one run each, inside this file's 2x noise.
+- **Objects per seal:** one new file in `sealed/` per window at 10, 1,000 and 10,000 streams, and one other (a checkpoint). A new file on `LocalFileSystem` stands for one PUT. Overwrites aren't counted. The 10,000 row reads 0.87 because publishing 10,000 streams takes up part of a window, so windows were missed in that count, which has no seal counter behind it, and the count isn't exact.
+- **Memory per idle stream** counts RSS with one 64-byte record per stream, after the records sealed, with 20,000 producers' dedupe entries among it. The active limit made no difference to RSS in this run. Whether the streams left RAM wasn't asserted here (M7's tests do that), and an allocator doesn't have to give memory back, so this isn't evidence for or against eviction.
+- All of section 7.2's caveats and this file's Caveats apply. Criterion suites weren't re-run at this commit: each table above names the commit it came from, and the code they measure may have changed since.
