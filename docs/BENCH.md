@@ -526,3 +526,88 @@ No difference here, so D51 stays. On macOS `sync_data` is a full flush, which li
 | 1 round | 3,000,000 | 980,060 | 713,129 | 0.728 | 1,025,938 | 244,263 |
 
 M9's acceptance still isn't met and no cause was isolated. A 2 s `sample` of the long run showed no sink or delivery function as a hot spot on the owning core. It did show the core spending about 15% of its samples re-arming its timer through `mio::Waker::wake`, but with or without sinks wasn't compared.
+
+## Short run at `39aa32f`
+
+The full plan in the build's run script didn't finish, so this is a shorter run: one run of each command on the release build, load average about 4 to 7, on the shared laptop, with the client on the same machine. Real S3, EBS and Linux were not exercised. **Not run:** 10,000 subscribers, 15,000 idle connections, 10,000 to 1,000,000 idle streams, seal windows of 10 s and 60 s, recovery at 1 GiB and 4 GiB, 2 GiB catch-up, and the criterion suites other than the two named here.
+
+```
+target/release/sillystream bench latency --count 5000 --cores 8 --timeout-seconds 400
+target/release/sillystream bench throughput --seconds 5 --cores 8 --timeout-seconds 400
+target/release/sillystream bench ack-matrix --seal-windows 1000 --seconds 5 --cores 8 --timeout-seconds 400
+target/release/sillystream bench fan-out --subscribers 1,100,1000 --seconds 5 --cores 8 --timeout-seconds 400
+target/release/sillystream bench recovery --wal-mib 0,16,256 --runs 1 --timeout-seconds 400
+target/release/sillystream bench catch-up --catch-up-mib 8 --cores 8 --timeout-seconds 400
+target/release/sillystream bench idle --idle-count 5000 --cores 8 --timeout-seconds 400
+cargo bench -p server --bench slab_alloc
+cargo bench -p format --bench record_codec
+```
+
+**Latency, 256-byte record, one publisher, 8 cores**
+
+| level | measures | samples | p50 µs | p99 µs | p99.9 µs |
+|---|---|---|---|---|---|
+| 0 | publish to delivery | 5000 | 36 | 140 | 209 |
+| 1 | ack, closed loop | 5000 | 36 | 63 | 107 |
+| 2 | ack, closed loop, local disk | 5000 | 4555 | 13847 | 76674 |
+| 3 | ack at 50 per second, `LocalFileSystem`, 1 s window | 1000 | 505774 | 999542 | 1008563 |
+
+**Throughput, one stream, 8 cores, 5 s each**
+
+| ack | connections | record data bytes | publishes/s | MB/s of data |
+|---|---|---|---|---|
+| 1 | 1 | 1024 | 300126 | 307.3 |
+| 1 | 1 | 65536 | 15318 | 1003.9 |
+| 1 | 4 | 1024 | 401181 | 410.8 |
+| 1 | 4 | 65536 | 21106 | 1383.2 |
+| 2 | 1 | 1024 | 176501 | 180.7 |
+| 2 | 1 | 65536 | 4936 | 323.5 |
+| 2 | 4 | 1024 | 383230 | 392.4 |
+| 2 | 4 | 65536 | 11619 | 761.5 |
+
+**Ack levels, 256-byte record, 8 cores, 1 s seal window, 5 s per row (level 3 flat out ran 9 s)**
+
+| level | load | publishes/s | ack p50 µs | ack p99 µs | ack p99.9 µs |
+|---|---|---|---|---|---|
+| 0 | 1 stream, 100/s, with a subscriber | 100 | no ack | no ack | no ack |
+| 0 | 4 streams, flat out, with a subscriber each | 1750517 | no ack | no ack | no ack |
+| 1 | 1 stream, 1 outstanding | 28272 | 33 | 79 | 143 |
+| 1 | 4 streams, 256 outstanding each | 659783 | 709 | 12363 | 17867 |
+| 2 | 1 stream, 1 outstanding | 210 | 4664 | 8555 | 20347 |
+| 2 | 4 streams, 256 outstanding each | 111022 | 9129 | 15024 | 25268 |
+| 3 | 1 stream, 50/s | 50 | 513054 | 1026107 | 1026107 |
+| 3 | 4 streams, 65,536 outstanding each | 56947 | 4286147 | 6061528 | 6194258 |
+
+The level 0 flat-out row delivered 682,548 records/s against 1,750,517 published, with delivery p50 about 1.36 s, so its subscribers were well behind by the end. The level 0 100/s row had delivery p50 273 µs and p99 1300 µs.
+
+**Fan-out, level 1, 256-byte record, one stream, 8 cores, 5 s, a new server per row**
+
+| subscribers | connections | publishes/s asked | publishes/s sent | delivered/s | p50 µs | p99 µs | p99.9 µs | BEHIND | delivered | expected |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 1000 | 1000 | 998 | 149 | 679 | 1545 | 0 | 5000 | 5000 |
+| 1 | 1 | flat out | 387306 | 386720 | 115 | 240 | 5428 | 0 | 1936558 | 1936558 |
+| 100 | 100 | 100 | 100 | 10002 | 790 | 3091 | 4978 | 0 | 50100 | 50100 |
+| 100 | 100 | 1000 | 1000 | 99855 | 501 | 2139 | 2834 | 0 | 500100 | 500100 |
+| 100 | 100 | flat out | 2567 | 255103 | 27554 | 32066 | 32768 | 0 | 1285900 | 1285900 |
+| 100 | 4 | 1000 | 1000 | 99841 | 240 | 825 | 2714 | 0 | 500000 | 500000 |
+| 1000 | 1000 | 10 | 10 | 10168 | 6455 | 13482 | 15024 | 0 | 51000 | 51000 |
+
+**Recovery after `kill -9`, 8 cores, 16 streams, 4096-byte records**
+
+| WAL asked MiB | acked at level 2 | entries replayed | MiB replayed | start to port s | read back s | records read back |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 0 | 0.051 | 0.00 | 0 |
+| 16 | 4096 | 4096 | 16 | 0.050 | 0.03 | 4096 |
+| 256 | 65536 | 65536 | 258 | 0.211 | 0.15 | 65536 |
+
+`kill -9` proves a process crash only, because the page cache survives it.
+
+**Catch-up, 2048 records of 4096 bytes, 8 cores, MB/s of data, 3 reads:** memory 1325, 1856, 2085. Local disk 1182, 2225, 2283. `LocalFileSystem` object store 1675, 1758, 1665. The object store row is the same SSD and says nothing about S3.
+
+**Idle connections, 8 cores:** 5,000 connections, 21,801 bytes per connection of server RSS.
+
+**`slab_alloc`, time per publish:** 64 B total: slab 871 ns, slab per publish 12.9 µs, allocation per record 17.9 µs. 288 B total: 4.81 µs, 18.6 µs, 21.1 µs. 4,128 B total: 69.6 µs, 116.6 µs, 116.2 µs.
+
+**`record_codec`:** encode 3.4 ns at 0 bytes, 42 ns at 4 KiB, 12.6 µs at 1 MiB. Decode about 2 ns at every size, since it doesn't touch the data. `record_walk`: 25.5 ns for 12 records, 2.09 µs for 1,000. From the start of the interrupted full run, same commit.
+
+**Against section 7.2:** level 1 p50 36 µs and p99 63 µs fits the estimate of under 0.1 ms. Level 2 at 4.6 ms p50 on this laptop's `F_FULLFSYNC` can't be compared with Linux NVMe or EBS. Level 3 at about half a window fits the shape of the estimate but not on S3, so the S3 and EBS rows stay unmeasured.

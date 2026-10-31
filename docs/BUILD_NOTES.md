@@ -607,3 +607,23 @@ Code at `e7e0a95`, on macOS, in one sitting. `cargo test -p e2e` passed 3 consec
 - Many older items under "Review findings not fixed" were not re-checked one by one. I corrected those I checked against the code, so don't read that list as complete or current.
 
 **Stray process, left running:** PID 4275, `target/debug/deps/wal_writer-53ccb395b8f4af84`, was already about 23 hours old when this round began. I didn't start it, so I left it. It's safe for you to stop.
+
+## Close-out of the final report at `39aa32f`
+
+**Suite:** `cargo test --workspace --no-fail-fast` at `39aa32f`, one run, exit 0: 771 passed, 0 failed, 1 ignored, and the e2e harness's 21 tests and process check. One run doesn't settle the known flakes.
+
+**Found while writing the report, not fixed:**
+
+- **`token issue` and the server read the same secret file differently.** The server strips trailing whitespace from `--token-secret-file` and the CLI's `--secret-file` doesn't. A secret file ending in a newline, which is what `xxd` or `echo` writes, gives tokens every request refuses with error 1 "token signature is wrong". Seen with the release binaries, and removing the newline fixed it.
+- **`cargo clippy --workspace --all-targets -- -D warnings` fails** on one `type_complexity` error in `crates/storage/benches/wal_prealloc.rs:43`. It's the only error, with `--keep-going`.
+- **The bench run script could not have run its system benches.** It was zsh and kept flags in an unquoted `$T`, which zsh passes as one word, so `sillystream` refuses it with "--timeout-seconds 3000 needs a value". This is from the same mistake seen in the report's own first attempt. That script isn't in the repo.
+
+**Bench choices that were never recorded, for review:**
+
+- `bench recovery` closes the object store directories to writes so that the WAL grows up to the size asked for. So it measures replay, and not a store in normal use.
+- `bench idle` is limited to about 15,000 connections, from roughly 16K ephemeral ports on one loopback address.
+
+**Seen in earlier bench diagnostics, not recorded before, neither proven:**
+
+- At 10,000 connections and 100 publishes/s, about 1M deliveries/s and above the roughly 365,000/s peak then seen, a few subscribers stalled for 10 s or more and p99.9 reached tens of seconds. The server had handed over every record, and `netstat`, usable in one stall, showed about 125 KB of Send-Q on two server sockets. This points at a macOS loopback stall when an overloaded client falls behind, but that's inferred.
+- In one run about 4,000 connections appeared to reconnect, with client pings off. Cause unexplained, and stray servers from that task's earlier timed-out runs were still up then.
