@@ -1112,6 +1112,7 @@ impl WsConn<'_> {
                 head,
                 state_ver,
                 state,
+                ..
             } => self.send_frame(ServerFrame::Subscribed {
                 sub,
                 head,

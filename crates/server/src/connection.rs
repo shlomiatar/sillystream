@@ -94,6 +94,9 @@ pub enum Event {
         head: u64,
         state_ver: u64,
         state: Bytes,
+        /// It started at or above what is visible, so no catch-up, and so no `DATA` or
+        /// `PROGRESS` up to `head`, will follow (D231).
+        caught_up: bool,
     },
     Data {
         sub: u32,
@@ -1502,7 +1505,15 @@ impl Home {
         }
     }
 
-    fn say_subscribed(&mut self, key: usize, head: u64, cursor: u64, state_ver: u64, state: Bytes) {
+    fn say_subscribed(
+        &mut self,
+        key: usize,
+        head: u64,
+        cursor: u64,
+        state_ver: u64,
+        state: Bytes,
+        caught_up: bool,
+    ) {
         let Some(Some(sub)) = self.subs.get_mut(key) else {
             return;
         };
@@ -1521,6 +1532,7 @@ impl Home {
                 head,
                 state_ver,
                 state,
+                caught_up,
             },
         );
     }
@@ -1541,7 +1553,7 @@ impl Home {
             return;
         }
         let key = sub_ref.key;
-        self.say_subscribed(key, head, cursor, state_ver, state);
+        self.say_subscribed(key, head, cursor, state_ver, state, true);
         let home_stream = self.streams.entry(Arc::clone(stream)).or_default();
         let sub = self.subs[key].as_mut().expect("checked above");
         let was_catching_up = sub.mode == Mode::CatchUp;
@@ -1777,7 +1789,7 @@ impl Home {
                 state,
             } => {
                 sub.mode = Mode::CatchUp;
-                self.say_subscribed(key, head, cursor, state_ver, state);
+                self.say_subscribed(key, head, cursor, state_ver, state, false);
             }
             CatchReply::Memory { batches, limit } => {
                 let filter = range_filter(&sub.filter, sub.position, limit);

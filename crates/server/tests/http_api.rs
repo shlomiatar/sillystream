@@ -1318,3 +1318,31 @@ async fn an_http_publish_below_the_minimum_waits_for_the_minimum() {
     assert_eq!(done.status, 200, "{}", done.text());
     assert!(done.field("first_id").is_some(), "{}", done.text());
 }
+
+/// A read from below the head whose start is already at the head has nothing to wait for. On a
+/// stream made again after a delete, every record below the head is below its floor.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_with_nothing_to_catch_up_on_doesnt_wait() {
+    let server = start();
+    let text = token(ALL);
+    let publish = Http::new("POST", "/v1/stream/d/publish", &text).body(b"x".to_vec());
+    assert_eq!(server.http(&publish).await.status, 200);
+    let path = "/v1/stream/d";
+    assert_eq!(
+        server.http(&Http::new("DELETE", path, &text)).await.status,
+        200
+    );
+    let made = Http::new("PUT", path, &text).body(b"{}".to_vec());
+    assert_eq!(server.http(&made).await.status, 200);
+
+    let started = std::time::Instant::now();
+    let read = Http::new("GET", "/v1/stream/d/read?from=0", &text);
+    let reply = server.http(&read).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    assert_eq!(reply.header("x-count"), Some("0"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1_000),
+        "{:?}",
+        started.elapsed()
+    );
+}

@@ -1145,9 +1145,11 @@ async fn collect_read(
     max_bytes: usize,
     wait_ms: u64,
 ) -> Response {
-    let head = loop {
+    let (head, caught_up) = loop {
         match connection.recv_within(wait_ms).await {
-            Some(Event::Subscribed { head, .. }) => break head,
+            Some(Event::Subscribed {
+                head, caught_up, ..
+            }) => break (head, caught_up),
             Some(Event::Error { code, msg, .. }) => return error(code, &msg),
             Some(_) => {}
             None => return error(ErrorCode::RateLimited, "the node isn't answering"),
@@ -1157,7 +1159,7 @@ async fn collect_read(
     let mut through = 0;
     let mut got_count = 0;
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
-    if from != u64::MAX && from < head {
+    if from != u64::MAX && from < head && !caught_up {
         'read: loop {
             match connection.recv_within(wait_ms).await {
                 Some(Event::Data { records, .. }) => pending.push_back(records.to_vec()),
