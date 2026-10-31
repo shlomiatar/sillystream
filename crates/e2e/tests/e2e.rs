@@ -47,6 +47,7 @@ const TESTS: &[(&str, TestFn)] = tests![
     sink_forward,
     retention_and_compaction,
     normal_build_has_no_hooks,
+    a_publisher_cannot_skew_other_streams_through_a_restart,
 ];
 
 fn main() {
@@ -2118,5 +2119,88 @@ async fn normal_build_has_no_hooks() {
         .as_millis() as u64;
     assert!(id >> 16 < now_ms + 60_000, "the clock moved: id {id}");
     assert!(node.is_running());
+    node.stop();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ids against the clock (D221)
+// ---------------------------------------------------------------------------------------------
+
+/// `record_count` empty records of 65,535 items: 32 bytes each, about 1 ms of ids each.
+fn max_count_records(record_count: usize) -> Vec<u8> {
+    let mut one = record(0, 0, b"");
+    one[28..30].copy_from_slice(&u16::MAX.to_le_bytes());
+    one.repeat(record_count)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis() as u64
+}
+
+/// One stream's publisher, with `publish` on that stream only, can't move its own ids without
+/// limit, nor, through the restart that carries the highest id to all, anyone else's.
+async fn a_publisher_cannot_skew_other_streams_through_a_restart() {
+    const ATTACKER: &str = "attacker.x";
+    const VICTIM: &str = "victim.y";
+    const FRAME_COUNT: u64 = 200;
+    /// `MAX_ID_LEAD_MS`, plus room for a slow restart's own credit.
+    const LEAD_LIMIT_MS: u64 = 72_000;
+    let lead_of = |id: u64| (id >> 16).saturating_sub(now_ms());
+    let mut node = Node::started(NodeOptions::default());
+    let admin = node.admin_token(ADMIN_AUTHOR);
+    let http = node.http(&admin);
+    http.publish_records(VICTIM, &record(1, 0, b"before")).await;
+    node.cli(&admin, &["stream", "create", ATTACKER]);
+
+    let token = node.token(9, &[&format!("{ATTACKER}:publish")], 3_600_000);
+    let mut attacker = node.ws(&token).await;
+    attacker.open(1, ATTACKER).await;
+    let frame = max_count_records(65_500);
+    let (mut acked, mut refused, mut highest) = (0, 0, 0);
+    for seq in 1..=FRAME_COUNT {
+        attacker
+            .publish(&PublishFrame {
+                handle: 1,
+                producer_id: 9,
+                seq,
+                ack: AckLevel::WalFsync,
+                state: None,
+                records: &frame,
+            })
+            .await;
+        match attacker.recv().await {
+            Owned::Ack {
+                first_id, count, ..
+            } => {
+                acked += 1;
+                highest = first_id + u64::from(count) - 1;
+            }
+            Owned::Nack { code, .. } => {
+                assert_eq!(code, ErrorCode::RateLimited);
+                refused += 1;
+            }
+            other => panic!("the attacker got {other:?}"),
+        }
+    }
+    println!("attacker: {acked} acked, {refused} refused");
+    assert!(refused > 0, "nothing limited it: {acked} acked");
+    assert!(
+        lead_of(highest) <= LEAD_LIMIT_MS,
+        "the stream itself is {} ms ahead",
+        lead_of(highest)
+    );
+
+    node.kill9();
+    node.start();
+    let http = node.http(&admin);
+    let id = http.publish_records(VICTIM, &record(1, 0, b"after")).await;
+    assert!(
+        lead_of(id) <= LEAD_LIMIT_MS,
+        "the victim is {} ms ahead",
+        lead_of(id)
+    );
     node.stop();
 }

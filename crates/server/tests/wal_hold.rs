@@ -151,3 +151,48 @@ async fn a_publish_durable_after_the_checkpoint_still_dedupes_after_a_crash() {
     drop(client);
     node.shutdown();
 }
+
+/// Level 1 ids borrowed ahead of the clock, delivered, then erased by a crash. Section 2 says
+/// ids are never reused, and a reader's cursor means "after this id", so a new record must land
+/// above them whether or not anything durable shows they existed (D221).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ids_stay_above_what_a_crash_erased_after_being_delivered() {
+    let _turn = TURN.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ScriptStore::new());
+    let clock = ManualClock::new(START_MS);
+    let (node, _) = start(dir.path(), &store, &clock, manual_config(1));
+    let mut client = node.client(0).await;
+    publish_at(&mut client, 1, b"durable", 2).await;
+
+    storage::hold_wal_writes(true);
+    let mut records = Vec::new();
+    for _ in 0..3_000 {
+        add_record(&mut records, 0, b"", u16::MAX);
+    }
+    client.publish(publish("s", &records, 2, 1)).await.unwrap();
+    let (_, first_id, count) = expect_ack(&mut client).await;
+    let erased_through = first_id + u64::from(count) - 1;
+    assert!(format::id_ms(erased_through) > START_MS + 2_000, "ahead");
+    // A reader has it, while no disk does.
+    let delivered = read_ids(&node, 3_001).await;
+    assert_eq!(delivered.last(), Some(&(erased_through - 65_534)));
+    let image = tempfile::tempdir().unwrap();
+    copy_dir(&dir.path().join("wal"), &image.path().join("wal"));
+    copy_dir(&dir.path().join("metadata"), &image.path().join("metadata"));
+    storage::hold_wal_writes(false);
+    drop(client);
+    node.shutdown();
+
+    // Back before the clock has caught up with those ids.
+    clock.advance(100);
+    let (node, _) = start(image.path(), &store, &clock, manual_config(1));
+    let mut client = node.client(0).await;
+    let (_, new_id) = publish_at(&mut client, 3, b"after", 2).await;
+    assert!(
+        new_id > erased_through,
+        "new id {new_id} reuses what was delivered through {erased_through}"
+    );
+    drop(client);
+    node.shutdown();
+}

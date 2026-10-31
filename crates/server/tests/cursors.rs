@@ -199,9 +199,10 @@ async fn named_cursors_are_limited_per_stream_and_by_name_length() {
     // A subscribe under a name it already has is fine.
     connection.subscribe(named(3, "c0", u64::MAX));
     hear_until(&mut connection, &mut heard, |heard| {
-        heard.events.iter().any(
-            |event| matches!(event, server::Event::Subscribed { sub, .. } if *sub == 3),
-        )
+        heard
+            .events
+            .iter()
+            .any(|event| matches!(event, server::Event::Subscribed { sub, .. } if *sub == 3))
     })
     .await;
 

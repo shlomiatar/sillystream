@@ -6,6 +6,12 @@ pub const COUNTER_BITS: u32 = 16;
 /// The highest ms a 48-bit field holds.
 pub const MAX_ID_MS: u64 = (1 << 48) - 1;
 
+/// How far past the clock ids may go (D221). Above the 65,536 ms that the largest publish D34
+/// allows spans, so that any publish can go through once the stream is near the clock.
+pub const MAX_ID_LEAD_MS: u64 = 70_000;
+/// What a restarted stream may borrow above its floor while the clock catches up to the floor.
+pub const RESTART_ID_CREDIT_MS: u64 = 1_000;
+
 pub fn make_id(ms: u64, counter: u16) -> u64 {
     (ms << COUNTER_BITS) | u64::from(counter)
 }
@@ -24,6 +30,7 @@ pub fn id_counter(id: u64) -> u16 {
 /// Items in one allocation are consecutive, so running out of a ms's counter
 /// values carries into the next ms: that is the borrowing the spec describes,
 /// and the clock catches up later. A frozen or backward clock changes nothing.
+/// `allocate` itself has no limit on borrowing: the owner asks `fits_lead` first (D221).
 #[derive(Debug, Clone)]
 pub struct IdAllocator {
     last_id: u64,
@@ -42,6 +49,25 @@ impl IdAllocator {
 
     pub fn last_id(&self) -> u64 {
         self.last_id
+    }
+
+    /// Whether `item_count` more ids stay within `MAX_ID_LEAD_MS` of `clock_ms`, or within
+    /// `RESTART_ID_CREDIT_MS` of the floor a restart set. What `allocate` would refuse anyway
+    /// counts as fitting, so that it gets `allocate`'s error.
+    pub fn fits_lead(&self, clock_ms: u64, item_count: u64) -> bool {
+        let clock_id = clock_ms.min(MAX_ID_MS) << COUNTER_BITS;
+        let first_id = self
+            .last_id
+            .saturating_add(1)
+            .max(clock_id)
+            .max(self.last_valid_id.saturating_add(1));
+        let Some(last_id) = first_id.checked_add(item_count.saturating_sub(1)) else {
+            return true;
+        };
+        let limit_ms = clock_ms
+            .saturating_add(MAX_ID_LEAD_MS)
+            .max(id_ms(self.last_valid_id).saturating_add(RESTART_ID_CREDIT_MS));
+        id_ms(last_id) <= limit_ms
     }
 
     /// Reserves `item_count` consecutive ids and returns the first.

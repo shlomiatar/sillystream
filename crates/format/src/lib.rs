@@ -17,7 +17,10 @@ mod system;
 pub use crc::{crc32c, crc32c_append, crc32c_seeded};
 pub use error::FormatError;
 pub use filter::{Clause, Filter, MAX_CLAUSES, OP_ANY, OP_EQ};
-pub use id::{COUNTER_BITS, IdAllocator, MAX_ID_MS, id_counter, id_ms, make_id};
+pub use id::{
+    COUNTER_BITS, IdAllocator, MAX_ID_LEAD_MS, MAX_ID_MS, RESTART_ID_CREDIT_MS, id_counter, id_ms,
+    make_id,
+};
 pub use publish::{ValidatedForward, ValidatedPublish, validate_forward, validate_publish};
 pub use record::{
     AUTHOR_OFFSET, CODEC_OFFSET, COUNT_OFFSET, DATA_OFFSET, HEADER_BYTES, ID_OFFSET, LEN_OFFSET,

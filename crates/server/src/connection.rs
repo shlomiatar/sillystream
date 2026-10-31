@@ -20,8 +20,8 @@ use tokio::time::Instant;
 
 use crate::core::Links;
 use crate::delivery::{
-    ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
-    CURSOR_NAME_REFUSED, cursor_name_is_allowed, walk_records,
+    CURSOR_NAME_REFUSED, ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
+    cursor_name_is_allowed, walk_records,
 };
 use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,

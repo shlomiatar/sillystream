@@ -3,7 +3,8 @@
 use std::num::NonZeroU64;
 
 use format::{
-    FormatError, IdAllocator, MAX_ID_MS, RecordHeader, id_counter, id_ms, make_id, validate_publish,
+    FormatError, IdAllocator, MAX_ID_LEAD_MS, MAX_ID_MS, RESTART_ID_CREDIT_MS, RecordHeader,
+    id_counter, id_ms, make_id, validate_publish,
 };
 use proptest::prelude::*;
 
@@ -155,9 +156,8 @@ fn a_clock_just_past_48_bits_is_clamped() {
     }
 }
 
-/// Pins today's behaviour for BUILD_NOTES Q13, which is the user's to decide.
-/// This is not an endorsement: the spec doesn't bound borrowing, so the allocator
-/// doesn't either. When Q13 is decided, this test changes with it.
+/// The allocator itself doesn't bound borrowing. The owner does, by asking `fits_lead` first
+/// (D221), which is what the next test holds.
 #[test]
 fn q13_empty_max_count_records_move_ids_ahead_of_the_clock_without_bound() {
     let header = RecordHeader {
@@ -189,6 +189,40 @@ fn q13_empty_max_count_records_move_ids_ahead_of_the_clock_without_bound() {
     assert_eq!(id_ms(allocator.last_id()) - START_MS, 65_535_999);
     let honest_id = allocator.allocate(START_MS, 1).unwrap();
     assert_eq!(id_ms(honest_id) - START_MS, 65_535_999);
+}
+
+#[test]
+fn a_publish_fits_only_within_the_lead() {
+    let allocator = IdAllocator::new(0, 0);
+    let per_ms = 1u64 << 16;
+    // Exactly up to the last id of the last ms allowed, from the start of this one.
+    let room = (MAX_ID_LEAD_MS + 1) * per_ms;
+    assert!(allocator.fits_lead(START_MS, room));
+    assert!(!allocator.fits_lead(START_MS, room + 1));
+    // The largest publish fits a stream at the clock.
+    assert!(allocator.fits_lead(START_MS, u64::from(u32::MAX)));
+
+    // Only the clock gives room back.
+    let mut allocator = IdAllocator::new(0, 0);
+    allocator.allocate(START_MS, room).unwrap();
+    assert!(!allocator.fits_lead(START_MS, 1));
+    assert!(allocator.fits_lead(START_MS + 1, per_ms));
+    assert!(!allocator.fits_lead(START_MS + 1, per_ms + 1));
+}
+
+#[test]
+fn a_floor_above_the_lead_has_its_credit() {
+    let floor_ms = START_MS + MAX_ID_LEAD_MS;
+    let allocator = IdAllocator::new(0, make_id(floor_ms, 0));
+    assert!(allocator.fits_lead(START_MS, 1));
+    let room = RESTART_ID_CREDIT_MS * (1 << 16);
+    assert!(allocator.fits_lead(START_MS, room));
+    assert!(!allocator.fits_lead(START_MS, room + (1 << 16)));
+}
+
+#[test]
+fn what_allocate_refuses_counts_as_fitting() {
+    assert!(IdAllocator::new(u64::MAX - 1, 0).fits_lead(0, 5));
 }
 
 #[test]

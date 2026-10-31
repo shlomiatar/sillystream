@@ -830,7 +830,15 @@ impl Node {
         };
         let (prepared, local) = prepared;
         config.generation = prepared.report.generation;
+        // The fence stays as it is in the report. New ids also go above all a former generation
+        // could have issued and a crash erased, since nothing durable shows those (D221).
         config.last_valid_id = prepared.report.last_valid_id;
+        if prepared.report.generation > 1 {
+            let floor_ms = clock.now_ms().saturating_add(format::MAX_ID_LEAD_MS);
+            config.last_valid_id = config
+                .last_valid_id
+                .max(format::make_id(floor_ms.min(format::MAX_ID_MS), 0));
+        }
         let report = prepared.report;
         let node = Node::start_parts(
             config,

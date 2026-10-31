@@ -698,8 +698,10 @@ impl Compactor {
         }
         if !closed && !not_ready && !forced && !batch.streams.is_empty() {
             let now_ms = self.clock.now_ms();
-            let young =
-                now_ms < id_ms(batch.first_manifest_id).saturating_add(self.config.merge_wait_ms);
+            // An id ahead of the clock says nothing of its age: ids after a restart are (D221).
+            let manifest_ms = id_ms(batch.first_manifest_id);
+            let young = manifest_ms <= now_ms
+                && now_ms < manifest_ms.saturating_add(self.config.merge_wait_ms);
             if young && batch.hour == now_ms / HOUR_MS {
                 return Ok(Planned::Wait);
             }

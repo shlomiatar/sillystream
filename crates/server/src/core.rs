@@ -191,6 +191,8 @@ struct Batch {
     waiters: Vec<Waiter>,
 }
 
+const IDS_TOO_FAR_AHEAD: &str = "ids would run too far ahead of the clock; retry later";
+
 const NO_CURSOR_ROOM: &str = "this stream has too many named cursors";
 
 /// The batches this core has stamped for one stream and not yet seen uploaded. It stays
@@ -449,6 +451,8 @@ pub(crate) struct Core {
 
     /// Deleted streams this core answers for, with their last id (D20).
     tombstones: HashMap<Arc<str>, u64>,
+    /// The highest time read so far, which ids' lead is measured from.
+    clock_high_ms: u64,
     logs: HashMap<Arc<str>, StreamLog>,
     dirty: Vec<Arc<str>>,
     next_ticket: u64,
@@ -560,6 +564,7 @@ impl Core {
             hold: None,
             deferred: VecDeque::new(),
             tombstones: HashMap::new(),
+            clock_high_ms: 0,
             logs: HashMap::new(),
             dirty: Vec::new(),
             next_ticket: 0,
@@ -1049,6 +1054,10 @@ impl Core {
             None => None,
         };
 
+        if !self.ids_fit_lead(&msg.stream, now_ms, item_count) {
+            nack(ErrorCode::RateLimited, &IDS_TOO_FAR_AHEAD);
+            return;
+        }
         let name = Arc::clone(&msg.stream);
         let stream = self.stream_entry(&name, shard);
         let name = Arc::clone(&stream.name);
@@ -1165,6 +1174,10 @@ impl Core {
             }
         };
         let now_ms = self.clock.now_ms();
+        if !self.ids_fit_lead(&msg.stream, now_ms, 1) {
+            error(ErrorCode::RateLimited, IDS_TOO_FAR_AHEAD.to_owned());
+            return;
+        }
         let stream = self.stream_entry(&msg.stream, shard);
         let name = Arc::clone(&stream.name);
         let ver = match stream.ids.allocate(now_ms, 1) {
@@ -2178,6 +2191,20 @@ impl Core {
                 ack,
                 reply: tx,
             });
+        }
+    }
+
+    /// The lead is measured from the highest time this core has read, so that a clock stepping
+    /// back doesn't stop every stream until it catches up (D221).
+    fn ids_fit_lead(&mut self, name: &str, now_ms: u64, item_count: u64) -> bool {
+        self.clock_high_ms = self.clock_high_ms.max(now_ms);
+        match self.streams.get(name) {
+            Some(stream) => stream.ids.fits_lead(self.clock_high_ms, item_count),
+            None => IdAllocator::new(
+                self.tombstones.get(name).copied().unwrap_or(0),
+                self.config.last_valid_id,
+            )
+            .fits_lead(self.clock_high_ms, item_count),
         }
     }
 
