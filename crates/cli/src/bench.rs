@@ -61,16 +61,19 @@ fn start_server(bin: &Path, cores: u64) -> Result<ServerChild, String> {
         std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
         Ok(path.to_str().ok_or("a path that isn't UTF-8")?.to_owned())
     };
+    // As text: the server trims whitespace from the end of its secret file, and raw bytes end
+    // in whitespace often enough to fail a run with a wrong signature.
     let secret: Vec<u8> = {
         use std::hash::{BuildHasher, Hasher};
         (0..8)
-            .flat_map(|_| {
-                std::collections::hash_map::RandomState::new()
+            .map(|_| {
+                let word = std::collections::hash_map::RandomState::new()
                     .build_hasher()
-                    .finish()
-                    .to_le_bytes()
+                    .finish();
+                format!("{word:016x}")
             })
-            .collect()
+            .collect::<String>()
+            .into_bytes()
     };
     let cert = write("cert.pem", &ca_pem)?;
     let key = write("key.pem", certified.key_pair.serialize_pem().as_bytes())?;
