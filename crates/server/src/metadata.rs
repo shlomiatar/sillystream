@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use object_store::ObjectStore;
+use bytes::Bytes;
+use object_store::{ObjectStore, PutPayload};
 use storage::{
     CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, MetadataError, MetadataStore,
     StreamMeta, build_checkpoint, checkpoint_path, decode_extent, decode_meta, encode_extent,
-    encode_meta, merge_meta, put_checkpoint, retry_delay,
+    encode_meta, merge_meta, put_checkpoint, put_checkpoint_payload, retry_delay,
 };
 use tokio::sync::mpsc;
 use xxhash_rust::xxh3::xxh3_128;
@@ -22,6 +23,10 @@ const TAG_STREAM: u8 = b's';
 const TAG_EXTENT: u8 = b'x';
 const KEY_COMPLETE: &[u8] = b"c";
 const KEY_MAX_ID: &[u8] = b"g";
+/// The file of the seal saved last: `generation u64 | seq u64 | file`. It goes in with that
+/// seal's local write, since a crash before its PUT would leave the store ahead of S3 with
+/// nothing to say what S3 lacks.
+const KEY_OWED: &[u8] = b"p";
 /// A stream id can be as long as a whole key (D57), so the longest ones are shortened. The
 /// value holds the whole name, which a read checks (D135).
 const KEY_NAME_BYTES: usize = 65_000;
@@ -64,6 +69,35 @@ impl From<MetadataError> for LocalError {
     fn from(error: MetadataError) -> Self {
         LocalError::Store(error)
     }
+}
+
+/// Finishes the PUT a crash may have left owed, before anything reads the checkpoints. If it did
+/// succeed, or a full file took the path, this changes nothing: the path is only ever created.
+pub(crate) async fn put_owed_checkpoint(
+    local: &MetadataStore,
+    store: &Arc<dyn ObjectStore>,
+) -> Result<(), String> {
+    let Some(value) = local.get(KEY_OWED).map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let (Some(generation), Some(seq), Some(file)) =
+        (value.get(..8), value.get(8..16), value.get(16..))
+    else {
+        return Err("local metadata: the owed checkpoint is truncated".to_owned());
+    };
+    let number = |bytes: &[u8]| {
+        let mut field = [0u8; 8];
+        field.copy_from_slice(bytes);
+        u64::from_le_bytes(field)
+    };
+    let path = checkpoint_path(number(generation), number(seq));
+    let payload = PutPayload::from(Bytes::copy_from_slice(file));
+    put_checkpoint_payload(store.as_ref(), &path, payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    local
+        .apply([(KEY_OWED, None)])
+        .map_err(|error| error.to_string())
 }
 
 /// The local key-value store, with a stream's fields under one key and each extent under its
@@ -122,9 +156,14 @@ impl LocalMeta {
         }))
     }
 
-    /// One atomic write of everything in `metas`. A meta's extents are added to what the store
-    /// has, and a tombstone clears them.
-    pub(crate) fn apply(&self, metas: &[StreamMeta], max_id: u64) -> Result<(), MetadataError> {
+    /// One atomic write of everything in `metas`, and of the file that owes S3 the same. A
+    /// meta's extents are added to what the store has, and a tombstone clears them.
+    pub(crate) fn apply(
+        &self,
+        metas: &[StreamMeta],
+        max_id: u64,
+        owed: Option<&[u8]>,
+    ) -> Result<(), MetadataError> {
         let mut changes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(metas.len() + 1);
         for meta in metas {
             if meta.deleted {
@@ -150,6 +189,9 @@ impl LocalMeta {
             ));
         }
         changes.push((KEY_MAX_ID.to_vec(), Some(max_id.to_le_bytes().to_vec())));
+        if let Some(owed) = owed {
+            changes.push((KEY_OWED.to_vec(), Some(owed.to_vec())));
+        }
         self.store.apply(
             changes
                 .iter()
@@ -165,7 +207,7 @@ pub(crate) enum MetaMsg {
         stream: Arc<str>,
         ticket: u64,
     },
-    /// A new checkpoint file. A full one lets older ones go, which only this thread reads.
+    /// A new checkpoint file, for lookups to walk.
     Installed(Box<CheckpointFile>),
 }
 
@@ -187,12 +229,15 @@ pub(crate) fn run_loader(
         return;
     };
     runtime.block_on(async {
-        delete_superseded(&store, &mut checkpoints).await;
+        // Beside the loads, which needn't wait for however many a long run left behind.
+        tokio::spawn(delete_superseded(
+            Arc::clone(&store),
+            std::mem::take(&mut checkpoints.superseded),
+        ));
         while let Some(message) = rx.recv().await {
             match message {
                 MetaMsg::Installed(file) => {
                     checkpoints.add_newest(*file);
-                    delete_superseded(&store, &mut checkpoints).await;
                 }
                 MetaMsg::Load {
                     core,
@@ -229,8 +274,8 @@ pub(crate) fn run_loader(
     });
 }
 
-async fn delete_superseded(store: &Arc<dyn ObjectStore>, checkpoints: &mut CheckpointSet) {
-    for path in std::mem::take(&mut checkpoints.superseded) {
+async fn delete_superseded(store: Arc<dyn ObjectStore>, superseded: Vec<object_store::path::Path>) {
+    for path in superseded {
         // One left behind costs nothing: a startup passes over it and tries again.
         let _ = store.delete(&path).await;
     }
@@ -261,6 +306,7 @@ pub(crate) async fn load_stream(
         .apply(
             std::slice::from_ref(&meta),
             local.max_id().map_err(|e| e.to_string())?.max(meta.last_id),
+            None,
         )
         .map_err(|error| error.to_string())?;
     Ok((Some(meta), true))
@@ -331,22 +377,52 @@ impl Checkpointer {
         }
     }
 
-    /// Local first: S3 only ever trails it. Then the file, then the older files can go. `None`
-    /// if the node stopped first.
+    /// Local first, with the file it owes S3, so a crash leaves S3 trailing by one file that the
+    /// next startup puts there. `None` if the node stopped first.
     pub(crate) async fn save(&mut self, job: CheckpointJob) -> Option<CheckpointDone> {
         let metas = latest_per_stream(job.metas);
         for meta in &metas {
             self.max_id = self.max_id.max(meta.last_id);
         }
+        let changed = !metas.is_empty() || !job.objects.is_empty();
+        let head = CheckpointHead {
+            full: false,
+            max_id: self.max_id,
+            objects: job.objects,
+        };
+        let built = if changed {
+            match build_checkpoint(&head, &metas) {
+                Ok(built) => Some(built),
+                Err(error) => {
+                    // Only a stream id or doc past what the format holds, which validation stops.
+                    eprintln!("building a checkpoint: {error}");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         {
             let (local, max_id) = (Arc::clone(&self.local), self.max_id);
+            let owed = built.as_ref().map(|built| {
+                let mut owed =
+                    Vec::with_capacity(16 + built.parts.iter().map(Bytes::len).sum::<usize>());
+                owed.extend_from_slice(&self.generation.to_le_bytes());
+                owed.extend_from_slice(&job.seal.to_le_bytes());
+                built
+                    .parts
+                    .iter()
+                    .for_each(|part| owed.extend_from_slice(part));
+                owed
+            });
             self.retry("writing the local metadata store", async || {
-                local.apply(&metas, max_id)
+                local.apply(&metas, max_id, owed.as_deref())
             })
             .await?;
         }
-        if !metas.is_empty() || !job.objects.is_empty() {
-            self.put_file(job.seal, metas, job.objects).await?;
+        storage::crash_point("checkpoint.before_put");
+        if let Some(built) = built {
+            self.put_file(job.seal, head, metas, built).await?;
         }
         Some(CheckpointDone {
             seal: job.seal,
@@ -359,11 +435,12 @@ impl Checkpointer {
     async fn put_file(
         &mut self,
         seq: u64,
+        delta: CheckpointHead,
         metas: Vec<StreamMeta>,
-        objects: Vec<String>,
+        delta_file: storage::BuiltCheckpoint,
     ) -> Option<()> {
         let full = self.checkpoints.files.len() + 1 >= self.full_every_count;
-        let (metas, objects) = if full {
+        let (head, built) = if full {
             let store = Arc::clone(&self.store);
             let checkpoints = self.checkpoints.clone();
             let mut all = self
@@ -374,28 +451,25 @@ impl Checkpointer {
             for meta in metas {
                 merge_meta(&mut all, meta);
             }
-            // Everything since the last full file, so a startup can tell what its time cut-off
-            // passes over. The last full file's own list is older than that.
-            let mut known: HashSet<String> = objects.into_iter().collect();
-            for file in self.checkpoints.files.iter().filter(|file| !file.head.full) {
-                known.extend(file.head.objects.iter().cloned());
+            // Everything recorded so far: nothing older than this file will be read, and an
+            // object in no list gets looked at on the next startup.
+            let mut known: HashSet<String> = delta.objects.into_iter().collect();
+            known.extend(self.checkpoints.recorded_objects().map(str::to_owned));
+            let head = CheckpointHead {
+                full,
+                max_id: delta.max_id,
+                objects: known.into_iter().collect(),
+            };
+            let metas: Vec<StreamMeta> = all.into_values().collect();
+            match build_checkpoint(&head, &metas) {
+                Ok(built) => (head, built),
+                Err(error) => {
+                    eprintln!("building a checkpoint: {error}");
+                    return None;
+                }
             }
-            (all.into_values().collect(), known.into_iter().collect())
         } else {
-            (metas, objects)
-        };
-        let head = CheckpointHead {
-            full,
-            max_id: self.max_id,
-            objects,
-        };
-        let built = match build_checkpoint(&head, &metas) {
-            Ok(built) => built,
-            Err(error) => {
-                // Only a stream id or doc past what the format holds, which validation stops.
-                eprintln!("building a checkpoint: {error}");
-                return None;
-            }
+            (delta, delta_file)
         };
         let path = checkpoint_path(self.generation, seq);
         let store = Arc::clone(&self.store);
@@ -405,7 +479,6 @@ impl Checkpointer {
         .await?;
         let file = CheckpointFile::new(self.generation, seq, built.top, head);
         self.checkpoints.add_newest(file.clone());
-        self.checkpoints.superseded.clear();
         let _ = self.loader.send(MetaMsg::Installed(Box::new(file)));
         Some(())
     }

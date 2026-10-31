@@ -693,6 +693,7 @@ struct RecoveredParts {
     first_seq: u64,
     closed_seqs: Vec<u64>,
     restored: Vec<RestoredStream>,
+    scanned_objects: Vec<String>,
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
@@ -757,6 +758,7 @@ impl Node {
                 first_seq: prepared.first_seq,
                 closed_seqs: prepared.closed_seqs,
                 restored: prepared.restored,
+                scanned_objects: prepared.scanned_objects,
             }),
         )?;
         Ok((node, report))
@@ -970,7 +972,7 @@ impl Node {
             meta = Some(ControlMeta {
                 jobs,
                 closed_seq_by_seal: HashMap::new(),
-                objects: Vec::new(),
+                objects: parts.scanned_objects,
                 gather_count: 0,
                 next_waiters: Vec::new(),
                 waiters_by_seal: BTreeMap::new(),

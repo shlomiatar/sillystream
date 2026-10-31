@@ -327,6 +327,7 @@ matrix! {
     crash_during_a_seal_after_rotation => "seal.after_rotate",
     crash_during_a_seal_before_the_upload => "seal.before_put",
     crash_after_the_upload_before_the_checkpoint => "seal.after_upload",
+    crash_after_the_local_write_before_the_checkpoint => "checkpoint.before_put",
     crash_after_the_checkpoint_before_recycling => "checkpoint.after_put",
     crash_during_recycling_before_emptying => "recycle.before_empty",
     crash_during_recycling_after_emptying => "recycle.after_empty",

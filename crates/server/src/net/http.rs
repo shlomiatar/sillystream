@@ -1348,6 +1348,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stream_id_past_what_the_formats_hold_is_refused() {
+        // A checkpoint page and a WAL entry both hold a name in a u16 (D42).
+        let at_limit = format!("/v1/stream/{}", "a".repeat(65_535));
+        assert!(route("PUT", &at_limit).is_ok());
+        let over_limit = format!("/v1/stream/{}", "a".repeat(65_536));
+        assert_eq!(route("PUT", &over_limit).err().map(|r| r.status), Some(400));
+    }
+
+    #[test]
     fn routes_match_section_11_2_and_d21() {
         let ok = |method, path, expected: Route| {
             assert_eq!(route(method, path).map(|(_, r)| r).ok(), Some(expected));

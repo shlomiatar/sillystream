@@ -7,9 +7,12 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// The `max_frame` a server starts with (D6d).
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// Stream ids are UTF-8 names without `/` (SPEC section 1). An empty name isn't a name.
+/// Stream ids are UTF-8 names without `/` (SPEC section 1). An empty name isn't a name, and a
+/// `str` holds at most 65,535 bytes (section 11.1), which WAL entries and footers rely on.
 pub fn is_valid_stream_id(stream: &str) -> bool {
-    !stream.is_empty() && !stream.as_bytes().contains(&b'/')
+    !stream.is_empty()
+        && stream.len() <= usize::from(u16::MAX)
+        && !stream.as_bytes().contains(&b'/')
 }
 
 /// Splits a frame into its type, flags and body, after the size limit.

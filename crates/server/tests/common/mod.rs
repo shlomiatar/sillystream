@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, IoSlice};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -121,6 +121,8 @@ pub struct ScriptStore {
     pub put_count: Arc<AtomicU64>,
     /// PUTs that have begun, whether or not held.
     pub put_begun_count: Arc<AtomicU64>,
+    /// How many more PUTs under `checkpoints/` may succeed. Negative: no limit.
+    pub checkpoint_put_budget: Arc<AtomicI64>,
 }
 
 impl fmt::Display for ScriptStore {
@@ -136,6 +138,7 @@ impl ScriptStore {
             hold_put: Arc::new(AtomicBool::new(false)),
             put_count: Arc::new(AtomicU64::new(0)),
             put_begun_count: Arc::new(AtomicU64::new(0)),
+            checkpoint_put_budget: Arc::new(AtomicI64::new(-1)),
         }
     }
 
@@ -159,6 +162,18 @@ impl ObjectStore for ScriptStore {
         self.put_begun_count.fetch_add(1, Ordering::SeqCst);
         while self.hold_put.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if location.as_ref().starts_with("checkpoints/") {
+            let budget = &self.checkpoint_put_budget;
+            if budget.load(Ordering::SeqCst) == 0 {
+                return Err(object_store::Error::Generic {
+                    store: "ScriptStore",
+                    source: "scripted checkpoint PUT failure".into(),
+                });
+            }
+            let _ = budget.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                (left > 0).then(|| left - 1)
+            });
         }
         self.put_count.fetch_add(1, Ordering::SeqCst);
         self.inner.put_opts(location, payload, opts).await

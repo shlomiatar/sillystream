@@ -7,8 +7,9 @@
 //! ```
 //!
 //! An entry holds only the extents new since the stream's last entry. A *full* file holds
-//! every stream's whole metadata, and nothing older is needed once one exists. A file's
-//! entry under the empty name, which no stream can have, holds its head.
+//! every stream's whole metadata and every object recorded so far, and nothing older is needed
+//! once a reader can trust one. A file's entry under the empty name, which no stream can have,
+//! holds its head.
 //!
 //! A former generation can still upload one of these after losing ownership. An entry from
 //! generation `g` whose last id is above `limit_for(g)` is ignored (section 8.1).
@@ -52,6 +53,7 @@ pub struct CheckpointHead {
     /// The highest stream last id it knows of, including through earlier files.
     pub max_id: u64,
     /// Segment objects whose extents are recorded by now, so a startup needn't look in them.
+    /// A full file's list includes those of the files it replaces.
     pub objects: Vec<String>,
 }
 
@@ -112,6 +114,12 @@ pub fn build_checkpoint(
     head: &CheckpointHead,
     metas: &[StreamMeta],
 ) -> Result<BuiltCheckpoint, SegmentError> {
+    if metas
+        .iter()
+        .any(|meta| meta.name.len() > usize::from(u16::MAX))
+    {
+        return Err(SegmentError::TooLong("stream id"));
+    }
     let mut parts = Vec::with_capacity(metas.len() + 3);
     let mut offset = 0u64;
     let mut index: Vec<(u64, StreamExtent)> = Vec::with_capacity(metas.len() + 1);
@@ -181,11 +189,24 @@ pub async fn put_checkpoint(
     path: &Path,
     built: &BuiltCheckpoint,
 ) -> object_store::Result<()> {
+    put_checkpoint_payload(
+        store,
+        path,
+        PutPayload::from_iter(built.parts.iter().cloned()),
+    )
+    .await
+}
+
+/// The same for a file's bytes, kept while its PUT was still owed.
+pub async fn put_checkpoint_payload(
+    store: &dyn ObjectStore,
+    path: &Path,
+    payload: PutPayload,
+) -> object_store::Result<()> {
     let options = PutOptions {
         mode: PutMode::Create,
         ..PutOptions::default()
     };
-    let payload = PutPayload::from_iter(built.parts.iter().cloned());
     match store.put_opts(path, payload, options).await {
         Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
         Err(error) => Err(error),
@@ -200,7 +221,6 @@ pub struct CheckpointFile {
     pub path: Path,
     pub top: TopIndex,
     pub head: CheckpointHead,
-    pub last_modified_ms: i64,
 }
 
 impl CheckpointFile {
@@ -211,7 +231,6 @@ impl CheckpointFile {
             path: checkpoint_path(generation, seq),
             top,
             head,
-            last_modified_ms: 0,
         }
     }
 }
@@ -243,7 +262,9 @@ async fn read_entry(
 pub struct CheckpointSet {
     pub files: Vec<CheckpointFile>,
     pub ownership: Ownership,
-    /// Files older than the newest full one, which nothing needs (D18).
+    /// Files older than the newest full one a reader can trust, which nothing needs (D18). Only
+    /// a startup that has just claimed ownership takes these, since it alone knows the limits
+    /// that make a full file trustworthy for every later reader.
     pub superseded: Vec<Path>,
 }
 
@@ -263,13 +284,10 @@ impl CheckpointSet {
         let listed = store
             .list_with_delimiter(Some(&Path::from(CHECKPOINT_PREFIX)))
             .await?;
-        let mut found: BTreeMap<(u64, u64), (Path, i64)> = BTreeMap::new();
+        let mut found: BTreeMap<(u64, u64), Path> = BTreeMap::new();
         for object in listed.objects {
             if let Some(key) = parse_checkpoint_path(&object.location) {
-                found.insert(
-                    key,
-                    (object.location, object.last_modified.timestamp_millis()),
-                );
+                found.insert(key, object.location);
             }
         }
         let mut set = CheckpointSet {
@@ -278,7 +296,7 @@ impl CheckpointSet {
             superseded: Vec::new(),
         };
         let mut reached_full = false;
-        for ((generation, seq), (path, last_modified_ms)) in found.into_iter().rev() {
+        for ((generation, seq), path) in found.into_iter().rev() {
             if reached_full {
                 set.superseded.push(path);
                 continue;
@@ -292,7 +310,6 @@ impl CheckpointSet {
                 path,
                 top,
                 head: CheckpointHead::default(),
-                last_modified_ms,
             };
             if let Some((_, blob)) = read_entry(store, &file, HEAD_NAME).await? {
                 file.head = decode_head(&blob)?;
@@ -304,14 +321,24 @@ impl CheckpointSet {
         Ok(set)
     }
 
-    /// Goes in front: it is the newest. A full one makes the rest superseded.
+    /// Goes in front: it is the newest. A running node doesn't need what a full one replaces,
+    /// and leaves the files themselves: it may no longer own the bucket, and if so a reader may
+    /// refuse that full file and need them (section 8.1).
     pub fn add_newest(&mut self, file: CheckpointFile) {
         if file.head.full {
-            let older = std::mem::take(&mut self.files);
-            self.superseded
-                .extend(older.into_iter().map(|file| file.path));
+            self.files.clear();
         }
         self.files.insert(0, file);
+    }
+
+    /// The objects whose extents these files record. A file with anything over its generation's
+    /// limit doesn't count: part of what it records is refused, and its objects have to be
+    /// looked at for what readers accept of them (section 8.1).
+    pub fn recorded_objects(&self) -> impl Iterator<Item = &str> {
+        self.files
+            .iter()
+            .filter(|file| self.accepts(file.generation, file.head.max_id))
+            .flat_map(|file| file.head.objects.iter().map(String::as_str))
     }
 
     pub fn max_id(&self) -> u64 {

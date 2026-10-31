@@ -2812,11 +2812,12 @@ impl Core {
         if let Some(shard) = self.shards.get_mut(&shard) {
             shard.streams.remove(&**name);
         }
-        self.tombstones
-            .insert(Arc::clone(name), stream.ids.last_id());
+        // Everything at or below the last valid id is older than this delete, though a former
+        // generation's late object can hold ids of it this stream never had (section 8.1).
+        let floor_id = stream.ids.last_id().max(self.config.last_valid_id);
+        self.tombstones.insert(Arc::clone(name), floor_id);
         if self.loader.is_some() {
-            self.dirty_tombstones
-                .push((Arc::clone(name), stream.ids.last_id()));
+            self.dirty_tombstones.push((Arc::clone(name), floor_id));
         }
         for home in 0..self.config.core_count {
             let seq = next_seq(&mut stream.delivery, home);

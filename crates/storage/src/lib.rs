@@ -19,7 +19,8 @@ mod wal_writer;
 pub use cache::{CacheError, SegmentCache};
 pub use checkpoint::{
     BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet,
-    build_checkpoint, checkpoint_path, merge_meta, put_checkpoint, retry_delay,
+    build_checkpoint, checkpoint_path, merge_meta, put_checkpoint, put_checkpoint_payload,
+    retry_delay,
 };
 pub use crash::crash_point;
 pub use meta_format::{

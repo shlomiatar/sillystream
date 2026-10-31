@@ -375,3 +375,14 @@ async fn a_former_generations_file_counts_up_to_its_limit() {
     assert_eq!(a.extents.len(), 1);
     assert_eq!(a.extents[0].id_last, 10);
 }
+
+#[test]
+fn a_checkpoint_refuses_a_name_its_pages_cannot_hold() {
+    let meta = |len: usize| StreamMeta {
+        name: "n".repeat(len),
+        ..StreamMeta::default()
+    };
+    let head = CheckpointHead::default();
+    assert!(build_checkpoint(&head, &[meta(65_535)]).is_ok());
+    assert!(build_checkpoint(&head, &[meta(65_536)]).is_err());
+}

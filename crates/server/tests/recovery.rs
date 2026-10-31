@@ -764,3 +764,409 @@ async fn an_evicted_stream_loads_on_the_core_its_shard_moved_to() {
     drop((client, fresh));
     node.shutdown();
 }
+
+// ---- Two owners on one bucket, local metadata ahead of S3, and objects no checkpoint records.
+
+fn full_every(count: usize) -> NodeConfig {
+    let mut config = manual_config(1);
+    config.full_checkpoint_every_count = count;
+    config
+}
+
+/// A second machine's disks, on the same bucket.
+fn replacement_for(disk: &Disk) -> Disk {
+    let mut replacement = Disk::new();
+    replacement.store = disk.store.clone();
+    replacement
+}
+
+fn fail_checkpoint_puts(disk: &Disk, budget: i64) {
+    disk.store
+        .checkpoint_put_budget
+        .store(budget, Ordering::SeqCst);
+}
+
+async fn checkpoint_files(disk: &Disk) -> Vec<object_store::path::Path> {
+    use futures::TryStreamExt;
+    disk.store
+        .list(Some(&object_store::path::Path::from("checkpoints")))
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+/// A few seals of another stream, each with a checkpoint.
+async fn busy_seals(node: &Node, rounds: u64) {
+    let mut client = node.client(0).await;
+    for seq in 1..=rounds {
+        publish_one(&mut client, "busy", seq + 1_000_000, b"busy").await;
+        assert!(node.seal_and_checkpoint().await);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_former_owners_full_file_leaves_what_the_next_owner_needs() {
+    let old_disk = Disk::new();
+    let new_disk = replacement_for(&old_disk);
+    let (old, _) = old_disk.start(full_every(2));
+    let mut old_client = old.client(0).await;
+    let (first, _) = publish_one(&mut old_client, "s", 1, b"accepted").await;
+    assert!(old.seal_and_checkpoint().await);
+
+    let (new, report) = new_disk.start(full_every(1000));
+    assert!(report.last_valid_id >= first);
+    new.shutdown();
+
+    // The old machine doesn't know. Its second file is a full one, with an id over the limit.
+    old_disk.clock.advance(1000);
+    let (second, _) = publish_one(&mut old_client, "s", 2, b"above").await;
+    assert!(second > report.last_valid_id);
+    assert!(old.seal_and_checkpoint().await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(checkpoint_files(&old_disk).await.len(), 2);
+    drop(old_client);
+    old.shutdown();
+
+    std::fs::remove_dir_all(new_disk.metadata_dir()).unwrap();
+    let (new, _) = new_disk.start(full_every(1000));
+    assert_eq!(
+        read_all(&new, "s", 1).await,
+        vec![(first, b"accepted".to_vec())]
+    );
+    new.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_owners_load_survives_a_former_owners_full_file() {
+    let old_disk = Disk::new();
+    let new_disk = replacement_for(&old_disk);
+    let (old, _) = old_disk.start(full_every(2));
+    let mut old_client = old.client(0).await;
+    let (first, _) = publish_one(&mut old_client, "s", 1, b"accepted").await;
+    assert!(old.seal_and_checkpoint().await);
+
+    let (new, report) = new_disk.start(full_every(1000));
+    old_disk.clock.advance(1000);
+    let (second, _) = publish_one(&mut old_client, "s", 2, b"above").await;
+    assert!(second > report.last_valid_id);
+    assert!(old.seal_and_checkpoint().await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = new.client(0).await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), client.snapshot("s")).await;
+    drop((client, old_client));
+    old.shutdown();
+    let hung = answer.is_err();
+    if hung {
+        // Its threads would never let a shutdown finish.
+        std::mem::forget(new);
+    } else {
+        assert_eq!(read_all(&new, "s", 1).await[0].0, first);
+        new.shutdown();
+    }
+    assert!(!hung, "a running new owner's load never returned");
+    assert!(answer.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_startup_clears_files_a_full_one_has_replaced() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(full_every(2));
+    busy_seals(&node, 3).await;
+    assert_eq!(checkpoint_files(&disk).await.len(), 3);
+    node.shutdown();
+
+    let (node, _) = disk.start(full_every(2));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while checkpoint_files(&disk).await.len() > 2 {
+        assert!(std::time::Instant::now() < deadline, "older files stayed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_object_at_the_limit_stays_out_of_a_deleted_stream_and_its_successor() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (old_id, _) = publish_one(&mut client, "late", 1, b"old").await;
+    disk.clock.advance(5);
+    publish_one(&mut client, "anchor", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    let (node, report) = disk.start(manual_config(1));
+    let limit = report.last_valid_id;
+    assert!(limit > old_id);
+    let mut client = node.client(0).await;
+    assert!(client.delete_stream("late").await);
+    drop(client);
+    // Generation 1's, finishing after the delete, with an id the limit accepts.
+    let object_records = vec![stamped(limit, 1, b"old generation")];
+    put_late_object(disk.store.as_ref(), 1, limit, object_records.clone()).await;
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("late").await.err(),
+        Some(proto::ErrorCode::NotFound),
+        "deleted stream came back"
+    );
+    drop(client);
+    node.shutdown();
+
+    // The same, when the name is made again before the object is seen.
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "late", 1, b"old").await;
+    disk.clock.advance(5);
+    publish_one(&mut client, "anchor", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+    let (node, report) = disk.start(manual_config(1));
+    let limit = report.last_valid_id;
+    let mut client = node.client(0).await;
+    assert!(client.delete_stream("late").await);
+    let (new_id, _) = publish_one(&mut client, "late", 1, b"new").await;
+    assert!(new_id > limit);
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit,
+        vec![stamped(limit, 1, b"old generation")],
+    )
+    .await;
+    node.shutdown();
+    let (node, _) = disk.start(manual_config(1));
+    assert_eq!(
+        read_all(&node, "late", 1).await,
+        vec![(new_id, b"new".to_vec())]
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seal_saved_only_locally_reaches_the_checkpoints_after_a_restart() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(full_every(2));
+    fail_checkpoint_puts(&disk, 0);
+    let mut client = node.client(0).await;
+    let (id, _) = publish_one(&mut client, "victim", 1, b"one").await;
+    node.seal().await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(client);
+    // Stands in for a crash: the file was never written, and the local store has the extent.
+    node.shutdown();
+
+    fail_checkpoint_puts(&disk, -1);
+    let (node, _) = disk.start(full_every(2));
+    assert_eq!(
+        read_all(&node, "victim", 1).await,
+        vec![(id, b"one".to_vec())]
+    );
+    busy_seals(&node, 4).await;
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, _) = disk.start(full_every(2));
+    assert_eq!(
+        read_all(&node, "victim", 1).await,
+        vec![(id, b"one".to_vec())],
+        "acked record gone after rebuild"
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_saved_only_locally_reaches_the_checkpoints_after_a_restart() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(full_every(2));
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "gone", 1, b"old").await;
+    assert!(node.seal_and_checkpoint().await);
+    publish_one(&mut client, "other", 1, b"x").await;
+    assert!(node.seal_and_checkpoint().await);
+
+    fail_checkpoint_puts(&disk, 0);
+    let mut deleter = node.client(0).await;
+    let unanswered = tokio::spawn(async move { deleter.delete_stream("gone").await });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(client);
+    node.shutdown();
+    let _ = unanswered.await;
+
+    fail_checkpoint_puts(&disk, -1);
+    let (node, _) = disk.start(full_every(2));
+    let mut client = node.client(0).await;
+    assert!(!client.delete_stream("gone").await);
+    assert_eq!(
+        client.snapshot("gone").await.err(),
+        Some(proto::ErrorCode::NotFound)
+    );
+    drop(client);
+    busy_seals(&node, 4).await;
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, _) = disk.start(full_every(2));
+    let mut client = node.client(0).await;
+    assert_eq!(
+        client.snapshot("gone").await.err(),
+        Some(proto::ErrorCode::NotFound),
+        "deleted stream is back"
+    );
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_level_3_record_survives_when_an_older_seals_full_file_lands_after_its_object() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(full_every(1));
+    fail_checkpoint_puts(&disk, 0);
+    let mut client = node.client(0).await;
+    publish_one(&mut client, "first", 1, b"one").await;
+    node.seal().await;
+    disk.clock.advance(5);
+    let records = record_with(0, b"victim");
+    client
+        .publish(publish("victim", &records, 1, 3))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    node.seal().await;
+    let (_, acked, _) = expect_ack(&mut client).await;
+
+    // The first seal's job gets its full file in. The second never does.
+    fail_checkpoint_puts(&disk, 1);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(client);
+    node.shutdown();
+    fail_checkpoint_puts(&disk, -1);
+
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    let (node, report) = disk.start(full_every(1));
+    assert!(report.last_valid_id >= acked, "{report:?} below {acked}");
+    assert_eq!(
+        read_all(&node, "victim", 1).await,
+        vec![(acked, b"victim".to_vec())],
+        "level 3 acked record lost"
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn losing_every_checkpoint_of_a_seal_leaves_its_records_reachable() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(full_every(64));
+    let mut client = node.client(0).await;
+    let (id, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    node.shutdown();
+
+    // What a crash before the only PUT would leave.
+    for path in checkpoint_files(&disk).await {
+        disk.store.delete(&path).await.unwrap();
+    }
+    let (node, _) = disk.start(full_every(1));
+    busy_seals(&node, 3).await;
+    node.shutdown();
+
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    let (node, _) = disk.start(full_every(1));
+    assert_eq!(
+        read_all(&node, "a", 1).await,
+        vec![(id, b"one".to_vec())],
+        "sealed record gone after machine loss"
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_object_is_still_found_after_a_full_file_and_only_looked_at_once() {
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    let (node, _) = disk.start(full_every(1));
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit - 1,
+        vec![stamped(limit - 1, 1, b"below")],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    busy_seals(&node, 1).await;
+    node.shutdown();
+
+    let (node, report) = disk.start(full_every(1));
+    assert_eq!(report.adopted_extent_count, 1, "{report:?}");
+    assert_eq!(
+        read_all(&node, "late", 1).await,
+        vec![(limit - 1, b"below".to_vec())]
+    );
+    busy_seals(&node, 2).await;
+    node.shutdown();
+
+    // Every object is recorded by now, through however many full files.
+    let (node, report) = disk.start(full_every(1));
+    assert_eq!(report.scanned_object_count, 0, "{report:?}");
+    assert_eq!(
+        read_all(&node, "late", 1).await,
+        vec![(limit - 1, b"below".to_vec())]
+    );
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    put_late_object(
+        disk.store.as_ref(),
+        1,
+        limit - 1,
+        vec![
+            stamped(limit - 1, 1, b"below"),
+            stamped(limit + 1, 1, b"above"),
+        ],
+    )
+    .await;
+    let meta = storage::StreamMeta {
+        name: "late".into(),
+        last_id: limit + 1,
+        applied_id: limit + 1,
+        ..Default::default()
+    };
+    let head = storage::CheckpointHead {
+        full: false,
+        max_id: limit + 1,
+        objects: vec![seal_path("former", 1, limit - 1).to_string()],
+    };
+    let built = storage::build_checkpoint(&head, &[meta]).unwrap();
+    storage::put_checkpoint(
+        disk.store.as_ref(),
+        &storage::checkpoint_path(1, 999),
+        &built,
+    )
+    .await
+    .unwrap();
+
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.adopted_extent_count, 1, "{report:?}");
+    assert_eq!(
+        read_all(&node, "late", 1).await,
+        vec![(limit - 1, b"below".to_vec())]
+    );
+    node.shutdown();
+}

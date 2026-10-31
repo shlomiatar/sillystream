@@ -19,7 +19,7 @@ use storage::{
 use crate::dedupe::DedupeTable;
 use crate::delivery::ExtentRef;
 use crate::message::{SinkSpec, StreamConfig};
-use crate::metadata::{LocalMeta, load_stream};
+use crate::metadata::{LocalMeta, load_stream, put_owed_checkpoint};
 use crate::state::StreamState;
 
 /// Where a recovering node's files are.
@@ -89,6 +89,9 @@ pub(crate) struct Prepared {
     pub checkpoints: CheckpointSet,
     pub max_id: u64,
     pub restored: Vec<RestoredStream>,
+    /// Objects this startup looked at, for the next checkpoint to record. Their extents are in
+    /// `restored`, or are ones nobody should read.
+    pub scanned_objects: Vec<String>,
 }
 
 pub(crate) fn extent_ref(stream: &Arc<str>, extent: &MetaExtent) -> ExtentRef {
@@ -177,38 +180,28 @@ struct ScannedExtent {
 }
 
 /// Objects no checkpoint records, which a crash left between upload and checkpoint or a
-/// former owner uploaded late. Those older than the newest full checkpoint were recorded
-/// (D139). Oldest generation first, since one object's extent keeps a later one's out.
+/// former owner uploaded late. Oldest generation first, since one object's extent keeps a
+/// later one's out.
 async fn scan_objects(
     store: &Arc<dyn ObjectStore>,
     checkpoints: &CheckpointSet,
     ownership: &Ownership,
+    objects_seen: &mut Vec<String>,
     report: &mut RecoveryReport,
 ) -> Result<Vec<ScannedExtent>, String> {
-    let known: HashSet<&str> = checkpoints
-        .files
-        .iter()
-        .flat_map(|file| file.head.objects.iter().map(String::as_str))
-        .collect();
-    let since_ms = checkpoints
-        .files
-        .iter()
-        .find(|file| file.head.full)
-        .map_or(i64::MIN, |file| file.last_modified_ms);
+    let known: HashSet<&str> = checkpoints.recorded_objects().collect();
     let mut objects: Vec<(u64, Path)> = list_sealed_objects(store.as_ref())
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|object| {
-            object.last_modified.timestamp_millis() >= since_ms
-                && !known.contains(object.location.as_ref())
-        })
+        .filter(|object| !known.contains(object.location.as_ref()))
         .filter_map(|object| Some((object_generation(&object.location)?, object.location)))
         .collect();
     objects.sort();
     let mut out = Vec::new();
     for (generation, path) in objects {
         report.scanned_object_count += 1;
+        objects_seen.push(path.to_string());
         let limit = ownership.limit_for(generation);
         let reader = SegmentReader::new(Arc::clone(store), path.clone());
         let top = reader
@@ -407,7 +400,7 @@ fn replay_stream(
 }
 
 /// Everything up to and including taking ownership. A process that loses that race has written
-/// nothing and must stop.
+/// nothing but a checkpoint its own crash owed, and must stop.
 pub(crate) async fn prepare(
     wal_dir: &FsPath,
     local_store: storage::MetadataStore,
@@ -421,6 +414,7 @@ pub(crate) async fn prepare(
     let wal_files = list_wal_files(wal_dir).map_err(|error| error.to_string())?;
     report.wal_lost = wal_files.is_empty() && ownership.current_generation().is_some();
 
+    put_owed_checkpoint(&local_store, store).await?;
     let mut checkpoints = CheckpointSet::read(store, ownership.clone())
         .await
         .map_err(|error| error.to_string())?;
@@ -428,7 +422,15 @@ pub(crate) async fn prepare(
         LocalMeta::open(local_store, checkpoints.files.is_empty())
             .map_err(|error| error.to_string())?,
     );
-    let scanned = scan_objects(store, &checkpoints, &ownership, &mut report).await?;
+    let mut scanned_objects = Vec::new();
+    let scanned = scan_objects(
+        store,
+        &checkpoints,
+        &ownership,
+        &mut scanned_objects,
+        &mut report,
+    )
+    .await?;
 
     let mut pending: BTreeMap<String, Pending> = BTreeMap::new();
     for extent in scanned {
@@ -490,6 +492,7 @@ pub(crate) async fn prepare(
             checkpoints,
             max_id: last_valid_id,
             restored,
+            scanned_objects,
         },
         local,
     ))
