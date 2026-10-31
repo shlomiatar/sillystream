@@ -7,6 +7,10 @@ publish.workspace = true
 [lib]
 bench = false
 
+[features]
+# Named crash points, for tests of the real binary (D32).
+test-hooks = []
+
 [dependencies]
 format.workspace = true
 bytes.workspace = true

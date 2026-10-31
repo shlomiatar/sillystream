@@ -288,6 +288,10 @@ pub(crate) struct TopEntry {
 }
 
 impl TopIndex {
+    pub(crate) fn from_pages(pages: Vec<TopEntry>) -> TopIndex {
+        TopIndex { pages }
+    }
+
     pub fn page_count(&self) -> usize {
         self.pages.len()
     }

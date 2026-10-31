@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tokio::sync::{oneshot, watch};
 
+use crate::crash::crash_point;
 use crate::wal_format::{WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header};
 use crate::wal_replay::wal_file_name;
 
@@ -121,10 +122,13 @@ impl WalVolume for DirVolume {
         let size_bytes = file.metadata()?.len();
         // Durably empty before it has the new name, so that a crash at any point
         // here leaves no old bytes under it. Its entries are already uploaded (D16).
+        crash_point("recycle.before_empty");
         file.set_len(0)?;
         file.sync_all()?;
+        crash_point("recycle.after_empty");
         let path = self.path(new_seq);
         std::fs::rename(old_path, &path)?;
+        crash_point("recycle.after_rename");
         file.set_len(size_bytes)?;
         DirVolume::write_header(&mut file, new_seq)?;
         self.sync_dir()?;
@@ -371,8 +375,11 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                 slices.push(IoSlice::new(&ZERO_PADDING[..*padding]));
             }
         }
+        crash_point("wal.before_write");
         write_all_vectored(&mut self.file, &mut slices).map_err(WalError::Write)?;
+        crash_point("wal.before_fsync");
         self.file.sync_data().map_err(WalError::Sync)?;
+        crash_point("wal.after_fsync");
 
         self.stats.sync_count += 1;
         self.stats.entry_count += batch.len() as u64;

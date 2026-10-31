@@ -9,8 +9,8 @@ use format::{BlockSummary, RecordHeader, crc32c_append};
 
 use crate::segment_format::{
     BlockEntry, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES, PAGE_HEAD_BYTES, SegmentError,
-    StreamExtent, TopEntry, encode_block_table, encode_footer, encode_page, index_entry_bytes,
-    stream_hash,
+    StreamExtent, TopEntry, TopIndex, encode_block_table, encode_footer, encode_page,
+    index_entry_bytes, stream_hash,
 };
 
 /// A finished segment, as the pieces of one PUT. Together they are the whole object.
@@ -163,48 +163,13 @@ impl SegmentBuilder {
     /// Writes the footer: sorted pages, the top index and the trailer. Only the index
     /// is sorted here, and the data stays where it is (section 6.4).
     pub fn finish(mut self) -> Result<BuiltSegment, SegmentError> {
-        self.extents.sort_unstable_by(|(hash_a, a), (hash_b, b)| {
-            (hash_a, &a.stream, a.offset).cmp(&(hash_b, &b.stream, b.offset))
-        });
-        let mut top = Vec::new();
-        let mut start = 0;
-        while start < self.extents.len() {
-            let mut end = start;
-            let mut page_bytes = PAGE_HEAD_BYTES;
-            while end < self.extents.len() {
-                let hash = self.extents[end].0;
-                // A run of one hash, from collisions and two-section streams, stays whole.
-                let mut run_end = end;
-                let mut run_bytes = 0;
-                while run_end < self.extents.len() && self.extents[run_end].0 == hash {
-                    run_bytes += index_entry_bytes(&self.extents[run_end].1.stream);
-                    run_end += 1;
-                }
-                if end > start && page_bytes + run_bytes > self.page_bytes {
-                    break;
-                }
-                page_bytes += run_bytes;
-                end = run_end;
-            }
-            let entries: Vec<(u64, &StreamExtent)> = self.extents[start..end]
-                .iter()
-                .map(|(hash, extent)| (*hash, extent))
-                .collect();
-            let page = encode_page(&entries);
-            let len_bytes =
-                u32::try_from(page.len()).map_err(|_| SegmentError::TooLong("footer page"))?;
-            top.push(TopEntry {
-                first_hash: self.extents[start].0,
-                offset: self.offset,
-                len_bytes,
-            });
-            self.offset += u64::from(len_bytes);
-            self.parts.push(Bytes::from(page));
-            start = end;
-        }
-        let footer = encode_footer(&top, self.offset);
-        self.offset += footer.len() as u64;
-        self.parts.push(Bytes::from(footer));
+        let (end_offset, _) = encode_index_parts(
+            &mut self.extents,
+            self.page_bytes,
+            self.offset,
+            &mut self.parts,
+        )?;
+        self.offset = end_offset;
         Ok(BuiltSegment {
             parts: self.parts,
             len_bytes: self.offset,
@@ -212,4 +177,68 @@ impl SegmentBuilder {
             extents: self.extents.into_iter().map(|(_, extent)| extent).collect(),
         })
     }
+}
+
+/// Writes sorted footer pages, the top index and the trailer after the bytes so far, and says
+/// where the object ends. Checkpoints use this too (D18).
+pub(crate) fn encode_index_parts(
+    extents: &mut [(u64, StreamExtent)],
+    page_bytes: usize,
+    mut offset: u64,
+    parts: &mut Vec<Bytes>,
+) -> Result<(u64, Vec<TopEntry>), SegmentError> {
+    extents.sort_unstable_by(|(hash_a, a), (hash_b, b)| {
+        (hash_a, &a.stream, a.offset).cmp(&(hash_b, &b.stream, b.offset))
+    });
+    let mut top = Vec::new();
+    let mut start = 0;
+    while start < extents.len() {
+        let mut end = start;
+        let mut page_used_bytes = PAGE_HEAD_BYTES;
+        while end < extents.len() {
+            let hash = extents[end].0;
+            // A run of one hash, from collisions and two-section streams, stays whole.
+            let mut run_end = end;
+            let mut run_bytes = 0;
+            while run_end < extents.len() && extents[run_end].0 == hash {
+                run_bytes += index_entry_bytes(&extents[run_end].1.stream);
+                run_end += 1;
+            }
+            if end > start && page_used_bytes + run_bytes > page_bytes {
+                break;
+            }
+            page_used_bytes += run_bytes;
+            end = run_end;
+        }
+        let entries: Vec<(u64, &StreamExtent)> = extents[start..end]
+            .iter()
+            .map(|(hash, extent)| (*hash, extent))
+            .collect();
+        let page = encode_page(&entries);
+        let len_bytes =
+            u32::try_from(page.len()).map_err(|_| SegmentError::TooLong("footer page"))?;
+        top.push(TopEntry {
+            first_hash: extents[start].0,
+            offset,
+            len_bytes,
+        });
+        offset += u64::from(len_bytes);
+        parts.push(Bytes::from(page));
+        start = end;
+    }
+    let footer = encode_footer(&top, offset);
+    offset += footer.len() as u64;
+    parts.push(Bytes::from(footer));
+    Ok((offset, top))
+}
+
+/// As `encode_index_parts`, for a caller that wants the top index back.
+pub(crate) fn encode_index(
+    extents: &mut [(u64, StreamExtent)],
+    page_bytes: usize,
+    offset: u64,
+    parts: &mut Vec<Bytes>,
+) -> Result<TopIndex, SegmentError> {
+    let (_, pages) = encode_index_parts(extents, page_bytes, offset, parts)?;
+    Ok(TopIndex::from_pages(pages))
 }

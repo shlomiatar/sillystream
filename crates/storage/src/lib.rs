@@ -2,8 +2,12 @@
 //! (SPEC sections 6.3, 6.4, 7.3, 7.6). No compression codec may enter this crate.
 
 mod cache;
+mod checkpoint;
+mod crash;
+mod meta_format;
 mod metadata;
 mod object;
+mod ownership;
 mod segment_builder;
 mod segment_format;
 mod segment_reader;
@@ -13,10 +17,23 @@ mod wal_replay;
 mod wal_writer;
 
 pub use cache::{CacheError, SegmentCache};
+pub use checkpoint::{
+    BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet,
+    build_checkpoint, checkpoint_path, merge_meta, put_checkpoint, retry_delay,
+};
+pub use crash::crash_point;
+pub use meta_format::{
+    MetaCursor, MetaDedupe, MetaError, MetaExtent, MetaSink, StreamMeta, decode_extent,
+    decode_meta, encode_extent, encode_meta,
+};
 pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{
-    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, build_store, dedicated_path, seal_path,
-    stream_fits_dedicated_path,
+    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, build_store, dedicated_path,
+    list_sealed_objects, object_generation, seal_path, stream_fits_dedicated_path,
+};
+pub use ownership::{
+    OWNERSHIP_MAGIC, OWNERSHIP_RECORD_BYTES, Ownership, OwnershipError, claim_generation,
+    decode_ownership, encode_ownership, ownership_path, read_ownership,
 };
 pub use segment_builder::{BuiltSegment, SegmentBuilder};
 pub use segment_format::{

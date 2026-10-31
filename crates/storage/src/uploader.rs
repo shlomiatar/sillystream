@@ -682,6 +682,7 @@ where
 /// path exists with the same bytes, an earlier attempt succeeded after reporting a
 /// failure, which counts as done (D55).
 async fn put_once(store: &dyn ObjectStore, path: &Path, parts: &[Bytes]) -> Result<(), PutError> {
+    crate::crash::crash_point("seal.before_put");
     let payload = PutPayload::from_iter(parts.iter().cloned());
     let options = PutOptions {
         mode: PutMode::Create,

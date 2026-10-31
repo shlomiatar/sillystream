@@ -111,3 +111,26 @@ pub fn seal_path(node: &str, generation: u64, first_id: u64) -> Path {
 pub fn dedicated_path(stream: &str, generation: u64, first_id: u64) -> Path {
     sealed_path(stream, generation, first_id)
 }
+
+/// The generation in an object's name (section 7.3).
+pub fn object_generation(path: &Path) -> Option<u64> {
+    let name = path.filename()?.strip_suffix(".seg")?;
+    name.split_once('-')?.0.parse().ok()
+}
+
+/// Every object under `sealed/`, listing hour by hour and owner by owner.
+pub async fn list_sealed_objects(
+    store: &dyn ObjectStore,
+) -> object_store::Result<Vec<object_store::ObjectMeta>> {
+    let mut out = Vec::new();
+    let hours = store
+        .list_with_delimiter(Some(&Path::from("sealed")))
+        .await?;
+    for hour in hours.common_prefixes {
+        let owners = store.list_with_delimiter(Some(&hour)).await?;
+        for owner in owners.common_prefixes {
+            out.extend(store.list_with_delimiter(Some(&owner)).await?.objects);
+        }
+    }
+    Ok(out)
+}
