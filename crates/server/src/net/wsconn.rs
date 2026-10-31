@@ -58,6 +58,8 @@ const READS_PER_WAKE_COUNT: usize = 16;
 /// How often a write the node can't take yet is tried again (D62).
 const RETRY_FULL_MS: u64 = 1;
 const OPEN_HANDLES_MAX_COUNT: usize = 65_536;
+/// What those handles' names may take in all (D232).
+const OPEN_HANDLES_MAX_BYTES: usize = 16 << 20;
 const IOV_MAX_COUNT: usize = 64;
 const REVOKED_MESSAGE: &str = "the renewed token doesn't grant this stream";
 
@@ -237,6 +239,7 @@ struct Session {
     client: Client,
     connection: Connection,
     handles: HashMap<u32, Arc<str>>,
+    handle_name_bytes: usize,
     /// Each subscription the core may hold, with the tag that tells it from an earlier one under
     /// the same id.
     subs: HashMap<u32, (Arc<str>, u64)>,
@@ -772,12 +775,16 @@ impl WsConn<'_> {
                 let Some(session) = &mut self.session else {
                     return Ok(());
                 };
-                if session.handles.len() >= OPEN_HANDLES_MAX_COUNT
-                    && !session.handles.contains_key(&handle)
+                let replaced_bytes = session.handles.get(&handle).map(|name| name.len());
+                let name_bytes =
+                    session.handle_name_bytes - replaced_bytes.unwrap_or(0) + stream.len();
+                if (session.handles.len() >= OPEN_HANDLES_MAX_COUNT && replaced_bytes.is_none())
+                    || name_bytes > OPEN_HANDLES_MAX_BYTES
                 {
                     self.send_error(handle, ErrorCode::Malformed, "too many open handles");
                     return Ok(());
                 }
+                session.handle_name_bytes = name_bytes;
                 session.handles.insert(handle, Arc::from(stream));
             }
             ClientFrame::Subscribe(subscribe) => {
@@ -982,6 +989,7 @@ impl WsConn<'_> {
                 client: self.shared.node.client(self.home),
                 connection,
                 handles: HashMap::new(),
+                handle_name_bytes: 0,
                 subs: HashMap::new(),
                 next_sub_tag: 0,
                 revoked_subs: HashSet::new(),

@@ -891,3 +891,40 @@ async fn an_answer_to_an_old_unsubscribe_doesnt_hide_a_new_subscription_from_exp
     assert!(!saw_record(&mut reader, b"after-expiry", 500).await);
     drop((writer, reader));
 }
+
+/// `OPEN` asks for no permission, so what it keeps per connection is bounded in bytes as well as
+/// in handles: no-grant tokens otherwise hold about 4 GiB per connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_handles_are_bounded_in_bytes() {
+    let server = start();
+    let no_grants = token_at(START_MS + 3_600_000, 5, &[]);
+    let mut ws = server.ws(&no_grants).await;
+    let name = "n".repeat(60_000);
+    let mut refused = None;
+    for handle in 0..600u32 {
+        ws.open(handle, &name).await;
+        if handle % 32 == 31 {
+            ws.send(&ClientFrame::Ping { nonce: handle }).await;
+            loop {
+                match ws.recv_owned().await {
+                    Owned::Pong { .. } => break,
+                    Owned::Error { reference, code } => {
+                        refused.get_or_insert((reference, code));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        if refused.is_some() {
+            break;
+        }
+    }
+    let (reference, code) = refused.expect("600 names of 60 KB were all kept");
+    assert_eq!(code, ErrorCode::Malformed);
+    assert!(u64::from(reference) * 60_000 <= 20 << 20, "{reference}");
+
+    // The bytes come back when a handle is used for a shorter name.
+    ws.open(0, "short").await;
+    ws.open(reference, &name).await;
+    ws.round_trip(1).await;
+}
