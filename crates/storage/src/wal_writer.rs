@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use tokio::sync::{oneshot, watch};
 
-use crate::crash::crash_point;
+use crate::crash::{crash_point, wal_write_gate};
 use crate::wal_format::{WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header};
 use crate::wal_replay::wal_file_name;
 
@@ -390,6 +390,7 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                 slices.push(IoSlice::new(&ZERO_PADDING[..*padding]));
             }
         }
+        wal_write_gate();
         crash_point("wal.before_write");
         write_all_vectored(&mut self.file, &mut slices).map_err(WalError::Write)?;
         crash_point("wal.before_fsync");

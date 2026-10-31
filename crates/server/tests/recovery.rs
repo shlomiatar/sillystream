@@ -1289,3 +1289,102 @@ async fn wal_entries_survive_two_restarts_on_their_own_disk() {
     assert_eq!(got[0].0, r1);
     node.shutdown();
 }
+
+/// A stream on `to`, published to level 2 in the upload window of a seal, on the core `from`
+/// that is about to lose it, with enough other streams on `to` that it is due for eviction.
+/// Ends with the seal done and the record on `from`, unsealed. Returns the two ids.
+async fn move_in_upload_window(
+    disk: &Disk,
+    node: &Node,
+    client: &mut server::Client,
+    stream: &str,
+) -> (u64, u64, usize) {
+    let shard = server::shard_of(stream, node.virtual_shard_count());
+    let from = shard as usize % 2;
+    let to = 1 - from;
+    let (first, _) = publish_one(client, stream, 1, b"one").await;
+    disk.clock.advance(1);
+    disk.store.hold();
+    let begun = disk.store.put_begun_count.load(Ordering::SeqCst);
+    let window = async {
+        while disk.store.put_begun_count.load(Ordering::SeqCst) == begun {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        disk.clock.advance(1);
+        let (second, _) = publish_one(client, stream, 2, b"two").await;
+        assert!(node.move_shard(shard, to).await);
+        let mut filler = 0;
+        let mut made = 0;
+        while made < 3 {
+            filler += 1;
+            let name = format!("filler.{filler}");
+            if server::shard_of(&name, node.virtual_shard_count()) as usize % 2 == to {
+                disk.clock.advance(1);
+                publish_one(client, &name, 1, b"f").await;
+                made += 1;
+            }
+        }
+        disk.store.release();
+        second
+    };
+    let (sealed, second) = tokio::join!(node.seal_and_checkpoint(), window);
+    assert!(sealed);
+    (first, second, to)
+}
+
+fn two_cores_evicting() -> NodeConfig {
+    let mut config = manual_config(2);
+    config.active_stream_limit = Some(2);
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_level_3_retry_waits_for_a_record_its_former_core_still_holds() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(two_cores_evicting());
+    let mut client = node.client(0).await;
+    let (_, second, _) = move_in_upload_window(&disk, &node, &mut client, "m").await;
+
+    let records = record_with(0, b"two");
+    client.publish(publish("m", &records, 2, 3)).await.unwrap();
+    // Only the WAL and the former core's memory have it.
+    expect_quiet(&mut client).await;
+    assert!(node.seal_and_checkpoint().await);
+    let (_, first_id, _) = expect_ack(&mut client).await;
+    assert_eq!(first_id, second);
+    drop(client);
+    node.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_gets_a_record_its_former_core_still_holds() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(two_cores_evicting());
+    let mut client = node.client(0).await;
+    let (first, second, to) = move_in_upload_window(&disk, &node, &mut client, "m").await;
+
+    let mut connection = node.connection(0).await.unwrap();
+    let mut heard = Heard::default();
+    connection.subscribe(Subscription::new(1, "m", 0));
+    hear_until(&mut connection, &mut heard, |heard| {
+        !heard.records(1).is_empty()
+    })
+    .await;
+    assert!(node.seal_and_checkpoint().await);
+    disk.clock.advance(1);
+    let (third, _) = publish_one(&mut client, "m", 3, b"three").await;
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).last().is_some_and(|last| last.0 >= third)
+    })
+    .await;
+    let got: Vec<u64> = heard.records(1).iter().map(|record| record.0).collect();
+    assert_eq!(got, [first, second, third]);
+    drop(connection);
+
+    // Once the former core has let go, it can leave RAM after all.
+    assert!(node.seal_and_checkpoint().await);
+    assert!(node.seal_and_checkpoint().await);
+    assert!(node.stats(to).await.unwrap().evicted_count >= 1);
+    drop(client);
+    node.shutdown();
+}

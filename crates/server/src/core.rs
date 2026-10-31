@@ -24,7 +24,7 @@ use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
     FanOut, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, StreamDelivery,
-    retention_start_id, walk_records,
+    UnsavedStep, retention_start_id, walk_records,
 };
 use crate::message::{
     AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
@@ -1188,7 +1188,9 @@ impl Core {
             shard.counters.ingest_records += ids.record_count;
         }
         let needs_wal = level >= 2;
+        let mut track_meta = false;
         if let Some(stream) = self.streams.get_mut(&**name) {
+            track_meta = stream.delivery.track_meta;
             stream.delivery.pending.push_back(PendingVisible {
                 core: self.config.id,
                 ticket,
@@ -1235,7 +1237,8 @@ impl Core {
         self.outbound.push_back(entry);
         self.flush_outbound();
 
-        if needs_wal {
+        // A checkpoint's view waits for the WAL whatever the level (D154).
+        if needs_wal || track_meta {
             self.wal_visible.push_back((ticket, Arc::clone(name)));
         }
         self.drain_visible(name);
@@ -1453,10 +1456,9 @@ impl Core {
         }
         for name in std::mem::take(&mut self.foreign_visible) {
             self.drain_visible(&name);
-            let waiting = self
-                .streams
-                .get(&*name)
-                .is_some_and(|stream| !stream.delivery.pending.is_empty());
+            let waiting = self.streams.get(&*name).is_some_and(|stream| {
+                !stream.delivery.pending.is_empty() || !stream.delivery.unsaved.is_empty()
+            });
             if waiting {
                 self.foreign_visible.push(name);
             }
@@ -1470,35 +1472,33 @@ impl Core {
         let Some(stream) = self.streams.get_mut(name) else {
             return;
         };
+        let durable_ticket = *self.inbox.durable.borrow();
+        let seen = |core: usize| {
+            if core == me {
+                durable_ticket
+            } else {
+                self.durable_by_core[core]
+            }
+        };
         while let Some(front) = stream.delivery.pending.front() {
-            if front.needs_wal {
-                let seen = if front.core == me {
-                    *self.inbox.durable.borrow()
-                } else {
-                    self.durable_by_core[front.core]
-                };
-                if front.ticket > seen {
-                    return;
-                }
+            if front.needs_wal && front.ticket > seen(front.core) {
+                break;
             }
             let Some(entry) = stream.delivery.pending.pop_front() else {
-                return;
+                break;
             };
             stream.delivery.visible_through = entry.last_id;
             if let Some(state) = &entry.state {
                 stream.delivery.visible_state = state.clone();
             }
             if stream.delivery.track_meta {
-                stream.delivery.meta_dirty = true;
-                if let Some((producer_id, producer_seq, first_id, count)) = entry.dedupe {
-                    stream.delivery.visible_dedupe.record(
-                        producer_id,
-                        producer_seq,
-                        first_id,
-                        count,
-                        self.clock.now_ms(),
-                    );
-                }
+                stream.delivery.unsaved.push_back(UnsavedStep {
+                    core: entry.core,
+                    ticket: entry.ticket,
+                    last_id: entry.last_id,
+                    state: entry.state.clone(),
+                    dedupe: entry.dedupe,
+                });
             }
             let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
             fan_out(
@@ -1513,6 +1513,29 @@ impl Core {
                     counters,
                 },
             );
+        }
+        while let Some(front) = stream.delivery.unsaved.front() {
+            if front.ticket > seen(front.core) {
+                break;
+            }
+            let Some(step) = stream.delivery.unsaved.pop_front() else {
+                break;
+            };
+            let delivery = &mut stream.delivery;
+            delivery.meta_dirty = true;
+            delivery.saved_through = step.last_id;
+            if let Some(state) = step.state {
+                delivery.saved_state = state;
+            }
+            if let Some((producer_id, producer_seq, first_id, count)) = step.dedupe {
+                delivery.saved_dedupe.record(
+                    producer_id,
+                    producer_seq,
+                    first_id,
+                    count,
+                    self.clock.now_ms(),
+                );
+            }
         }
     }
 
@@ -2557,7 +2580,9 @@ impl Core {
                 entry.count,
             )
         }));
-        delivery.visible_dedupe = dedupe.clone();
+        delivery.saved_through = meta.last_id;
+        delivery.saved_state = (meta.state_ver, meta.state.clone());
+        delivery.saved_dedupe = dedupe.clone();
         self.use_count += 1;
         delivery.last_used = self.use_count;
         let mut state = StreamState::new();
@@ -2668,9 +2693,9 @@ impl Core {
                 deleted: false,
                 last_id: stream.ids.last_id(),
                 floor_id: delivery.floor_id,
-                applied_id: delivery.visible_through,
-                state_ver: delivery.visible_state.0,
-                state: delivery.visible_state.1.clone(),
+                applied_id: delivery.saved_through,
+                state_ver: delivery.saved_state.0,
+                state: delivery.saved_state.1.clone(),
                 default_ack_level: stream.config.default_ack_level,
                 min_ack_level: stream.config.min_ack_level,
                 retention_ms: stream.config.retention_ms,
@@ -2683,7 +2708,7 @@ impl Core {
                     })
                     .collect(),
                 dedupe: delivery
-                    .visible_dedupe
+                    .saved_dedupe
                     .entries()
                     .iter()
                     .map(|entry| MetaDedupe {
@@ -2736,6 +2761,8 @@ impl Core {
                 !delivery.meta_dirty
                     && delivery.saved_gather <= done_gather
                     && delivery.pending.is_empty()
+                    && delivery.unsaved.is_empty()
+                    && delivery.held_elsewhere.is_empty()
                     && delivery.table.is_unwatched()
                     && self
                         .logs
@@ -2780,11 +2807,20 @@ impl Core {
         if last_id > 0 {
             stream.owners.push((last_id, self.config.id));
         }
+        if let Some(batch) = self.logs.get(name).and_then(|log| log.batches.back()) {
+            stream.delivery.held_elsewhere.push(batch.last_id);
+        }
         // The new owner hears when what it takes over from here becomes durable (D84).
         let durable_ticket = *self.inbox.durable.borrow();
+        let track_meta = stream.delivery.track_meta;
         for pending in &stream.delivery.pending {
-            if pending.needs_wal && pending.core == self.config.id {
+            if (pending.needs_wal || track_meta) && pending.core == self.config.id {
                 self.durable_owed = self.durable_owed.max(pending.ticket);
+            }
+        }
+        for step in &stream.delivery.unsaved {
+            if step.core == self.config.id {
+                self.durable_owed = self.durable_owed.max(step.ticket);
             }
         }
         if self.durable_owed != 0 && durable_ticket >= self.durable_owed {
@@ -3031,7 +3067,7 @@ impl Core {
                     stamped_through: self.next_ticket,
                 });
             }
-            if !stream.delivery.pending.is_empty() {
+            if !stream.delivery.pending.is_empty() || !stream.delivery.unsaved.is_empty() {
                 self.foreign_visible.push(Arc::clone(&stream.name));
             }
             self.streams.insert(

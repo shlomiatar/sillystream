@@ -280,6 +280,16 @@ pub(crate) struct ExtentRef {
     pub extent: StreamExtent,
 }
 
+/// What a visible batch changes in the saved view, once its ticket is durable.
+#[derive(Debug)]
+pub(crate) struct UnsavedStep {
+    pub core: usize,
+    pub ticket: u64,
+    pub last_id: u64,
+    pub state: Option<(u64, Bytes)>,
+    pub dedupe: Option<(u64, u64, u64, u32)>,
+}
+
 /// A stream's delivery state. Moves with the stream.
 #[derive(Debug)]
 pub(crate) struct StreamDelivery {
@@ -300,9 +310,16 @@ pub(crate) struct StreamDelivery {
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
-    /// Dedupe entries as of `visible_through`, which is what a checkpoint may save: an entry
-    /// for a publish a crash can erase would ack it on the retry, unwritten (D136).
-    pub visible_dedupe: DedupeTable,
+    /// What a checkpoint may save: the stream as of its last record in the WAL. An entry for a
+    /// publish a crash can erase would ack it on the retry, unwritten (D136, D154).
+    pub saved_through: u64,
+    pub saved_state: (u64, Bytes),
+    pub saved_dedupe: DedupeTable,
+    /// Visible, and not yet in the WAL, in id order. Only with `track_meta`.
+    pub unsaved: VecDeque<UnsavedStep>,
+    /// The last id each core held when this stream left it. Its extent still has to reach
+    /// here, and until it does this stream's owner list is the only way to that core (D153).
+    pub held_elsewhere: Vec<u64>,
     /// Whether this stream's metadata is saved at seals. Off on a node without a store.
     pub track_meta: bool,
     pub meta_dirty: bool,
@@ -326,7 +343,11 @@ impl StreamDelivery {
             extents: Vec::new(),
             floor_id: 0,
             sinks: std::collections::BTreeMap::new(),
-            visible_dedupe: DedupeTable::new(),
+            saved_through: 0,
+            saved_state: (0, Bytes::new()),
+            saved_dedupe: DedupeTable::new(),
+            unsaved: VecDeque::new(),
+            held_elsewhere: Vec::new(),
             track_meta: false,
             meta_dirty: false,
             saved_gather: 0,
@@ -347,6 +368,8 @@ impl StreamDelivery {
 
     /// Both cores of a seal report its extents, so one may arrive twice.
     pub fn add_extent(&mut self, path: &Path, extent: &StreamExtent) {
+        self.held_elsewhere
+            .retain(|id| !(extent.id_first <= *id && *id <= extent.id_last));
         let at = self
             .extents
             .partition_point(|known| known.extent.id_first < extent.id_first);

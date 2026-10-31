@@ -23,6 +23,8 @@ pub use checkpoint::{
     retry_delay,
 };
 pub use crash::crash_point;
+#[cfg(feature = "test-hooks")]
+pub use crash::hold_wal_writes;
 pub use meta_format::{
     MetaCursor, MetaDedupe, MetaError, MetaExtent, MetaSink, StreamMeta, decode_extent,
     decode_meta, encode_extent, encode_meta,
