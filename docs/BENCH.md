@@ -351,3 +351,21 @@ The same throughput command, re-run after frames that span reads gained a copy (
 | 2 | 1 | 65536 | 6586 | 431.6 |
 | 2 | 4 | 1024 | 468264 | 479.5 |
 | 2 | 4 | 65536 | 13788 | 903.6 |
+
+## M9: a stalled sink against publishing
+
+```
+CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo test -p server --test sink_stall -- --nocapture
+```
+
+Working tree on top of `270514e`, committed together with this file. Same machine as above. This is a test, in a debug build, with a scripted WAL file, so it compares two runs and says nothing about absolute speed. No criterion bench was added for M9.
+
+30,000 records of 1,024 bytes over 5 rounds, measured after a 40,000 record warm-up. The receivers of all 16 sinks hold their responses.
+
+| | No sinks | 16 stalled sinks |
+|---|---|---|
+| Steady, records/s | 128,107 | 104,436 (0.815) |
+| Slowest 1,000 records, ms | 11 | 13 |
+| While sinks fill their budgets, records/s | 129,812 | 67,489 (0.52) |
+
+Caveats: one run on a shared laptop. The test asserts a steady ratio above 0.7, a bound picked for noise. The steady cost isn't explained (see BUILD_NOTES), and filling costs about half while it lasts. A real fsync would likely hide some of this, which wasn't measured.
