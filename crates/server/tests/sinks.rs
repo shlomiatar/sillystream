@@ -1418,6 +1418,9 @@ async fn on_expire_stop_warns_then_halts() {
     let (spec, cursor) = sink_of(&mut client, STREAM, 1).await;
     assert_eq!(cursor, 0, "nothing passed");
     assert_eq!(spec.gap_count, 0);
+    // A request already on its way when the sink paused may still land (section 9's update and
+    // pause let in-flight work finish). None may start from here on.
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
     let count = receiver.count();
     harness.clock.advance(60_000);
     receiver.stays_at(count).await;
