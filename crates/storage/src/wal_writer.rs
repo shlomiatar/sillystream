@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tokio::sync::{oneshot, watch};
 
 use crate::crash::{crash_point, wal_write_gate};
@@ -127,9 +130,15 @@ impl WalVolume for DirVolume {
             .read(true)
             .write(true)
             .open(self.path(seq))?;
-        file.set_len(self.preallocate_bytes.max(WAL_FILE_HEADER_BYTES as u64))?;
-        self.write_header(&mut file, seq)?;
-        self.sync_dir()?;
+        let ready = file
+            .set_len(self.preallocate_bytes.max(WAL_FILE_HEADER_BYTES as u64))
+            .and_then(|()| self.write_header(&mut file, seq))
+            .and_then(|()| self.sync_dir());
+        if let Err(error) = ready {
+            // A retry of this seq (D233) needs the name free, and a half-made file holds nothing.
+            let _ = std::fs::remove_file(self.path(seq));
+            return Err(error);
+        }
         Ok(file)
     }
 
@@ -225,18 +234,24 @@ pub enum WalSendError<T> {
 /// A core's end of the channel. Every method is `try_send`, so no core ever blocks.
 pub struct WalSender<R> {
     tx: Sender<WalCommand<R>>,
+    /// The writer has no active file. Appends wait as they do for a full channel (D233).
+    no_file: Arc<AtomicBool>,
 }
 
 impl<R> Clone for WalSender<R> {
     fn clone(&self) -> Self {
         WalSender {
             tx: self.tx.clone(),
+            no_file: Arc::clone(&self.no_file),
         }
     }
 }
 
 impl<R> WalSender<R> {
     pub fn try_append(&self, entry: WalEntry<R>) -> Result<(), WalSendError<WalEntry<R>>> {
+        if self.no_file.load(Ordering::Acquire) {
+            return Err(WalSendError::Full(entry));
+        }
         self.tx
             .try_send(WalCommand::Append(entry))
             .map_err(|error| match error {
@@ -296,12 +311,27 @@ where
     V: WalVolume + 'static,
     N: DurableNotify + 'static,
 {
-    let file = volume.create(config.first_seq)?;
+    // Closed files are what a seal uploads and then frees, so a full volume can drain (D233).
+    let file = match volume.create(config.first_seq) {
+        Ok(file) => Some(file),
+        Err(error)
+            if error.kind() == io::ErrorKind::StorageFull && !config.closed_seqs.is_empty() =>
+        {
+            eprintln!(
+                "the WAL volume has no room for a new file: {error}. Writes wait until a seal has \
+                 uploaded what the WAL holds and freed one of its files."
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let no_file = Arc::new(AtomicBool::new(file.is_none()));
     let (tx, rx) = bounded(config.channel_capacity);
     let writer = Writer {
         volume,
         notify,
         file,
+        no_file: Arc::clone(&no_file),
         active_seq: config.first_seq,
         closed_seqs: config.closed_seqs.into(),
         free_seqs: VecDeque::new(),
@@ -321,13 +351,15 @@ where
             }
             result
         })?;
-    Ok((WalSender { tx }, WalHandle { thread }))
+    Ok((WalSender { tx, no_file }, WalHandle { thread }))
 }
 
 struct Writer<V: WalVolume, N> {
     volume: V,
     notify: N,
-    file: V::File,
+    /// `None` while the volume has no room for the file `active_seq` names (D233).
+    file: Option<V::File>,
+    no_file: Arc<AtomicBool>,
     active_seq: u64,
     closed_seqs: VecDeque<u64>,
     free_seqs: VecDeque<u64>,
@@ -379,11 +411,32 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                         self.closed_seqs.pop_front();
                         self.free(seq);
                     }
+                    if self.file.is_none() {
+                        self.open_active().map_err(WalError::Rotate)?;
+                    }
                 }
                 Some(WalCommand::Append(_)) | None => {}
             }
         }
         Ok(self.stats)
+    }
+
+    /// Tries again for the file `active_seq` names. Still no room isn't an error.
+    fn open_active(&mut self) -> io::Result<()> {
+        let opened = match self.free_seqs.front().copied() {
+            Some(old_seq) => self.volume.reuse(old_seq, self.active_seq),
+            None => self.volume.create(self.active_seq),
+        };
+        match opened {
+            Ok(file) => {
+                self.free_seqs.pop_front();
+                self.file = Some(file);
+                self.no_file.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::StorageFull => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// One spare is all a rotation needs, and any more only stays on the volume and in the next
@@ -404,6 +457,11 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
         batch: &[WalEntry<R>],
         heads: &mut Vec<u8>,
     ) -> Result<(), WalError> {
+        // Only an append that passed the flag just as a rotation found no room can get here. It
+        // has no file to go in, and it isn't acked, so this ends as any full disk does.
+        let Some(file) = &mut self.file else {
+            return Err(WalError::Write(io::ErrorKind::StorageFull.into()));
+        };
         heads.clear();
         let mut layout = Vec::with_capacity(batch.len());
         for entry in batch {
@@ -421,9 +479,9 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
         }
         wal_write_gate();
         crash_point("wal.before_write");
-        write_all_vectored(&mut self.file, &mut slices).map_err(WalError::Write)?;
+        write_all_vectored(file, &mut slices).map_err(WalError::Write)?;
         crash_point("wal.before_fsync");
-        self.file.sync_data().map_err(WalError::Sync)?;
+        file.sync_data().map_err(WalError::Sync)?;
         crash_point("wal.after_fsync");
 
         self.stats.sync_count += 1;
@@ -446,11 +504,30 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
     /// Everything before this command has been synced by `commit`, so the old file
     /// is complete when the new one takes over.
     fn rotate(&mut self) -> io::Result<WalRotated> {
+        if self.file.is_none() {
+            // Nothing is active, so what is closed is everything below it.
+            self.open_active()?;
+            return Ok(WalRotated {
+                closed_seq: self.active_seq - 1,
+                new_seq: self.active_seq,
+            });
+        }
         let closed_seq = self.active_seq;
         let new_seq = closed_seq + 1;
         self.file = match self.free_seqs.pop_front() {
-            Some(old_seq) => self.volume.reuse(old_seq, new_seq)?,
-            None => self.volume.create(new_seq)?,
+            Some(old_seq) => Some(self.volume.reuse(old_seq, new_seq)?),
+            None => match self.volume.create(new_seq) {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == io::ErrorKind::StorageFull => {
+                    eprintln!(
+                        "the WAL volume has no room for a new file: {error}. Writes wait until \
+                         this seal has uploaded and freed a file."
+                    );
+                    self.no_file.store(true, Ordering::Release);
+                    None
+                }
+                Err(error) => return Err(error),
+            },
         };
         self.closed_seqs.push_back(closed_seq);
         self.active_seq = new_seq;

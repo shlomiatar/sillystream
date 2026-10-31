@@ -808,10 +808,24 @@ impl Node {
     /// process takes ownership first or the local store is held, having changed nothing but
     /// what S3 already backs: a checkpoint it owed, and a store another generation left stale.
     pub fn recover(
+        config: NodeConfig,
+        recover: RecoverConfig,
+        store: Arc<dyn ObjectStore>,
+        clock: Arc<dyn Clock>,
+    ) -> io::Result<(Node, RecoveryReport)> {
+        let (wal_dir, preallocate_bytes) = (recover.wal_dir.clone(), recover.wal_preallocate_bytes);
+        Node::recover_on(config, recover, store, clock, move |generation| {
+            DirVolume::for_generation(wal_dir, preallocate_bytes, generation)
+        })
+    }
+
+    /// `recover`, on a volume made once the generation is known.
+    pub fn recover_on<V: WalVolume + 'static>(
         mut config: NodeConfig,
         recover: RecoverConfig,
         store: Arc<dyn ObjectStore>,
         clock: Arc<dyn Clock>,
+        make_volume: impl FnOnce(u64) -> V,
     ) -> io::Result<(Node, RecoveryReport)> {
         std::fs::create_dir_all(&recover.wal_dir)?;
         std::fs::create_dir_all(&recover.metadata_dir)?;
@@ -842,11 +856,7 @@ impl Node {
         let report = prepared.report;
         let node = Node::start_parts(
             config,
-            DirVolume::for_generation(
-                &recover.wal_dir,
-                recover.wal_preallocate_bytes,
-                report.generation,
-            ),
+            make_volume(report.generation),
             store,
             clock,
             Some(RecoveredParts {

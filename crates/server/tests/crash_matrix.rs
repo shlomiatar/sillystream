@@ -521,3 +521,117 @@ fn of_binaries_racing_on_one_bucket_each_generation_has_one_winner() {
     }
     panic!("no process lost the race in 10 rounds of {PROCESS_COUNT}");
 }
+
+/// Detaches the disk image even if the test fails.
+struct Image {
+    mount: PathBuf,
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args(["detach", "-force"])
+            .arg(&self.mount)
+            .stdout(Stdio::null())
+            .status();
+    }
+}
+
+/// A real full volume, on macOS only, so it isn't part of a normal run. Run with `--ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "macOS only: mounts a 40 MB disk image with hdiutil"]
+async fn a_really_full_wal_volume_restarts_and_drains() {
+    let files = Files::new();
+    let image_path = files.path("full.dmg");
+    let mount = files.path("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let ran = Command::new("hdiutil")
+        .args([
+            "create", "-size", "40m", "-fs", "APFS", "-volname", "walfull",
+        ])
+        .arg(&image_path)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ran.success());
+    let ran = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-mountpoint"])
+        .arg(&mount)
+        .arg(&image_path)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ran.success());
+    let _image = Image {
+        mount: mount.clone(),
+    };
+    std::fs::create_dir(mount.join("wal")).unwrap();
+    std::os::unix::fs::symlink(mount.join("wal"), files.path("wal")).unwrap();
+
+    let mut producer = Producer::new(&files);
+    let first = start(&files, "first", None);
+    let port = first.port.expect("it listens");
+    for _ in 0..3 {
+        assert!(producer.publish_next(port).await);
+    }
+    // Fill what is left but a few MB, and let the WAL run into the end of those.
+    {
+        use std::io::Write;
+        let mut filler = File::create(mount.join("filler")).unwrap();
+        let block = vec![7u8; 1 << 20];
+        while filler.write_all(&block).is_ok() {}
+        let size_bytes = filler.metadata().unwrap().len();
+        filler.set_len(size_bytes - (4 << 20)).unwrap();
+        filler.sync_all().unwrap();
+    }
+    let path = format!("/v1/stream/{STREAM}/publish?ack=2");
+    let mut refused = false;
+    let mut big_ids = Vec::new();
+    for seq in 100..400u64 {
+        let seq_text = seq.to_string();
+        let request = Http::new("POST", &path, &producer.token)
+            .header("X-Producer-Id", "8")
+            .header("X-Producer-Seq", &seq_text)
+            .body({
+                let mut body = seq_text.clone().into_bytes();
+                body.resize(256 * 1024, b'x');
+                body
+            });
+        match producer.request(port, &request).await {
+            Some(reply) if reply.status == 200 => {
+                big_ids.push(reply.field("first_id").unwrap().parse::<u64>().unwrap());
+            }
+            _ => {
+                refused = true;
+                break;
+            }
+        }
+    }
+    assert!(refused, "the volume never filled");
+    drop(first);
+
+    // Each of these used to get closer to a start that exits with no port.
+    for name in ["second", "third"] {
+        let running = start(&files, name, None);
+        let port = running
+            .port
+            .unwrap_or_else(|| panic!("{}", std::fs::read_to_string(&running.stderr).unwrap()));
+        let seen = producer.read_everything(port).await;
+        for (seq, first_id) in &producer.acked {
+            let data = format!("record-{seq}").into_bytes();
+            assert!(seen.iter().any(|(id, got)| id == first_id && *got == data));
+        }
+        for first_id in &big_ids {
+            assert!(seen.iter().any(|(id, _)| id == first_id), "{first_id} lost");
+        }
+        drop(running);
+    }
+
+    assert!(!big_ids.is_empty(), "nothing was acked before it filled");
+    // With no space freed by anyone, seals drain the WAL and a new write goes through.
+    let running = start(&files, "fourth", None);
+    let port = running.port.expect("it listens");
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    assert!(producer.publish_next(port).await, "no ack after the drain");
+    check(&producer, port).await;
+}

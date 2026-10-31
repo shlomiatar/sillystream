@@ -1563,3 +1563,130 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
     assert_eq!(got, want, "from S3 alone");
     node.shutdown();
 }
+
+/// A `DirVolume` on a volume with no room for a new file. A reused file needs none.
+struct FullVolume {
+    inner: storage::DirVolume,
+    created_count: Arc<std::sync::atomic::AtomicU64>,
+    full: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl storage::WalVolume for FullVolume {
+    type File = std::fs::File;
+
+    fn create(&mut self, seq: u64) -> std::io::Result<std::fs::File> {
+        self.created_count.fetch_add(1, Ordering::SeqCst);
+        if self.full.load(Ordering::SeqCst) {
+            return Err(std::io::ErrorKind::StorageFull.into());
+        }
+        self.inner.create(seq)
+    }
+
+    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> std::io::Result<std::fs::File> {
+        self.inner.reuse(old_seq, new_seq)
+    }
+
+    fn remove(&mut self, seq: u64) -> std::io::Result<()> {
+        self.inner.remove(seq)
+    }
+}
+
+/// With no room for a new WAL file, a restart still starts: it serves reads, holds writes back,
+/// and uploads what the closed files hold, and that frees the file it then writes to. It was
+/// stuck: nothing could be uploaded until the writer had a file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_with_no_room_for_a_wal_file_uploads_its_way_out() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let mut ids = Vec::new();
+    for seq in 1..=3 {
+        ids.push(publish_one(&mut client, "full", seq, b"acked").await.0);
+    }
+    drop(client);
+    node.shutdown();
+
+    let created_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (wal_dir, attempts) = (disk.wal_dir(), Arc::clone(&created_count));
+    let (node, report) = Node::recover_on(
+        manual_config(1),
+        disk.recover_config(),
+        disk.store.clone(),
+        Arc::new(disk.clock.clone()),
+        move |generation| FullVolume {
+            inner: storage::DirVolume::for_generation(wal_dir, 1024 * 1024, generation),
+            created_count: attempts,
+            full: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        },
+    )
+    .expect("a full volume doesn't stop a start");
+    assert_eq!(report.generation, 2);
+    assert!(created_count.load(Ordering::SeqCst) >= 1);
+
+    // What is acked can be read at once, before any upload.
+    let got: Vec<u64> = read_all(&node, "full", 3)
+        .await
+        .iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(got, ids);
+
+    // A new write can't be made durable yet, so no ack comes.
+    let mut client = node.client(0).await;
+    let records = record_with(0, b"new");
+    client
+        .publish(publish("full", &records, 4, 2))
+        .await
+        .unwrap();
+    assert!(
+        client.recv_within(200).await.is_none(),
+        "an answer with nowhere to have written it"
+    );
+
+    // One seal uploads it all and frees a file, and then the write goes through.
+    assert!(node.seal_and_checkpoint().await);
+    let (_, first_id, _) = expect_ack(&mut client).await;
+    assert!(first_id > ids[2]);
+    let files = storage::list_wal_files(&disk.wal_dir()).unwrap();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let got = read_all(&node, "full", 4).await;
+    assert_eq!(got.len(), 4);
+    drop(client);
+    node.shutdown();
+
+    // And nothing was lost over another restart, on a volume with room again.
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.generation, 3);
+    assert_eq!(read_all(&node, "full", 4).await.len(), 4);
+    node.shutdown();
+}
+
+/// The same at a rotation: the node had a file, the volume filled, and the seal goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_with_no_room_still_seals_and_frees_a_file() {
+    let disk = Disk::new();
+    let full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (wal_dir, full_flag) = (disk.wal_dir(), Arc::clone(&full));
+    let (node, _) = Node::recover_on(
+        manual_config(1),
+        disk.recover_config(),
+        disk.store.clone(),
+        Arc::new(disk.clock.clone()),
+        move |generation| FullVolume {
+            inner: storage::DirVolume::for_generation(wal_dir, 1024 * 1024, generation),
+            created_count: Arc::default(),
+            full: full_flag,
+        },
+    )
+    .unwrap();
+    let mut client = node.client(0).await;
+    let (first_id, _) = publish_one(&mut client, "full", 1, b"before").await;
+    full.store(true, Ordering::SeqCst);
+    assert!(node.seal_and_checkpoint().await);
+    let (next_id, _) = publish_one(&mut client, "full", 2, b"after").await;
+    assert!(next_id > first_id);
+    let got = read_all(&node, "full", 2).await;
+    assert_eq!(got.len(), 2);
+    drop(client);
+    node.shutdown();
+}
