@@ -636,6 +636,7 @@ pub(crate) enum ConnCmd {
         name: Option<Arc<str>>,
         with_state: bool,
         state_only: bool,
+        tag: u64,
         ticket: CommandTicket,
     },
     Unsubscribe {

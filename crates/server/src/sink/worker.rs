@@ -504,6 +504,7 @@ impl<'a> Reading<'a> {
                 reference,
                 code,
                 msg,
+                ..
             } if reference == self.sub => {
                 if code == ErrorCode::NotFound {
                     return Some(self.finish_in_flight(Spell::Reload).await);

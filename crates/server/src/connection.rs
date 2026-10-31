@@ -116,6 +116,9 @@ pub enum Event {
         reference: u32,
         code: ErrorCode,
         msg: String,
+        /// The `tag` of the subscription this ended, if it ended one. The id alone can't say:
+        /// the client may have used it again by the time this is read (D229).
+        ended: Option<u64>,
     },
 }
 
@@ -132,6 +135,8 @@ pub struct Subscription<'a> {
     pub with_state: bool,
     pub state_only: bool,
     pub include_system: bool,
+    /// Comes back on the error that ends this subscription.
+    pub tag: u64,
 }
 
 impl<'a> Subscription<'a> {
@@ -148,6 +153,7 @@ impl<'a> Subscription<'a> {
             with_state: false,
             state_only: false,
             include_system: false,
+            tag: 0,
         }
     }
 }
@@ -330,6 +336,7 @@ impl Connection {
             name: subscription.name.map(Arc::from),
             with_state: subscription.with_state,
             state_only: subscription.state_only,
+            tag: subscription.tag,
             ticket: CommandTicket::new(&self.out),
         });
     }
@@ -499,6 +506,7 @@ struct Sub {
     filter: Filter,
     linger_ms: u16,
     name: Option<Arc<str>>,
+    tag: u64,
     mode: Mode,
     subscribed_sent: bool,
     queue: VecDeque<QueueItem>,
@@ -850,9 +858,11 @@ impl Home {
                 name,
                 with_state,
                 state_only,
+                tag,
                 ticket,
             } => self.subscribe(
-                conn, sub, stream, from, linger_ms, filter, name, with_state, state_only, ticket,
+                conn, sub, stream, from, linger_ms, filter, name, with_state, state_only, tag,
+                ticket,
             ),
             ConnCmd::Unsubscribe { conn, sub, .. } => {
                 let key = self.conns[conn]
@@ -866,6 +876,7 @@ impl Home {
                             reference: sub,
                             code: ErrorCode::NotFound,
                             msg: "no such subscription".to_owned(),
+                            ended: None,
                         },
                     ),
                 }
@@ -889,6 +900,7 @@ impl Home {
                             reference: 0,
                             code: ErrorCode::Malformed,
                             msg: CURSOR_NAME_REFUSED.to_owned(),
+                            ended: None,
                         },
                     );
                     return;
@@ -966,6 +978,7 @@ impl Home {
                     reference: sub,
                     code: ErrorCode::Malformed,
                     msg: "COMMIT needs a subscription with a named cursor".to_owned(),
+                    ended: None,
                 },
             );
             return;
@@ -986,12 +999,14 @@ impl Home {
         name: Option<Arc<str>>,
         with_state: bool,
         state_only: bool,
+        tag: u64,
         ticket: CommandTicket,
     ) {
         let error = |code, msg: &str| Event::Error {
             reference: id,
             code,
             msg: msg.to_owned(),
+            ended: Some(tag),
         };
         let Some(connection) = self.conns.get(conn).and_then(Option::as_ref) else {
             return;
@@ -1028,6 +1043,7 @@ impl Home {
             filter: filter.expect("checked above"),
             linger_ms,
             name: name.clone(),
+            tag,
             mode: Mode::Attaching,
             subscribed_sent: false,
             queue: VecDeque::new(),
@@ -1450,22 +1466,23 @@ impl Home {
     /// Every subscription on the stream ends with error 2, and the owner's numbering starts
     /// over. What is in `reorder` overtook this, so it belongs to a new stream of this name.
     fn on_deleted(&mut self, stream: &Arc<str>) {
-        let keys: Vec<(usize, usize, u32)> = self
+        let keys: Vec<(usize, usize, u32, u64)> = self
             .subs
             .iter()
             .enumerate()
             .filter_map(|(key, sub)| {
                 let sub = sub.as_ref()?;
-                (sub.stream == *stream).then_some((key, sub.conn, sub.id))
+                (sub.stream == *stream).then_some((key, sub.conn, sub.id, sub.tag))
             })
             .collect();
-        for (key, conn, id) in keys {
+        for (key, conn, id, tag) in keys {
             self.send_event(
                 conn,
                 Event::Error {
                     reference: id,
                     code: ErrorCode::NotFound,
                     msg: "the stream was deleted".to_owned(),
+                    ended: Some(tag),
                 },
             );
             self.remove_sub(key);
@@ -1800,13 +1817,14 @@ impl Home {
                 });
             }
             CatchReply::Fail { code, msg } => {
-                let (conn, id) = (sub.conn, sub.id);
+                let (conn, id, tag) = (sub.conn, sub.id, sub.tag);
                 self.send_event(
                     conn,
                     Event::Error {
                         reference: id,
                         code,
                         msg,
+                        ended: Some(tag),
                     },
                 );
                 self.remove_sub(key);
@@ -1849,13 +1867,14 @@ impl Home {
                 sub.gone = sub.extent.take().map(|progress| progress.extent.path);
             }
             ReadDone::Fail { code, msg } => {
-                let (conn, id) = (sub.conn, sub.id);
+                let (conn, id, tag) = (sub.conn, sub.id, sub.tag);
                 self.send_event(
                     conn,
                     Event::Error {
                         reference: id,
                         code,
                         msg,
+                        ended: Some(tag),
                     },
                 );
                 self.remove_sub(key);

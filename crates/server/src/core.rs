@@ -2051,6 +2051,7 @@ impl Core {
                         reference: report.reference,
                         code,
                         msg: msg.to_owned(),
+                        ended: None,
                     },
                 });
             }

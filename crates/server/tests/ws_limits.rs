@@ -846,3 +846,48 @@ async fn a_reader_that_stops_cant_keep_the_memory_cap_pinned() {
     drop((writer, stalled));
     server.server.shutdown();
 }
+
+/// An `UNSUBSCRIBE` of an id with nothing behind it answers error 2. That answer comes after a
+/// `SUBSCRIBE` sent in the same write has been noted, and it isn't about that subscription, which
+/// has to stay known for expiry to end it (section 12).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_to_an_old_unsubscribe_doesnt_hide_a_new_subscription_from_expiry() {
+    let manual = Arc::new(ManualClock::new(START_MS));
+    let server = start_with(node_config(1), Arc::new(SystemClock), manual);
+    let now_ms = SystemClock.now_ms();
+    let mut writer = server
+        .ws(&token_at(now_ms + 3_600_000, 5, &[("*", ALL)]))
+        .await;
+    writer.open(1, "secret").await;
+    publish_acked(&mut writer, 1, b"before").await;
+
+    let short = token_at(SystemClock.now_ms() + 700, 5, &[("secret", READ)]);
+    let mut reader = server.ws(&short).await;
+    let in_one_write = |frame: &ClientFrame<'_>| {
+        let mut bytes = Vec::new();
+        frame.encode(&mut bytes).unwrap();
+        tokio_tungstenite::tungstenite::Message::Binary(bytes)
+    };
+    let unsubscribe = in_one_write(&ClientFrame::Unsubscribe { sub: 5 });
+    let subscribe = in_one_write(&ClientFrame::Subscribe(proto::Subscribe {
+        sub: 5,
+        from: u64::MAX,
+        linger_ms: 0,
+        author: None,
+        clauses: proto::WireClauses::default(),
+        stream: "secret",
+        name: None,
+        with_state: false,
+        state_only: false,
+        include_system: false,
+    }));
+    use futures_util::SinkExt;
+    reader.socket.feed(unsubscribe).await.unwrap();
+    reader.socket.feed(subscribe).await.unwrap();
+    reader.socket.flush().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    publish_acked(&mut writer, 2, b"after-expiry").await;
+    assert!(!saw_record(&mut reader, b"after-expiry", 500).await);
+    drop((writer, reader));
+}

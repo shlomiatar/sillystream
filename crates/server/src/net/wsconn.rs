@@ -237,7 +237,10 @@ struct Session {
     client: Client,
     connection: Connection,
     handles: HashMap<u32, Arc<str>>,
-    subs: HashMap<u32, Arc<str>>,
+    /// Each subscription the core may hold, with the tag that tells it from an earlier one under
+    /// the same id.
+    subs: HashMap<u32, (Arc<str>, u64)>,
+    next_sub_tag: u64,
     /// Subscriptions a renewed token ended, so that a `COMMIT` on one still hears why.
     revoked_subs: HashSet<u32>,
 }
@@ -820,9 +823,11 @@ impl WsConn<'_> {
                     return Ok(());
                 }
                 session.revoked_subs.remove(&subscribe.sub);
+                session.next_sub_tag += 1;
+                let tag = session.next_sub_tag;
                 session
                     .subs
-                    .insert(subscribe.sub, Arc::from(subscribe.stream));
+                    .insert(subscribe.sub, (Arc::from(subscribe.stream), tag));
                 session.connection.subscribe(Subscription {
                     sub: subscribe.sub,
                     stream: subscribe.stream,
@@ -834,6 +839,7 @@ impl WsConn<'_> {
                     with_state: subscribe.with_state,
                     state_only: subscribe.state_only,
                     include_system: subscribe.include_system,
+                    tag,
                 });
             }
             ClientFrame::Unsubscribe { sub } => {
@@ -857,7 +863,7 @@ impl WsConn<'_> {
                 }
                 // A subscription this connection never had is the handle's error to report.
                 let allowed = match session.subs.get(&sub) {
-                    Some(stream) => session.token.check(stream, auth::PERM_READ, now_ms),
+                    Some((stream, _)) => session.token.check(stream, auth::PERM_READ, now_ms),
                     None => Ok(()),
                 };
                 if let Err(error) = allowed {
@@ -977,6 +983,7 @@ impl WsConn<'_> {
                 connection,
                 handles: HashMap::new(),
                 subs: HashMap::new(),
+                next_sub_tag: 0,
                 revoked_subs: HashSet::new(),
             }));
         }
@@ -998,7 +1005,7 @@ impl WsConn<'_> {
             return;
         };
         let mut ended = Vec::new();
-        session.subs.retain(|sub, stream| {
+        session.subs.retain(|sub, (stream, _)| {
             let keep = session.token.check(stream, auth::PERM_READ, now_ms).is_ok();
             if !keep {
                 ended.push(*sub);
@@ -1140,13 +1147,12 @@ impl WsConn<'_> {
                 reference,
                 code,
                 msg,
+                ended,
             } => {
-                if matches!(
-                    code,
-                    ErrorCode::NotFound
-                        | ErrorCode::TooManySubscriptions
-                        | ErrorCode::RetentionExpired
-                ) && let Some(session) = &mut self.session
+                // Only the subscription that ended: `subs` is what expiry and a renewal walk, so
+                // a live one must never leave it (section 12, D229).
+                if let (Some(tag), Some(session)) = (ended, &mut self.session)
+                    && session.subs.get(&reference).is_some_and(|sub| sub.1 == tag)
                 {
                     session.subs.remove(&reference);
                 }
