@@ -4,8 +4,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use sdk::{
@@ -18,9 +18,29 @@ use crate::Args;
 
 const SEAL_WINDOW_MS: u64 = 1_000;
 
+/// A server on another machine, set once from the flags. Only benches that need nothing of the
+/// server's files run against one, and each client names its streams apart with its prefix.
+struct Remote {
+    url: String,
+    ca_pem: Vec<u8>,
+    token: String,
+    stream_prefix: String,
+    rss_command: Option<String>,
+}
+
+static REMOTE: OnceLock<Remote> = OnceLock::new();
+
+fn stream_name(name: &str) -> String {
+    match REMOTE.get() {
+        Some(remote) => format!("{}{name}", remote.stream_prefix),
+        None => name.to_owned(),
+    }
+}
+
 /// The server as a child process in a temporary directory, killed when this goes.
 struct ServerChild {
-    child: Child,
+    /// `None` when the server is another machine's (`--remote-url`).
+    child: Option<Child>,
     bin: PathBuf,
     settings: ServerSettings,
     url: String,
@@ -31,8 +51,10 @@ struct ServerChild {
 
 impl Drop for ServerChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -74,6 +96,17 @@ fn start_server(bin: &Path, cores: u64) -> Result<ServerChild, String> {
 
 fn start_server_with(bin: &Path, settings: ServerSettings) -> Result<ServerChild, String> {
     let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+    if let Some(remote) = REMOTE.get() {
+        return Ok(ServerChild {
+            child: None,
+            bin: bin.to_owned(),
+            settings,
+            url: remote.url.clone(),
+            ca_pem: remote.ca_pem.clone(),
+            token: remote.token.clone(),
+            dir,
+        });
+    }
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
         .map_err(|error| error.to_string())?;
     let ca_pem = certified.cert.pem().into_bytes();
@@ -109,7 +142,7 @@ fn start_server_with(bin: &Path, settings: ServerSettings) -> Result<ServerChild
     .sign(&secret)
     .map_err(|error| format!("{error:?}"))?;
     Ok(ServerChild {
-        child,
+        child: Some(child),
         bin: bin.to_owned(),
         settings,
         url: format!("localhost:{port}"),
@@ -173,12 +206,16 @@ impl ServerChild {
     /// A clean stop, which seals, by this child's own PID, and a start on the same files.
     fn restart(&mut self, clear_cache: bool) -> Result<(), String> {
         let text = |error: std::io::Error| error.to_string();
-        let pid = self.child.id().to_string();
+        let child = self
+            .child
+            .as_mut()
+            .ok_or("a remote server can't be restarted")?;
+        let pid = child.id().to_string();
         Command::new("kill")
             .args(["-TERM", &pid])
             .status()
             .map_err(text)?;
-        let status = self.child.wait().map_err(text)?;
+        let status = child.wait().map_err(text)?;
         if !status.success() {
             return Err(format!("the server stopped with {status}"));
         }
@@ -186,7 +223,7 @@ impl ServerChild {
             std::fs::remove_dir_all(self.dir.path().join("data/cache")).map_err(text)?;
         }
         let (child, port) = spawn_server(&self.bin, self.settings, self.dir.path())?;
-        self.child = child;
+        self.child = Some(child);
         self.url = format!("localhost:{port}");
         Ok(())
     }
@@ -223,10 +260,20 @@ impl ServerChild {
     }
 
     fn rss_bytes(&self) -> Result<u64, String> {
-        let output = Command::new("ps")
-            .args(["-o", "rss=", "-p", &self.child.id().to_string()])
-            .output()
-            .map_err(|error| error.to_string())?;
+        let output = match (&self.child, REMOTE.get()) {
+            (Some(child), _) => Command::new("ps")
+                .args(["-o", "rss=", "-p", &child.id().to_string()])
+                .output(),
+            (
+                None,
+                Some(Remote {
+                    rss_command: Some(command),
+                    ..
+                }),
+            ) => Command::new("sh").args(["-c", command]).output(),
+            _ => return Err("idle against a remote server needs --rss-command".to_owned()),
+        }
+        .map_err(|error| error.to_string())?;
         let text = String::from_utf8_lossy(&output.stdout);
         let kib: u64 = text
             .trim()
@@ -234,6 +281,68 @@ impl ServerChild {
             .map_err(|_| format!("ps said {text:?}"))?;
         Ok(kib * 1024)
     }
+}
+
+/// New connections: TCP, the full TLS 1.3 handshake (no resumption), the upgrade and `HELLO`,
+/// which is what every client pays again after a server restart.
+async fn connect_rate(args: &Args, bin: &Path) -> Result<(), String> {
+    let count = args.number("--connect-count")?.unwrap_or(5_000);
+    let cores = args.number("--cores")?.unwrap_or(4);
+    let server = start_server(bin, cores)?;
+    println!("### Connection setup, TCP to `HELLO` answered, {cores} cores\n");
+    println!("| at once | connections | failed | per second | p50 µs | p99 µs | p99.9 µs |");
+    println!("|---|---|---|---|---|---|---|");
+    for concurrency in number_list(args, "--connect-concurrency", "1,16,256")? {
+        let (url, ca_pem, token) = (
+            server.url.clone(),
+            server.ca_pem.clone(),
+            server.token.clone(),
+        );
+        let next = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..concurrency {
+            let (url, ca_pem, token) = (url.clone(), ca_pem.clone(), token.clone());
+            let (next, failed) = (next.clone(), failed.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut times_us = Vec::new();
+                while next.fetch_add(1, Ordering::Relaxed) < count {
+                    let began = Instant::now();
+                    match Client::connect(ClientConfig::new(&url, &ca_pem, &token)).await {
+                        Ok(client) => {
+                            times_us.push(began.elapsed().as_secs_f64() * 1e6);
+                            drop(client);
+                        }
+                        Err(_) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                times_us
+            }));
+        }
+        let mut samples = Vec::new();
+        for task in tasks {
+            samples.extend(task.await.map_err(|error| error.to_string())?);
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        samples.sort_by(f64::total_cmp);
+        if samples.is_empty() {
+            return Err("no connection succeeded".to_owned());
+        }
+        println!(
+            "| {concurrency} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} |",
+            samples.len(),
+            failed.load(Ordering::Relaxed),
+            samples.len() as f64 / seconds,
+            percentile(&samples, 0.50),
+            percentile(&samples, 0.99),
+            percentile(&samples, 0.999),
+        );
+    }
+    println!();
+    Ok(())
 }
 
 /// One encoded record of `data_bytes`, which don't compress, and aren't asked to.
@@ -261,7 +370,7 @@ fn publisher_config(ack: AckLevel) -> PublisherConfig {
 
 /// Closed loop, one at a time: each ack before the next publish.
 async fn ack_latencies(client: &Client, ack: AckLevel, count: u64) -> Result<Vec<f64>, String> {
-    let stream = format!("latency.{}", ack as u8);
+    let stream = stream_name(&format!("latency.{}", ack as u8));
     let mut publisher = client
         .publisher(&stream, publisher_config(ack))
         .map_err(|error| error.to_string())?;
@@ -513,7 +622,7 @@ async fn idle(args: &Args, bin: &Path) -> Result<(), String> {
     // A little work first, so that what is measured isn't first-use allocation of the runtime.
     let warm = server.client().await?;
     let mut publisher = warm
-        .publisher("warm", PublisherConfig::default())
+        .publisher(&stream_name("warm"), PublisherConfig::default())
         .map_err(|error| error.to_string())?;
     publisher.add(0, b"warm".to_vec());
     publisher.flush().await.map_err(|error| error.to_string())?;
@@ -678,7 +787,7 @@ async fn many_streams(args: &Args, bin: &Path) -> Result<(), String> {
             for at in 0..stream_count {
                 let server = Arc::clone(&server);
                 runs.push(tokio::spawn(async move {
-                    let stream = format!("many.{at}");
+                    let stream = stream_name(&format!("many.{at}"));
                     throughput_run(&server, ack, 1, data_bytes, seconds, &stream).await
                 }));
             }
@@ -966,7 +1075,7 @@ async fn load_run(server: &ServerChild, shape: LoadShape) -> Result<LoadRun, Str
     let mut readers = Vec::new();
     for at in 0..shape.stream_count {
         let client = server.client().await?;
-        let stream = format!("load.{at}");
+        let stream = stream_name(&format!("load.{at}"));
         let mut publisher = client
             .publisher(
                 &stream,
@@ -1294,7 +1403,8 @@ async fn fan_out_row(
     const DATA_BYTES: usize = 256;
     let zero = Instant::now();
     let writer = server.client().await?;
-    let stream = "fan";
+    let stream = stream_name("fan");
+    let stream = stream.as_str();
     let mut opener = writer
         .publisher(stream, publisher_config(AckLevel::Memory))
         .map_err(|error| error.to_string())?;
@@ -1568,14 +1678,18 @@ async fn recovery(args: &Args, bin: &Path) -> Result<(), String> {
             let acked = per_stream * STREAM_COUNT;
 
             // `Child::kill` is SIGKILL, to this child's own PID.
-            server.child.kill().map_err(|error| error.to_string())?;
-            server.child.wait().map_err(|error| error.to_string())?;
+            let child = server
+                .child
+                .as_mut()
+                .ok_or("recovery needs a local server")?;
+            child.kill().map_err(|error| error.to_string())?;
+            child.wait().map_err(|error| error.to_string())?;
             set_dir_modes(&objects, 0o700)?;
 
             let started = Instant::now();
             let (child, port) = spawn_server(bin, server.settings, server.dir.path())?;
             let start_seconds = started.elapsed().as_secs_f64();
-            server.child = child;
+            server.child = Some(child);
             server.url = format!("localhost:{port}");
             let replayed = replayed_entries(server.dir.path())?;
 
@@ -1616,14 +1730,62 @@ pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
         "--wal-mib",
         "--runs",
         "--timeout-seconds",
+        "--remote-url",
+        "--remote-ca",
+        "--remote-token-file",
+        "--stream-prefix",
+        "--rss-command",
+        "--connect-count",
+        "--connect-concurrency",
     ])?;
-    let bin = server_bin(args)?;
+    let bin = match args.one("--remote-url") {
+        Some(url) => {
+            set_remote(args, url, what)?;
+            PathBuf::new()
+        }
+        None => server_bin(args)?,
+    };
     // Dropping the future kills whichever server it holds, which a signal to this process
     // wouldn't. So this is what bounds a run.
     let limit = Duration::from_secs(args.number("--timeout-seconds")?.unwrap_or(24 * 3600));
     tokio::time::timeout(limit, run_one(args, what, &bin))
         .await
         .map_err(|_| format!("bench {what} ran out of time"))?
+}
+
+fn set_remote(args: &Args, url: &str, what: &str) -> Result<(), String> {
+    if ![
+        "latency",
+        "throughput",
+        "idle",
+        "many-streams",
+        "ack-matrix",
+        "fan-out",
+        "connect",
+    ]
+    .contains(&what)
+    {
+        return Err(format!(
+            "bench {what} needs the server's files, so it can't run remotely"
+        ));
+    }
+    let read = |flag: &str| -> Result<Vec<u8>, String> {
+        let file = args
+            .one(flag)
+            .ok_or_else(|| format!("--remote-url needs {flag}"))?;
+        std::fs::read(file).map_err(|error| format!("{file}: {error}"))
+    };
+    let token = String::from_utf8(read("--remote-token-file")?).map_err(|e| e.to_string())?;
+    let remote = Remote {
+        url: url.to_owned(),
+        ca_pem: read("--remote-ca")?,
+        token: token.trim().to_owned(),
+        stream_prefix: args.one("--stream-prefix").unwrap_or("").to_owned(),
+        rss_command: args.one("--rss-command").map(str::to_owned),
+    };
+    REMOTE
+        .set(remote)
+        .map_err(|_| "remote set twice".to_owned())
 }
 
 async fn run_one(args: &Args, what: &str, bin: &Path) -> Result<(), String> {
@@ -1639,6 +1801,7 @@ async fn run_one(args: &Args, what: &str, bin: &Path) -> Result<(), String> {
         "ack-matrix" => ack_matrix(args, &bin).await,
         "fan-out" => fan_out(args, &bin).await,
         "recovery" => recovery(args, &bin).await,
+        "connect" => connect_rate(args, &bin).await,
         "all" => {
             latency(args, &bin).await?;
             throughput(args, &bin).await?;
@@ -1649,6 +1812,7 @@ async fn run_one(args: &Args, what: &str, bin: &Path) -> Result<(), String> {
             idle_streams(args, &bin).await?;
             ack_matrix(args, &bin).await?;
             fan_out(args, &bin).await?;
+            connect_rate(args, &bin).await?;
             recovery(args, &bin).await
         }
         other => Err(format!("bench {other}?")),

@@ -269,13 +269,13 @@ Reading these:
 - **A write among catch-ups.** D101's effect, as a one-off in a release build at `db473b0` and not a criterion bench: 1 core, 4,000 publishes of 200 records of 32 B held in memory, K subscribers from 0 with a filter matching nothing, then time one level 1 ack. K=1: 23 µs, K=100: 1.9 ms, K=1,000: 28 ms, K=5,000: 66 ms, against 3.5 ms, 333 ms, 3.34 s and 16.6 s before. The catch-ups themselves took 1.4 ms, 119 ms, 1.16 s and 17.1 s. What remains in the ack is the burst of subscribe commands the core reads first, with one read on each turn.
 - **Not measured:** real disks, catch-up rate (M10's load generator), and delivery with non-matching filters. One filter per connection isn't varied, since connections are fixed at 16.
 
-## M6: `sillystream bench`
+## M6: `silly bench`
 
 The real server binary as a child process, a client in another process, TLS 1.3 and WebSocket over loopback, through the SDK. Run at commit `0d8ceb5`, on the machine above with a load average around 3.
 
 ```
 CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo build --release -p server -p cli
-target/release/sillystream bench all --count 5000 --seconds 10 --idle-count 10000 --cores 4
+target/release/silly bench all --count 5000 --seconds 10 --idle-count 10000 --cores 4
 ```
 
 ### Latency, 256-byte record, one publisher, 4 cores
@@ -339,7 +339,7 @@ The same throughput command, re-run after frames that span reads gained a copy (
 
 ### Throughput after D129 to D133
 
-`sillystream bench throughput --seconds 3 --cores 4`, release build, re-run after the command gate (D131) and the changes to `wsconn`. One run each at 3 s, where the table above used a longer run, so this shows no large cost rather than no cost. The publisher has no subscriber here, so it doesn't exercise D132's release of `DATA` chunks, and it publishes over WebSocket, so D130's extra copy on HTTP publishes wasn't measured.
+`silly bench throughput --seconds 3 --cores 4`, release build, re-run after the command gate (D131) and the changes to `wsconn`. One run each at 3 s, where the table above used a longer run, so this shows no large cost rather than no cost. The publisher has no subscriber here, so it doesn't exercise D132's release of `DATA` chunks, and it publishes over WebSocket, so D130's extra copy on HTTP publishes wasn't measured.
 
 | ack | connections | record data bytes | publishes/s | MB/s of data |
 |---|---|---|---|---|
@@ -376,14 +376,14 @@ All of it at commit `0681e76`, release build, the real server binary as a child 
 
 ```
 CARGO_TARGET_DIR=/Users/s/work/mcshlom/sillystream/target cargo build --release -p server -p cli
-target/release/sillystream bench latency --count 5000 --cores 4
-target/release/sillystream bench throughput --seconds 10 --cores 4
-target/release/sillystream bench idle --idle-count 10000 --cores 4
-target/release/sillystream bench catch-up --cores 4 --catch-up-mib 8
-target/release/sillystream bench catch-up --cores 4 --catch-up-mib 256
-target/release/sillystream bench many-streams --cores 16 --seconds 10
-target/release/sillystream bench puts --cores 4
-target/release/sillystream bench idle-streams --cores 4 --idle-streams 20000
+target/release/silly bench latency --count 5000 --cores 4
+target/release/silly bench throughput --seconds 10 --cores 4
+target/release/silly bench idle --idle-count 10000 --cores 4
+target/release/silly bench catch-up --cores 4 --catch-up-mib 8
+target/release/silly bench catch-up --cores 4 --catch-up-mib 256
+target/release/silly bench many-streams --cores 16 --seconds 10
+target/release/silly bench puts --cores 4
+target/release/silly bench idle-streams --cores 4 --idle-streams 20000
 ```
 
 #### Latency, 256-byte record, one publisher, 4 cores
@@ -494,7 +494,7 @@ target/release/sillystream bench idle-streams --cores 4 --idle-streams 20000
 
 ## Catch-up, memory tier, corrected
 
-`target/release/sillystream bench catch-up --cores 4 --catch-up-mib 8`, release build, one set of 3 runs each way, 2048 records of 4096 bytes. The earlier memory figures were the bench's own trace: `--trace-catch-up` printed one stderr line per memory batch, 2048 here, where the other tiers print one per read. The server now prints one line per memory read. The trace-per-batch column is the same code with only that line put back.
+`target/release/silly bench catch-up --cores 4 --catch-up-mib 8`, release build, one set of 3 runs each way, 2048 records of 4096 bytes. The earlier memory figures were the bench's own trace: `--trace-catch-up` printed one stderr line per memory batch, 2048 here, where the other tiers print one per read. The server now prints one line per memory read. The trace-per-batch column is the same code with only that line put back.
 
 | tier | one line per batch, MB/s | one line per read, MB/s |
 |---|---|---|
@@ -532,13 +532,13 @@ M9's acceptance still isn't met and no cause was isolated. A 2 s `sample` of the
 The full plan in the build's run script didn't finish, so this is a shorter run: one run of each command on the release build, load average about 4 to 7, on the shared laptop, with the client on the same machine. Real S3, EBS and Linux were not exercised. **Not run:** 10,000 subscribers, 15,000 idle connections, 10,000 to 1,000,000 idle streams, seal windows of 10 s and 60 s, recovery at 1 GiB and 4 GiB, 2 GiB catch-up, and the criterion suites other than the two named here.
 
 ```
-target/release/sillystream bench latency --count 5000 --cores 8 --timeout-seconds 400
-target/release/sillystream bench throughput --seconds 5 --cores 8 --timeout-seconds 400
-target/release/sillystream bench ack-matrix --seal-windows 1000 --seconds 5 --cores 8 --timeout-seconds 400
-target/release/sillystream bench fan-out --subscribers 1,100,1000 --seconds 5 --cores 8 --timeout-seconds 400
-target/release/sillystream bench recovery --wal-mib 0,16,256 --runs 1 --timeout-seconds 400
-target/release/sillystream bench catch-up --catch-up-mib 8 --cores 8 --timeout-seconds 400
-target/release/sillystream bench idle --idle-count 5000 --cores 8 --timeout-seconds 400
+target/release/silly bench latency --count 5000 --cores 8 --timeout-seconds 400
+target/release/silly bench throughput --seconds 5 --cores 8 --timeout-seconds 400
+target/release/silly bench ack-matrix --seal-windows 1000 --seconds 5 --cores 8 --timeout-seconds 400
+target/release/silly bench fan-out --subscribers 1,100,1000 --seconds 5 --cores 8 --timeout-seconds 400
+target/release/silly bench recovery --wal-mib 0,16,256 --runs 1 --timeout-seconds 400
+target/release/silly bench catch-up --catch-up-mib 8 --cores 8 --timeout-seconds 400
+target/release/silly bench idle --idle-count 5000 --cores 8 --timeout-seconds 400
 cargo bench -p server --bench slab_alloc
 cargo bench -p format --bench record_codec
 ```
@@ -611,3 +611,62 @@ The level 0 flat-out row delivered 682,548 records/s against 1,750,517 published
 **`record_codec`:** encode 3.4 ns at 0 bytes, 42 ns at 4 KiB, 12.6 µs at 1 MiB. Decode about 2 ns at every size, since it doesn't touch the data. `record_walk`: 25.5 ns for 12 records, 2.09 µs for 1,000. From the start of the interrupted full run, same commit.
 
 **Against section 7.2:** level 1 p50 36 µs and p99 63 µs fits the estimate of under 0.1 ms. Level 2 at 4.6 ms p50 on this laptop's `F_FULLFSYNC` can't be compared with Linux NVMe or EBS. Level 3 at about half a window fits the shape of the estimate but not on S3, so the S3 and EBS rows stay unmeasured.
+
+## Linux on GCP, first run
+
+Working tree on top of `abb7e6d`, `us-east4-a`, 2026-11-01, rustc 1.99.1 on Ubuntu 24.04 (kernel 7.0). One server, `n2-standard-16` (Xeon 2.8 GHz), with a 375 GB local NVMe SSD for each of `/mnt/nvme` and `/mnt/nvme2` and a 200 GB `pd-ssd`, all ext4. Two `n2-standard-8` clients on internal addresses, TLS 1.3 and WebSocket, through the SDK, using `silly bench --remote-url`. A 1 s seal window, and `LocalFileSystem` for objects, so level 3 and real object storage are **unmeasured**. A project limit of 32 vCPUs ruled out larger machines. Mostly one run each; treat differences under 2x as noise. Table headings printed by the tool say "4 cores" or "8 cores", but the server here always has 16.
+
+**Raw `fdatasync`, 4 KiB, by `fio`:** p50 77 µs on local NVMe and 306 µs on `pd-ssd`.
+
+**Ack latency, 256-byte record, one client, µs (p50 / p99 / p99.9):**
+
+| level | local NVMe | `pd-ssd` |
+|---|---|---|
+| 0, publish to delivery | 111 / 179 / 250 | 136 / 232 / 296 |
+| 1, memory | 110 / 193 / 358 | 131 / 233 / 508 |
+| 2, WAL fsync | 251 / 581 / 1,585 | 576 / 1,399 / 1,589 |
+
+Against section 7.2: level 2 is inside the 0.1–2 ms NVMe estimate. `pd-ssd` beats the 1–4 ms EBS estimate, but it isn't EBS. Level 1's p50 is above "under 0.1 ms" across a real network; the share of that due to the network wasn't separated.
+
+**Throughput, one stream per client, publishes/s per client, level 2:** where the WAL's filesystem also holds the uploads and cache, it falls badly.
+
+| WAL on | 1 KiB, 1 connection | 1 KiB, 4 connections | 64 KiB, 4 connections |
+|---|---|---|---|
+| its own NVMe | 141K | 166K–189K | 967–1,161 |
+| NVMe shared with data and objects, run 1 | 40K | 6.5K–6.9K | 2.1K |
+| the same, run 2 | 3.7K–4K | 16K–17K | 1.8K–1.9K |
+| `pd-ssd`, with data and objects on NVMe | 101K–104K | 104K–251K | 3.6K–4.3K |
+
+The cause wasn't isolated. Fsyncs flushing the other files' data through the shared ext4 journal is the likely one. The 64 KiB drop on the WAL's own NVMe wasn't explained either. At level 1, the server was about 71% idle at the rates reached, so these show the two 8 vCPU clients as much as the server, and maximum ingest wasn't reached.
+
+**Fan-out, 10 publishes/s on each of two streams, half the subscribers on each client:**
+
+| subscribers | delivered/s | p50 | p99 | p99.9 | `BEHIND` | lost |
+|---|---|---|---|---|---|---|
+| 100 | 1,006 | 0.6 ms | 0.8 ms | 0.9 ms | 0 | 0 |
+| 1,000 | 10,062 | 1.4 ms | 2.1 ms | 2.2 ms | 0 | 0 |
+| 10,000 | 100,572 | 8.4 ms | 13 ms | 14 ms | 0 | 0 |
+
+**Connection setup, TCP to `HELLO` answered, per client, full TLS 1.3 handshake, no DNS lookup:**
+
+| at once | per second | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| 1 | 1,020 | 0.97 ms | 1.2 ms | 1.2–2.1 ms |
+| 16 | 10,300 | 1.5 ms | 2.4 ms | 2.7–3.1 ms |
+| 256 | 3,500–12,300 | 20 ms | 40–52 ms | 45–1,062 ms |
+| 1,024 | 1,300 | 780 ms | 2.1 s | 2.4 s |
+
+- **DNS:** with a name to resolve, 256 at once showed a p99 of exactly 5.01 s, in every run. An `/etc/hosts` entry removed it. The SDK resolves on every connection, so a burst overflows the resolver and waits out its 5 s retry. It isn't in the server.
+- **Listen backlog:** the socket's backlog is 128 (`ss -ltn`), and the kernel counted 129 listen overflows over the no-DNS runs. Those are the likely source of the 1 s outliers and the slow 1,024 row, which is what a reconnect after a restart looks like.
+
+**Memory per idle connection:** 19,593 bytes of server RSS at 20,000 connections.
+
+**Where the server's CPU goes, by `perf`, top symbols added up by group:**
+
+| load | kernel | TLS and crypto | crc32c | other user | CPU idle |
+|---|---|---|---|---|---|
+| publish, flat out | 46.7% | 6.2% | 8.1% | 39.6% | 71% |
+| fan-out, 10,000 subscribers | 47.9% | 8.1% | | 44.6% | 91% |
+| connecting | 20.5% | 58.9% | | 20.5% | 85% |
+
+The groups come from symbol names, unresolved symbols count as other user, and client machines aren't included.
