@@ -32,3 +32,18 @@ pub use system::{
     ENTRY_SEAL_MANIFEST, ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, SystemRecord,
     decode_manifest_doc, encode_manifest_doc, encode_system_record,
 };
+
+/// Set in the producer id of every forward sink, and refused on any other publish, so forwards
+/// have a dedupe key space no publisher can reach (section 9.1).
+pub const FORWARD_PRODUCER_BIT: u64 = 1 << 63;
+
+/// The producer id a forward from `source` under `sink_id` publishes with. FNV-1a, because it
+/// must stay the same across restarts and releases.
+pub fn forward_producer_id(source: &str, sink_id: u64) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.bytes().chain(sink_id.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash | FORWARD_PRODUCER_BIT
+}

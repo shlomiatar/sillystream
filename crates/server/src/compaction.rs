@@ -357,6 +357,15 @@ impl Compactor {
         let mut head = None;
         while let Some(event) = connection.recv_within(LOG_QUIET_MS).await {
             match event {
+                // Nothing is left to read, and no `Progress` will say so: all of it has expired.
+                Event::Subscribed {
+                    head: at,
+                    caught_up: true,
+                    ..
+                } => {
+                    log.through = log.through.max(at);
+                    return true;
+                }
                 Event::Subscribed { head: at, .. } => head = Some(at),
                 Event::Data { records, .. } => log.add(&records.to_vec()),
                 Event::Progress { id, .. } => log.through = log.through.max(id),

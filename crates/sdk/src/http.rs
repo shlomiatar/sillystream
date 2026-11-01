@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::SdkError;
 use crate::client::{parse_address, tls_connector};
+use crate::resolve::Resolver;
 
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -40,6 +40,7 @@ pub struct HttpClient {
     port: u16,
     token: String,
     connector: TlsConnector,
+    resolver: Resolver,
 }
 
 impl HttpClient {
@@ -51,6 +52,7 @@ impl HttpClient {
             port,
             token: token.to_owned(),
             connector: tls_connector(ca_pem).map(Arc::unwrap_or_clone)?,
+            resolver: Resolver::default(),
         })
     }
 
@@ -62,7 +64,9 @@ impl HttpClient {
         body: &[u8],
     ) -> Result<Response, SdkError> {
         let failed = |error: std::io::Error| SdkError::Connect(error.to_string());
-        let socket = TcpStream::connect((self.host.as_str(), self.port))
+        let socket = self
+            .resolver
+            .connect(&self.host, self.port)
             .await
             .map_err(failed)?;
         let name = rustls::pki_types::ServerName::try_from(self.host.clone())

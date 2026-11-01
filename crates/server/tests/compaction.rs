@@ -7,6 +7,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use common::*;
@@ -1367,7 +1368,7 @@ async fn a_stored_cursor_with_expired_records_after_it_gets_error_7() {
 /// **Q32, not fixed: this pins the limit and changes with the decision.** What expired is known
 /// only while the stream is in memory, so after a restart this cursor is served with a gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn q32_after_a_restart_a_position_before_expired_records_still_resumes_silently() {
+async fn after_a_restart_a_position_before_expired_records_is_told() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let (a, _, c) = expired_then_one_more(&disk, &node).await;
@@ -1376,7 +1377,8 @@ async fn q32_after_a_restart_a_position_before_expired_records_still_resumes_sil
 
     let node = disk.start(config(1));
     let heard = hear_all(&node, "gone", a, 1).await;
-    assert_eq!(heard.error_code(1), None);
+    assert_eq!(heard.error_code(1), Some(ErrorCode::RetentionExpired));
+    let heard = hear_all(&node, "gone", 0, 1).await;
     assert_eq!(heard.records(1)[0].0, c);
     node.shutdown();
 }
@@ -1589,11 +1591,18 @@ async fn a_manifest_only_in_the_wal_leaves_its_object_unrecorded() {
         format!("{:020}.seg", first_id + 1),
         std::time::Duration::from_millis(300),
     ));
+    // Each seal has to be at its PUT before the next step, or the two would merge into one.
+    let begun = disk.store.put_begun_count.load(Ordering::SeqCst);
+    let puts_begun = async |count: u64| {
+        while disk.store.put_begun_count.load(Ordering::SeqCst) < begun + count {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
     let (seal_a, (second_id, seal_b)) = tokio::join!(node.seal(), async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        puts_begun(1).await;
         let second_id = publish_one(&mut client, "seven", 2, b"r2").await;
         let (seal_b, ()) = tokio::join!(node.seal(), async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            puts_begun(2).await;
             disk.store.release();
         });
         (second_id, seal_b)

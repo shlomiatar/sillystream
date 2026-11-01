@@ -1017,6 +1017,13 @@ impl Core {
             nack(ErrorCode::Unauthorized, &"this stream is the server's");
             return;
         }
+        if !msg.forward && msg.producer_id & format::FORWARD_PRODUCER_BIT != 0 {
+            nack(
+                ErrorCode::Malformed,
+                &"producer ids with the top bit set are the server's",
+            );
+            return;
+        }
         let checked = if msg.forward {
             check_forward(&msg.stream, &mut records)
                 .map(|(validated, count)| (CheckedRecords::Forward(validated), count))
@@ -1053,22 +1060,12 @@ impl Core {
                         }),
                         first_id + u64::from(count) - 1,
                     ),
-                    DedupeCheck::Older {
-                        latest_last_id,
-                        latest_seq,
-                    } => (
-                        Some(if msg.forward {
-                            Reply::ForwardOlder {
-                                producer_seq: msg.producer_seq,
-                                latest_seq,
-                            }
-                        } else {
-                            Reply::Ack {
-                                handle: msg.handle,
-                                producer_seq: msg.producer_seq,
-                                first_id: 0,
-                                count: 0,
-                            }
+                    DedupeCheck::Older { latest_last_id, .. } => (
+                        Some(Reply::Ack {
+                            handle: msg.handle,
+                            producer_seq: msg.producer_seq,
+                            first_id: 0,
+                            count: 0,
                         }),
                         latest_last_id,
                     ),
@@ -3099,6 +3096,7 @@ impl Core {
         let mut delivery = StreamDelivery::new(self.config.core_count);
         delivery.track_meta = true;
         delivery.floor_id = meta.floor_id;
+        delivery.expired_through = meta.expired_through;
         delivery.visible_through = meta.last_id;
         delivery.visible_state = (meta.state_ver, meta.state.clone());
         delivery.cursors = meta
@@ -3247,6 +3245,7 @@ impl Core {
                 deleted: false,
                 last_id: stream.ids.last_id(),
                 floor_id: delivery.floor_id,
+                expired_through: delivery.expired_through,
                 applied_id: delivery.saved_through,
                 state_ver: delivery.saved_state.0,
                 state: delivery.saved_state.1.clone(),

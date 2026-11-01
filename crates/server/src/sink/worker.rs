@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinSet;
 
 use super::webhook::{self, PostError, PostParts, StatusClass, WebhookUrl};
-use super::{ForwardClaim, PoolContext, SinkAction, SinkKey, SinkStep, WorkerExit, backoff_ms};
+use super::{PoolContext, SinkAction, SinkKey, SinkStep, WorkerExit, backoff_ms};
 use crate::connection::{Connection, Event, Subscription};
 use crate::delivery::retention_start_id;
 use crate::message::{Reply, SinkOp, SinkReport, SinkSpec};
@@ -169,22 +169,6 @@ impl Worker {
         }
     }
 
-    /// Takes `(target, sink id)` for this source. False if another source holds it.
-    fn take_claim(&self, target: &str) -> bool {
-        let mut claims = self
-            .context
-            .forward_claims
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let claim = claims
-            .entry((target.to_owned(), self.key.1))
-            .or_insert_with(|| ForwardClaim {
-                source: self.key.0.to_string(),
-                acked_seq: 0,
-            });
-        *claim.source == *self.key.0
-    }
-
     async fn op(&self, op: SinkOp) -> Result<(), ErrorCode> {
         self.client.lock().await.sink_op(&self.key.0, op).await
     }
@@ -232,18 +216,6 @@ impl Worker {
                 self.wait_paused(&spec, cursor, info.head, info.earliest_id, retention_ms)
                     .await
             } else {
-                if kind == Kind::Forward {
-                    let target = spec.target.clone().unwrap_or_default();
-                    if !self.take_claim(&target) {
-                        let reason = format!(
-                            "another stream forwards to {target} with sink id {}, so one's \
-                             records would be dropped as the other's duplicates",
-                            self.key.1
-                        );
-                        self.report(SinkReport::Paused { reason }).await;
-                        continue;
-                    }
-                }
                 let spell = Reading::new(self, home, spec, kind, cursor, retention_ms);
                 match spell {
                     Ok(mut spell) => spell.run().await,
@@ -1112,7 +1084,7 @@ impl Attempt {
             .publish_forward(
                 target,
                 record,
-                self.sink_id,
+                format::forward_producer_id(&self.stream, self.sink_id),
                 self.first_id,
                 FORWARD_ACK_LEVEL,
             )
@@ -1137,27 +1109,7 @@ impl Attempt {
                 Ok(None) => return Outcome::Retry("the node has stopped".to_owned()),
                 // An answer to an earlier try that timed out.
                 Ok(Some(Reply::Ack { producer_seq, .. })) if producer_seq == self.first_id => {
-                    self.note_acked(target);
                     return Outcome::Delivered;
-                }
-                Ok(Some(Reply::ForwardOlder {
-                    producer_seq,
-                    latest_seq,
-                })) if producer_seq == self.first_id => {
-                    let head = match client.stream_info(&self.stream).await {
-                        Ok(info) => info.head,
-                        Err(code) => return Outcome::Retry(format!("reading the head: {code:?}")),
-                    };
-                    return if self.older_is_our_own(target, latest_seq, head) {
-                        Outcome::Delivered
-                    } else {
-                        Outcome::Permanent(format!(
-                            "{target} already has seq {latest_seq} from producer id {}, which \
-                             isn't this sink's, so this record ({}) would be dropped as a \
-                             duplicate; use another sink id",
-                            self.sink_id, self.first_id
-                        ))
-                    };
                 }
                 Ok(Some(Reply::Nack {
                     producer_seq,
@@ -1178,35 +1130,6 @@ impl Attempt {
                 Ok(Some(_)) => {}
             }
         }
-    }
-
-    fn note_acked(&self, target: &str) {
-        let mut claims = self
-            .context
-            .forward_claims
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(claim) = claims.get_mut(&(target.to_owned(), self.sink_id)) {
-            claim.acked_seq = claim.acked_seq.max(self.first_id);
-        }
-    }
-
-    /// Whether a drop as older can be a repeat of what this sink sent, after a restart whose
-    /// cursor was behind, or a reset. It can't be if the target's latest seq is one the source
-    /// hasn't reached, or if since this node started the target has taken this sink's seqs only
-    /// up to below this one. Anything else passes: it can't be told apart (D200, Q37).
-    fn older_is_our_own(&self, target: &str, latest_seq: u64, head: u64) -> bool {
-        if latest_seq > head {
-            return false;
-        }
-        let claims = self
-            .context
-            .forward_claims
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        claims
-            .get(&(target.to_owned(), self.sink_id))
-            .is_none_or(|claim| claim.acked_seq == 0 || self.first_id <= claim.acked_seq)
     }
 
     async fn archive(&self) -> Outcome {

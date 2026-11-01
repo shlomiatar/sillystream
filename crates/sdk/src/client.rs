@@ -27,6 +27,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
 use crate::batch::{BatchConfig, Item, build_records, decode_some, last_id};
+use crate::resolve::Resolver;
 use crate::{FROM_LIVE, FROM_START, SdkError};
 
 /// What a frame needs around its records: `type flags handle id seq ack` and a length.
@@ -65,7 +66,8 @@ impl ClientConfig {
 pub struct PublisherConfig {
     pub ack: AckLevel,
     pub batch: BatchConfig,
-    /// `None` picks a random one. Set it, with `first_seq`, to carry on after a restart.
+    /// `None` picks a random one. Set it, with `first_seq`, to carry on after a restart. The
+    /// top bit must be clear: those ids are the server's.
     pub producer_id: Option<u64>,
     pub first_seq: u64,
     /// Records unanswered, in bytes. `send` waits past this.
@@ -324,6 +326,7 @@ impl Client {
         let (commands, receiver) = mpsc::unbounded_channel();
         let max_frame_bytes = Arc::new(AtomicUsize::new(proto::DEFAULT_MAX_FRAME_BYTES));
         let driver = Driver {
+            resolver: Resolver::default(),
             host,
             port,
             connector,
@@ -442,7 +445,8 @@ fn random_nonzero() -> u64 {
     loop {
         let value = std::collections::hash_map::RandomState::new()
             .build_hasher()
-            .finish();
+            .finish()
+            & !format::FORWARD_PRODUCER_BIT;
         if value != 0 {
             return value;
         }
@@ -725,6 +729,7 @@ impl Drop for Subscription {
 }
 
 struct Driver {
+    resolver: Resolver,
     host: String,
     port: u16,
     connector: Arc<TlsConnector>,
@@ -766,15 +771,14 @@ fn encode_within(frame: &ClientFrame<'_>, max_frame_bytes: usize) -> Result<Mess
 /// Socket, TLS, upgrade, `HELLO` and `WELCOME`. It owns what it needs, so the driver goes on
 /// answering commands while this waits. Gives back the connection and its `max_frame`.
 async fn connect_once(
+    resolver: Resolver,
     host: String,
     port: u16,
     connector: Arc<TlsConnector>,
     token: String,
 ) -> Result<(Ws, u32), SdkError> {
     let failed = |error: std::io::Error| SdkError::Connect(error.to_string());
-    let socket = TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(failed)?;
+    let socket = resolver.connect(&host, port).await.map_err(failed)?;
     socket.set_nodelay(true).map_err(failed)?;
     let name = rustls::pki_types::ServerName::try_from(host.clone())
         .map_err(|error| SdkError::Config(error.to_string()))?;
@@ -839,6 +843,7 @@ impl Driver {
     fn connect_attempt(&self) -> impl Future<Output = Result<(Ws, u32), SdkError>> + use<> {
         let wait = Duration::from_millis(self.ping_interval_ms.max(CONNECT_TIMEOUT_MIN_MS));
         let attempt = connect_once(
+            self.resolver.clone(),
             self.host.clone(),
             self.port,
             Arc::clone(&self.connector),

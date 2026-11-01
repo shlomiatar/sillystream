@@ -32,12 +32,6 @@ pub enum Reply {
         code: ErrorCode,
         msg: String,
     },
-    /// To a forward sink, in place of the `ACK` with `first_id = 0`: dropped as older than the
-    /// producer's `latest_seq`. Only the sink can judge whether that seq was its own (D200).
-    ForwardOlder {
-        producer_seq: u64,
-        latest_seq: u64,
-    },
     StateResult {
         req: u32,
         ok: bool,

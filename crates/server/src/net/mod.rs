@@ -57,6 +57,8 @@ pub struct IoStats {
     pub open_connection_count: u64,
     pub accepted_count: u64,
     pub handshake_failed_count: u64,
+    /// Closed on accept for being past `max_connections`.
+    pub refused_connection_count: u64,
 }
 
 #[derive(Default)]
@@ -80,6 +82,9 @@ pub(crate) struct Shared {
     pub acceptor: tokio_rustls::TlsAcceptor,
     pub counters: Vec<IoCounters>,
     pub session_count: AtomicU64,
+    pub max_connections: u64,
+    pub connection_count: AtomicU64,
+    pub refused_connection_count: AtomicU64,
     /// Bytes of HTTP read responses waiting on their clients, on every core. It is only added
     /// up, so no core waits on another for it.
     pub held_response_bytes: Arc<AtomicU64>,
@@ -162,9 +167,9 @@ impl Server {
             ));
         }
         let tls_config = tls13_only_config(&config.cert_pem, &config.key_pem)?;
-        let listener = std::net::TcpListener::bind(config.listen)?;
-        listener.set_nonblocking(true)?;
+        let listener = bind_listener(config.listen, config.node.listen_backlog)?;
         let local_addr = listener.local_addr()?;
+        let max_connections = config.node.max_connections;
         let max_frame_bytes = config.node.max_frame_bytes;
         let max_subscriptions = config.node.max_subscriptions_per_connection;
         let partial_frame_timeout_ms = config.node.partial_frame_timeout_ms;
@@ -183,6 +188,9 @@ impl Server {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_config)),
             counters: (0..core_count).map(|_| IoCounters::default()).collect(),
             session_count: AtomicU64::new(0),
+            max_connections,
+            connection_count: AtomicU64::new(0),
+            refused_connection_count: AtomicU64::new(0),
             held_response_bytes: Arc::new(AtomicU64::new(0)),
             held_response_cap_bytes,
         });
@@ -226,6 +234,7 @@ impl Server {
             stats.accepted_count += load(&counters.accepted_count);
             stats.handshake_failed_count += load(&counters.handshake_failed_count);
         }
+        stats.refused_connection_count = load(&self.shared.refused_connection_count);
         stats
     }
 
@@ -276,6 +285,40 @@ impl Drop for Server {
     }
 }
 
+fn bind_listener(listen: SocketAddr, backlog: i32) -> io::Result<std::net::TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(listen),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&listen.into())?;
+    socket.listen(backlog)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// One of `max_connections`, held for as long as the connection lives.
+struct ConnectionSlot(Arc<Shared>);
+
+impl ConnectionSlot {
+    fn take(shared: &Arc<Shared>) -> Option<ConnectionSlot> {
+        shared
+            .connection_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < shared.max_connections).then_some(count + 1)
+            })
+            .ok()?;
+        Some(ConnectionSlot(Arc::clone(shared)))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.connection_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn accept_loop(listener: std::net::TcpListener, shared: Arc<Shared>, stop: Arc<Notify>) {
     let Ok(listener) = tokio::net::TcpListener::from_std(listener) else {
         return;
@@ -287,6 +330,10 @@ async fn accept_loop(listener: std::net::TcpListener, shared: Arc<Shared>, stop:
             _ = stop.notified() => return,
             accepted = listener.accept() => match accepted {
                 Ok((socket, _)) => {
+                    let Some(slot) = ConnectionSlot::take(&shared) else {
+                        shared.refused_connection_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
                     let _ = socket.set_nodelay(true);
                     let Ok(socket) = socket.into_std() else {
                         continue;
@@ -296,7 +343,10 @@ async fn accept_loop(listener: std::net::TcpListener, shared: Arc<Shared>, stop:
                     shared.counters[home].accepted_count.fetch_add(1, Ordering::Relaxed);
                     let task_shared = Arc::clone(&shared);
                     shared.node.run_on_core(home, Box::new(move || {
-                        tokio::spawn(conn::serve(task_shared, home, socket));
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            conn::serve(task_shared, home, socket).await;
+                        });
                     }));
                 }
                 // Out of descriptors, most likely. It passes when a connection ends.

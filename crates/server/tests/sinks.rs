@@ -15,10 +15,11 @@ use hmac::{Hmac, Mac};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use proptest::prelude::*;
+use proto::ErrorCode;
 use server::{
-    Client, ManualClock, Node, NodeConfig, RecoverConfig, RetentionClass, SinkAction, SinkHook,
-    SinkOp, SinkReport, SinkResolver, SinkSpec, SinkStart, SinkStep, StateChange, StateOp,
-    StreamConfig, Subscription,
+    Client, ManualClock, Node, NodeConfig, RecoverConfig, Reply, RetentionClass, SinkAction,
+    SinkHook, SinkOp, SinkReport, SinkResolver, SinkSpec, SinkStart, SinkStep, StateChange,
+    StateOp, StreamConfig, Subscription,
 };
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1055,7 +1056,8 @@ fn check_wal_fields(harness: &Harness, target: &str, sink_id: u64, run: &Forward
     let entries = harness.wal.stream_entries(target);
     let mut seqs: Vec<u64> = entries.iter().map(|entry| entry.producer_seq).collect();
     seqs.dedup();
-    assert!(entries.iter().all(|entry| entry.producer_id == sink_id));
+    let producer_id = format::forward_producer_id(STREAM, sink_id);
+    assert!(entries.iter().all(|entry| entry.producer_id == producer_id));
     let wanted: Vec<u64> = run.sent.keys().copied().collect();
     assert_eq!(seqs, wanted, "producer_seq is the source first_id");
 }
@@ -1176,32 +1178,28 @@ async fn several_streams_fan_in_to_one() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_sources_with_one_sink_id_on_one_target_cannot_lose_records_to_each_other() {
+async fn two_sources_with_one_sink_id_on_one_target_both_arrive() {
     let harness = Harness::new(config());
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, "same.a").await;
     make_stream(&mut client, "same.b").await;
-    put_sink(
-        &mut client,
-        "same.a",
-        9,
-        forward_spec("same.all"),
-        SinkStart::Earliest,
-    )
-    .await;
-    let id = send(&mut client, "same.a", b"a", 1).await;
-    wait_for_cursor(&mut client, "same.a", 9, id).await;
-    put_sink(
-        &mut client,
-        "same.b",
-        9,
-        forward_spec("same.all"),
-        SinkStart::Earliest,
-    )
-    .await;
-    let reason = wait_for_pause(&mut client, "same.b", 9).await;
-    assert!(reason.contains("duplicates"), "{reason}");
+    let b_id = send(&mut client, "same.b", b"b", 1).await;
+    harness.clock.advance(5);
+    let a_id = send(&mut client, "same.a", b"a", 1).await;
+    for source in ["same.a", "same.b"] {
+        put_sink(
+            &mut client,
+            source,
+            9,
+            forward_spec("same.all"),
+            SinkStart::Earliest,
+        )
+        .await;
+    }
+    wait_for_cursor(&mut client, "same.a", 9, a_id).await;
+    wait_for_cursor(&mut client, "same.b", 9, b_id).await;
+    assert_eq!(target_records(node, "same.all", 2).await.len(), 2);
     drop(client);
     harness.finish();
 }
@@ -2416,11 +2414,12 @@ async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently(
     harness.finish();
 }
 
-/// A dedupe entry at the target outlasts a pause, so the claim on its producer id does too.
+/// Each source has its own key at the target, so a paused one is no obstacle to another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_paused_forward_keeps_its_claim_on_its_sink_id() {
+async fn a_paused_forward_does_not_hold_up_another_source_with_its_sink_id() {
     let harness = Harness::new(config());
-    let mut client = harness.node().client(0).await;
+    let node = harness.node();
+    let mut client = node.client(0).await;
     make_stream(&mut client, "c.a").await;
     make_stream(&mut client, "c.b").await;
     put_sink(
@@ -2444,7 +2443,7 @@ async fn a_paused_forward_keeps_its_claim_on_its_sink_id() {
         .await
         .unwrap();
     harness.clock.advance(5);
-    send(&mut client, "c.b", b"b1", 1).await;
+    let b1 = send(&mut client, "c.b", b"b1", 1).await;
     put_sink(
         &mut client,
         "c.b",
@@ -2453,17 +2452,18 @@ async fn a_paused_forward_keeps_its_claim_on_its_sink_id() {
         SinkStart::Earliest,
     )
     .await;
-    let reason = wait_for_pause(&mut client, "c.b", 9).await;
-    assert!(reason.contains("duplicates"), "{reason}");
+    wait_for_cursor(&mut client, "c.b", 9, b1).await;
+    assert_eq!(target_records(node, "c.t", 2).await.len(), 2);
     drop(client);
     harness.finish();
 }
 
-/// So does a delete: nothing else stops a later source's records being taken as duplicates.
+/// The later source's lower ids were once dropped as older than the deleted sink's seq (Q37).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_deleted_forward_keeps_its_claim_on_its_sink_id() {
+async fn a_sink_id_reused_by_another_source_after_a_delete_loses_nothing() {
     let harness = Harness::new(config());
-    let mut client = harness.node().client(0).await;
+    let node = harness.node();
+    let mut client = node.client(0).await;
     make_stream(&mut client, "re.a").await;
     let b_id = send(&mut client, "re.b", b"from b", 1).await;
     harness.clock.advance(5);
@@ -2489,19 +2489,18 @@ async fn a_deleted_forward_keeps_its_claim_on_its_sink_id() {
         SinkStart::Earliest,
     )
     .await;
-    let reason = wait_for_pause(&mut client, "re.b", 9).await;
-    assert!(reason.contains("duplicates"), "{reason}");
-    let (_, cursor) = sink_of(&mut client, "re.b", 9).await;
-    assert!(cursor < b_id, "the cursor passed a record that never went");
+    wait_for_cursor(&mut client, "re.b", 9, b_id).await;
+    assert_eq!(target_records(node, "re.all", 2).await.len(), 2);
     drop(client);
     harness.finish();
 }
 
-/// The target says its latest seq for this producer is one this source can't have sent.
+/// A publisher using the sink's id is in another key space, so neither affects the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_forward_whose_producer_id_was_used_by_a_publisher_pauses() {
+async fn a_publisher_sharing_a_sink_id_cannot_drop_forwarded_records() {
     let harness = Harness::new(config());
-    let mut client = harness.node().client(0).await;
+    let node = harness.node();
+    let mut client = node.client(0).await;
     make_stream(&mut client, "p.src").await;
     let poison = record_with(1, b"poison");
     let mut message = publish("p.dst", &poison, u64::MAX, 2);
@@ -2517,48 +2516,25 @@ async fn a_forward_whose_producer_id_was_used_by_a_publisher_pauses() {
     )
     .await;
     let real = send(&mut client, "p.src", b"real", 1).await;
-    let reason = wait_for_pause(&mut client, "p.src", 9).await;
-    assert!(reason.contains("producer id"), "{reason}");
-    let (_, cursor) = sink_of(&mut client, "p.src", 9).await;
-    assert!(cursor < real, "the cursor passed a record that never went");
+    wait_for_cursor(&mut client, "p.src", 9, real).await;
+    assert_eq!(target_records(node, "p.dst", 2).await.len(), 2);
     drop(client);
     harness.finish();
 }
 
-/// Once it has seen its own seqs land, a seq above them answered as older can't be its own, even
-/// when the other publisher's seq is below the source's head.
+/// The top bit of a producer id is the server's, which is what keeps that space private.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_publisher_using_a_running_forwards_producer_id_pauses_it() {
+async fn a_publisher_cannot_use_the_forward_key_space() {
     let harness = Harness::new(config());
     let mut client = harness.node().client(0).await;
-    make_stream(&mut client, "q.src").await;
-    put_sink(
-        &mut client,
-        "q.src",
-        9,
-        forward_spec("q.dst"),
-        SinkStart::Earliest,
-    )
-    .await;
-    let first = send(&mut client, "q.src", b"first", 1).await;
-    wait_for_cursor(&mut client, "q.src", 9, first).await;
-    // A little above the next record, which will be two ids on, once the clock has moved.
-    harness.clock.advance(5);
-    let other = record_with(1, b"other");
-    let mut message = publish("q.dst", &other, first + (10 << 16), 2);
-    message.producer_id = 9;
+    let record = record_with(1, b"forged");
+    let mut message = publish("q.dst", &record, 1, 2);
+    message.producer_id = format::forward_producer_id("q.src", 9);
     client.publish(message).await.unwrap();
-    expect_ack(&mut client).await;
-    let second = send(&mut client, "q.src", b"second", 2).await;
-    harness.clock.advance(20);
-    send(&mut client, "q.src", b"above it", 3).await;
-    let reason = wait_for_pause(&mut client, "q.src", 9).await;
-    assert!(reason.contains("producer id"), "{reason}");
-    let (_, cursor) = sink_of(&mut client, "q.src", 9).await;
-    assert!(
-        cursor < second,
-        "the cursor passed a record that never went"
-    );
+    match client.recv().await {
+        Some(Reply::Nack { code, .. }) => assert_eq!(code, ErrorCode::Malformed),
+        other => panic!("{other:?}"),
+    }
     drop(client);
     harness.finish();
 }

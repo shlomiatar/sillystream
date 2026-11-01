@@ -2,7 +2,7 @@
 //! blob in a checkpoint. All little-endian.
 //!
 //! ```text
-//! meta   := crc32c u32 | flags u32 | name str32 | last_id u64 | floor_id u64 | applied_id u64 |
+//! meta   := crc32c u32 | flags u32 | name str32 | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
 //!           n u32 | n × cursor | n u32 | n × dedupe | n u32 | n × sink | n u32 | n × extent |
@@ -88,6 +88,8 @@ pub struct StreamMeta {
     pub last_id: u64,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
+    /// The highest id in an extent retention took away. A position below it has lost records.
+    pub expired_through: u64,
     /// State and dedupe include every change up to this id, and no later one. A change above
     /// it comes from the WAL.
     pub applied_id: u64,
@@ -156,6 +158,7 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     put_bytes(&mut out, meta.name.as_bytes());
     put_u64(&mut out, meta.last_id);
     put_u64(&mut out, meta.floor_id);
+    put_u64(&mut out, meta.expired_through);
     put_u64(&mut out, meta.applied_id);
     put_u64(&mut out, meta.state_ver);
     put_bytes(&mut out, &meta.state);
@@ -304,8 +307,13 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
         return Err(MetaError("an unknown flag"));
     }
     let name = reader.text()?;
-    let (last_id, floor_id, applied_id, state_ver) =
-        (reader.u64()?, reader.u64()?, reader.u64()?, reader.u64()?);
+    let (last_id, floor_id, expired_through, applied_id, state_ver) = (
+        reader.u64()?,
+        reader.u64()?,
+        reader.u64()?,
+        reader.u64()?,
+        reader.u64()?,
+    );
     let state = Bytes::copy_from_slice(reader.bytes32()?);
     let (default_ack_level, min_ack_level) = (reader.u8()?, reader.u8()?);
     if reader.take(6)? != [0; 6] {
@@ -317,6 +325,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
         deleted: flags & FLAG_DELETED != 0,
         last_id,
         floor_id,
+        expired_through,
         applied_id,
         state_ver,
         state,

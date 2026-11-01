@@ -326,7 +326,7 @@ pub(crate) struct StreamDelivery {
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
     /// The highest id in an extent taken away with nothing in its place. A position below this
-    /// has lost records. Not saved, so a restart or an eviction forgets it (D178, Q32).
+    /// has lost records (D178, Q32).
     pub expired_through: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
     /// The highest epoch of a sink deleted here. Not saved: no delivery outlives a restart.

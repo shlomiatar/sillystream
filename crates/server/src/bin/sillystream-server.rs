@@ -19,6 +19,7 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
   [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
   [--sink-pool-threads N] [--sink-max-in-flight N] [--trace-catch-up true|false]
+  [--max-connections N] [--listen-backlog N]
 
 --wal-dir decides what a level 2 ack survives: an acked record survives machine loss only if
 EBS is mounted there. On local disk, machine loss can take up to one seal window. See
@@ -58,6 +59,8 @@ fn run() -> Result<(), String> {
     let mut object_store = None;
     let mut cores = None;
     let mut seal_window_ms = None;
+    let mut max_connections = None;
+    let mut listen_backlog = None;
     let mut node_name = None;
     let mut memory_cap_bytes = None;
     let mut cache_cap_bytes = 10 * 1024 * 1024 * 1024u64;
@@ -90,6 +93,8 @@ fn run() -> Result<(), String> {
             "--object-store" => object_store = Some(value),
             "--cores" => cores = Some(number(&value)? as usize),
             "--seal-window-ms" => seal_window_ms = Some(number(&value)?),
+            "--max-connections" => max_connections = Some(number(&value)?),
+            "--listen-backlog" => listen_backlog = Some(number(&value)? as i32),
             "--node-name" => node_name = Some(value),
             "--memory-cap-bytes" => memory_cap_bytes = Some(number(&value)?),
             "--local-cache-cap-bytes" => cache_cap_bytes = number(&value)?,
@@ -161,6 +166,12 @@ fn run() -> Result<(), String> {
         ));
     }
     node.seal_window_ms = Some(seal_window_ms);
+    if let Some(max_connections) = max_connections {
+        node.max_connections = max_connections;
+    }
+    if let Some(listen_backlog) = listen_backlog {
+        node.listen_backlog = listen_backlog;
+    }
     if let Some(cap_bytes) = memory_cap_bytes {
         node.memory_cap_bytes = cap_bytes;
     }

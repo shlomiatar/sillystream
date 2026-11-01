@@ -106,6 +106,7 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 deleted,
                 last_id,
                 floor_id,
+                expired_through: floor_id / 2,
                 applied_id,
                 state_ver,
                 state: Bytes::from(state),
@@ -188,6 +189,7 @@ fn meta_bytes_are_exact() {
         deleted: true,
         last_id: 2,
         floor_id: 3,
+        expired_through: 20,
         applied_id: 4,
         state_ver: 5,
         state: Bytes::from_static(b"st"),
@@ -242,7 +244,7 @@ fn meta_bytes_are_exact() {
     };
     u32le(&mut body, 1);
     text(&mut body, b"s");
-    for value in [2, 3, 4, 5] {
+    for value in [2, 3, 20, 4, 5] {
         u64le(&mut body, value);
     }
     text(&mut body, b"st");

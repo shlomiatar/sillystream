@@ -15,6 +15,18 @@ The first version runs on one node (SPEC section 8). This covers what the operat
 
 `--data-dir` holds only caches and the local metadata store. It can be local NVMe, and losing it is safe: everything in it is rebuilt from the object store.
 
+A retried publish depends on this too. If `--wal-dir` and `--data-dir` are both lost, a publish in an object no checkpoint records has lost its dedupe entry, so a retry is stamped again and a state incr applies twice. Records aren't lost. With EBS at `--wal-dir` this doesn't arise.
+
+**Keep `--wal-dir` on its own filesystem.** On GCP, sharing one with `--data-dir` cut level 2 throughput by about 10× and made it unstable. The cause isn't isolated yet.
+
+A flipped bit in a closed WAL file can't be told from the file's normal end, so replay takes the file up to that point. The server warns about it on start. It matters only if the machine crashes before that file's segment is uploaded.
+
+## Connections
+
+`--max-connections`, 100,000 by default. Past it a connection is closed on accept, before any TLS work, and counted as refused. An idle connection costs about 20 KB, so the default can hold about 2 GB. Set it to fit the machine, and keep the file descriptor limit above it.
+
+`--listen-backlog`, 4,096 by default. The kernel caps it, at `net.core.somaxconn` on Linux, so raise that too for large connection bursts.
+
 ## Seal window
 
 `--seal-window-ms`, 1000 to 120000, 10000 by default. A shorter window loses less on AZ loss and makes level 3 acks faster, but costs more PUTs: about 2.6M a month per node at 1 s, 260K at 10 s and 22K at 120 s.

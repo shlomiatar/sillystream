@@ -120,7 +120,7 @@ Level 1 fits section 7.2's estimate. The level 2 EBS and level 3 S3 estimates re
 
 **Known and open:**
 
-- **Flaky tests, not fixed:** `a_manifest_only_in_the_wal_leaves_its_object_unrecorded` and `on_expire_stop_warns_then_halts` are timing-dependent. Clean runs don't settle them, so a workspace run can still go red.
+- **Flaky tests:** `a_manifest_only_in_the_wal_leaves_its_object_unrecorded` no longer merges its two seals, but still failed 12 of 100 runs under parallel load, with nothing copied and the cause not found. It may be the fixed 300 ms wait in the test or a real race. `on_expire_stop_warns_then_halts` passed 198 of 198 runs under load, so its flake was not reproduced or fixed.
 - **M9 stall acceptance:** as above.
 - **Silent or lasting loss and damage cases:** Q32 (silent gap past retention), Q40 (a retry after losing both disks can be stamped again and apply state twice), Q15 (bit rot in a closed WAL file can leave a silent gap, and only warns), Q43 (WAL entries fenced by a start before the volume is attached stay unreadable, with no tool to restore them).
 - **Crash windows:** a level 0 or 1 state change in a snapshot can refer to an id a crash erased (D136). A snapshot can show state that a crash then erases (Q20).

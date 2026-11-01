@@ -928,3 +928,28 @@ async fn open_handles_are_bounded_in_bytes() {
     ws.open(reference, &name).await;
     ws.round_trip(1).await;
 }
+
+/// Past `max_connections` a connection is closed on accept, and a closed one frees its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_past_the_limit_are_closed_before_tls() {
+    let mut node = node_config(1);
+    node.max_connections = 1;
+    let server = start_node(node);
+    let first = server.tls().await;
+    let mut second = tokio::net::TcpStream::connect(server.server.local_addr())
+        .await
+        .unwrap();
+    let mut byte = [0; 1];
+    let read = second.read(&mut byte).await;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert_eq!(server.server.io_stats().refused_connection_count, 1);
+    drop(first);
+    let started = Instant::now();
+    while server.server.io_stats().open_connection_count > 0 {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(server.tls().await);
+    assert_eq!(server.server.io_stats().refused_connection_count, 1);
+}

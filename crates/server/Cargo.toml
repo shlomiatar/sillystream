@@ -23,6 +23,7 @@ auth.workspace = true
 storage.workspace = true
 xxhash-rust.workspace = true
 bytes.workspace = true
+socket2 = "0.5"
 ciborium.workspace = true
 object_store.workspace = true
 rustls = { workspace = true }

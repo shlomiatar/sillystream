@@ -210,6 +210,8 @@ fn token_issue(args: &Args) -> Result<(), String> {
     args.only(&["--secret-file", "--author", "--grant", "--ttl-ms"])?;
     let secret_file = args.one("--secret-file").ok_or("needs --secret-file")?;
     let secret = std::fs::read(secret_file).map_err(|error| format!("{secret_file}: {error}"))?;
+    // As the server reads it, so a file from `echo` or `xxd` gives tokens that work.
+    let secret = secret.trim_ascii_end();
     let author = args.number("--author")?.ok_or("needs --author")?;
     let author = std::num::NonZeroU64::new(author).ok_or("--author can't be 0: 0 is the system")?;
     let ttl_ms = args.number("--ttl-ms")?.ok_or("needs --ttl-ms")?;
@@ -239,7 +241,7 @@ fn token_issue(args: &Args) -> Result<(), String> {
         author,
         grants,
     }
-    .sign(&secret)
+    .sign(secret)
     .map_err(|error| format!("{error:?}"))?;
     println!("{token}");
     Ok(())

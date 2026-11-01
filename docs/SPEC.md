@@ -242,7 +242,7 @@ A stream is in one of two states, and S3 backs both:
 - **Idle:** evicted from RAM, least recently used first, to a local key-value store on NVMe, and loaded on the next access.
 - **Backup:** if the local copy is gone, the stream is rebuilt on demand from its S3 checkpoint.
 
-The metadata is last id, state, config, cursors, dedupe entries and extents (`id range → memory, local or S3 location`).
+The metadata is last id, the highest expired id, state, config, cursors, dedupe entries and extents (`id range → memory, local or S3 location`). A position below the highest expired id gets error 7, including after a restart.
 
 At each seal, changed metadata is written to the local store and to S3 checkpoints. Checkpoints go into shared files, so PUTs don't grow with stream count, and they are separate from segments because they must outlive record retention. The key-value store stays out of the write path.
 
@@ -292,7 +292,7 @@ A sink is a source stream, a filter, a destination, and a named cursor `sink:<id
 
 ### 9.1 Forwarding between streams
 
-A `forward` sink publishes with `producer_id = sink_id` and `producer_seq = source first_id`, so retries dedupe through normal idempotency and never duplicate records in the target. It keeps each record's original author.
+A `forward` sink publishes with a `producer_id` the server derives from the source stream and `sink_id`, with the top bit set, and `producer_seq = source first_id`. A publisher that sets the top bit is rejected with error 8, so forwards have a dedupe key space of their own. Retries therefore dedupe through normal idempotency and never duplicate records in the target. It keeps each record's original author.
 
 There are no server-side wildcards. A feed across many streams is a fan-in: forward sinks into one aggregate stream.
 

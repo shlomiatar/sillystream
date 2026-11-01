@@ -91,6 +91,10 @@ pub struct NodeConfig {
     pub trace_catch_up: bool,
     pub max_frame_bytes: u64,
     pub max_subscriptions_per_connection: usize,
+    /// Connections past this are closed on accept, before any TLS work.
+    pub max_connections: u64,
+    /// The listen backlog. The kernel may cap it, at `somaxconn` on Linux.
+    pub listen_backlog: i32,
     /// How long a WebSocket message may take to arrive once it has begun. Past it the
     /// connection is closed, because what it sent so far is held in memory.
     pub partial_frame_timeout_ms: u64,
@@ -177,6 +181,8 @@ impl NodeConfig {
             trace_catch_up: false,
             max_frame_bytes: 16 * 1024 * 1024,
             max_subscriptions_per_connection: 1_024,
+            max_connections: 100_000,
+            listen_backlog: 4_096,
             partial_frame_timeout_ms: 60_000,
             fair_share_bytes: 256 * 1024,
             connection_window_bytes: 4 * 1024 * 1024,

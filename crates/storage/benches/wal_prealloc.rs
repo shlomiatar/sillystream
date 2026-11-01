@@ -10,6 +10,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 const FILE_BYTES: u64 = 256 * 1024 * 1024;
 const APPEND_BYTES: usize = 4096;
 
+type Maker = fn(&std::path::Path) -> File;
+
 fn open(path: &std::path::Path) -> File {
     OpenOptions::new()
         .create(true)
@@ -40,8 +42,7 @@ fn append_and_sync(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wal");
     let bytes = vec![0x5Au8; APPEND_BYTES];
-    let makers: [(&str, fn(&std::path::Path) -> File); 2] =
-        [("sparse", sparse), ("blocks_written_first", written)];
+    let makers: [(&str, Maker); 2] = [("sparse", sparse), ("blocks_written_first", written)];
     let mut group = c.benchmark_group("wal_append_and_sync_data_4k");
     group.sample_size(50);
     for (name, make) in makers {

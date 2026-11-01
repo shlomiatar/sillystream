@@ -4,6 +4,7 @@
 mod batch;
 mod client;
 pub mod http;
+mod resolve;
 
 pub use batch::{BatchConfig, CODEC_RAW, CODEC_ZSTD, Item, build_records, decode_records};
 pub use client::{
