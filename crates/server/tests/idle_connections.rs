@@ -1,5 +1,5 @@
 //! Section 6.5: an idle connection holds no read buffer. 10,000 of them, over real TLS, asserted
-//! on the pool's counters. Memory per connection is measured by `sillystream bench idle`, on
+//! on the pool's counters. Memory per connection is measured by `silly bench idle`, on
 //! the server's own process, and recorded in docs/BENCH.md.
 
 mod api;

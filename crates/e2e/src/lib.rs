@@ -89,7 +89,7 @@ pub fn binaries() -> &'static Binaries {
         };
         cargo_build(&target, &root, &["-p", "server", "-p", "cli", "--bins"]);
         let server = keep("sillystream-server", "plain");
-        let cli = keep("sillystream", "plain");
+        let cli = keep("silly", "plain");
         cargo_build(
             &target,
             &root,
@@ -438,7 +438,7 @@ impl Node {
             .collect()
     }
 
-    /// `sillystream` with this node's address and certificate, which must succeed.
+    /// `silly` with this node's address and certificate, which must succeed.
     pub fn cli(&self, token: &str, args: &[&str]) -> String {
         let output = Command::new(&binaries().cli)
             .args(args)
@@ -446,10 +446,10 @@ impl Node {
             .args(["--ca", &self.path_text("cert.pem")])
             .args(["--token", token])
             .output()
-            .expect("running sillystream");
+            .expect("running silly");
         assert!(
             output.status.success(),
-            "sillystream {args:?}: {}",
+            "silly {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
@@ -464,7 +464,7 @@ impl Node {
         for grant in grants {
             command.args(["--grant", grant]);
         }
-        let output = command.output().expect("running sillystream");
+        let output = command.output().expect("running silly");
         assert!(
             output.status.success(),
             "token issue: {}",

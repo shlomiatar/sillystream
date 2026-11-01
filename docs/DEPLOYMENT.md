@@ -40,7 +40,7 @@ The process logs to stderr. Have your supervisor alert on these. There is no hea
 
 ## Hot streams
 
-`sillystream stream core NAME --core N`, or `PUT /v1/stream/NAME/core` with `{"core": N}` and an `admin` token, gives a very hot stream its own shard on core N (section 6.1). Up to 64 streams can have one, and asking again moves the shard. The table is in memory: after a restart the stream goes back to its hashed shard, and you set it again.
+`silly stream core NAME --core N`, or `PUT /v1/stream/NAME/core` with `{"core": N}` and an `admin` token, gives a very hot stream its own shard on core N (section 6.1). Up to 64 streams can have one, and asking again moves the shard. The table is in memory: after a restart the stream goes back to its hashed shard, and you set it again.
 
 ## Object stores
 

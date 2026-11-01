@@ -9,7 +9,7 @@ use server::net::{Server, ServerConfig};
 use server::{NodeConfig, SystemClock};
 use storage::DirVolume;
 
-const BIN: &str = env!("CARGO_BIN_EXE_sillystream");
+const BIN: &str = env!("CARGO_BIN_EXE_silly");
 const SECRET: &[u8] = b"a test secret, thirty-two bytes or more";
 
 struct Fixture {

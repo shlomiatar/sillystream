@@ -30,7 +30,7 @@ A failure that can't be fixed is reported as a failure. Tests are never weakened
 | `storage` | WAL writer, segments, object store, uploader, metadata store | no codec |
 | `server` | cores, write path, delivery, state, APIs, recovery, compaction, sinks; binary `sillystream-server` | no codec |
 | `sdk` | Rust client, batching, zstd | only crate with zstd |
-| `cli` | binary `sillystream`: load generator, tokens, config | |
+| `cli` | binary `silly`: load generator, tokens, config | |
 | `e2e` | black-box suite | starts the real binaries |
 
 Vectors live in `tests/vectors/` of `format` and `proto`.
@@ -52,7 +52,7 @@ Benchmarks are a deliverable, not an afterthought. SPEC.md says its latency figu
 | M4 | `state_apply` | merge and incr | doc size up to 64 KB |
 | M5 | `fan_out` | bytes per second and ns per subscriber | 1, 100, 10,000 subscribers; 1, 10, 100 distinct filters; 1 and N cores |
 
-**Load generator numbers,** through the real server over TLS, from `sillystream bench` (M6) and finished in M10:
+**Load generator numbers,** through the real server over TLS, from `silly bench` (M6) and finished in M10:
 
 - Ack latency p50, p99 and p99.9 at each level 0–3, against the table in section 7.2, marked as local disk and `LocalFileSystem`. The S3 and EBS rows stay marked as unmeasured estimates.
 - Maximum ingest throughput for one stream on one core (the hard limit of section 6.1), and across many streams on 16 cores.
@@ -149,7 +149,7 @@ Visibility: delivery advances in id order. A level 0–1 record is visible at on
 - Every HTTP route has a test for success and each error it can return. The simple publish form from section 11.2 works with `curl`-equivalent headers. `If-Match` conflict gives a version conflict. Hex `X-Options` parses.
 - SDK: published records round trip through zstd, with the server's dependency tree still free of codecs. Ordering across publishes holds, and a `expect_ver` publish blocks later ones from that producer until acked.
 - Idle: 10,000 idle connections hold no read buffer (asserted on pool counters), and memory per connection is recorded in `docs/BENCH.md`.
-- `sillystream bench` produces the level 0–3 latency tables and single-stream throughput in `docs/BENCH.md`.
+- `silly bench` produces the level 0–3 latency tables and single-stream throughput in `docs/BENCH.md`.
 
 ### M7. Recovery, ownership and stream metadata
 

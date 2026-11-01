@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "sillystream"
+name = "silly"
 path = "src/main.rs"
 bench = false
 

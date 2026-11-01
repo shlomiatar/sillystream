@@ -23,7 +23,7 @@ All ten milestones have code, and the real server and CLI work end to end on one
 | `storage` | WAL, segments, object store access, uploader, metadata |
 | `server` | cores, write path, state, delivery, HTTP and WebSocket APIs, recovery, compaction, sinks, and the `sillystream-server` binary |
 | `sdk` | the Rust client, and the only crate with zstd |
-| `cli` | the `sillystream` binary: tokens, admin, publish, tail, load generator |
+| `cli` | the `silly` binary: tokens, admin, publish, tail, load generator |
 | `e2e` | the real binaries as child processes over real TLS sockets |
 
 About 66,000 lines of Rust, tests included, in 127 commits on this branch's history. Also see `docs/DEPLOYMENT.md`.
@@ -49,7 +49,7 @@ cargo test --workspace --no-fail-fast
 cargo test -p e2e
 cargo test -p server --test crash_matrix -- --ignored   # the macOS full-volume test, needs hdiutil
 cargo build --release -p server -p cli
-target/release/sillystream bench latency --count 5000 --cores 8
+target/release/silly bench latency --count 5000 --cores 8
 ```
 
 A local node. I ran exactly these steps with the release binaries, and `publish` and `tail` round-tripped two records at level 2:
@@ -64,10 +64,10 @@ openssl x509 -req -in req.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -
 target/release/sillystream-server --listen 127.0.0.1:18443 --wal-dir ./wal --data-dir ./data \
     --cert cert.pem --key key.pem --token-secret-file secret --object-store local:./store --cores 2
 
-T=$(target/release/sillystream token issue --secret-file secret --author 7 \
+T=$(target/release/silly token issue --secret-file secret --author 7 \
     --grant 'demo*:read,publish,admin' --ttl-ms 600000)
-target/release/sillystream publish demo.a --ack 2 --url localhost:18443 --ca ca.pem --token "$T" hello world
-target/release/sillystream tail demo.a --from start --limit 2 --url localhost:18443 --ca ca.pem --token "$T"
+target/release/silly publish demo.a --ack 2 --url localhost:18443 --ca ca.pem --token "$T" hello world
+target/release/silly tail demo.a --from start --limit 2 --url localhost:18443 --ca ca.pem --token "$T"
 ```
 
 A single self-signed certificate is refused by the client (`CaUsedAsEndEntity`), which is why there is a separate CA.
