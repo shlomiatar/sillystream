@@ -56,6 +56,8 @@ The process logs to stderr. Have your supervisor alert on these. There is no hea
 
 ## Object stores
 
+- `--object-store gs:BUCKET` uses Google Cloud Storage's own API. It reads a key file's path from `GOOGLE_SERVICE_ACCOUNT`, or uses the environment's default credentials, such as a VM's attached service account. **Don't use `s3:` with Google's S3 endpoint:** it ignores a conditional create, so it overwrites objects, and the server refuses to start on it.
+- Every store is checked on start: the server creates one scratch object under `startup-checks/` twice, and exits unless the second is refused.
 - `--object-store s3:BUCKET` reads `S3_REGION`, `S3_ENDPOINT` and the usual AWS key variables.
 - `--sink-archive-store s3:BUCKET` reads `SINK_ARCHIVE_S3_REGION`, `SINK_ARCHIVE_S3_ENDPOINT`, `SINK_ARCHIVE_AWS_ACCESS_KEY_ID` and `SINK_ARCHIVE_AWS_SECRET_ACCESS_KEY`, so an archive to R2 can sit beside a node on AWS. With no archive keys it uses the AWS variables.
 - Seals and the ownership record depend on conditional puts (`ETagMatch`). That this works on R2 is unverified, so test it before relying on it. An archive sink also writes with a conditional create.

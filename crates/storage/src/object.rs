@@ -1,16 +1,17 @@
 //! Object store access and paths (SPEC section 7.3). Everything is tested on
-//! `LocalFileSystem` and `InMemory`. Real S3 exists only behind configuration here,
-//! and has never been exercised.
+//! `LocalFileSystem` and `InMemory`. Native GCS has been run against a real bucket, by hand. Real
+//! S3 exists only behind configuration here, and has never been exercised.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use format::id_ms;
-use object_store::ObjectStore;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::{Path, PathPart};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
 /// S3 or anything that speaks it, such as R2 or MinIO. Without keys, the credentials
 /// come from the environment's usual sources when a request is first made (D13).
@@ -39,8 +40,16 @@ impl std::fmt::Debug for S3Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectStoreConfig {
     Memory,
-    Local { root: PathBuf },
+    Local {
+        root: PathBuf,
+    },
     S3(S3Config),
+    /// Google Cloud Storage's own API, because its S3 endpoint ignores a conditional create.
+    /// Without a key file, credentials come from the environment's default sources.
+    Gcs {
+        bucket: String,
+        service_account_path: Option<String>,
+    },
 }
 
 /// Builds the client. This never connects: the first request does.
@@ -73,10 +82,51 @@ pub fn build_store(config: &ObjectStoreConfig) -> object_store::Result<Arc<dyn O
             }
             Ok(Arc::new(builder.build()?))
         }
+        ObjectStoreConfig::Gcs {
+            bucket,
+            service_account_path,
+        } => {
+            let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+            if let Some(path) = service_account_path {
+                builder = builder.with_service_account_path(path);
+            }
+            Ok(Arc::new(builder.build()?))
+        }
     }
 }
 
-/// Reads `local:DIR`, `memory` or `s3:BUCKET`. For `s3:`, `env` is asked for `<prefix>S3_REGION`,
+/// Creates one scratch object twice, and fails unless the second is refused. Seals and ownership
+/// records depend on that refusal, and a store that ignores it overwrites them with no error.
+pub async fn check_conditional_create(store: &dyn ObjectStore) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let path = Path::from(format!("startup-checks/{}-{nanos}", std::process::id()));
+    let create = || PutOptions {
+        mode: PutMode::Create,
+        ..PutOptions::default()
+    };
+    store
+        .put_opts(&path, PutPayload::from_static(b"first"), create())
+        .await
+        .map_err(|error| format!("creating {path}: {error}"))?;
+    let second = store
+        .put_opts(&path, PutPayload::from_static(b"second"), create())
+        .await;
+    let _ = store.delete(&path).await;
+    match second {
+        Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+        Ok(_) => Err(
+            "this store overwrote an object that a conditional create should have refused, which \
+             would lose acked records. On Google Cloud Storage use gs:BUCKET, not s3:BUCKET"
+                .to_owned(),
+        ),
+        Err(error) => Err(format!("creating {path} a second time: {error}")),
+    }
+}
+
+/// Reads `local:DIR`, `memory`, `gs:BUCKET` or `s3:BUCKET`. For `gs:`, `env` is asked for
+/// `<prefix>GOOGLE_SERVICE_ACCOUNT`, a key file's path. For `s3:`, `env` is asked for `<prefix>S3_REGION`,
 /// `<prefix>S3_ENDPOINT`, `<prefix>AWS_ACCESS_KEY_ID` and `<prefix>AWS_SECRET_ACCESS_KEY`. With an
 /// empty prefix, keys left out come from the usual AWS variables in `build_store` (D250).
 pub fn parse_store_config(
@@ -90,12 +140,18 @@ pub fn parse_store_config(
     if let Some(root) = text.strip_prefix("local:") {
         return Ok(ObjectStoreConfig::Local { root: root.into() });
     }
+    let var = |name: &str| env(&format!("{prefix}{name}"));
+    if let Some(bucket) = text.strip_prefix("gs:") {
+        return Ok(ObjectStoreConfig::Gcs {
+            bucket: bucket.to_owned(),
+            service_account_path: var("GOOGLE_SERVICE_ACCOUNT"),
+        });
+    }
     let Some(bucket) = text.strip_prefix("s3:") else {
         return Err(format!(
-            "a store is local:DIR, memory or s3:BUCKET, not {text}"
+            "a store is local:DIR, memory, gs:BUCKET or s3:BUCKET, not {text}"
         ));
     };
-    let var = |name: &str| env(&format!("{prefix}{name}"));
     let (access_key_id, secret_access_key) = if prefix.is_empty() {
         (None, None)
     } else {

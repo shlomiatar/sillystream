@@ -8,7 +8,7 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
     ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig, build_store,
-    dedicated_path, parse_store_config, seal_path,
+    check_conditional_create, dedicated_path, parse_store_config, seal_path,
 };
 
 fn fake_s3(endpoint: String) -> ObjectStoreConfig {
@@ -234,4 +234,67 @@ async fn a_store_with_its_own_keys_signs_with_them() {
         .unwrap();
     let request = heard.join().unwrap();
     assert!(request.contains("credential=fake-key-id/"), "{request}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_startup_check_passes_a_store_that_refuses_a_second_create() {
+    let store = build_store(&ObjectStoreConfig::Memory).unwrap();
+    check_conditional_create(store.as_ref()).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local = ObjectStoreConfig::Local {
+        root: dir.path().to_owned(),
+    };
+    let store = build_store(&local).unwrap();
+    check_conditional_create(store.as_ref()).await.unwrap();
+}
+
+/// Answers every request with a success, as Google's S3 endpoint does a conditional create.
+fn answer_everything(listener: TcpListener) {
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            std::thread::spawn(move || {
+                let mut buffer = [0; 4096];
+                while let Ok(read) = socket.read(&mut buffer) {
+                    if read == 0 {
+                        return;
+                    }
+                    if buffer[..read].ends_with(b"first")
+                        || buffer[..read].ends_with(b"second")
+                        || buffer[..read].ends_with(b"\r\n\r\n")
+                            && !buffer[..read].starts_with(b"PUT")
+                    {
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 200 OK\r\netag: \"a\"\r\ncontent-length: 0\r\n\r\n",
+                        );
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_startup_check_refuses_a_store_that_overwrites() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    answer_everything(listener);
+    let store = build_store(&fake_s3(endpoint)).unwrap();
+    let error = check_conditional_create(store.as_ref()).await.unwrap_err();
+    assert!(error.contains("overwrote"), "{error}");
+}
+
+#[test]
+fn gs_reads_its_key_file_from_the_prefixed_variable() {
+    let config = parse_store_config("gs:logs", "SINK_ARCHIVE_", |name| {
+        (name == "SINK_ARCHIVE_GOOGLE_SERVICE_ACCOUNT").then(|| "key.json".to_owned())
+    })
+    .unwrap();
+    assert_eq!(
+        config,
+        ObjectStoreConfig::Gcs {
+            bucket: "logs".to_owned(),
+            service_account_path: Some("key.json".to_owned()),
+        }
+    );
 }

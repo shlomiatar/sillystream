@@ -352,6 +352,7 @@ These follow the delivery decisions and change them where they say so. Tests: `c
 - **D256.** `max_connections` (100,000) closes a connection on accept, before TLS, and counts it in `refused_connection_count`. `listen_backlog` (4,096) replaces the 128 from `TcpListener::bind`. Reason: bursts overflowed the backlog on GCP, and nothing bounded idle connections.
 - **D257.** The SDK keeps one DNS answer per client and resolves again only when no known address answers. Reason: at 256 connections at once, a resolver retry set p99 to 5.01 s.
 - **D258.** `token issue` strips trailing whitespace from the secret file, as the server does.
+- **D259.** A `gs:BUCKET` store uses Google Cloud Storage's own API, and each store passes a check on start: a second create of a scratch object must be refused. Reason: through `storage.googleapis.com`, `PutMode::Create` overwrote the object with no error. Colliding seal names (manifest ids overlap stream ids) then destroyed acked records in a real run, and ownership records use the same create.
 
 ## Review findings not fixed
 

@@ -8,16 +8,16 @@ use server::net::{Server, ServerConfig};
 use server::{
     Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SinkConfig, SystemClock,
 };
-use storage::{ObjectStoreConfig, build_store, parse_store_config};
+use storage::{ObjectStoreConfig, build_store, check_conditional_create, parse_store_config};
 
 const USAGE: &str = "\
 sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key PEM \\
-    --token-secret-file FILE --object-store local:DIR|memory|s3:BUCKET
+    --token-secret-file FILE --object-store local:DIR|memory|gs:BUCKET|s3:BUCKET
   [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
   [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
-  [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|s3:BUCKET]
+  [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|gs:BUCKET|s3:BUCKET]
   [--sink-pool-threads N] [--sink-max-in-flight N] [--trace-catch-up true|false]
   [--max-connections N] [--listen-backlog N]
 
@@ -25,7 +25,8 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
 EBS is mounted there. On local disk, machine loss can take up to one seal window. See
 docs/DEPLOYMENT.md.
 
-For --object-store s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys
+For gs:BUCKET, GOOGLE_SERVICE_ACCOUNT is a key file's path (SINK_ARCHIVE_GOOGLE_SERVICE_ACCOUNT
+for an archive). For --object-store s3:BUCKET, S3_REGION and S3_ENDPOINT are read from the environment, and keys
 from the usual AWS variables. For --sink-archive-store s3:BUCKET, the same names with the prefix
 SINK_ARCHIVE_ are read: SINK_ARCHIVE_S3_REGION, SINK_ARCHIVE_S3_ENDPOINT,
 SINK_ARCHIVE_AWS_ACCESS_KEY_ID and SINK_ARCHIVE_AWS_SECRET_ACCESS_KEY, so that an archive to R2
@@ -146,6 +147,7 @@ fn run() -> Result<(), String> {
         token_secret.pop();
     }
     let store_config = parse_store(&object_store.ok_or_else(|| need("--object-store"))?, "")?;
+    check_store(&store_config)?;
     let store = build_store(&store_config).map_err(|error| error.to_string())?;
 
     std::fs::create_dir_all(&wal_dir).map_err(|error| format!("{}: {error}", wal_dir.display()))?;
@@ -187,6 +189,7 @@ fn run() -> Result<(), String> {
     }
     if let Some(text) = sink_archive_store {
         let config = parse_store(&text, ARCHIVE_ENV_PREFIX)?;
+        check_store(&config)?;
         sink.archive_store = Some(build_store(&config).map_err(|error| error.to_string())?);
     }
     node.sink = sink;
@@ -266,6 +269,17 @@ fn clock() -> Arc<dyn Clock> {
 #[cfg(not(feature = "test-hooks"))]
 fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
+}
+
+/// On a client and a runtime of its own, since neither outlives the check.
+fn check_store(config: &ObjectStoreConfig) -> Result<(), String> {
+    let store = build_store(config).map_err(|error| error.to_string())?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?
+        .block_on(check_conditional_create(store.as_ref()))
+        .map_err(|error| format!("the object store failed its startup check: {error}"))
 }
 
 fn parse_store(text: &str, prefix: &str) -> Result<ObjectStoreConfig, String> {
