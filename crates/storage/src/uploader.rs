@@ -15,10 +15,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, never, select};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 
 use crate::cache::SegmentCache;
 use crate::object::{path_fits_stores, sealed_path};
@@ -161,7 +161,7 @@ fn unwrap_send<R, T>(
 ) -> UploadSendError<T> {
     match error {
         TrySendError::Full(command) => UploadSendError::Full(value(command)),
-        TrySendError::Disconnected(command) => UploadSendError::Stopped(value(command)),
+        TrySendError::Closed(command) => UploadSendError::Stopped(value(command)),
     }
 }
 
@@ -175,7 +175,7 @@ impl<R> UploaderSender<R> {
     fn send(&self, command: UploadCommand<R>) -> Result<(), TrySendError<UploadCommand<R>>> {
         self.sending_count.fetch_add(1, Ordering::SeqCst);
         let result = if self.stop.load(Ordering::SeqCst) {
-            Err(TrySendError::Disconnected(command))
+            Err(TrySendError::Closed(command))
         } else {
             self.tx.try_send(command)
         };
@@ -246,8 +246,8 @@ where
     R: AsRef<[u8]> + Clone + Send + 'static,
 {
     pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender<R>, Uploader<R>)> {
-        let (tx, rx) = bounded(config.channel_capacity);
-        let (touch_tx, touch_rx) = bounded(config.channel_capacity);
+        let (tx, rx) = channel(config.channel_capacity);
+        let (touch_tx, touch_rx) = channel(config.channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
         let sending_count = Arc::new(AtomicUsize::new(0));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -368,22 +368,23 @@ impl fmt::Display for PutError {
 impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     async fn run(
         mut self,
-        rx: Receiver<UploadCommand<R>>,
+        mut rx: Receiver<UploadCommand<R>>,
         mut touch_rx: Receiver<Path>,
     ) -> UploaderExit<R> {
+        let mut touches_open = true;
         loop {
-            // `select!` blocks this thread, which runs nothing else: the runtime is here
-            // only for `object_store` calls (D12).
-            let command = select! {
-                recv(rx) -> command => match command {
-                    Ok(command) => command,
-                    Err(_) => break,
+            // This has to wait on the runtime, not block the thread: connections opened here
+            // run on this runtime, and the store's other users share them (D260).
+            let command = tokio::select! {
+                command = rx.recv() => match command {
+                    Some(command) => command,
+                    None => break,
                 },
-                recv(touch_rx) -> path => {
+                path = touch_rx.recv(), if touches_open => {
                     match path {
-                        Ok(path) => self.touch_cache(&path),
+                        Some(path) => self.touch_cache(&path),
                         // Every sender is gone, and `rx` will say so next.
-                        Err(_) => touch_rx = never(),
+                        None => touches_open = false,
                     }
                     if self.stop.load(Ordering::SeqCst) {
                         break;
@@ -393,11 +394,10 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
             };
             // Reads that came before this upload count before its eviction. The bound
             // keeps a fast reader from holding the upload up.
-            for path in touch_rx
-                .try_iter()
-                .take(self.config.channel_capacity)
-                .collect::<Vec<_>>()
-            {
+            for _ in 0..self.config.channel_capacity {
+                let Ok(path) = touch_rx.try_recv() else {
+                    break;
+                };
                 self.touch_cache(&path);
             }
             if self.stop.load(Ordering::SeqCst) {

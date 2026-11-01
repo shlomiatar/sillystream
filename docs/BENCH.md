@@ -670,3 +670,43 @@ The cause wasn't isolated. Fsyncs flushing the other files' data through the sha
 | connecting | 20.5% | 58.9% | | 20.5% | 85% |
 
 The groups come from symbol names, unresolved symbols count as other user, and client machines aren't included.
+
+## Google Cloud Storage and OS tuning, from inside the region
+
+`1fd3872`, `us-east4-a`, 2026-11-01, kernel 7.0, one `n2-standard-16` server and two `n2-standard-8` clients, as in the first run. The server used `gs:BUCKET` with an attached service account, in the same region as the bucket. Differences under 2× count as noise.
+
+**On the bucket, 1 s window:**
+
+| what | result |
+|---|---|
+| Level 3 publishes, one process each, 60 s | 60 of 60, p50 983 ms, max 1,021 ms, including CLI start |
+| Bench ack latency, p50 | level 0 67–75 µs, level 1 58 µs, level 2 about 175 µs, level 3 555–620 ms |
+| Level 3 p99 | 1.05–1.68 s |
+| Cold read, about 59 records, disks wiped, 10 rounds | 2.9–5.5 s, apart from one 33 s stall |
+| Acked records read back in the rounds that counted them | all |
+| Largest object at full load | 33.6 MB |
+| Plain PUT with `curl` | 64 MiB 0.8 s, 256 MiB 2.6 s |
+
+- **30 s stall:** a checkpoint PUT can hang until `object_store`'s default 30 s request timeout. A stop then takes about 30 s, and a cold read can take 33 s. After 60 s of publishing, the stop stalled in 4 of 5 rounds with pooled connections and 0 of 5 with `with_pool_max_idle_per_host(0)`, whose cold reads took about 5 s instead of about 3 s. With HTTP/1 only it stalled in 2 of 4 rounds, so HTTP/2 isn't required. The cause was the uploader blocking its runtime while idle, which froze the connections it had opened (D260). After that fix, from a Mac in Japan to this bucket, 5 rounds of 60 s of publishing, each on an emptied bucket, gave stops of 1.1–2.0 s, slowest publish 2.1 s, and no checkpoint retries. This hasn't been repeated from inside the region.
+- **One connection, 64 KiB:** 730 publishes/s (48 MB/s) on the bucket, in every run, against 5,400–8,100/s (360–530 MB/s) on a local store. Four connections on the bucket reached 5,200–6,400/s. 33.6 MB at 48 MB/s is 0.7 s, close to one PUT at a time, but that's unconfirmed.
+- **Startup with wiped disks:** from the same Mac, the time until listening grew with the objects in the bucket: 5.8 s at 4 objects, 25 s at 51, 42 s at 92. A first publish then took up to 66 s while `meta-loader` read from the bucket, and a stop could wait on that too, at up to 73 s.
+- **Unexplained:** `no WELCOME in time` failed publishes on the HTTP/1 test build and on the Mac, possibly clients connecting during a slow startup. One latency run and one throughput run on the bucket printed no results, and both benches passed when run again.
+- **Not measured:** catch-up from the bucket, because `bench catch-up` can't run remotely, and a 1 GiB PUT.
+
+**OS tuning, local store, WAL on its own NVMe, median of 3 runs, each group alone:**
+
+| group | level 2 p50 / p99 / p99.9, µs | 256 at once, connect p50 / p99, ms | fan-out p99, ms |
+|---|---|---|---|
+| baseline, first | 276 / 669 / 1,547 | 12.3 / 42 | 6.2 |
+| baseline, last | 259 / 661 / 1,932 | 12.4 / 43 | 6.1 |
+| socket buffers and backlogs | 268 / 635 / 1,727 | 12.3 / 43 | 6.3 |
+| IRQ pinning, no `irqbalance` | 270 / 646 / 1,702 | 12.4 / 40 | 6.1 |
+| `swappiness`, dirty limits, THP off | 261 / 657 / 1,741 | 12.4 / 41 | 6.3 |
+| `noatime` | 263 / 623 / 1,809 | 12.4 / 42 | 6.2 |
+| WAL on XFS | 270 / 511 / 639 | 12.4 / 42 | 6.2 |
+
+- **XFS:** a repeat alternating with ext4, 5 rounds each, gave level 2 p99 median 507 µs against 819 µs, and p99.9 644–1,928 µs against 1,671–2,375 µs. That's about 1.6× at p99, and the 639 µs above was a good draw.
+- **Nothing else passed 2×:** throughput also stayed within noise.
+- **RPS:** tested separately over 3 alternating rounds. Peak throughput didn't improve.
+- **No effect possible here:** the VM has no C-state controls, the NVMe scheduler was already `none`, and `somaxconn` was already 4,096.
+- **Clients are the limit on connection bursts:** during a long burst of 256 at once, a client was 0.13% idle and the server 66% idle, with no listen overflows, and the 300,000-connection run ran out of time on the clients. The connect and fan-out columns may therefore hide any server gain.

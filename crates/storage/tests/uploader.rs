@@ -1040,6 +1040,117 @@ async fn a_put_that_hangs_times_out_and_retries() {
     uploader.shutdown();
 }
 
+/// A store whose first PUT leaves a task on the caller's runtime, as an HTTP client leaves one to
+/// drive a pooled connection.
+#[derive(Debug)]
+struct LeavesATask {
+    inner: InMemory,
+    ticks: Arc<std::sync::atomic::AtomicU64>,
+    started: AtomicBool,
+}
+
+impl std::fmt::Display for LeavesATask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LeavesATask")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for LeavesATask {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if !self.started.swap(true, Ordering::SeqCst) {
+            let ticks = Arc::clone(&self.ticks);
+            tokio::spawn(async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            });
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// A shared client's other users wait on the connections this thread opened, so an idle uploader
+/// has to keep running their tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_uploader_keeps_running_the_tasks_a_put_left() {
+    let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(LeavesATask {
+        inner: InMemory::new(),
+        ticks: Arc::clone(&ticks),
+        started: AtomicBool::new(false),
+    });
+    let (config, mut events) = config(store, SECTIONS);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sections, _) = sections(4, FIRST_ID);
+    for (core, section) in sections.into_iter().enumerate() {
+        sender.try_send_section(1, core, section).unwrap();
+    }
+    loop {
+        if let UploadEvent::Uploaded { .. } = events.recv().await.expect("the uploader stopped") {
+            break;
+        }
+    }
+    let before = ticks.load(Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while ticks.load(Ordering::SeqCst) < before + 5 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the task stopped running once the uploader went idle");
+    drop(sender);
+    uploader.shutdown();
+}
+
 /// A store whose first PUTs fail with an error that can't be told from an outage.
 #[derive(Debug)]
 struct FailsAtFirst {
