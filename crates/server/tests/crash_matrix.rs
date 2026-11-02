@@ -243,7 +243,7 @@ async fn run_matrix_case(point: &str) {
     for _ in 0..20 {
         assert!(producer.publish_next(port).await);
     }
-    // Long enough for a seal, a checkpoint, and so for files to recycle later.
+    // Long enough for a seal, a checkpoint, and so for files to be removed later.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     for _ in 0..5 {
         assert!(producer.publish_next(port).await);
@@ -325,13 +325,12 @@ matrix! {
     crash_before_the_fsync => "wal.before_fsync:3",
     crash_after_the_fsync_before_the_ack => "wal.after_fsync:3",
     crash_during_a_seal_after_rotation => "seal.after_rotate",
+    crash_during_a_seal_before_the_local_write => "seal.before_pending",
+    crash_during_a_seal_after_the_local_write => "seal.after_pending",
     crash_during_a_seal_before_the_upload => "seal.before_put",
     crash_after_the_upload_before_the_checkpoint => "seal.after_upload",
     crash_after_the_local_write_before_the_checkpoint => "checkpoint.before_put",
-    crash_after_the_checkpoint_before_recycling => "checkpoint.after_put",
-    crash_during_recycling_before_emptying => "recycle.before_empty",
-    crash_during_recycling_after_emptying => "recycle.after_empty",
-    crash_during_recycling_after_renaming => "recycle.after_rename",
+    crash_after_the_checkpoint_before_removing => "checkpoint.after_put",
     crash_before_the_ownership_write => "ownership.before_write",
     crash_after_the_ownership_write => "ownership.after_write",
 }
@@ -406,7 +405,7 @@ async fn entries_a_generation_fenced_off_are_warned_of_and_their_file_is_kept() 
     let port = mounted.port.expect("it listens");
     let text = std::fs::read_to_string(&mounted.stderr).unwrap();
     assert!(text.contains(" WAL entries are above"), "{text}");
-    // More than one seal window, for a recycle to have happened if one was going to.
+    // More than one seal window, for a removal to have happened if one was going to.
     assert!(producer.publish_next(port).await);
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     drop(mounted);

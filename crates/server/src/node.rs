@@ -43,7 +43,7 @@ use crate::sink::{SinkConfig, SinkNote, SinkPool};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 use crate::state::StateOp;
 
-/// The local tier of section 6.2: copies of uploaded segments.
+/// The local segment directory of section 7.3.
 #[derive(Debug, Clone)]
 pub struct LocalCacheConfig {
     pub dir: PathBuf,
@@ -541,15 +541,15 @@ impl Control {
             gather,
             metas,
             objects,
-            recycle_seq: if clean { closed_seq } else { None },
+            remove_seq: if clean { closed_seq } else { None },
         });
     }
 
     fn on_checkpoint_saved(&mut self, done: CheckpointDone) {
         storage::crash_point("checkpoint.after_put");
-        if let Some(seq) = done.recycle_seq {
-            // A full channel only leaves the file until the next seal's recycle covers it.
-            let _ = self.wal.try_recycle(seq);
+        if let Some(seq) = done.remove_seq {
+            // A full channel only leaves the file until the next seal's removal covers it.
+            let _ = self.wal.try_remove(seq);
         }
         for control in &self.links.control {
             let _ = control.send(ControlMsg::CheckpointDone {
@@ -891,9 +891,16 @@ impl Node {
         let prepared = {
             // On its own thread, since the caller may already be inside a runtime.
             let (wal_dir, store) = (recover.wal_dir.clone(), Arc::clone(&store));
+            let segment_dir = config.local_cache.as_ref().map(|local| local.dir.clone());
             std::thread::spawn(move || {
                 runtime()?
-                    .block_on(prepare(&wal_dir, local_store, &store, now_ms))
+                    .block_on(prepare(
+                        &wal_dir,
+                        segment_dir.as_deref(),
+                        local_store,
+                        &store,
+                        now_ms,
+                    ))
                     .map_err(io::Error::other)
             })
             .join()

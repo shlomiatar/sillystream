@@ -1109,9 +1109,6 @@ impl WalVolume for FailingVolume {
     fn create(&mut self, _seq: u64) -> std::io::Result<FailingFile> {
         Ok(FailingFile)
     }
-    fn reuse(&mut self, _old_seq: u64, _new_seq: u64) -> std::io::Result<FailingFile> {
-        Ok(FailingFile)
-    }
     fn remove(&mut self, _seq: u64) -> std::io::Result<()> {
         Ok(())
     }

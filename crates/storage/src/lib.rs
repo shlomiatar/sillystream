@@ -16,7 +16,7 @@ mod wal_format;
 mod wal_replay;
 mod wal_writer;
 
-pub use cache::{CacheError, SegmentCache};
+pub use cache::{CacheError, MappedSegments, PendingWriter, SegmentCache, upload_pending};
 pub use checkpoint::{
     BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet,
     build_checkpoint, checkpoint_path, merge_meta, put_checkpoint, put_checkpoint_payload,

@@ -1,35 +1,46 @@
-//! The local tier: copies of uploaded segments under a byte cap, least recently used
-//! out first (SPEC section 6.2, D11, D54).
+//! The local segment directory: `pending/` holds segments waiting to upload, and `cached/` holds
+//! uploaded ones under a byte cap shared by both, oldest written out first (SPEC section 7.3).
 //!
-//! Files are laid out as `LocalFileSystem` expects, so a `SegmentReader` works on the
-//! cache unchanged through `store()`. This value has one owner, the uploader thread,
-//! and takes `&mut self`: it shares no lock with the cores.
+//! `SegmentCache` has one owner, the uploader thread, and takes `&mut self`: it shares no lock
+//! with the cores, which read `cached/` through `MappedSegments`. A startup uploads what
+//! `pending/` holds before anything else reads the store.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::VecDeque;
 use std::fmt;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::local::LocalFileSystem;
-use object_store::path::Path;
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use object_store::path::{Path, PathPart};
+use object_store::{
+    GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+};
 
+use crate::uploader::put_new_object;
+
+const PENDING_DIR: &str = "pending";
+const CACHED_DIR: &str = "cached";
 const TEMP_PREFIX: &str = "tmp-";
+const WRITE_BUFFER_BYTES: usize = 1 << 20;
+const STORE_NAME: &str = "local segments";
+/// Pending segments a startup uploads at once.
+const CONCURRENT_STARTUP_PUTS: usize = 8;
 
 #[derive(Debug)]
-pub enum CacheError {
-    Io(io::Error),
-    Store(object_store::Error),
-}
+pub struct CacheError(io::Error);
 
 impl fmt::Display for CacheError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CacheError::Io(error) => write!(f, "segment cache: {error}"),
-            CacheError::Store(error) => write!(f, "segment cache: {error}"),
-        }
+        write!(f, "segment directory: {}", self.0)
     }
 }
 
@@ -37,32 +48,15 @@ impl std::error::Error for CacheError {}
 
 impl From<io::Error> for CacheError {
     fn from(error: io::Error) -> Self {
-        CacheError::Io(error)
+        CacheError(error)
     }
 }
 
-impl From<object_store::Error> for CacheError {
-    fn from(error: object_store::Error) -> Self {
-        CacheError::Store(error)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CachedFile {
-    len_bytes: u64,
-    used_at: u64,
-}
-
-pub struct SegmentCache {
-    root: PathBuf,
-    store: Arc<LocalFileSystem>,
-    cap_bytes: u64,
-    used_bytes: u64,
-    files: HashMap<PathBuf, CachedFile>,
-    /// `used_at → file`, oldest first.
-    by_use: BTreeMap<u64, PathBuf>,
-    clock: u64,
-    next_temp: u64,
+/// `path` under `dir`. A `Path`'s parts are already encoded so that each is safe as a file name.
+fn file_for(dir: &FsPath, path: &Path) -> PathBuf {
+    let mut file = dir.to_path_buf();
+    file.extend(path.parts().map(|part| part.as_ref().to_owned()));
+    file
 }
 
 /// Lists every file under `dir`, removing directories that turn out to be empty.
@@ -81,35 +75,104 @@ fn walk(dir: &FsPath, found: &mut Vec<(PathBuf, std::fs::Metadata)>) -> io::Resu
     Ok(())
 }
 
-fn write_then_rename(temp: &FsPath, parts: &[Bytes], target: &FsPath) -> io::Result<()> {
-    let mut file = std::fs::File::create(temp)?;
-    for part in parts {
-        file.write_all(part)?;
+/// Maps a whole file. Segments are never written or truncated once they have their name, and
+/// removing one leaves a map of it working, so this can't end the process that way. A read the
+/// disk fails does end it (SPEC section 7.3).
+fn map_file(file: &File) -> io::Result<Bytes> {
+    if file.metadata()?.len() == 0 {
+        return Ok(Bytes::new());
     }
-    drop(file);
-    std::fs::rename(temp, target)
+    // SAFETY: as above. Nothing here changes a file that has its final name.
+    let map = unsafe { memmap2::Mmap::map(file) }?;
+    Ok(Bytes::from_owner(map))
+}
+
+/// Creates `target`'s parents, moves `from` there and makes the name durable.
+fn rename_into(from: &FsPath, target: &FsPath) -> io::Result<()> {
+    let parent = target.parent().unwrap_or(FsPath::new("."));
+    std::fs::create_dir_all(parent)?;
+    std::fs::rename(from, target)?;
+    File::open(parent)?.sync_all()
+}
+
+/// What a PUT task needs to write a segment, apart from the owner's accounting.
+#[derive(Debug, Clone)]
+pub struct PendingWriter {
+    root: PathBuf,
+    next_temp: Arc<AtomicU64>,
+}
+
+impl PendingWriter {
+    /// Writes under a temporary name, fsyncs and renames, so that anything in `pending/` is
+    /// complete, and returns the file mapped. A retry writes it again, and has the same bytes.
+    pub fn write(&self, path: &Path, parts: &[Bytes]) -> io::Result<Bytes> {
+        let target = file_for(&self.root.join(PENDING_DIR), path);
+        let temp = self.root.join(format!(
+            "{TEMP_PREFIX}{}",
+            self.next_temp.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = (|| {
+            // Readable too, or it can't be mapped.
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            let mut out = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
+            for part in parts {
+                out.write_all(part)?;
+            }
+            let file = out.into_inner().map_err(|error| error.into_error())?;
+            file.sync_all()?;
+            rename_into(&temp, &target)?;
+            map_file(&file)
+        })();
+        if written.is_err() {
+            // Out of the accounting's sight, so it must not stay, least of all on a full disk.
+            let _ = std::fs::remove_file(&temp);
+        }
+        written
+    }
+}
+
+pub struct SegmentCache {
+    root: PathBuf,
+    store: Arc<MappedSegments>,
+    cap_bytes: u64,
+    pending_bytes: u64,
+    cached_bytes: u64,
+    /// Oldest written first, with its length.
+    cached: VecDeque<(PathBuf, u64)>,
+    writer: PendingWriter,
 }
 
 impl SegmentCache {
-    /// Opens the directory, keeping what is there (oldest modified evicted first) and
-    /// removing leftovers of interrupted writes and empty directories. Evicts down to `cap_bytes` if needed.
+    /// Opens the directory, removing interrupted writes and anything else that isn't a segment,
+    /// and keeping `cached/` by modified time. Whatever `pending/` holds stays and counts, and
+    /// eviction goes down to `cap_bytes` as far as `cached/` allows.
     pub fn open(root: &FsPath, cap_bytes: u64) -> Result<SegmentCache, CacheError> {
-        std::fs::create_dir_all(root)?;
+        std::fs::create_dir_all(root.join(PENDING_DIR))?;
+        std::fs::create_dir_all(root.join(CACHED_DIR))?;
         let root = root.canonicalize()?;
-        let store = Arc::new(LocalFileSystem::new_with_prefix(&root)?);
-        let mut found = Vec::new();
-        walk(&root, &mut found)?;
-        let mut existing = Vec::new();
-        for (path, metadata) in found {
-            let is_temp = path.parent() == Some(root.as_path())
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(TEMP_PREFIX));
-            if is_temp {
-                std::fs::remove_file(path)?;
+        for item in std::fs::read_dir(&root)? {
+            let item = item?;
+            let name = item.file_name();
+            if name == PENDING_DIR || name == CACHED_DIR {
                 continue;
             }
+            if item.metadata()?.is_dir() {
+                std::fs::remove_dir_all(item.path())?;
+            } else {
+                std::fs::remove_file(item.path())?;
+            }
+        }
+        let mut found = Vec::new();
+        walk(&root.join(PENDING_DIR), &mut found)?;
+        let pending_bytes = found.iter().map(|(_, metadata)| metadata.len()).sum();
+        found.clear();
+        walk(&root.join(CACHED_DIR), &mut found)?;
+        let mut existing = Vec::with_capacity(found.len());
+        for (path, metadata) in found {
             let modified = metadata
                 .modified()?
                 .duration_since(UNIX_EPOCH)
@@ -117,113 +180,307 @@ impl SegmentCache {
             existing.push((modified, path, metadata.len()));
         }
         existing.sort();
+        let cached_bytes = existing.iter().map(|(_, _, len_bytes)| *len_bytes).sum();
         let mut cache = SegmentCache {
+            store: Arc::new(MappedSegments {
+                dir: root.join(CACHED_DIR),
+            }),
+            writer: PendingWriter {
+                root: root.clone(),
+                next_temp: Arc::new(AtomicU64::new(0)),
+            },
             root,
-            store,
             cap_bytes,
-            used_bytes: 0,
-            files: HashMap::new(),
-            by_use: BTreeMap::new(),
-            clock: 0,
-            next_temp: 0,
+            pending_bytes,
+            cached_bytes,
+            cached: existing
+                .into_iter()
+                .map(|(_, path, len_bytes)| (path, len_bytes))
+                .collect(),
         };
-        for (_, path, len_bytes) in existing {
-            cache.track(path, len_bytes);
-        }
         cache.evict()?;
         Ok(cache)
     }
 
-    /// A store over the cached files, for `SegmentReader`. A missing object means
-    /// it was never cached or has been evicted, and the reader goes to S3.
-    pub fn store(&self) -> Arc<LocalFileSystem> {
+    /// A store over `cached/`, for `SegmentReader`. A missing object means it was evicted or
+    /// never got here, and the reader goes to S3.
+    pub fn store(&self) -> Arc<MappedSegments> {
         Arc::clone(&self.store)
     }
 
+    pub fn writer(&self) -> PendingWriter {
+        self.writer.clone()
+    }
+
     pub fn used_bytes(&self) -> u64 {
-        self.used_bytes
+        self.pending_bytes + self.cached_bytes
     }
 
-    fn track(&mut self, path: PathBuf, len_bytes: u64) {
-        self.clock += 1;
-        self.by_use.insert(self.clock, path.clone());
-        self.used_bytes += len_bytes;
-        let file = CachedFile {
-            len_bytes,
-            used_at: self.clock,
-        };
-        if let Some(old) = self.files.insert(path, file) {
-            self.by_use.remove(&old.used_at);
-            self.used_bytes -= old.len_bytes;
-        }
+    /// Whether another seal may start. At most one segment past the cap gets in.
+    pub fn has_room(&self) -> bool {
+        self.pending_bytes < self.cap_bytes
     }
 
-    /// Stores a copy of an object. An object bigger than the cap isn't kept, which
-    /// returns `false`. The write is not fsynced: this is a cache, and readers
-    /// check CRCs on whatever they read from it.
-    pub fn put(&mut self, path: &Path, parts: &[Bytes]) -> Result<bool, CacheError> {
-        let len_bytes: u64 = parts.iter().map(|part| part.len() as u64).sum();
-        if len_bytes > self.cap_bytes {
-            return Ok(false);
-        }
-        let target = self.store.path_to_filesystem(path)?;
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = self.root.join(format!("{TEMP_PREFIX}{}", self.next_temp));
-        self.next_temp += 1;
-        if let Err(error) = write_then_rename(&temp, parts, &target) {
-            // Not counted in `used_bytes` and out of eviction's sight, so it must not
-            // stay, least of all when the error is a full disk.
-            let _ = std::fs::remove_file(&temp);
-            self.remove_empty_parents(&target);
-            return Err(error.into());
-        }
-        self.track(target, len_bytes);
-        self.evict()?;
-        Ok(true)
+    /// Counts a segment about to be written, and makes what room `cached/` can give.
+    pub fn reserve(&mut self, len_bytes: u64) -> Result<(), CacheError> {
+        self.pending_bytes += len_bytes;
+        self.evict()
     }
 
-    /// Removes `file`'s directory and those above it, as far as they are empty and
-    /// below the root. A directory with anything in it stops the walk.
-    fn remove_empty_parents(&self, file: &FsPath) {
-        let mut dir = file.parent();
-        while let Some(current) = dir {
-            if current == self.root
-                || !current.starts_with(&self.root)
-                || std::fs::remove_dir(current).is_err()
-            {
-                return;
-            }
-            dir = current.parent();
-        }
-    }
-
-    /// Marks an object as just used. Returns whether it is cached.
-    pub fn touch(&mut self, path: &Path) -> Result<bool, CacheError> {
-        let target = self.store.path_to_filesystem(path)?;
-        let Some(file) = self.files.get(&target).copied() else {
-            return Ok(false);
-        };
-        self.track(target, file.len_bytes);
-        Ok(true)
+    /// A pending segment is in the store, under `path`, which a collision can have changed
+    /// since it was written as `written`. If this fails, the file stays in `pending/` and the
+    /// next startup finds the same bytes in the store.
+    pub fn uploaded(
+        &mut self,
+        written: &Path,
+        path: &Path,
+        len_bytes: u64,
+    ) -> Result<(), CacheError> {
+        let from = file_for(&self.root.join(PENDING_DIR), written);
+        let target = file_for(&self.root.join(CACHED_DIR), path);
+        rename_into(&from, &target)?;
+        remove_empty_parents(&self.root.join(PENDING_DIR), &from);
+        self.pending_bytes = self.pending_bytes.saturating_sub(len_bytes);
+        self.cached_bytes += len_bytes;
+        self.cached.push_back((target, len_bytes));
+        self.evict()
     }
 
     fn evict(&mut self) -> Result<(), CacheError> {
-        while self.used_bytes > self.cap_bytes {
-            let Some((_, path)) = self.by_use.pop_first() else {
+        while self.used_bytes() > self.cap_bytes {
+            let Some((path, len_bytes)) = self.cached.pop_front() else {
                 break;
             };
-            if let Some(file) = self.files.remove(&path) {
-                self.used_bytes -= file.len_bytes;
-            }
+            self.cached_bytes -= len_bytes;
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
-            self.remove_empty_parents(&path);
+            remove_empty_parents(&self.root.join(CACHED_DIR), &path);
         }
         Ok(())
+    }
+}
+
+/// Removes `file`'s directory and those above it, as far as they are empty and below `root`.
+fn remove_empty_parents(root: &FsPath, file: &FsPath) {
+    let mut dir = file.parent();
+    while let Some(current) = dir {
+        if current == root || !current.starts_with(root) || std::fs::remove_dir(current).is_err() {
+            return;
+        }
+        dir = current.parent();
+    }
+}
+
+/// `sealed/.../<generation>-<first_id>.seg` under the first free `first_id` from the one in its
+/// name (D156).
+fn with_first_id(path: &Path, first_id: u64) -> Path {
+    let mut parts: Vec<PathPart<'_>> = path.parts().collect();
+    if let Some(name) = parts.last_mut()
+        && let Some((generation, _)) = name.as_ref().split_once('-')
+    {
+        *name = PathPart::from(format!("{generation}-{first_id:020}.seg"));
+    }
+    Path::from_iter(parts)
+}
+
+fn first_id_of(path: &Path) -> Option<u64> {
+    let name = path.filename()?.strip_suffix(".seg")?;
+    name.split_once('-')?.1.parse().ok()
+}
+
+async fn upload_one(
+    root: &FsPath,
+    store: &dyn ObjectStore,
+    file: PathBuf,
+    written: Path,
+) -> Result<(), String> {
+    let describe = |error: &dyn fmt::Display| format!("{}: {error}", file.display());
+    let bytes = File::open(&file)
+        .and_then(|handle| map_file(&handle))
+        .map_err(|error| describe(&error))?;
+    let first_id = first_id_of(&written).ok_or_else(|| describe(&"not a segment's name"))?;
+    let path = put_new_object(
+        store,
+        |first_id| with_first_id(&written, first_id),
+        first_id,
+        std::slice::from_ref(&bytes),
+    )
+    .await
+    .map_err(|error| describe(&error))?;
+    rename_into(&file, &file_for(&root.join(CACHED_DIR), &path)).map_err(|error| describe(&error))
+}
+
+/// Uploads what a former process left in `pending/` and moves it to `cached/`. A former
+/// generation's limit applies to these as to any object it uploaded late (section 8.1). What's
+/// here is complete, since it only gets its name once it is fsynced. Returns how many there were.
+pub async fn upload_pending(root: &FsPath, store: &dyn ObjectStore) -> Result<u64, String> {
+    let dir = root.join(PENDING_DIR);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut found = Vec::new();
+    walk(&dir, &mut found).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let mut files = Vec::with_capacity(found.len());
+    for (file, _) in found {
+        let relative = file
+            .strip_prefix(&dir)
+            .ok()
+            .and_then(FsPath::to_str)
+            .ok_or_else(|| format!("{}: not a segment's name", file.display()))?;
+        let written = Path::parse(relative).map_err(|error| error.to_string())?;
+        files.push((file, written));
+    }
+    let count = files.len() as u64;
+    let mut uploads = futures::stream::iter(
+        files
+            .into_iter()
+            .map(|(file, written)| upload_one(root, store, file, written)),
+    )
+    .buffer_unordered(CONCURRENT_STARTUP_PUTS);
+    while let Some(upload) = uploads.next().await {
+        upload?;
+    }
+    Ok(count)
+}
+
+/// Reads `cached/` through memory maps, as a store that does nothing else (section 7.3). Every
+/// read touches its pages on a blocking thread, so a page fault can't stall a core, and hands out
+/// the mapped bytes with no copy.
+#[derive(Debug)]
+pub struct MappedSegments {
+    dir: PathBuf,
+}
+
+impl fmt::Display for MappedSegments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{STORE_NAME}({})", self.dir.display())
+    }
+}
+
+fn not_supported() -> object_store::Error {
+    object_store::Error::NotImplemented
+}
+
+/// Reads one byte per page, which faults them all in. The page size is a lower bound here, so a
+/// larger one only touches a page more than once.
+fn touch_pages(bytes: &[u8]) {
+    const PAGE_BYTES: usize = 4096;
+    let mut sum = 0u8;
+    for at in (0..bytes.len()).step_by(PAGE_BYTES) {
+        sum = sum.wrapping_add(bytes[at]);
+    }
+    std::hint::black_box(sum);
+}
+
+fn read_mapped(
+    file_path: &FsPath,
+    location: &Path,
+    options: &GetOptions,
+) -> object_store::Result<GetResult> {
+    let store_error = |source: io::Error| object_store::Error::Generic {
+        store: STORE_NAME,
+        source: Box::new(source),
+    };
+    let file = File::open(file_path).map_err(|error| match error.kind() {
+        io::ErrorKind::NotFound => object_store::Error::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        },
+        _ => store_error(error),
+    })?;
+    let metadata = file.metadata().map_err(store_error)?;
+    let size = metadata.len() as usize;
+    let meta = ObjectMeta {
+        location: location.clone(),
+        last_modified: metadata
+            .modified()
+            .map(DateTime::<Utc>::from)
+            .map_err(store_error)?,
+        size,
+        e_tag: None,
+        version: None,
+    };
+    let range = match &options.range {
+        None => 0..size,
+        Some(GetRange::Bounded(range)) => range.start..range.end.min(size),
+        Some(GetRange::Offset(start)) => *start..size,
+        Some(GetRange::Suffix(len)) => size.saturating_sub(*len)..size,
+    };
+    if range.start > range.end {
+        return Err(store_error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("range {range:?} of a {size} byte file"),
+        )));
+    }
+    let bytes = if options.head {
+        Bytes::new()
+    } else {
+        let bytes = map_file(&file).map_err(store_error)?.slice(range.clone());
+        touch_pages(&bytes);
+        bytes
+    };
+    Ok(GetResult {
+        payload: GetResultPayload::Stream(futures::stream::once(async move { Ok(bytes) }).boxed()),
+        meta,
+        range,
+        attributes: Default::default(),
+    })
+}
+
+#[async_trait]
+impl ObjectStore for MappedSegments {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let file = file_for(&self.dir, location);
+        let location = location.clone();
+        tokio::task::spawn_blocking(move || read_mapped(&file, &location, &options))
+            .await
+            .map_err(|error| object_store::Error::JoinError { source: error })?
+    }
+
+    async fn put_opts(
+        &self,
+        _location: &Path,
+        _payload: PutPayload,
+        _options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        Err(not_supported())
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _options: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        Err(not_supported())
+    }
+
+    async fn delete(&self, _location: &Path) -> object_store::Result<()> {
+        Err(not_supported())
+    }
+
+    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        futures::stream::once(async { Err(not_supported()) }).boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        _prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        Err(not_supported())
+    }
+
+    async fn copy(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        Err(not_supported())
+    }
+
+    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
+        Err(not_supported())
     }
 }

@@ -432,7 +432,6 @@ async fn uploaded_objects_reach_the_local_cache() {
         .try_send_dedicated(Arc::from("s"), 0, vec![bytes.clone()])
         .unwrap();
     let (_, path, _) = next_uploaded(&mut events).await;
-    assert!(sender.try_cache_touch(path.clone()));
     // Same bytes from both tiers, through the same reader.
     let from_cache = SegmentReader::new(local.clone(), path.clone());
     assert_eq!(from_cache.read_stream("s").await.unwrap(), bytes);
@@ -697,7 +696,7 @@ fn a_sender_that_never_pauses_cannot_hold_up_shutdown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn cache_touches_cannot_take_the_room_sections_need() {
+async fn a_stuck_upload_leaves_room_for_the_sections_behind_it() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
@@ -713,12 +712,6 @@ async fn cache_touches_cannot_take_the_room_sections_need() {
         events.recv().await,
         Some(UploadEvent::Retrying { .. })
     ));
-    let mut touch_count = 0;
-    while sender.try_cache_touch(Path::from("sealed/1/node/a.seg")) {
-        touch_count += 1;
-        assert!(touch_count <= 1000, "touches have no bound");
-    }
-    assert!(touch_count >= 1, "a touch is accepted when there is room");
     for seal in 2..10 {
         sender
             .try_send_section(seal, 0, one_stream_section("s", &bytes))
@@ -727,44 +720,58 @@ async fn cache_touches_cannot_take_the_room_sections_need() {
     assert_eq!(uploader.shutdown().unfinished.len(), 9);
 }
 
-/// A touch sent before an upload counts before that upload's eviction, so a read
-/// protects what it read.
+/// The file is what a PUT sends, and it is on disk before the PUT starts. With the store away, it
+/// waits in `pending/`, and once that reaches the cap, so do later seals.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cache_touch_still_reaches_the_cache() {
+async fn a_full_pending_directory_holds_later_seals_back() {
     let dir = tempfile::tempdir().unwrap();
-    // One record's object is well under 1 KiB. Measured below, then the cap fits two.
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     let probe = {
         let mut builder = storage::SegmentBuilder::new();
-        let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-        builder.add_extent("s", [bytes]).unwrap();
+        builder.add_extent("s", [bytes.clone()]).unwrap();
         builder.finish().unwrap().len_bytes
     };
-    let cache = SegmentCache::open(dir.path(), probe * 2).unwrap();
-    let local = cache.store();
-    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (mut config, mut events) = config(inner, 1);
+    let cache = SegmentCache::open(dir.path(), probe).unwrap();
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = counting;
+    let (mut config, mut events) = config(store, 1);
     config.cache = Some(cache);
     let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let mut paths = Vec::new();
-    for number in 0..2u64 {
-        // One ms apart in ids, so the objects have different paths and the same size.
-        let id = FIRST_ID + (number << 16);
-        let bytes = Bytes::from(record(id, 1, 7, b"x"));
-        sender
-            .try_send_dedicated(Arc::from("s"), number, vec![bytes])
-            .unwrap();
-        paths.push(next_uploaded(&mut events).await.1);
-    }
-    assert!(sender.try_cache_touch(paths[0].clone()));
-    let bytes = Bytes::from(record(FIRST_ID + (2 << 16), 1, 7, b"x"));
     sender
-        .try_send_dedicated(Arc::from("s"), 2, vec![bytes])
+        .try_send_dedicated(Arc::from("s"), 0, vec![bytes.clone()])
         .unwrap();
-    next_uploaded(&mut events).await;
-    assert!(local.head(&paths[0]).await.is_ok(), "the touched one stays");
-    assert!(local.head(&paths[1]).await.is_err(), "the other goes");
-    drop(sender);
-    uploader.finish();
+    // The PUT is failing, so the file exists by now.
+    assert!(matches!(
+        events.recv().await,
+        Some(UploadEvent::Retrying { .. })
+    ));
+    let mut files = Vec::new();
+    list_files(&dir.path().join("pending"), &mut files);
+    assert_eq!(files.len(), 1);
+    assert_eq!(std::fs::metadata(&files[0]).unwrap().len(), probe);
+    for number in 1..4 {
+        let later = Bytes::from(record(FIRST_ID + (number << 16), 1, 7, b"x"));
+        sender
+            .try_send_dedicated(Arc::from("s"), number, vec![later])
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut files = Vec::new();
+    list_files(&dir.path().join("pending"), &mut files);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(uploader.shutdown().unfinished.len(), 4);
+}
+
+fn list_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+    for item in std::fs::read_dir(dir).unwrap() {
+        let item = item.unwrap();
+        if item.metadata().unwrap().is_dir() {
+            list_files(&item.path(), found);
+        } else {
+            found.push(item.path());
+        }
+    }
 }
 
 fn seal_sections_held(unfinished: &[UnfinishedUpload<Bytes>]) -> Vec<(u64, usize)> {

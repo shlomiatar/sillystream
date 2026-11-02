@@ -548,7 +548,6 @@ impl Core {
             parts.links.clone(),
             parts.settings,
             parts.stores,
-            parts.uploader.clone(),
             parts.accounts,
         );
         Core {

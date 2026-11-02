@@ -1,11 +1,13 @@
-//! The local segment cache and its eviction.
+//! The local segment directory: its cap, its eviction, mapped reads and a startup's uploads.
 
+use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use object_store::path::Path;
-use storage::{SegmentBuilder, SegmentCache, SegmentReader};
+use storage::{SegmentBuilder, SegmentCache, SegmentReader, upload_pending};
 
 fn path(name: &str) -> Path {
     Path::from(format!("sealed/1/node/{name}.seg"))
@@ -18,77 +20,124 @@ fn parts(len: usize) -> Vec<Bytes> {
     ]
 }
 
+/// What the uploader does with one segment, with the PUT left out.
+fn pend(cache: &mut SegmentCache, object: &Path, parts: &[Bytes]) -> u64 {
+    let len_bytes = parts.iter().map(|part| part.len() as u64).sum();
+    cache.reserve(len_bytes).unwrap();
+    cache.writer().write(object, parts).unwrap();
+    len_bytes
+}
+
+fn put(cache: &mut SegmentCache, object: &Path, parts: &[Bytes]) {
+    let len_bytes = pend(cache, object, parts);
+    cache.uploaded(object, object, len_bytes).unwrap();
+}
+
 async fn is_cached(cache: &SegmentCache, path: &Path) -> bool {
     cache.store().head(path).await.is_ok()
 }
 
+fn is_pending(root: &FsPath, path: &Path) -> bool {
+    root.join("pending").join(path.as_ref()).exists()
+}
+
 #[tokio::test]
-async fn the_least_recently_used_goes_first_and_the_cap_holds() {
+async fn the_oldest_written_goes_first_whatever_was_read() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 300).unwrap();
-    assert!(cache.put(&path("a"), &parts(100)).unwrap());
-    assert!(cache.put(&path("b"), &parts(100)).unwrap());
-    assert!(cache.put(&path("c"), &parts(100)).unwrap());
+    put(&mut cache, &path("a"), &parts(100));
+    put(&mut cache, &path("b"), &parts(100));
+    put(&mut cache, &path("c"), &parts(100));
     assert_eq!(cache.used_bytes(), 300);
-    // `a` is older but was just used, so `b` goes.
-    assert!(cache.touch(&path("a")).unwrap());
-    assert!(cache.put(&path("d"), &parts(100)).unwrap());
+    cache.store().get(&path("a")).await.unwrap();
+    put(&mut cache, &path("d"), &parts(100));
     assert_eq!(cache.used_bytes(), 300);
-    assert!(is_cached(&cache, &path("a")).await);
-    assert!(!is_cached(&cache, &path("b")).await);
-    assert!(is_cached(&cache, &path("c")).await);
-    assert!(is_cached(&cache, &path("d")).await);
-    assert!(!cache.touch(&path("b")).unwrap());
+    assert!(!is_cached(&cache, &path("a")).await);
+    assert!(is_cached(&cache, &path("b")).await);
     // A big one pushes out several.
-    assert!(cache.put(&path("e"), &parts(250)).unwrap());
+    put(&mut cache, &path("e"), &parts(250));
     assert!(cache.used_bytes() <= 300);
     assert!(is_cached(&cache, &path("e")).await);
     assert!(!is_cached(&cache, &path("c")).await);
 }
 
+/// A waiting segment is the only way it reaches the store, so the cap can't take it. It takes
+/// `cached/` first, and then seals wait.
 #[tokio::test]
-async fn an_object_over_the_cap_is_not_kept_and_evicts_nothing() {
+async fn pending_segments_are_never_evicted_and_fill_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 200).unwrap();
+    put(&mut cache, &path("old"), &parts(100));
+    pend(&mut cache, &path("a"), &parts(100));
+    assert!(cache.has_room());
+    assert!(is_cached(&cache, &path("old")).await);
+    pend(&mut cache, &path("b"), &parts(100));
+    assert!(!is_cached(&cache, &path("old")).await);
+    assert!(!cache.has_room());
+    // Over the cap, and still on disk. The cap isn't worth an acked record.
+    pend(&mut cache, &path("c"), &parts(100));
+    assert_eq!(cache.used_bytes(), 300);
+    for name in ["a", "b", "c"] {
+        assert!(is_pending(dir.path(), &path(name)));
+    }
+    cache.uploaded(&path("a"), &path("a"), 100).unwrap();
+    assert!(!cache.has_room(), "b and c still fill it");
+    cache.uploaded(&path("b"), &path("b"), 100).unwrap();
+    assert!(cache.has_room());
+}
+
+#[tokio::test]
+async fn a_segment_over_the_cap_is_still_written_and_goes_once_uploaded() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 100).unwrap();
-    assert!(cache.put(&path("a"), &parts(100)).unwrap());
-    assert!(!cache.put(&path("big"), &parts(101)).unwrap());
-    assert!(is_cached(&cache, &path("a")).await);
-    assert!(!is_cached(&cache, &path("big")).await);
+    let big = path("big");
+    pend(&mut cache, &big, &parts(101));
+    assert!(is_pending(dir.path(), &big));
+    cache.uploaded(&big, &big, 101).unwrap();
+    assert!(!is_pending(dir.path(), &big));
+    assert!(!is_cached(&cache, &big).await);
+    assert_eq!(cache.used_bytes(), 0);
 }
 
 #[tokio::test]
-async fn overwriting_an_object_counts_its_bytes_once() {
+async fn a_collision_caches_it_under_the_name_it_got() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 1000).unwrap();
-    cache.put(&path("a"), &parts(100)).unwrap();
-    cache.put(&path("a"), &parts(50)).unwrap();
-    assert_eq!(cache.used_bytes(), 50);
+    pend(&mut cache, &path("wanted"), &parts(100));
+    cache.uploaded(&path("wanted"), &path("got"), 100).unwrap();
+    assert!(is_cached(&cache, &path("got")).await);
+    assert!(!is_cached(&cache, &path("wanted")).await);
+    assert!(!is_pending(dir.path(), &path("wanted")));
 }
 
 #[tokio::test]
-async fn reopening_finds_files_enforces_a_smaller_cap_and_clears_temp_files() {
+async fn reopening_keeps_segments_enforces_a_smaller_cap_and_clears_the_rest() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut cache = SegmentCache::open(dir.path(), 1000).unwrap();
-        cache.put(&path("a"), &parts(100)).unwrap();
+        put(&mut cache, &path("a"), &parts(100));
         // Separate modified times, which is all a reopen has to order by.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        cache.put(&path("b"), &parts(100)).unwrap();
+        put(&mut cache, &path("b"), &parts(100));
+        pend(&mut cache, &path("c"), &parts(100));
     }
     std::fs::write(dir.path().join("tmp-3"), b"interrupted").unwrap();
+    std::fs::create_dir_all(dir.path().join("sealed/1/from-an-older-layout")).unwrap();
     let cache = SegmentCache::open(dir.path(), 1000).unwrap();
-    assert_eq!(cache.used_bytes(), 200);
+    assert_eq!(cache.used_bytes(), 300);
     assert!(is_cached(&cache, &path("a")).await);
     assert!(!dir.path().join("tmp-3").exists());
+    assert!(!dir.path().join("sealed").exists());
     drop(cache);
-    let cache = SegmentCache::open(dir.path(), 150).unwrap();
-    assert_eq!(cache.used_bytes(), 100);
+    let cache = SegmentCache::open(dir.path(), 250).unwrap();
+    assert_eq!(cache.used_bytes(), 200);
     assert!(!is_cached(&cache, &path("a")).await, "oldest out first");
     assert!(is_cached(&cache, &path("b")).await);
+    assert!(is_pending(dir.path(), &path("c")));
 }
 
 #[tokio::test]
-async fn a_segment_reader_works_on_the_cache_and_sees_eviction_as_not_found() {
+async fn a_segment_reader_works_on_mapped_files_and_sees_eviction_as_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 4096).unwrap();
     let mut builder = SegmentBuilder::new();
@@ -106,15 +155,23 @@ async fn a_segment_reader_works_on_the_cache_and_sees_eviction_as_not_found() {
     builder.add_extent("s", [record.clone()]).unwrap();
     let built = builder.finish().unwrap();
     let first = path("first");
-    cache.put(&first, &built.parts).unwrap();
+    put(&mut cache, &first, &built.parts);
     let store: Arc<dyn ObjectStore> = cache.store();
     let reader = SegmentReader::new(store, first.clone());
-    assert_eq!(reader.read_stream("s").await.unwrap(), record);
-    cache.put(&path("big"), &parts(4096)).unwrap();
-    assert!(reader.read_stream("s").await.is_err());
+    let read = reader.read_stream("s").await.unwrap();
+    assert_eq!(read, record);
+    put(&mut cache, &path("big"), &parts(4096));
+    assert!(matches!(
+        reader.read_stream("s").await,
+        Err(storage::SegmentError::Store(
+            object_store::Error::NotFound { .. }
+        ))
+    ));
+    // A map outlives its file's name, so a reader holding bytes loses nothing to eviction.
+    assert_eq!(read, record);
 }
 
-fn temp_files(root: &std::path::Path) -> Vec<String> {
+fn temp_files(root: &FsPath) -> Vec<String> {
     std::fs::read_dir(root)
         .unwrap()
         .map(|item| item.unwrap().file_name().into_string().unwrap())
@@ -123,23 +180,24 @@ fn temp_files(root: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
-fn a_failed_put_leaves_no_temp_file_and_the_cache_keeps_working() {
+fn a_failed_write_leaves_no_temp_file_and_a_retry_works() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    let cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
     // A directory at the target makes the final rename fail.
     let target = path("a");
-    std::fs::create_dir_all(dir.path().join(target.as_ref()).join("in-the-way")).unwrap();
+    let in_the_way = dir.path().join("pending").join(target.as_ref());
+    std::fs::create_dir_all(in_the_way.join("in-the-way")).unwrap();
     for _ in 0..5 {
-        assert!(cache.put(&target, &parts(400 * 1024)).is_err());
+        assert!(cache.writer().write(&target, &parts(400 * 1024)).is_err());
     }
     assert_eq!(temp_files(dir.path()), Vec::<String>::new());
-    assert_eq!(cache.used_bytes(), 0);
-    assert!(cache.put(&path("b"), &parts(100)).unwrap());
-    assert_eq!(cache.used_bytes(), 100);
+    std::fs::remove_dir_all(&in_the_way).unwrap();
+    let file = cache.writer().write(&target, &parts(100)).unwrap();
+    assert_eq!(file.len(), 100);
     assert_eq!(temp_files(dir.path()), Vec::<String>::new());
 }
 
-fn count_dirs(root: &std::path::Path) -> usize {
+fn count_dirs(root: &FsPath) -> usize {
     let mut count = 0;
     for item in std::fs::read_dir(root).unwrap() {
         let item = item.unwrap();
@@ -151,45 +209,88 @@ fn count_dirs(root: &std::path::Path) -> usize {
 }
 
 #[test]
-fn eviction_removes_the_directories_it_empties() {
+fn eviction_and_uploads_remove_the_directories_they_empty() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 100).unwrap();
     for hour in 0..50 {
         let object = Path::from(format!("sealed/{hour}/stream-{hour}/a.seg"));
-        assert!(cache.put(&object, &parts(100)).unwrap());
+        put(&mut cache, &object, &parts(100));
     }
     assert_eq!(cache.used_bytes(), 100);
-    // `sealed`, one hour and one stream, for the one file that is left.
-    assert_eq!(count_dirs(dir.path()), 3);
+    // `pending` and `cached`, and `sealed`, one hour and one stream for the file that is left.
+    assert_eq!(count_dirs(dir.path()), 5);
 }
 
-#[test]
-fn eviction_keeps_a_directory_that_still_has_a_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cache = SegmentCache::open(dir.path(), 200).unwrap();
-    let first = Path::from("sealed/1/node/a.seg");
-    let second = Path::from("sealed/1/node/b.seg");
-    let third = Path::from("sealed/1/node/c.seg");
-    cache.put(&first, &parts(100)).unwrap();
-    cache.put(&second, &parts(100)).unwrap();
-    cache.put(&third, &parts(100)).unwrap();
-    assert_eq!(count_dirs(dir.path()), 3);
-    assert!(dir.path().join(second.as_ref()).exists());
-    assert!(dir.path().join(third.as_ref()).exists());
+fn segment_path(generation: u64, first_id: u64) -> Path {
+    storage::sealed_path("node", generation, first_id, first_id)
 }
 
-#[test]
-fn reopening_removes_empty_directories_and_never_the_root() {
+#[tokio::test]
+async fn a_startup_uploads_what_is_pending_and_caches_it() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("sealed/1/gone")).unwrap();
-    std::fs::create_dir_all(dir.path().join("sealed/2/kept")).unwrap();
-    std::fs::write(dir.path().join("sealed/2/kept/a.seg"), b"data").unwrap();
-    let cache = SegmentCache::open(dir.path(), 1000).unwrap();
-    assert_eq!(cache.used_bytes(), 4);
-    assert_eq!(count_dirs(dir.path()), 3);
+    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    let (first, second) = (segment_path(1, 1 << 16), segment_path(1, 2 << 16));
+    pend(&mut cache, &first, &parts(100));
+    pend(&mut cache, &second, &parts(200));
     drop(cache);
+    let store = InMemory::new();
+    assert_eq!(upload_pending(dir.path(), &store).await.unwrap(), 2);
+    assert_eq!(store.get(&first).await.unwrap().meta.size, 100);
+    assert_eq!(store.get(&second).await.unwrap().meta.size, 200);
+    assert!(!is_pending(dir.path(), &first));
+    let cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    assert!(is_cached(&cache, &first).await);
+    assert_eq!(cache.used_bytes(), 300);
+    assert_eq!(upload_pending(dir.path(), &store).await.unwrap(), 0);
+}
 
-    let empty = tempfile::tempdir().unwrap();
-    SegmentCache::open(empty.path(), 1000).unwrap();
-    assert!(empty.path().is_dir());
+/// A crash can come after the PUT and before the rename.
+#[tokio::test]
+async fn a_startup_counts_the_same_bytes_in_the_store_as_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    let object = segment_path(1, 1 << 16);
+    let bytes = parts(100);
+    pend(&mut cache, &object, &bytes);
+    drop(cache);
+    let store = InMemory::new();
+    store
+        .put(&object, object_store::PutPayload::from_iter(bytes))
+        .await
+        .unwrap();
+    assert_eq!(upload_pending(dir.path(), &store).await.unwrap(), 1);
+    assert!(!is_pending(dir.path(), &object));
+    assert_eq!(store.get(&object).await.unwrap().meta.size, 100);
+}
+
+#[tokio::test]
+async fn a_startup_moves_past_a_name_held_by_other_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    let object = segment_path(1, 1 << 16);
+    pend(&mut cache, &object, &parts(100));
+    drop(cache);
+    let store = InMemory::new();
+    store
+        .put(&object, Bytes::from_static(b"other").into())
+        .await
+        .unwrap();
+    assert_eq!(upload_pending(dir.path(), &store).await.unwrap(), 1);
+    let next = segment_path(1, (1 << 16) + 1);
+    assert_eq!(store.get(&next).await.unwrap().meta.size, 100);
+    assert_eq!(store.get(&object).await.unwrap().meta.size, 5);
+    let cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    assert!(is_cached(&cache, &next).await);
+}
+
+/// The file stays, so the next startup tries again.
+#[tokio::test]
+async fn a_startup_that_cannot_upload_fails_and_keeps_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
+    let object = Path::from("sealed/1/node/no-first-id-here.seg");
+    pend(&mut cache, &object, &parts(100));
+    drop(cache);
+    assert!(upload_pending(dir.path(), &InMemory::new()).await.is_err());
+    assert!(is_pending(dir.path(), &object));
 }

@@ -1,10 +1,10 @@
 //! The uploader thread: one object per seal (SPEC section 6.4, D12, D55).
 //!
 //! Each core hands over one sorted section per seal. When every core's section for
-//! a seal has arrived, they become one segment and one PUT, without sorting or copying
-//! data. A failed PUT is retried with the references still held, so nothing is lost
-//! and memory stays pinned while the store is down (Q9). An upload that no retry can
-//! help fails on its own, so one object can't stop the ones behind it (D59).
+//! a seal has arrived, they become one segment, written to the local segment directory and
+//! uploaded from that file (D266). A failed PUT is retried with the references still held, so
+//! nothing is lost and memory stays pinned while the store is down (Q9). An upload that no retry
+//! can help fails on its own, so one object can't stop the ones behind it (D59).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -24,7 +24,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 
-use crate::cache::SegmentCache;
+use crate::cache::{PendingWriter, SegmentCache};
 use crate::object::{path_fits_stores, sealed_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
@@ -110,7 +110,8 @@ pub struct UploaderConfig {
     /// The least one PUT attempt gets, before allowing for its size. Past that it counts as a
     /// retryable failure (D242).
     pub put_timeout_min_ms: u64,
-    /// Where uploaded objects are copied (section 6.2, step 5).
+    /// Where segments are written before they upload, and stay as a read cache after (section
+    /// 6.2). A node with none uploads from memory, which only tests do.
     pub cache: Option<SegmentCache>,
     /// Every core's event channel. Each event goes to all.
     pub events: Vec<UnboundedSender<UploadEvent>>,
@@ -140,8 +141,6 @@ pub enum UploadSendError<T> {
 
 pub struct UploaderSender<R> {
     tx: Sender<UploadCommand<R>>,
-    /// Separate from `tx`, so reads can't use up the room sections need (D54).
-    touch_tx: Sender<Path>,
     stop: Arc<AtomicBool>,
     /// Sends that have passed the stop check and may not have reached the channel. See
     /// `send`.
@@ -152,7 +151,6 @@ impl<R> Clone for UploaderSender<R> {
     fn clone(&self) -> Self {
         UploaderSender {
             tx: self.tx.clone(),
-            touch_tx: self.touch_tx.clone(),
             stop: Arc::clone(&self.stop),
             sending_count: Arc::clone(&self.sending_count),
         }
@@ -229,13 +227,6 @@ impl<R> UploaderSender<R> {
             })
         })
     }
-
-    /// Tells the local cache an object was read. Losing this on a full queue costs
-    /// only a slightly worse eviction choice, and it has its own queue, so a burst of
-    /// reads can't make a section or dedicated object come back `Full`.
-    pub fn try_cache_touch(&self, path: Path) -> bool {
-        !self.stop.load(Ordering::SeqCst) && self.touch_tx.try_send(path).is_ok()
-    }
 }
 
 pub struct Uploader<R> {
@@ -251,7 +242,6 @@ where
 {
     pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender<R>, Uploader<R>)> {
         let (tx, rx) = channel(config.channel_capacity);
-        let (touch_tx, touch_rx) = channel(config.channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
         let sending_count = Arc::new(AtomicUsize::new(0));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -270,6 +260,7 @@ where
                     retry_initial_ms: config.retry_initial_ms,
                     retry_max_ms: config.retry_max_ms,
                     put_timeout_min_ms: config.put_timeout_min_ms,
+                    local: config.cache.as_ref().map(SegmentCache::writer),
                 });
                 let worker = Worker {
                     config,
@@ -280,7 +271,7 @@ where
                     last_seal_by_core: vec![None; section_count],
                     unfinished: Vec::new(),
                 };
-                let exit = runtime.block_on(worker.run(rx, touch_rx));
+                let exit = runtime.block_on(worker.run(rx));
                 // Dropping the runtime would wait for a cancelled PUT's blocking thread,
                 // which a stalled mount never lets go.
                 runtime.shutdown_background();
@@ -289,7 +280,6 @@ where
         Ok((
             UploaderSender {
                 tx: tx.clone(),
-                touch_tx,
                 stop: Arc::clone(&stop),
                 sending_count,
             },
@@ -359,12 +349,16 @@ struct Putter {
     retry_initial_ms: u64,
     retry_max_ms: u64,
     put_timeout_min_ms: u64,
+    local: Option<PendingWriter>,
 }
 
 enum PutEnd {
     Uploaded {
+        /// The name it has in `pending/`, which a collision can leave behind `path`.
+        written: Path,
         path: Path,
-        built: BuiltSegment,
+        len_bytes: u64,
+        extents: Vec<StreamExtent>,
     },
     /// Nothing to upload.
     Empty,
@@ -414,15 +408,19 @@ impl fmt::Display for PutError {
 }
 
 impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
-    async fn run(
-        mut self,
-        mut rx: Receiver<UploadCommand<R>>,
-        mut touch_rx: Receiver<Path>,
-    ) -> UploaderExit<R> {
-        let mut touches_open = true;
+    async fn run(mut self, mut rx: Receiver<UploadCommand<R>>) -> UploaderExit<R> {
         let mut in_flight: FuturesOrdered<Put<R>> = FuturesOrdered::new();
         loop {
-            let (has_room, has_puts) = (in_flight.len() < CONCURRENT_PUTS, !in_flight.is_empty());
+            let has_puts = !in_flight.is_empty();
+            // With `pending/` full, seals wait here, and the channel fills behind them. What is
+            // there with nothing in flight failed for good, and is the next startup's.
+            let has_room = in_flight.len() < CONCURRENT_PUTS
+                && (!has_puts
+                    || self
+                        .config
+                        .cache
+                        .as_ref()
+                        .is_none_or(SegmentCache::has_room));
             // This has to wait on the runtime, not block the thread: connections opened here
             // run on this runtime, and the store's other users share them (D260).
             let command = tokio::select! {
@@ -436,26 +434,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     Some(command) => command,
                     None => break,
                 },
-                path = touch_rx.recv(), if touches_open => {
-                    match path {
-                        Some(path) => self.touch_cache(&path),
-                        // Every sender is gone, and `rx` will say so next.
-                        None => touches_open = false,
-                    }
-                    if self.stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    continue;
-                },
             };
-            // Reads that came before this upload count before its eviction. The bound
-            // keeps a fast reader from holding the upload up.
-            for _ in 0..self.config.channel_capacity {
-                let Ok(path) = touch_rx.try_recv() else {
-                    break;
-                };
-                self.touch_cache(&path);
-            }
             if self.stop.load(Ordering::SeqCst) {
                 self.keep_unfinished(command);
                 break;
@@ -497,13 +476,6 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
         UploaderExit {
             unfinished: self.unfinished,
-        }
-    }
-
-    fn touch_cache(&mut self, path: &Path) {
-        if let Some(cache) = &mut self.config.cache {
-            // A cache problem never affects the upload path.
-            let _ = cache.touch(path);
         }
     }
 
@@ -576,16 +548,21 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     fn finish(&mut self, finished: Finished<R>) {
         let Finished { key, ended, keep } = finished;
         match ended {
-            PutEnd::Uploaded { path, built } => {
+            PutEnd::Uploaded {
+                written,
+                path,
+                len_bytes,
+                extents,
+            } => {
                 if let Some(cache) = &mut self.config.cache {
                     // The object is safe in the store, so a local failure only costs a read.
-                    let _ = cache.put(&path, &built.parts);
+                    let _ = cache.uploaded(&written, &path, len_bytes);
                 }
                 self.emit(UploadEvent::Uploaded {
                     key,
                     path,
-                    len_bytes: built.len_bytes,
-                    extents: Arc::new(built.extents),
+                    len_bytes,
+                    extents: Arc::new(extents),
                 });
             }
             PutEnd::Empty => self.emit(UploadEvent::Empty { key }),
@@ -597,7 +574,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
     }
 
-    fn start_seal(&self, seal: u64, sections: BTreeMap<usize, Section<R>>) -> Put<R> {
+    fn start_seal(&mut self, seal: u64, sections: BTreeMap<usize, Section<R>>) -> Put<R> {
         let key = UploadKey::Seal(seal);
         let built = build_seal(&sections);
         let (node, generation) = (self.config.node.clone(), self.config.generation);
@@ -609,7 +586,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         )
     }
 
-    fn start_dedicated(&self, stream: Arc<str>, number: u64, records: Vec<R>) -> Put<R> {
+    fn start_dedicated(&mut self, stream: Arc<str>, number: u64, records: Vec<R>) -> Put<R> {
         let key = UploadKey::Dedicated {
             stream: Arc::clone(&stream),
             number,
@@ -635,13 +612,19 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     }
 
     fn start(
-        &self,
+        &mut self,
         key: UploadKey,
         built: Result<BuiltSegment, SegmentError>,
         path_for: Box<dyn Fn(u64, u64) -> Path>,
         keep: UnfinishedUpload<R>,
     ) -> Put<R> {
         let putter = Arc::clone(&self.putter);
+        if let (Some(cache), Ok(built)) = (&mut self.config.cache, &built)
+            && built.first_id.is_some()
+        {
+            // A local failure here costs only room, and the write reports its own.
+            let _ = cache.reserve(built.len_bytes);
+        }
         Box::pin(async move {
             let ended = match built {
                 Ok(built) => match built.first_id {
@@ -674,15 +657,37 @@ impl Putter {
         if !path_fits_stores(&path) {
             return PutEnd::Failed(format!("{path} has a part too long for an object path"));
         }
+        let written = path.clone();
+        let BuiltSegment {
+            parts,
+            len_bytes,
+            extents,
+            ..
+        } = built;
+        // The references have done their job once it is a file, and the PUT reads that.
+        let parts = match &self.local {
+            Some(local) => match self.write_pending(key, local, &written, parts).await {
+                Some(file) => vec![file],
+                None => return PutEnd::Stopped,
+            },
+            None => parts,
+        };
         let mut backoff_ms = self.retry_initial_ms;
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let Some(put) = self.put_unless_stopped(&path, &built.parts).await else {
+            let Some(put) = self.put_unless_stopped(&path, &parts).await else {
                 return PutEnd::Stopped;
             };
             match put {
-                Ok(()) => return PutEnd::Uploaded { path, built },
+                Ok(()) => {
+                    return PutEnd::Uploaded {
+                        written,
+                        path,
+                        len_bytes,
+                        extents,
+                    };
+                }
                 Err(PutError::Collision) => {
                     first_id += 1;
                     path = path_for(first_id);
@@ -701,6 +706,53 @@ impl Putter {
             }
             if !self.wait_unless_stopped(backoff_ms).await {
                 return PutEnd::Stopped;
+            }
+            backoff_ms = backoff_ms.saturating_mul(2).min(self.retry_max_ms);
+        }
+    }
+
+    /// Writes the segment on a blocking thread, so the PUTs on this one go on. A disk that can't
+    /// take it now is retried like a store that can't, with the references still held. `None`
+    /// if the uploader was stopped first.
+    async fn write_pending(
+        &self,
+        key: &UploadKey,
+        local: &PendingWriter,
+        path: &Path,
+        parts: Vec<Bytes>,
+    ) -> Option<Bytes> {
+        let mut backoff_ms = self.retry_initial_ms;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let write = tokio::task::spawn_blocking({
+                let (local, path, parts) = (local.clone(), path.clone(), parts.clone());
+                move || {
+                    crate::crash::crash_point("seal.before_pending");
+                    local.write(&path, &parts)
+                }
+            });
+            let error = tokio::select! {
+                biased;
+                written = write => match written {
+                    Ok(Ok(file)) => {
+                        crate::crash::crash_point("seal.after_pending");
+                        return Some(file);
+                    }
+                    Ok(Err(error)) => error.to_string(),
+                    Err(error) => error.to_string(),
+                },
+                _ = self.wait_for_stop() => return None,
+            };
+            for events in &self.events {
+                let _ = events.send(UploadEvent::Retrying {
+                    key: key.clone(),
+                    attempt,
+                    error: format!("writing {path} locally: {error}"),
+                });
+            }
+            if !self.wait_unless_stopped(backoff_ms).await {
+                return None;
             }
             backoff_ms = backoff_ms.saturating_mul(2).min(self.retry_max_ms);
         }

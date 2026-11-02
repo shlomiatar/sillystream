@@ -140,14 +140,14 @@ Each core exclusively owns a set of streams, including their ids, buffers and su
 1. The owning core reads the publish into a slab (section 6.5), dedupes on `(producer_id, producer_seq)` and stamps the records in place.
 2. It passes a reference to the bytes to the WAL writer, without copying.
 3. The WAL writer appends and fsyncs, then tells the cores what is durable. The cores send the acks and deliver to subscribers.
-4. At seal, each core hands the uploader its references, sorted by stream, and the uploader uploads one segment.
-5. The local copy stays as a read cache until disk pressure evicts it.
+4. At seal, each core hands the uploader its references, sorted by stream. The uploader writes one segment to the local segment directory and fsyncs it, every time.
+5. It uploads the segment from that file. Once it is uploaded, the file stays as a read cache until the directory's cap evicts it (section 7.3).
 
-Local disks are caches, except for the unsealed WAL. The source of truth is the WAL until a segment is sealed, and S3 after that.
+The source of truth is the WAL until a segment is uploaded, and S3 after that. A segment waiting to upload is a copy of what the WAL still holds.
 
 ### 6.3 WAL writer
 
-One preallocated append-only file, written by one thread per volume, using crossbeam channels. It is read only during crash recovery and recycled once the segments covering it are uploaded.
+One active append-only file at a time, written by one thread per volume, using crossbeam channels, and rotated at each seal. A WAL file is read only during crash recovery. It is removed once the segments covering it are uploaded and checkpointed, and is never reused, so a new file holds no old bytes.
 
 ```rust
 loop {
@@ -168,7 +168,9 @@ loop {
 
 One thread per node, following the same pattern as the WAL writer. It produces **one object per node per seal**, so a node's PUT count doesn't depend on its stream count.
 
-A stream lives on one core, so the cores' sections don't overlap. The uploader writes the sections one after another from the references it received, already sorted by stream, and combines their footer indexes. It doesn't sort or copy data. A stream that moved cores during the window appears in two sections, so the footer allows two entries for it.
+A stream lives on one core, so the cores' sections don't overlap. The uploader writes the sections to a local file one after another from the references it received, already sorted by stream, and combines their footer indexes. A stream that moved cores during the window appears in two sections, so the footer allows two entries for it.
+
+The file write and fsync never run on the WAL writer's thread or a core, so they can't delay an ack. There is one upload path: every PUT sends a finished local file, however fast the network is.
 
 ### 6.5 Memory
 
@@ -217,6 +219,11 @@ Each publish asks for an ack level, and the ack is sent only after that level is
 - There are no per-stream S3 objects on the write path, except that a stream filling its own buffer within the window gets a dedicated object.
 - Path: `sealed/<ingest_hour>/<node-or-stream>/<generation>-<first_id>.seg`.
 - Plain files. Segment bytes are the same as wire bytes.
+- **Local segment directory:** `pending/` holds segments waiting to upload, and `cached/` holds uploaded ones. A finished upload renames the file across, so the listing alone says what each file is. A write goes to a temporary name, is fsynced and is then renamed into `pending/`, so anything in `pending/` is complete.
+- **Cap:** one size cap covers both directories. Only `cached/` can be evicted, oldest written first. When `pending/` alone reaches the cap, seals wait, and the backpressure reaches publishers through the usual bounds.
+- **Crash:** startup uploads what is in `pending/` before it does anything else with the store, under the generation in each file's path. Section 8.1's limits then apply to those objects as they do to a late upload by a former owner.
+- **Reads of history:** a segment in the local directory is read through a memory map, on a thread that isn't a core, so a page fault can't stall publishes. A read error on a mapped page ends the process, and it isn't retried from S3.
+- **Deleted data:** expired or deleted records can stay in `cached/` until eviction reaches them. The read index stops them being served.
 
 ### 7.4 Retention and deletion
 
@@ -401,7 +408,7 @@ A signed token grants access to streams. It lists stream id patterns such as `lo
 
 ## 14. Open questions
 
-None at the moment.
+- **Letting go earlier.** A sealed segment is on local disk before its upload finishes, so RAM (section 6.5) and the WAL could both be released at that point, and a slow network would then cost only local disk. Today both wait for the upload. Releasing RAM needs readers and checkpoints to tell a local extent from an uploaded one. Releasing the WAL also needs dedupe entries (section 3) to survive without it, and needs `pending/` on a volume as durable as `wal_dir` (section 7.1).
 
 ## 15. Not brought over
 

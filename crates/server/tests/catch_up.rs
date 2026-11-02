@@ -61,7 +61,7 @@ async fn fill_tiers(
         panic!("the seal should have uploaded");
     };
     // Gone from the cache, so only the store has it.
-    std::fs::remove_file(cache_dir.join(path.as_ref())).unwrap();
+    std::fs::remove_file(cache_dir.join("cached").join(path.as_ref())).unwrap();
 
     publish_some(client, &mut records).await;
     let local_first_id = records[per_tier_count as usize].0;
@@ -559,13 +559,16 @@ async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
     };
     expect_ack(&mut client).await;
     wait_for_memory_to_empty(node, STREAM).await;
-    let local = cache.path().join(path.as_ref());
+    let local = cache.path().join("cached").join(path.as_ref());
     let mut bytes = std::fs::read(&local).unwrap();
     // Every byte, so that the block, the footer or both fail whichever is read first.
     for byte in &mut bytes {
         *byte ^= 0xFF;
     }
-    std::fs::write(&local, &bytes).unwrap();
+    // A new file under the old name, as nothing changes a segment in place.
+    let corrupt = local.with_extension("corrupt");
+    std::fs::write(&corrupt, &bytes).unwrap();
+    std::fs::rename(&corrupt, &local).unwrap();
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();

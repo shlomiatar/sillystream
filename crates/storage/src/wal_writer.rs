@@ -28,16 +28,13 @@ pub trait WalFile: Send {
     fn sync_data(&mut self) -> io::Result<()>;
 }
 
-/// Where WAL files come from. Both calls return a file positioned for its first
-/// entry, with a durable header and a durable name.
+/// Where WAL files come from. `create` returns a file positioned for its first entry, with a
+/// durable header and a durable name.
 pub trait WalVolume: Send {
     type File: WalFile;
     fn create(&mut self, seq: u64) -> io::Result<Self::File>;
-    /// Makes a closed file the file `new_seq`, with nothing of its old contents left.
-    /// Record data is the publisher's, so old bytes could hold an entry that is valid
-    /// under `new_seq`, and a CRC can't tell it apart (D60).
-    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<Self::File>;
-    /// Removes a closed file nothing needs, one more than reuse has a place for.
+    /// Removes a closed file nothing needs. Files are never reused: record data is the
+    /// publisher's, so old bytes could hold an entry a CRC can't tell apart (D265).
     fn remove(&mut self, seq: u64) -> io::Result<()>;
 }
 
@@ -142,28 +139,6 @@ impl WalVolume for DirVolume {
         Ok(file)
     }
 
-    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<File> {
-        let old_path = self.path(old_seq);
-        let mut file = OpenOptions::new().read(true).write(true).open(&old_path)?;
-        // Both descriptors before anything changes, so that running out of them leaves the old
-        // file there for a retry (D234).
-        let dir = File::open(&self.dir)?;
-        let size_bytes = file.metadata()?.len();
-        // Durably empty before it has the new name, so that a crash at any point
-        // here leaves no old bytes under it. Its entries are already uploaded (D16).
-        crash_point("recycle.before_empty");
-        file.set_len(0)?;
-        file.sync_all()?;
-        crash_point("recycle.after_empty");
-        let path = self.path(new_seq);
-        std::fs::rename(old_path, &path)?;
-        crash_point("recycle.after_rename");
-        file.set_len(size_bytes)?;
-        self.write_header(&mut file, new_seq)?;
-        dir.sync_all()?;
-        Ok(file)
-    }
-
     fn remove(&mut self, seq: u64) -> io::Result<()> {
         std::fs::remove_file(self.path(seq))
     }
@@ -173,7 +148,7 @@ impl WalVolume for DirVolume {
 pub struct WalConfig {
     /// The active file's `seq`. After a restart, one above every file in `wal_dir`.
     pub first_seq: u64,
-    /// Files left from before a restart, which become reusable through `try_recycle`.
+    /// Files left from before a restart, which `try_remove` removes in their turn.
     pub closed_seqs: Vec<u64>,
     /// Bound of the channel, in commands. A full channel is backpressure.
     pub channel_capacity: usize,
@@ -222,7 +197,7 @@ pub struct WalRotated {
 enum WalCommand<R> {
     Append(WalEntry<R>),
     Rotate(oneshot::Sender<WalRotated>),
-    Recycle { up_to_seq: u64 },
+    Remove { up_to_seq: u64 },
 }
 
 /// Why a `try_*` call didn't queue. It always returns at once, and gives the value back.
@@ -279,8 +254,8 @@ impl<R> WalSender<R> {
 
     /// Closed files up to `up_to_seq` are covered by uploaded segments and checkpoints,
     /// so the next rotations may reuse them (D16). The active file is never affected.
-    pub fn try_recycle(&self, up_to_seq: u64) -> Result<(), WalSendError<u64>> {
-        match self.tx.try_send(WalCommand::Recycle { up_to_seq }) {
+    pub fn try_remove(&self, up_to_seq: u64) -> Result<(), WalSendError<u64>> {
+        match self.tx.try_send(WalCommand::Remove { up_to_seq }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(WalSendError::Full(up_to_seq)),
             Err(TrySendError::Disconnected(_)) => Err(WalSendError::Stopped(up_to_seq)),
@@ -335,10 +310,8 @@ where
         notify,
         file,
         no_file: Arc::clone(&no_file),
-        first_seq: config.first_seq,
         active_seq: config.first_seq,
         closed_seqs: config.closed_seqs.into(),
-        free_seqs: VecDeque::new(),
         channel_capacity: config.channel_capacity,
         stats: WalStats::default(),
     };
@@ -366,9 +339,6 @@ struct Writer<V: WalVolume, N> {
     no_file: Arc<AtomicBool>,
     active_seq: u64,
     closed_seqs: VecDeque<u64>,
-    /// Files below this are from before a restart, and replay may still have them mapped.
-    first_seq: u64,
-    free_seqs: VecDeque<u64>,
     channel_capacity: usize,
     stats: WalStats,
 }
@@ -407,7 +377,7 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                     // A core that stopped waiting doesn't matter to the writer.
                     let _ = done.send(rotated);
                 }
-                Some(WalCommand::Recycle { up_to_seq }) => {
+                Some(WalCommand::Remove { up_to_seq }) => {
                     while let Some(seq) = self
                         .closed_seqs
                         .front()
@@ -415,7 +385,11 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
                         .filter(|seq| *seq <= up_to_seq)
                     {
                         self.closed_seqs.pop_front();
-                        self.free(seq);
+                        // A file that can't be removed is harmless: it replays as entries already
+                        // covered, and the next startup has it back in its closed list.
+                        if let Err(error) = self.volume.remove(seq) {
+                            eprintln!("removing WAL file {seq}: {error}");
+                        }
                     }
                     if self.file.is_none() {
                         self.open_active().map_err(WalError::Rotate)?;
@@ -429,31 +403,14 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
 
     /// Tries again for the file `active_seq` names. Still none to be had isn't an error.
     fn open_active(&mut self) -> io::Result<()> {
-        let opened = match self.free_seqs.front().copied() {
-            Some(old_seq) => self.volume.reuse(old_seq, self.active_seq),
-            None => self.volume.create(self.active_seq),
-        };
-        match opened {
+        match self.volume.create(self.active_seq) {
             Ok(file) => {
-                self.free_seqs.pop_front();
                 self.file = Some(file);
                 self.no_file.store(false, Ordering::Release);
                 Ok(())
             }
             Err(error) if can_pass(&error) => Ok(()),
             Err(error) => Err(error),
-        }
-    }
-
-    /// One spare is all a rotation needs, and any more only stays on the volume and in the next
-    /// startup's reading (D155). A file from before a restart is never the spare, since emptying
-    /// it would take the pages out from under a map of it, and removing it doesn't (D263). A file that can't be removed is harmless: it replays as
-    /// entries already covered, and the next startup has it back in its closed list.
-    fn free(&mut self, seq: u64) {
-        if seq >= self.first_seq && self.free_seqs.is_empty() {
-            self.free_seqs.push_back(seq);
-        } else if let Err(error) = self.volume.remove(seq) {
-            eprintln!("removing WAL file {seq}: {error}");
         }
     }
 
@@ -521,15 +478,8 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
         }
         let closed_seq = self.active_seq;
         let new_seq = closed_seq + 1;
-        let opened = match self.free_seqs.front().copied() {
-            Some(old_seq) => self.volume.reuse(old_seq, new_seq),
-            None => self.volume.create(new_seq),
-        };
-        self.file = match opened {
-            Ok(file) => {
-                self.free_seqs.pop_front();
-                Some(file)
-            }
+        self.file = match self.volume.create(new_seq) {
+            Ok(file) => Some(file),
             Err(error) if can_pass(&error) => {
                 eprintln!(
                     "the WAL can't open a new file: {error}. Writes wait for a later seal to \

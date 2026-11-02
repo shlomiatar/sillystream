@@ -1287,7 +1287,8 @@ async fn a_wal_entry_above_the_former_generations_limit_is_ignored() {
     std::fs::remove_dir_all(disk_a.metadata_dir()).unwrap();
     disk_a.clock.advance(10_000);
     let (node, report) = disk_a.start(manual_config(1));
-    assert_eq!(report.replayed_entry_count, 1, "only r1 is at or below it");
+    // r1's file went once it was checkpointed, so all that is left is r2, which is above it.
+    assert_eq!(report.replayed_entry_count, 0);
     let got: Vec<u64> = read_all(&node, "s", 2)
         .await
         .into_iter()
@@ -1418,7 +1419,7 @@ fn wal_file_count(disk: &Disk) -> usize {
     storage::list_wal_files(&disk.wal_dir()).unwrap().len()
 }
 
-/// The writer hears of a recycle by message, and doesn't answer it.
+/// The writer hears of a removal by message, and doesn't answer it.
 async fn wait_for_wal_files(disk: &Disk, count: usize, what: &str) {
     for _ in 0..2_000 {
         if wal_file_count(disk) <= count {
@@ -1588,7 +1589,7 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
     node.shutdown();
 }
 
-/// A `DirVolume` on a volume with no room for a new file. A reused file needs none.
+/// A `DirVolume` on a volume with no room for a new file.
 struct FullVolume {
     inner: storage::DirVolume,
     created_count: Arc<std::sync::atomic::AtomicU64>,
@@ -1604,10 +1605,6 @@ impl storage::WalVolume for FullVolume {
             return Err(std::io::ErrorKind::StorageFull.into());
         }
         self.inner.create(seq)
-    }
-
-    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> std::io::Result<std::fs::File> {
-        self.inner.reuse(old_seq, new_seq)
     }
 
     fn remove(&mut self, seq: u64) -> std::io::Result<()> {
@@ -1732,6 +1729,8 @@ async fn a_checkpoint_that_stays_bad_refuses_what_waits_for_it() {
         publish_one(&mut client, "busy", seq + 1, b"x").await;
         assert!(node.seal_and_checkpoint().await);
     }
+    // Not sealed, so the WAL holds this stream.
+    publish_one(&mut client, "busy", 11, b"x").await;
     drop(client);
     node.shutdown();
     std::fs::remove_dir_all(disk.metadata_dir()).unwrap();

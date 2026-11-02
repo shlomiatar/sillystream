@@ -8,7 +8,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::record;
 use storage::{
     DirVolume, DurableNotify, WalConfig, WalEntry, WalError, WalFile, WalRotated, WalSendError,
     WalVolume, durable_watches, encode_file_header, encode_wal_entry, replay_dir, start_wal_writer,
@@ -17,7 +16,6 @@ use storage::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     Create(u64),
-    Reuse(u64, u64),
     Remove(u64),
     Write(usize),
     Sync,
@@ -136,11 +134,6 @@ impl WalVolume for Script {
 
     fn create(&mut self, seq: u64) -> io::Result<ScriptFile> {
         self.log.push(Call::Create(seq));
-        Ok(self.open_file())
-    }
-
-    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<ScriptFile> {
-        self.log.push(Call::Reuse(old_seq, new_seq));
         Ok(self.open_file())
     }
 
@@ -419,7 +412,7 @@ fn partial_writes_still_produce_exact_bytes() {
 }
 
 #[test]
-fn rotation_syncs_the_old_file_first_and_reuses_only_recycled_files() {
+fn rotation_syncs_the_old_file_first_and_only_ever_creates_files() {
     let script = Script::default();
     let log = Arc::clone(&script.log);
     let (sender, handle) =
@@ -433,8 +426,8 @@ fn rotation_syncs_the_old_file_first_and_reuses_only_recycled_files() {
             new_seq: 2
         }
     );
-    // Nothing recycled yet: a new file. The active file can't be recycled.
-    sender.try_recycle(2).unwrap();
+    // The active file can't be removed.
+    sender.try_remove(2).unwrap();
     sender.try_rotate().unwrap().blocking_recv().unwrap();
     sender.try_rotate().unwrap().blocking_recv().unwrap();
     drop(sender);
@@ -448,8 +441,9 @@ fn rotation_syncs_the_old_file_first_and_reuses_only_recycled_files() {
             Call::Sync,
             Call::Durable(0, 1),
             Call::Create(2),
-            Call::Reuse(1, 3),
-            // 2 was active at the recycle, so it isn't reused.
+            Call::Remove(1),
+            // 2 was active at the removal, so it stays.
+            Call::Create(3),
             Call::Create(4),
         ]
     );
@@ -487,41 +481,6 @@ async fn a_real_file_end_to_end_wakes_the_core_and_replays() {
 }
 
 #[test]
-fn a_real_reused_file_returns_none_of_its_stale_entries() {
-    let dir = tempfile::tempdir().unwrap();
-    let (notify, _receivers) = durable_watches(1);
-    let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(DirVolume::new(dir.path(), 1 << 16), notify, config(64))
-            .unwrap();
-    for ticket in 1..=20 {
-        sender.try_append(entry(0, ticket)).unwrap();
-    }
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    sender.try_recycle(1).unwrap();
-    // File 3 is file 1 renamed, with none of its 20 old entries left in it.
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    sender.try_append(entry(0, 21)).unwrap();
-    drop(sender);
-    handle.join().unwrap();
-    let names: Vec<u64> = storage::list_wal_files(dir.path())
-        .unwrap()
-        .iter()
-        .map(|file| file.seq)
-        .collect();
-    assert_eq!(names, [2, 3]);
-    let raw = std::fs::read(dir.path().join(storage::wal_file_name(3))).unwrap();
-    assert_eq!(
-        &raw[..storage::WAL_FILE_HEADER_BYTES],
-        encode_file_header(3, 0)
-    );
-    let stale = encode_wal_entry(1, "stream", 7, 2, &[2; 40]).unwrap();
-    assert!(!raw.windows(stale.len()).any(|window| window == stale));
-    let entries = replay_dir(dir.path()).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].producer_seq, 21);
-}
-
-#[test]
 fn entries_that_the_format_cannot_hold_are_refused() {
     use storage::WalEntryError;
     let records = Bytes::from_static(&[0; 8]);
@@ -538,83 +497,6 @@ fn entries_that_the_format_cannot_hold_are_refused() {
         WalEntry::new(Arc::from("s"), 0, 0, Bytes::new(), 0, 0).unwrap_err(),
         WalEntryError::EmptyRecords
     );
-}
-
-/// Record data is the publisher's, and is written verbatim into the file, so it can
-/// hold a fully valid entry seeded with a `seq` the file will have later.
-#[test]
-fn record_data_in_a_reused_file_cannot_be_replayed_as_an_entry() {
-    const AUTHOR: u64 = 7;
-    const FORGED_AT_BYTES: usize = 104;
-    let dir = tempfile::tempdir().unwrap();
-    let (notify, _receivers) = durable_watches(1);
-    let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(DirVolume::new(dir.path(), 1 << 16), notify, config(64))
-            .unwrap();
-    let forged_record = record(u64::MAX >> 1, 0, 0, b"forged system record, author 0");
-    let forged = encode_wal_entry(3, "victim", 999, 1, &forged_record).unwrap();
-    // The entry's head is 34 bytes and the record's 32, so 6 zeros reach the offset.
-    let mut data = vec![0; 6];
-    data.extend_from_slice(&forged);
-    let planted = Bytes::from(record(1 << 16, 0, AUTHOR, &data));
-    sender
-        .try_append(WalEntry::new(Arc::from("attacker"), 1, 1, planted, 0, 1).unwrap())
-        .unwrap();
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    let raw = std::fs::read(dir.path().join(storage::wal_file_name(1))).unwrap();
-    assert_eq!(
-        raw[FORGED_AT_BYTES..]
-            .windows(forged.len())
-            .position(|window| window == forged),
-        Some(0),
-        "the forged entry is where the test means to land"
-    );
-    sender.try_recycle(1).unwrap();
-    // File 3 is file 1 renamed, and the forged entry's CRC is seeded with 3.
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    let innocent = Bytes::from(record(2 << 16, 0, AUTHOR, &[1]));
-    let new_entry = WalEntry::new(Arc::from("other"), 2, 1, innocent.clone(), 0, 2).unwrap();
-    assert_eq!(
-        encode_wal_entry(3, "other", 2, 1, &innocent).unwrap().len(),
-        FORGED_AT_BYTES - storage::WAL_FILE_HEADER_BYTES,
-        "the new entry ends exactly where the forged one starts"
-    );
-    sender.try_append(new_entry).unwrap();
-    drop(sender);
-    handle.join().unwrap();
-    let replayed: Vec<String> = replay_dir(dir.path())
-        .unwrap()
-        .into_iter()
-        .map(|entry| entry.stream)
-        .collect();
-    assert_eq!(replayed, ["other"]);
-}
-
-#[test]
-fn reuse_keeps_the_size_and_nothing_of_the_old_contents() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut volume = DirVolume::new(dir.path(), 4096);
-    let mut file = volume.create(1).unwrap();
-    // Past the preallocated size, as a busy window does (D51).
-    std::io::Write::write_all(&mut file, &[0xAB; 8192]).unwrap();
-    drop(file);
-    let size_bytes = std::fs::metadata(dir.path().join(storage::wal_file_name(1)))
-        .unwrap()
-        .len();
-    assert!(size_bytes > 4096);
-    drop(volume.reuse(1, 2).unwrap());
-    let raw = std::fs::read(dir.path().join(storage::wal_file_name(2))).unwrap();
-    assert_eq!(raw.len() as u64, size_bytes);
-    assert_eq!(
-        &raw[..storage::WAL_FILE_HEADER_BYTES],
-        encode_file_header(2, 0)
-    );
-    assert!(
-        raw[storage::WAL_FILE_HEADER_BYTES..]
-            .iter()
-            .all(|byte| *byte == 0)
-    );
-    assert!(!dir.path().join(storage::wal_file_name(1)).exists());
 }
 
 /// A `Script` whose next opens fail with this OS error, as a descriptor limit would make them.
@@ -638,11 +520,6 @@ impl WalVolume for FailingOpens {
     fn create(&mut self, seq: u64) -> io::Result<ScriptFile> {
         self.check()?;
         self.script.create(seq)
-    }
-
-    fn reuse(&mut self, old_seq: u64, new_seq: u64) -> io::Result<ScriptFile> {
-        self.check()?;
-        self.script.reuse(old_seq, new_seq)
     }
 
     fn remove(&mut self, seq: u64) -> io::Result<()> {
@@ -688,7 +565,7 @@ fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
         ));
         // Still out: another seal is no worse.
         sender.try_rotate().unwrap().blocking_recv().unwrap();
-        sender.try_recycle(0).unwrap();
+        sender.try_remove(0).unwrap();
 
         os_error.store(0, std::sync::atomic::Ordering::SeqCst);
         sender.try_rotate().unwrap().blocking_recv().unwrap();
@@ -697,24 +574,6 @@ fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
         handle.join().unwrap();
         assert!(log.calls().contains(&Call::Durable(0, 2)));
     }
-}
-
-/// A failed reuse leaves the spare in place, so that the retry can still use it.
-#[test]
-fn a_reuse_out_of_descriptors_keeps_its_file_for_the_retry() {
-    let (sender, handle, os_error, log) = start_failing_opens();
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    sender.try_recycle(1).unwrap();
-    os_error.store(EMFILE, std::sync::atomic::Ordering::SeqCst);
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    os_error.store(0, std::sync::atomic::Ordering::SeqCst);
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    sender.try_append(entry(0, 1)).unwrap();
-    drop(sender);
-    handle.join().unwrap();
-    let calls = log.calls();
-    assert!(calls.contains(&Call::Reuse(1, 3)), "{calls:?}");
-    assert!(calls.contains(&Call::Durable(0, 1)), "{calls:?}");
 }
 
 /// Anything else is what it was: a disk that can't be trusted, which ends the writer.
@@ -760,18 +619,12 @@ fn a_flood_cannot_grow_one_group_past_the_channel() {
     assert!(stats.largest_group_count > 1, "nothing grouped: {stats:?}");
 }
 
-/// A map from replay may still be reading a file from before the restart, and emptying the file
-/// would end the process (D263). So those files go, and the spare comes from this run's own.
+/// A removed file's blocks and old bytes go with it, so every file starts with nothing in it,
+/// and a map from replay keeps reading what it has (D263, D265).
 #[test]
-fn a_file_from_before_a_restart_is_removed_and_never_reused() {
+fn a_removed_file_is_gone_and_the_next_one_is_new() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(storage::wal_file_name(1)), b"before").unwrap();
-    let mapped_inode = {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(dir.path().join(storage::wal_file_name(1)))
-            .unwrap()
-            .ino()
-    };
     let (notify, _receivers) = durable_watches(1);
     let (sender, handle) = start_wal_writer::<Bytes, _, _>(
         DirVolume::new(dir.path(), 1 << 16),
@@ -783,7 +636,7 @@ fn a_file_from_before_a_restart_is_removed_and_never_reused() {
         },
     )
     .unwrap();
-    sender.try_recycle(1).unwrap();
+    sender.try_remove(1).unwrap();
     sender.try_rotate().unwrap().blocking_recv().unwrap();
     drop(sender);
     handle.join().unwrap();
@@ -792,8 +645,14 @@ fn a_file_from_before_a_restart_is_removed_and_never_reused() {
         files.iter().map(|file| file.seq).collect::<Vec<_>>(),
         [2, 3]
     );
-    use std::os::unix::fs::MetadataExt;
-    for file in files {
-        assert_ne!(std::fs::metadata(&file.path).unwrap().ino(), mapped_inode);
-    }
+    let raw = std::fs::read(&files[1].path).unwrap();
+    assert_eq!(
+        &raw[..storage::WAL_FILE_HEADER_BYTES],
+        encode_file_header(3, 0)
+    );
+    assert!(
+        raw[storage::WAL_FILE_HEADER_BYTES..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
 }

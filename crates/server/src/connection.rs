@@ -14,7 +14,7 @@ use bytes::Bytes;
 use format::{Clause, Decision, Filter};
 use object_store::ObjectStore;
 use proto::ErrorCode;
-use storage::{BlockTable, SegmentError, SegmentReader, UploaderSender};
+use storage::{BlockTable, SegmentError, SegmentReader};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -27,7 +27,7 @@ use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
     ReadStepMsg, StreamBody, SubRef,
 };
-use crate::slab::{SlabAccount, SlabBytes};
+use crate::slab::SlabAccount;
 
 /// `type u8 | flags u8 | sub u32 | len u32` of a `DATA` frame.
 const DATA_FRAME_HEAD_BYTES: u64 = 10;
@@ -744,7 +744,6 @@ pub(crate) struct Home {
     links: Links,
     settings: DeliverySettings,
     stores: Stores,
-    uploader: UploaderSender<SlabBytes>,
     /// Every core's slab account: a subscriber here can pin a publisher's slabs anywhere.
     accounts: Vec<SlabAccount>,
     next_pressure_check: Instant,
@@ -770,7 +769,6 @@ impl Home {
         links: Links,
         settings: DeliverySettings,
         stores: Stores,
-        uploader: UploaderSender<SlabBytes>,
         accounts: Vec<SlabAccount>,
     ) -> Home {
         Home {
@@ -778,7 +776,6 @@ impl Home {
             links,
             settings,
             stores,
-            uploader,
             accounts,
             next_pressure_check: Instant::now(),
             conns: Vec::new(),
@@ -1736,7 +1733,6 @@ impl Home {
                     uid: sub.uid,
                 },
             };
-            let _ = self.uploader.try_cache_touch(extent.extent.path.clone());
             tokio::spawn(run_extent_job(job));
             return;
         }

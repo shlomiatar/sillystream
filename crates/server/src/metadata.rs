@@ -362,14 +362,14 @@ pub(crate) struct CheckpointJob {
     pub metas: Vec<StreamMeta>,
     pub objects: Vec<String>,
     /// The WAL file this seal closed, if all it holds is now safely elsewhere (D137).
-    pub recycle_seq: Option<u64>,
+    pub remove_seq: Option<u64>,
 }
 
 /// One seal's job, finished.
 pub(crate) struct CheckpointDone {
     pub seal: u64,
     pub gather: u64,
-    pub recycle_seq: Option<u64>,
+    pub remove_seq: Option<u64>,
 }
 
 pub(crate) struct Checkpointer {
@@ -480,7 +480,7 @@ impl Checkpointer {
         Some(CheckpointDone {
             seal: job.seal,
             gather: job.gather,
-            recycle_seq: job.recycle_seq,
+            remove_seq: job.remove_seq,
         })
     }
 

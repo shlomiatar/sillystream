@@ -15,6 +15,7 @@ use storage::{
     BlockEntry, CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership,
     SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects,
     list_wal_files, object_generation, read_ownership, replay_files, sync_wal_files,
+    upload_pending,
 };
 
 use crate::compaction::MANIFEST_STREAM;
@@ -46,11 +47,13 @@ pub struct RecoveryReport {
     pub synced_wal_file_count: u64,
     /// WAL entries above their former generation's limit, left out of replay (section 8.1).
     pub ignored_entry_count: u64,
-    /// The files holding those. Never recycled, since no segment covers them (D228).
+    /// The files holding those. Never removed, since no segment covers them (D228).
     pub kept_wal_seqs: Vec<u64>,
     /// Closed WAL files with something other than zeros after their valid entries (D252).
     pub damaged_wal_seqs: Vec<u64>,
     pub restored_stream_count: u64,
+    /// Segments a former process left waiting to upload, uploaded before anything else.
+    pub uploaded_pending_count: u64,
     /// Objects no checkpoint knew of, whose extents were looked at.
     pub scanned_object_count: u64,
     /// Extents taken from them, and those a former generation's limit ruled out entirely.
@@ -93,7 +96,7 @@ impl RecoveryReport {
                  {} object extents. They were left out and can't be read, and any acked records \
                  among them are gone from the stream. An earlier start with an empty wal_dir, \
                  such as one before its volume was mounted, causes this. WAL files {:?} are kept \
-                 and not recycled; remove them by hand when they are not wanted.",
+                 and not removed; remove them by hand when they are not wanted.",
                 self.ignored_entry_count, self.ignored_extent_count, self.kept_wal_seqs
             )
         })
@@ -567,11 +570,16 @@ fn replay_stream(
 /// and must stop.
 pub(crate) async fn prepare(
     wal_dir: &FsPath,
+    segment_dir: Option<&FsPath>,
     local_store: storage::MetadataStore,
     store: &Arc<dyn ObjectStore>,
     now_ms: u64,
 ) -> Result<(Prepared, Arc<LocalMeta>), String> {
     let mut report = RecoveryReport::default();
+    // Before the scan, which then finds them as it finds any object no checkpoint records.
+    if let Some(dir) = segment_dir {
+        report.uploaded_pending_count = upload_pending(dir, store.as_ref()).await?;
+    }
     let mut ownership = read_ownership(store.as_ref())
         .await
         .map_err(|error| error.to_string())?;
