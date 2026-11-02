@@ -759,3 +759,41 @@ fn a_flood_cannot_grow_one_group_past_the_channel() {
     );
     assert!(stats.largest_group_count > 1, "nothing grouped: {stats:?}");
 }
+
+/// A map from replay may still be reading a file from before the restart, and emptying the file
+/// would end the process (D263). So those files go, and the spare comes from this run's own.
+#[test]
+fn a_file_from_before_a_restart_is_removed_and_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(storage::wal_file_name(1)), b"before").unwrap();
+    let mapped_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir.path().join(storage::wal_file_name(1)))
+            .unwrap()
+            .ino()
+    };
+    let (notify, _receivers) = durable_watches(1);
+    let (sender, handle) = start_wal_writer::<Bytes, _, _>(
+        DirVolume::new(dir.path(), 1 << 16),
+        notify,
+        WalConfig {
+            first_seq: 2,
+            closed_seqs: vec![1],
+            channel_capacity: 16,
+        },
+    )
+    .unwrap();
+    sender.try_recycle(1).unwrap();
+    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let files = storage::list_wal_files(dir.path()).unwrap();
+    assert_eq!(
+        files.iter().map(|file| file.seq).collect::<Vec<_>>(),
+        [2, 3]
+    );
+    use std::os::unix::fs::MetadataExt;
+    for file in files {
+        assert_ne!(std::fs::metadata(&file.path).unwrap().ino(), mapped_inode);
+    }
+}

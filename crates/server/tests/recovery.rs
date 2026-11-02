@@ -337,6 +337,29 @@ async fn limit_on_first_generation(disk: &Disk) -> u64 {
     report.last_valid_id
 }
 
+/// A scan needs an object's indexes and any system records, so a publisher's data stays in the
+/// store until something reads it (D264).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scan_doesnt_download_what_publishers_wrote() {
+    let disk = Disk::new();
+    let limit = limit_on_first_generation(&disk).await;
+    let data = vec![7u8; 2 * 1024 * 1024];
+    put_late_object(
+        disk.store.as_ref(),
+        2,
+        limit + 1,
+        vec![stamped(limit + 1, 1, &data)],
+    )
+    .await;
+    disk.store.range_get_bytes.store(0, Ordering::SeqCst);
+    let (node, report) = disk.start(manual_config(1));
+    assert_eq!(report.adopted_extent_count, 1);
+    let scanned = disk.store.range_get_bytes.load(Ordering::SeqCst);
+    assert!(scanned < 64 * 1024, "the scan asked for {scanned} bytes");
+    assert_eq!(read_all(&node, "late", 1).await, vec![(limit + 1, data)]);
+    node.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_late_object_is_accepted_up_to_the_last_valid_id_and_no_further() {
     let disk = Disk::new();
@@ -1588,12 +1611,15 @@ impl storage::WalVolume for FullVolume {
     }
 
     fn remove(&mut self, seq: u64) -> std::io::Result<()> {
+        // Removing a file is what makes room.
+        self.full.store(false, Ordering::SeqCst);
         self.inner.remove(seq)
     }
 }
 
 /// With no room for a new WAL file, a restart still starts: it serves reads, holds writes back,
-/// and uploads what the closed files hold, and that frees the file it then writes to. It was
+/// and uploads what the closed files hold, and removing those makes room for the file it then
+/// writes to (D263). It was
 /// stuck: nothing could be uploaded until the writer had a file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_with_no_room_for_a_wal_file_uploads_its_way_out() {

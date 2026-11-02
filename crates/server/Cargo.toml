@@ -17,6 +17,7 @@ bench = false
 test-hooks = ["storage/test-hooks"]
 
 [dependencies]
+futures-util.workspace = true
 format.workspace = true
 proto.workspace = true
 auth.workspace = true

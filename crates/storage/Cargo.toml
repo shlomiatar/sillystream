@@ -16,7 +16,10 @@ format.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
 fjall.workspace = true
+libc = "0.2"
+memmap2 = "0.9"
 object_store.workspace = true
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 xxhash-rust.workspace = true
 

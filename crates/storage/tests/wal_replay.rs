@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use proptest::prelude::*;
 use storage::{
-    ReplayedEntry, WAL_FILE_HEADER_BYTES, encode_file_header, encode_wal_entry, replay_bytes,
-    replay_dir, wal_file_name,
+    ReplayedEntry, WAL_FILE_HEADER_BYTES, WalFileInfo, encode_file_header, encode_wal_entry,
+    replay_bytes, replay_dir, replay_file, replay_files, wal_file_name,
 };
 
 const SEQ: u64 = 42;
@@ -229,4 +229,62 @@ proptest! {
     fn entirely_random_files_never_panic(bytes in prop::collection::vec(any::<u8>(), 0..64), seq in any::<u64>()) {
         let _ = replay_bytes(&Bytes::from(bytes), seq);
     }
+}
+
+/// Writes `bytes` at the start of a file of `len_bytes`, the rest a hole, as `DirVolume` does.
+fn sparse_wal_file(dir: &std::path::Path, seq: u64, bytes: &[u8], len_bytes: u64) -> WalFileInfo {
+    let path = dir.join(wal_file_name(seq));
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len_bytes)
+        .unwrap();
+    WalFileInfo { seq, path }
+}
+
+#[test]
+fn a_mapped_file_with_a_hole_for_a_tail_replays_and_has_no_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = encode_file_header(SEQ, 0).to_vec();
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 26);
+    let replayed = replay_file(&file).unwrap();
+    assert_eq!(replayed.entries.len(), 1);
+    assert_eq!(replayed.entries[0].records, vec![0xEE; 32]);
+    assert_eq!(replayed.valid_end_bytes, bytes.len());
+    assert!(!replayed.damaged_tail);
+}
+
+#[test]
+fn a_mapped_file_finds_damage_past_a_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = encode_file_header(SEQ, 0).to_vec();
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 22);
+    let mut handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file.path)
+        .unwrap();
+    std::io::Seek::seek(&mut handle, std::io::SeekFrom::Start((1 << 22) - 1)).unwrap();
+    std::io::Write::write_all(&mut handle, &[1]).unwrap();
+    drop(handle);
+    let replayed = replay_file(&file).unwrap();
+    assert_eq!(replayed.entries.len(), 1);
+    assert!(replayed.damaged_tail);
+}
+
+#[test]
+fn replayed_entries_outlive_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = encode_file_header(SEQ, 0).to_vec();
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 16);
+    let replayed = replay_files(std::slice::from_ref(&file))
+        .pop()
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&file.path).unwrap();
+    assert_eq!(replayed.entries[0].records, vec![0xEE; 32]);
 }

@@ -9,12 +9,16 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::error::TrySendError;
@@ -259,8 +263,17 @@ where
             .name("uploader".to_owned())
             .spawn(move || {
                 let section_count = config.section_count;
+                let putter = Arc::new(Putter {
+                    store: Arc::clone(&config.store),
+                    stop: Arc::clone(&thread_stop),
+                    events: config.events.clone(),
+                    retry_initial_ms: config.retry_initial_ms,
+                    retry_max_ms: config.retry_max_ms,
+                    put_timeout_min_ms: config.put_timeout_min_ms,
+                });
                 let worker = Worker {
                     config,
+                    putter,
                     stop: thread_stop,
                     sending_count: thread_sending_count,
                     pending: BTreeMap::new(),
@@ -334,8 +347,43 @@ const STOP_CHECK_MS: u64 = 20;
 /// What a PUT attempt is allowed on top of its minimum: 1 MiB/s, about.
 const PUT_TIMEOUT_BYTES_PER_MS: u64 = 1_024;
 
+/// PUTs running at once. Each is one object, so this bounds how far uploads can fall behind a
+/// store whose single PUT is slow, and it doesn't change how many objects a seal makes (D261).
+const CONCURRENT_PUTS: usize = 8;
+
+/// What a PUT needs from the uploader, apart from `Worker`, which only runs between them.
+struct Putter {
+    store: Arc<dyn ObjectStore>,
+    stop: Arc<AtomicBool>,
+    events: Vec<UnboundedSender<UploadEvent>>,
+    retry_initial_ms: u64,
+    retry_max_ms: u64,
+    put_timeout_min_ms: u64,
+}
+
+enum PutEnd {
+    Uploaded {
+        path: Path,
+        built: BuiltSegment,
+    },
+    /// Nothing to upload.
+    Empty,
+    Failed(String),
+    Stopped,
+}
+
+struct Finished<R> {
+    key: UploadKey,
+    ended: PutEnd,
+    /// The references, which go back if the object didn't reach the store.
+    keep: UnfinishedUpload<R>,
+}
+
+type Put<R> = Pin<Box<dyn Future<Output = Finished<R>>>>;
+
 struct Worker<R> {
     config: UploaderConfig,
+    putter: Arc<Putter>,
     stop: Arc<AtomicBool>,
     sending_count: Arc<AtomicUsize>,
     pending: BTreeMap<u64, BTreeMap<usize, Section<R>>>,
@@ -372,11 +420,19 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         mut touch_rx: Receiver<Path>,
     ) -> UploaderExit<R> {
         let mut touches_open = true;
+        let mut in_flight: FuturesOrdered<Put<R>> = FuturesOrdered::new();
         loop {
+            let (has_room, has_puts) = (in_flight.len() < CONCURRENT_PUTS, !in_flight.is_empty());
             // This has to wait on the runtime, not block the thread: connections opened here
             // run on this runtime, and the store's other users share them (D260).
             let command = tokio::select! {
-                command = rx.recv() => match command {
+                finished = in_flight.next(), if has_puts => {
+                    if let Some(finished) = finished {
+                        self.finish(finished);
+                    }
+                    continue;
+                },
+                command = rx.recv(), if has_room => match command {
                     Some(command) => command,
                     None => break,
                 },
@@ -410,15 +466,21 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                     core,
                     section,
                 } => {
-                    self.receive_section(seal, core, section).await;
+                    if let Some(put) = self.receive_section(seal, core, section) {
+                        in_flight.push_back(put);
+                    }
                 }
                 UploadCommand::Dedicated {
                     stream,
                     number,
                     records,
-                } => self.upload_dedicated(stream, number, records).await,
+                } => in_flight.push_back(self.start_dedicated(stream, number, records)),
                 UploadCommand::Wake => {}
             }
+        }
+        // These end soon if the flag is set. Otherwise they retry until they're in the store.
+        while let Some(finished) = in_flight.next().await {
+            self.finish(finished);
         }
         // The flag is set or every sender is gone, so nothing can arrive after these
         // sends (see `UploaderSender::send`). They take a moment, so this is a short wait.
@@ -445,7 +507,8 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
     }
 
-    async fn receive_section(&mut self, seal: u64, core: usize, section: Section<R>) {
+    /// The seal's upload, once this was its last section.
+    fn receive_section(&mut self, seal: u64, core: usize, section: Section<R>) -> Option<Put<R>> {
         // Counting sections is what fires the upload, so a wrong one must not count,
         // and replacing one would drop its references.
         let in_order = self
@@ -461,16 +524,16 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                 key: UploadKey::Seal(seal),
                 error: format!("unexpected section from core {core}"),
             });
-            return;
+            return None;
         };
         *last = Some(seal);
         let sections = self.pending.entry(seal).or_default();
         sections.insert(core, section);
-        if sections.len() == self.config.section_count
-            && let Some(sections) = self.pending.remove(&seal)
-        {
-            self.upload_seal(seal, sections).await;
+        if sections.len() != self.config.section_count {
+            return None;
         }
+        let sections = self.pending.remove(&seal)?;
+        Some(self.start_seal(seal, sections))
     }
 
     fn keep_unfinished(&mut self, command: UploadCommand<R>) {
@@ -508,35 +571,45 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
     }
 
-    async fn upload_seal(&mut self, seal: u64, sections: BTreeMap<usize, Section<R>>) {
-        let key = UploadKey::Seal(seal);
-        let built = build_seal(&sections);
-        let uploaded = match built {
-            Ok(built) => {
-                let Some(first_id) = built.first_id else {
-                    self.emit(UploadEvent::Empty { key });
-                    return;
-                };
-                let (node, generation) = (self.config.node.clone(), self.config.generation);
-                let last_id = built.last_id.unwrap_or(first_id);
-                let path = |first_id| sealed_path(&node, generation, first_id, last_id);
-                self.upload(key, &path, first_id, built).await
-            }
-            Err(error) => {
-                self.emit(UploadEvent::Failed {
+    /// Runs in the order uploads started, however their PUTs finish, because a seal's event
+    /// lets its WAL files go and that seal's records have to be in the store by then (D261).
+    fn finish(&mut self, finished: Finished<R>) {
+        let Finished { key, ended, keep } = finished;
+        match ended {
+            PutEnd::Uploaded { path, built } => {
+                if let Some(cache) = &mut self.config.cache {
+                    // The object is safe in the store, so a local failure only costs a read.
+                    let _ = cache.put(&path, &built.parts);
+                }
+                self.emit(UploadEvent::Uploaded {
                     key,
-                    error: error.to_string(),
+                    path,
+                    len_bytes: built.len_bytes,
+                    extents: Arc::new(built.extents),
                 });
-                false
             }
-        };
-        if !uploaded {
-            self.unfinished
-                .push(UnfinishedUpload::Seal { seal, sections });
+            PutEnd::Empty => self.emit(UploadEvent::Empty { key }),
+            PutEnd::Failed(error) => {
+                self.emit(UploadEvent::Failed { key, error });
+                self.unfinished.push(keep);
+            }
+            PutEnd::Stopped => self.unfinished.push(keep),
         }
     }
 
-    async fn upload_dedicated(&mut self, stream: Arc<str>, number: u64, records: Vec<R>) {
+    fn start_seal(&self, seal: u64, sections: BTreeMap<usize, Section<R>>) -> Put<R> {
+        let key = UploadKey::Seal(seal);
+        let built = build_seal(&sections);
+        let (node, generation) = (self.config.node.clone(), self.config.generation);
+        self.start(
+            key,
+            built,
+            Box::new(move |first_id, last_id| sealed_path(&node, generation, first_id, last_id)),
+            UnfinishedUpload::Seal { seal, sections },
+        )
+    }
+
+    fn start_dedicated(&self, stream: Arc<str>, number: u64, records: Vec<R>) -> Put<R> {
         let key = UploadKey::Dedicated {
             stream: Arc::clone(&stream),
             number,
@@ -547,97 +620,90 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
             Ok(()) => builder.finish(),
             Err(error) => Err(error),
         };
-        let uploaded = match built {
-            Ok(built) => {
-                let Some(first_id) = built.first_id else {
-                    self.emit(UploadEvent::Empty { key });
-                    return;
-                };
-                let generation = self.config.generation;
-                let last_id = built.last_id.unwrap_or(first_id);
-                let path = |first_id| sealed_path(&stream, generation, first_id, last_id);
-                self.upload(key, &path, first_id, built).await
-            }
-            Err(error) => {
-                self.emit(UploadEvent::Failed {
-                    key,
-                    error: error.to_string(),
-                });
-                false
-            }
-        };
-        if !uploaded {
-            self.unfinished.push(UnfinishedUpload::Dedicated {
+        let name = Arc::clone(&stream);
+        let generation = self.config.generation;
+        self.start(
+            key,
+            built,
+            Box::new(move |first_id, last_id| sealed_path(&name, generation, first_id, last_id)),
+            UnfinishedUpload::Dedicated {
                 stream,
                 number,
                 records,
-            });
-        }
+            },
+        )
     }
 
-    /// Retries until the PUT succeeds or the uploader is stopped. Returns whether the
-    /// object is in the store. A path held by different bytes moves to the next `first_id`:
-    /// the name only has to be unique, and readers find objects by extent (D156).
-    async fn upload(
-        &mut self,
+    fn start(
+        &self,
         key: UploadKey,
+        built: Result<BuiltSegment, SegmentError>,
+        path_for: Box<dyn Fn(u64, u64) -> Path>,
+        keep: UnfinishedUpload<R>,
+    ) -> Put<R> {
+        let putter = Arc::clone(&self.putter);
+        Box::pin(async move {
+            let ended = match built {
+                Ok(built) => match built.first_id {
+                    Some(first_id) => {
+                        let last_id = built.last_id.unwrap_or(first_id);
+                        let path = |first_id| path_for(first_id, last_id);
+                        putter.upload(&key, &path, first_id, built).await
+                    }
+                    None => PutEnd::Empty,
+                },
+                Err(error) => PutEnd::Failed(error.to_string()),
+            };
+            Finished { key, ended, keep }
+        })
+    }
+}
+
+impl Putter {
+    /// Retries until the PUT succeeds or the uploader is stopped. A path held by different bytes
+    /// moves to the next `first_id`: the name only has to be unique, and readers find objects by
+    /// extent (D156).
+    async fn upload(
+        &self,
+        key: &UploadKey,
         path_for: &dyn Fn(u64) -> Path,
         mut first_id: u64,
         built: BuiltSegment,
-    ) -> bool {
+    ) -> PutEnd {
         let mut path = path_for(first_id);
         if !path_fits_stores(&path) {
-            self.emit(UploadEvent::Failed {
-                key,
-                error: format!("{path} has a part too long for an object path"),
-            });
-            return false;
+            return PutEnd::Failed(format!("{path} has a part too long for an object path"));
         }
-        let mut backoff_ms = self.config.retry_initial_ms;
+        let mut backoff_ms = self.retry_initial_ms;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let Some(put) = self.put_unless_stopped(&path, &built.parts).await else {
-                return false;
+                return PutEnd::Stopped;
             };
             match put {
-                Ok(()) => break,
+                Ok(()) => return PutEnd::Uploaded { path, built },
                 Err(PutError::Collision) => {
                     first_id += 1;
                     path = path_for(first_id);
                     continue;
                 }
-                Err(error @ PutError::Permanent(_)) => {
-                    self.emit(UploadEvent::Failed {
-                        key,
-                        error: error.to_string(),
-                    });
-                    return false;
-                }
+                Err(error @ PutError::Permanent(_)) => return PutEnd::Failed(error.to_string()),
                 Err(error @ PutError::Retryable(_)) => {
-                    self.emit(UploadEvent::Retrying {
-                        key: key.clone(),
-                        attempt,
-                        error: error.to_string(),
-                    });
+                    for events in &self.events {
+                        let _ = events.send(UploadEvent::Retrying {
+                            key: key.clone(),
+                            attempt,
+                            error: error.to_string(),
+                        });
+                    }
                 }
             }
             if !self.wait_unless_stopped(backoff_ms).await {
-                return false;
+                return PutEnd::Stopped;
             }
-            backoff_ms = backoff_ms.saturating_mul(2).min(self.config.retry_max_ms);
+            backoff_ms = backoff_ms.saturating_mul(2).min(self.retry_max_ms);
         }
-        if let Some(cache) = &mut self.config.cache {
-            // The object is safe in the store, so a local failure only costs a read.
-            let _ = cache.put(&path, &built.parts);
-        }
-        self.emit(UploadEvent::Uploaded {
-            key,
-            path,
-            len_bytes: built.len_bytes,
-            extents: Arc::new(built.extents),
-        });
-        true
     }
 
     /// One PUT, abandoned if the uploader is stopped: nothing bounds how long a store
@@ -650,12 +716,11 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
     ) -> Option<Result<(), PutError>> {
         let total_bytes: usize = parts.iter().map(Bytes::len).sum();
         let timeout_ms = self
-            .config
             .put_timeout_min_ms
             .saturating_add(total_bytes as u64 / PUT_TIMEOUT_BYTES_PER_MS);
         let put = tokio::time::timeout(
             Duration::from_millis(timeout_ms),
-            put_once(self.config.store.as_ref(), path, parts),
+            put_once(self.store.as_ref(), path, parts),
         );
         tokio::select! {
             biased;

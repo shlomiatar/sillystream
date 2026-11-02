@@ -7,13 +7,14 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use format::Records;
+use format::{BlockAuthor, Records};
+use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership, SegmentReader,
-    StreamExtent, StreamMeta, claim_generation, list_sealed_objects, list_wal_files,
-    object_generation, read_ownership, replay_file, sync_wal_files,
+    BlockEntry, CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership,
+    SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects,
+    list_wal_files, object_generation, read_ownership, replay_files, sync_wal_files,
 };
 
 use crate::compaction::MANIFEST_STREAM;
@@ -256,7 +257,103 @@ fn entry_is_above(entry: &storage::ReplayedEntry, limit: u64) -> bool {
 struct ScannedExtent {
     stream: Arc<str>,
     extent: MetaExtent,
-    records: Bytes,
+    /// The blocks that may hold system records, in order. Replay needs nothing else (D264).
+    system_blocks: Vec<Bytes>,
+}
+
+/// Objects a scan reads at once. Their order is kept.
+const CONCURRENT_OBJECT_SCANS: usize = 16;
+
+/// Reads the runs of an extent's blocks that may hold system records.
+async fn read_system_blocks(
+    reader: &SegmentReader,
+    extent: &StreamExtent,
+) -> Result<Vec<Bytes>, SegmentError> {
+    let table = reader.read_table(extent).await?;
+    let may_hold = |block: &BlockEntry| !matches!(block.summary.author, BlockAuthor::Single(author) if author != 0);
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < table.blocks.len() {
+        if !may_hold(&table.blocks[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while table.blocks.get(index).is_some_and(may_hold) {
+            index += 1;
+        }
+        blocks.push(reader.read_blocks(extent, &table, start..index).await?);
+    }
+    Ok(blocks)
+}
+
+/// One object of a scan.
+struct ScannedOne {
+    extents: Vec<ScannedExtent>,
+    object: ScannedObject,
+    ignored_extent_count: u64,
+}
+
+async fn scan_object(
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    len_bytes: u64,
+    limit: Option<u64>,
+) -> Result<ScannedOne, String> {
+    let describe = |error: SegmentError| format!("{path}: {error}");
+    let reader = SegmentReader::new(store, path.clone());
+    let top = reader.read_top_index().await.map_err(describe)?;
+    let extents = reader.all_extents(&top).await.map_err(describe)?;
+    let mut out = Vec::new();
+    let mut needs_manifest = false;
+    let mut ignored_extent_count = 0;
+    for extent in extents {
+        if limit.is_some_and(|limit| extent.id_first > limit) {
+            ignored_extent_count += 1;
+            continue;
+        }
+        let (id_last, system_blocks) = match limit {
+            // Where the accepted part ends takes the records themselves.
+            Some(limit) if extent.id_last > limit => {
+                let records = reader.read_extent(&extent).await.map_err(describe)?;
+                match accepted_prefix(&records, limit) {
+                    Some((id_last, records)) => (id_last, vec![records]),
+                    None => {
+                        ignored_extent_count += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => (
+                extent.id_last,
+                read_system_blocks(&reader, &extent)
+                    .await
+                    .map_err(describe)?,
+            ),
+        };
+        needs_manifest |= &*extent.stream != MANIFEST_STREAM;
+        out.push(ScannedExtent {
+            stream: Arc::clone(&extent.stream),
+            extent: MetaExtent {
+                path: path.to_string(),
+                offset: extent.offset,
+                len_bytes: extent.len_bytes,
+                id_first: extent.id_first,
+                id_last,
+                block_count: extent.block_count,
+            },
+            system_blocks,
+        });
+    }
+    Ok(ScannedOne {
+        extents: out,
+        object: ScannedObject {
+            path: path.to_string(),
+            len_bytes,
+            needs_manifest,
+        },
+        ignored_extent_count,
+    })
 }
 
 /// Objects no checkpoint records, which a crash left between upload and checkpoint or a
@@ -284,58 +381,19 @@ async fn scan_objects(
         })
         .collect();
     objects.sort();
+    let mut scans =
+        futures_util::stream::iter(objects.into_iter().map(|(generation, path, len_bytes)| {
+            let limit = ownership.limit_for(generation);
+            scan_object(Arc::clone(store), path, len_bytes, limit)
+        }))
+        .buffered(CONCURRENT_OBJECT_SCANS);
     let mut out = Vec::new();
-    for (generation, path, len_bytes) in objects {
+    while let Some(scan) = scans.next().await {
+        let scan = scan?;
         report.scanned_object_count += 1;
-        let mut needs_manifest = false;
-        let limit = ownership.limit_for(generation);
-        let reader = SegmentReader::new(Arc::clone(store), path.clone());
-        let top = reader
-            .read_top_index()
-            .await
-            .map_err(|error| format!("{path}: {error}"))?;
-        let extents = reader
-            .all_extents(&top)
-            .await
-            .map_err(|error| format!("{path}: {error}"))?;
-        for extent in extents {
-            if limit.is_some_and(|limit| extent.id_first > limit) {
-                report.ignored_extent_count += 1;
-                continue;
-            }
-            let records = reader
-                .read_extent(&extent)
-                .await
-                .map_err(|error| format!("{path}: {error}"))?;
-            let (id_last, records) = match limit {
-                Some(limit) if extent.id_last > limit => match accepted_prefix(&records, limit) {
-                    Some(accepted) => accepted,
-                    None => {
-                        report.ignored_extent_count += 1;
-                        continue;
-                    }
-                },
-                _ => (extent.id_last, records),
-            };
-            needs_manifest |= &*extent.stream != MANIFEST_STREAM;
-            out.push(ScannedExtent {
-                stream: Arc::clone(&extent.stream),
-                extent: MetaExtent {
-                    path: path.to_string(),
-                    offset: extent.offset,
-                    len_bytes: extent.len_bytes,
-                    id_first: extent.id_first,
-                    id_last,
-                    block_count: extent.block_count,
-                },
-                records,
-            });
-        }
-        objects_seen.push(ScannedObject {
-            path: path.to_string(),
-            len_bytes,
-            needs_manifest,
-        });
+        report.ignored_extent_count += scan.ignored_extent_count;
+        out.extend(scan.extents);
+        objects_seen.push(scan.object);
     }
     Ok(out)
 }
@@ -364,7 +422,7 @@ fn replay_stream(
     let mut new_extents = Vec::new();
 
     enum Item {
-        Scanned(Bytes),
+        Scanned { blocks: Vec<Bytes>, last_id: u64 },
         Wal(storage::ReplayedEntry),
     }
     let mut items: Vec<(u64, Item)> = Vec::new();
@@ -378,7 +436,13 @@ fn replay_stream(
             continue;
         }
         report.adopted_extent_count += 1;
-        items.push((extent.id_first, Item::Scanned(scanned.records)));
+        items.push((
+            extent.id_first,
+            Item::Scanned {
+                blocks: scanned.system_blocks,
+                last_id: extent.id_last,
+            },
+        ));
         new_extents.push(extent.clone());
         meta.extents.push(extent);
     }
@@ -408,29 +472,33 @@ fn replay_stream(
         state.install(meta.state.clone(), meta.state_ver);
     }
     for (first_id, item) in items {
-        let (bytes, producer) = match &item {
-            Item::Scanned(bytes) => (bytes, None),
+        let (parts, producer, known_last_id) = match &item {
+            Item::Scanned { blocks, last_id } => (blocks.as_slice(), None, Some(*last_id)),
             Item::Wal(entry) => (
-                &entry.records,
+                std::slice::from_ref(&entry.records),
                 Some((entry.producer_id, entry.producer_seq)),
+                None,
             ),
         };
         let mut last_id = first_id;
         let mut item_count = 0u64;
-        for record in Records::new(bytes) {
-            let record = record.map_err(|error| format!("a record of {name}: {error}"))?;
-            last_id = record.header.last_id();
-            item_count += u64::from(record.header.count);
-            // The one case the runtime reads a record's data (section 2.2).
-            if record.header.is_system()
-                && record.header.options != format::ENTRY_SEAL_MANIFEST
-                && record.header.id > applied_id
-            {
-                state
-                    .replay(&record)
-                    .map_err(|error| format!("a state op of {name}: {error}"))?;
+        for bytes in parts {
+            for record in Records::new(bytes) {
+                let record = record.map_err(|error| format!("a record of {name}: {error}"))?;
+                last_id = record.header.last_id();
+                item_count += u64::from(record.header.count);
+                // The one case the runtime reads a record's data (section 2.2).
+                if record.header.is_system()
+                    && record.header.options != format::ENTRY_SEAL_MANIFEST
+                    && record.header.id > applied_id
+                {
+                    state
+                        .replay(&record)
+                        .map_err(|error| format!("a state op of {name}: {error}"))?;
+                }
             }
         }
+        let last_id = known_last_id.unwrap_or(last_id);
         if last_id <= floor_id {
             continue;
         }
@@ -546,10 +614,10 @@ pub(crate) async fn prepare(
     let mut closed_seqs = Vec::with_capacity(wal_files.len());
     let mut empty_files = Vec::new();
     let mut first_seq = 1;
-    for file in &wal_files {
+    for (file, replayed) in wal_files.iter().zip(replay_files(&wal_files)) {
         closed_seqs.push(file.seq);
         first_seq = first_seq.max(file.seq + 1);
-        let replayed = replay_file(file).map_err(|error| error.to_string())?;
+        let replayed = replayed.map_err(|error| error.to_string())?;
         // The newest file's tail is the torn write the CRC is for.
         if replayed.damaged_tail && wal_files.last().is_some_and(|last| last.seq != file.seq) {
             report.damaged_wal_seqs.push(file.seq);

@@ -496,11 +496,21 @@ impl Checkpointer {
         let (head, built) = if full {
             let store = Arc::clone(&self.store);
             let checkpoints = self.checkpoints.clone();
-            let mut all = self
-                .retry("merging checkpoints", async || {
-                    checkpoints.merge_all(&store).await
-                })
-                .await?;
+            let merged = self.retry("merging checkpoints", async || {
+                checkpoints.merge_all(&store).await
+            });
+            // One read per stream per file, so this can outlast any wait for a stop. The next
+            // startup puts the file this seal owes (D262).
+            let stop = Arc::clone(&self.stop);
+            let stopped = async {
+                while !stop.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let mut all = tokio::select! {
+                merged = merged => merged?,
+                () = stopped => return None,
+            };
             for meta in metas {
                 merge_meta(&mut all, meta);
             }
@@ -561,6 +571,11 @@ pub(crate) fn run_checkpointer(
     };
     runtime.block_on(async {
         while let Some(job) = rx.recv().await {
+            // What's still queued can wait for the next startup, which replays it from the WAL
+            // these jobs haven't let go of (D262).
+            if checkpointer.stop.load(Ordering::SeqCst) {
+                return;
+            }
             match checkpointer.save(job).await {
                 Some(finished) => done(finished),
                 None => return,

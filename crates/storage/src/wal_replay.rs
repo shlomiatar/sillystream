@@ -1,7 +1,11 @@
 //! Reading the WAL during recovery (SPEC sections 6.3, 8.1).
 
+use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use format::{crc32c, crc32c_append, crc32c_seeded};
@@ -83,10 +87,54 @@ fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, 
     Some((entry, offset + total))
 }
 
+/// Whether any byte is set. An OR over a whole chunk has no early exit, so it compiles to SIMD.
+fn any_nonzero(bytes: &[u8]) -> bool {
+    bytes
+        .chunks(64 * 1024)
+        .any(|chunk| chunk.iter().fold(0u8, |set, byte| set | byte) != 0)
+}
+
+/// `any_nonzero` of `bytes[start..]`, the whole of `file`, without touching its holes: a
+/// preallocated tail is one (D51), and reading it would fault in every page.
+fn any_nonzero_in_data(file: &File, bytes: &[u8], start: usize) -> bool {
+    let fd = file.as_raw_fd();
+    let mut offset = start;
+    while offset < bytes.len() {
+        // SAFETY: `lseek` takes no pointers, and `file` keeps `fd` open.
+        let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            return match io::Error::last_os_error().raw_os_error() {
+                // Only a hole is left.
+                Some(libc::ENXIO) => false,
+                _ => any_nonzero(&bytes[offset..]),
+            };
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        let end = if hole < 0 { bytes.len() } else { hole as usize };
+        let (data, end) = (data as usize, end.min(bytes.len()));
+        if data >= end {
+            return false;
+        }
+        if any_nonzero(&bytes[data..end]) {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
 /// The longest valid prefix of a file that should have the given `seq`. A file whose
 /// header isn't exactly `magic, seq, generation, crc, 0` has no valid entries: this covers a
 /// crash between the rename and the header write of a reused file (D8).
 pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
+    let mut replayed = parse_prefix(file, seq);
+    replayed.damaged_tail = any_nonzero(&file[replayed.valid_end_bytes..]);
+    replayed
+}
+
+/// The prefix alone, with `damaged_tail` left for the caller.
+fn parse_prefix(file: &Bytes, seq: u64) -> ReplayedFile {
     let mut replayed = ReplayedFile {
         entries: Vec::new(),
         valid_end_bytes: 0,
@@ -99,7 +147,6 @@ pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
         || read_u32(file, 24) != crc32c(&file[..24])
         || read_u32(file, 28) != 0
     {
-        replayed.damaged_tail = file.iter().any(|byte| *byte != 0);
         return replayed;
     }
     replayed.generation = read_u64(file, 16);
@@ -109,7 +156,6 @@ pub fn replay_bytes(file: &Bytes, seq: u64) -> ReplayedFile {
         offset = next;
     }
     replayed.valid_end_bytes = offset;
-    replayed.damaged_tail = file[offset..].iter().any(|byte| *byte != 0);
     replayed
 }
 
@@ -157,9 +203,49 @@ pub fn sync_wal_files(dir: &Path, files: &[WalFileInfo]) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// Replays a file through a map of it, so that its entries cost page cache the kernel can take
+/// back and not heap (D263).
 pub fn replay_file(file: &WalFileInfo) -> io::Result<ReplayedFile> {
-    let bytes = Bytes::from(std::fs::read(&file.path)?);
-    Ok(replay_bytes(&bytes, file.seq))
+    let handle = File::open(&file.path)?;
+    if handle.metadata()?.len() == 0 {
+        return Ok(replay_bytes(&Bytes::new(), file.seq));
+    }
+    // SAFETY: nothing truncates or writes a file while its map lives. Only the writer touches
+    // this directory, and it removes files from before a restart instead of reusing them. A
+    // read the disk fails ends the process, as a failed WAL sync does.
+    let map = unsafe { memmap2::Mmap::map(&handle) }?;
+    map.advise(memmap2::Advice::Sequential)?;
+    let bytes = Bytes::from_owner(map);
+    let mut replayed = parse_prefix(&bytes, file.seq);
+    replayed.damaged_tail = any_nonzero_in_data(&handle, &bytes, replayed.valid_end_bytes);
+    Ok(replayed)
+}
+
+/// `replay_file` of each of `files`, on every core, in their order.
+pub fn replay_files(files: &[WalFileInfo]) -> Vec<io::Result<ReplayedFile>> {
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<io::Result<ReplayedFile>>>> =
+        files.iter().map(|_| Mutex::new(None)).collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(files.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(file) = files.get(index) else {
+                        return;
+                    };
+                    *slots[index].lock().unwrap() = Some(replay_file(file));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap().expect("every file was taken"))
+        .collect()
 }
 
 /// The valid prefix of every file, oldest file first. The end of one file's prefix

@@ -335,6 +335,7 @@ where
         notify,
         file,
         no_file: Arc::clone(&no_file),
+        first_seq: config.first_seq,
         active_seq: config.first_seq,
         closed_seqs: config.closed_seqs.into(),
         free_seqs: VecDeque::new(),
@@ -365,6 +366,8 @@ struct Writer<V: WalVolume, N> {
     no_file: Arc<AtomicBool>,
     active_seq: u64,
     closed_seqs: VecDeque<u64>,
+    /// Files below this are from before a restart, and replay may still have them mapped.
+    first_seq: u64,
     free_seqs: VecDeque<u64>,
     channel_capacity: usize,
     stats: WalStats,
@@ -443,10 +446,11 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
     }
 
     /// One spare is all a rotation needs, and any more only stays on the volume and in the next
-    /// startup's reading (D155). A file that can't be removed is harmless: it replays as
+    /// startup's reading (D155). A file from before a restart is never the spare, since emptying
+    /// it would take the pages out from under a map of it, and removing it doesn't (D263). A file that can't be removed is harmless: it replays as
     /// entries already covered, and the next startup has it back in its closed list.
     fn free(&mut self, seq: u64) {
-        if self.free_seqs.is_empty() {
+        if seq >= self.first_seq && self.free_seqs.is_empty() {
             self.free_seqs.push_back(seq);
         } else if let Err(error) = self.volume.remove(seq) {
             eprintln!("removing WAL file {seq}: {error}");

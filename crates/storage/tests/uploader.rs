@@ -412,9 +412,10 @@ async fn try_send_on_a_full_channel_returns_at_once() {
             Err(UploadSendError::Stopped(_)) => panic!("stopped"),
         }
     }
-    assert!(full_count >= 997, "{full_count}");
+    // At most 8 PUTs at once and 2 waiting in the channel, whatever was being retried.
+    assert!(full_count >= 989, "{full_count}");
     let exit = uploader.shutdown();
-    assert_eq!(exit.unfinished.len(), 3);
+    assert_eq!(exit.unfinished.len(), 1 + 999 - full_count);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1149,6 +1150,190 @@ async fn an_idle_uploader_keeps_running_the_tasks_a_put_left() {
     .expect("the task stopped running once the uploader went idle");
     drop(sender);
     uploader.shutdown();
+}
+
+/// Holds back PUTs of objects whose name has `held` in it until `release` is set, and counts the
+/// PUTs waiting.
+#[derive(Debug)]
+struct HoldsPuts {
+    inner: InMemory,
+    held: String,
+    release: Arc<AtomicBool>,
+    waiting: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl std::fmt::Display for HoldsPuts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HoldsPuts")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for HoldsPuts {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if location.as_ref().contains(&self.held) {
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn dedicated_records(stream: &str, id: u64) -> (Arc<str>, Vec<Bytes>) {
+    (
+        Arc::from(stream),
+        vec![Bytes::from(record(id, 0, 7, b"held back"))],
+    )
+}
+
+async fn wait_for(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !done() {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// A slow PUT holds the store's next ones up no longer, and their events still come in order: a
+/// seal's event lets its WAL files go, so it can't pass an earlier seal still on its way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn puts_overlap_and_their_events_stay_in_order() {
+    let inner = InMemory::new();
+    let release = Arc::new(AtomicBool::new(false));
+    let waiting = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(HoldsPuts {
+        inner,
+        held: "slow.stream".to_owned(),
+        release: Arc::clone(&release),
+        waiting: Arc::clone(&waiting),
+    });
+    let (config, mut events) = config(Arc::clone(&store), SECTIONS);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (stream, records) = dedicated_records("slow.stream", FIRST_ID);
+    sender.try_send_dedicated(stream, 1, records).unwrap();
+    wait_for("the held PUT", || waiting.load(Ordering::SeqCst) == 1).await;
+    let (stream, records) = dedicated_records("fast.stream", FIRST_ID + 1);
+    sender.try_send_dedicated(stream, 2, records).unwrap();
+
+    let fast = sealed_path_of(&store, "fast.stream").await;
+    assert!(fast.is_some(), "the second PUT waited for the first");
+    assert!(events.try_recv().is_err(), "an event passed an earlier PUT");
+
+    release.store(true, Ordering::SeqCst);
+    let numbers = [
+        next_number(&mut events).await,
+        next_number(&mut events).await,
+    ];
+    assert_eq!(numbers, [1, 2]);
+    drop(sender);
+    uploader.finish();
+}
+
+async fn sealed_path_of(store: &Arc<dyn ObjectStore>, stream: &str) -> Option<Path> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let listed = storage::list_sealed_objects(store.as_ref()).await.unwrap();
+            if let Some(object) = listed
+                .into_iter()
+                .find(|object| object.location.as_ref().contains(stream))
+            {
+                return object.location;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+async fn next_number(events: &mut UnboundedReceiver<UploadEvent>) -> u64 {
+    match events.recv().await.expect("the uploader stopped") {
+        UploadEvent::Uploaded {
+            key: UploadKey::Dedicated { number, .. },
+            ..
+        } => number,
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// Every PUT under way when the uploader stops hands its references back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_returns_every_put_under_way() {
+    let release = Arc::new(AtomicBool::new(false));
+    let waiting = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(HoldsPuts {
+        inner: InMemory::new(),
+        held: "held.".to_owned(),
+        release,
+        waiting: Arc::clone(&waiting),
+    });
+    let (config, _events) = config(store, SECTIONS);
+    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    for number in 0..3 {
+        let (stream, records) = dedicated_records(&format!("held.{number}"), FIRST_ID + number);
+        sender.try_send_dedicated(stream, number, records).unwrap();
+    }
+    wait_for("three held PUTs", || waiting.load(Ordering::SeqCst) == 3).await;
+    drop(sender);
+    let exit = uploader.shutdown();
+    assert_eq!(exit.unfinished.len(), 3);
+    assert!(
+        exit.unfinished
+            .iter()
+            .all(|left| matches!(left, UnfinishedUpload::Dedicated { .. }))
+    );
 }
 
 /// A store whose first PUTs fail with an error that can't be told from an outage.

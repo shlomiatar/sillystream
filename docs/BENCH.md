@@ -710,3 +710,34 @@ The groups come from symbol names, unresolved symbols count as other user, and c
 - **RPS:** tested separately over 3 alternating rounds. Peak throughput didn't improve.
 - **No effect possible here:** the VM has no C-state controls, the NVMe scheduler was already `none`, and `somaxconn` was already 4,096.
 - **Clients are the limit on connection bursts:** during a long burst of 256 at once, a client was 0.13% idle and the server 66% idle, with no listen overflows, and the 300,000-connection run ran out of time on the clients. The connect and fan-out columns may therefore hide any server gain.
+
+### In-region re-check at `4af8815`
+
+One `n2-standard-16` in `us-east4-a`, client on the same machine, `gs:` with a 1 s window.
+
+- **Stall fix:** 5 rounds of 60 s of level 3 publishes, each on an emptied bucket: stops 553–556 ms, slowest publish 1.0–1.1 s, no checkpoint retries, every acked record read back. Before the fix, 4 of 5 stops took about 30 s.
+- **Cold read:** 60 records took 5.7–6.1 s here, against 2.9–3.1 s in most rounds before the fix. The cause isn't known, and the two runs differ in bucket contents as well as the fix.
+- **Startup with wiped disks:** 558 ms at 53 objects, 2.6 s at 106, 4.6 s at 159, and 1.8 s at 149, the count falling after a new full checkpoint. Full checkpoints come every 64 (`full_checkpoint_every_count`), which fits the cost following the checkpoints since the last full one, but each step wasn't timed. Stops took about 1.45 s.
+- **Uploads:** the uploader sends one PUT at a time and was 92–96% busy through the throughput bench. It moved 85–95 MB/s as 4–5 MB objects and about 110 MB/s as 33 MB objects, at 100 ms and 270 ms a PUT. About 10.7 GB took about 160 s to upload, well after publishing ended, so the 4-connection rates here are what the WAL and memory absorb, not what the bucket sustains.
+- **One connection, 64 KiB:** on the bucket 730/s at level 2 and 1,010–1,050/s at level 1, against 1,560–2,080/s and 6,330–6,470/s on a local store. Both level 2 figures are lower than a fresh server gave, so earlier bench steps affect later ones, because each step shares a server. The cause of the cap is still unconfirmed.
+
+### Parallel uploads, not yet committed
+
+Up to 8 PUTs at once. In-region rows are the same VM setup as above; the restart rows ran from a Mac on a home connection.
+
+- **Uploads:** sustained upload went from about 110 MB/s to 285–294 MB/s, with no retries.
+- **One connection, 64 KiB, level 2:** 730/s became 5,400–6,300/s, so the earlier cap was upload backlog.
+- **Stop after load:** about 11 s, from a forced kill at 30 s. This comes from D262.
+- **Restart after a stop under load is slow:** in-region, 3 of 3 restarts passed a 60 s limit and the read that followed found 0 of 200 acked records, since nothing checked the server was up. From the Mac on GCS, one restart and one start with wiped disks each took about 640 s, the wiped one with 202 objects looked at. A later 195-of-195 read back after a 66 s restart.
+- **Records survive on a local store:** 200 of 200 in each of 3 rounds, restarts 2.1–3.4 s with 115–231 objects looked at.
+- **Cause, before D264:** `scan_objects` read every extent of every object no checkpoint records, one at a time, before the server listened, and replay read each 64 MiB WAL file whole, tail of zeros included.
+- **Restart in-region, no time limit:** one `n2-standard-16` (64 GB), 3 alternating rounds, about 25 s of load then a stop while it ran.
+
+| Version | Restart | Peak memory on restart | Objects looked at | WAL entries replayed | Stop | Markers read back |
+|---|---|---|---|---|---|---|
+| `4af8815` | 83–106 s | 49.9–50.7 GB | 143–333 | 3.1–3.2 M | 11–18 s | 600 of 600 |
+| Parallel uploads | 208–231 s | 56.8–61.7 GB | 836–917 | 3.4–3.9 M | 11–12 s | 600 of 600 |
+| Parallel uploads, D263 and D264 | 8.6–11.6 s | 9.7–9.9 GB | 802–872 | 3.7–3.9 M | 11–12 s | 600 of 600 |
+
+- **What this settles:** the earlier 0 of 200 was the server not being up yet. No marker was lost in 6 rounds, though only the markers were read back, not the bench's records.
+- **What it doesn't settle:** both versions were tested with their own upload rate, so this can't separate D262 from parallel uploads. The peak memory figure counts mapped WAL pages, which the kernel can take back. Heap alone wasn't measured.
