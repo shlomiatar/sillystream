@@ -82,17 +82,26 @@ async fn a_section_is_only_what_arrived_before_it_and_the_rest_goes_next() {
     harness.finish();
 }
 
+/// The cap is one total for the node, counted by the WAL writer, so half of it, which was a
+/// core's share when cores counted, seals nothing (D268).
 #[tokio::test]
-async fn reaching_a_cores_share_of_the_segment_cap_seals_early() {
+async fn reaching_the_segment_cap_seals_early() {
     let mut config = manual_config(2);
-    // Each core's share is 16 KiB.
     config.segment_cap_bytes = 32 * 1024;
     let harness = Harness::new(config);
     let mut client = harness.node().client(0).await;
     let records = record_with(1, &[5; 4096]);
+    for seq in 1..=4 {
+        client
+            .publish(publish("s", &records, seq, 2))
+            .await
+            .unwrap();
+        expect_ack(&mut client).await;
+    }
+    assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 0);
 
     // Level 3 acks come only from a seal, and nothing here asks for one.
-    for seq in 1..=4 {
+    for seq in 5..=8 {
         client
             .publish(publish("s", &records, seq, 3))
             .await

@@ -3,8 +3,11 @@
 //! The loop is the spec's: wait for one command, take whatever else has queued,
 //! write it all, `sync_data`, and only then tell the cores. There is no timer: what
 //! queues during a sync goes in the next one.
+//!
+//! The writer keeps a reference to every entry in its active file, and a seal hands those to
+//! the uploader, so a seal holds exactly what its file holds (D268).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IoSlice, Seek, SeekFrom, Write};
@@ -15,9 +18,12 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use tokio::sync::{oneshot, watch};
 
 use crate::crash::{crash_point, wal_write_gate};
+use crate::object::stream_fits_dedicated_path;
+use crate::uploader::{Handoff, SealExtent};
 use crate::wal_format::{WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header};
 use crate::wal_replay::wal_file_name;
 
@@ -59,6 +65,30 @@ pub fn durable_watches(core_count: usize) -> (DurableWatch, Vec<watch::Receiver<
 impl DurableNotify for DurableWatch {
     fn durable(&mut self, core: usize, ticket: u64) {
         self.senders[core].send_replace(ticket);
+    }
+}
+
+/// Where sealed files and dedicated objects go, and who hears that the active file is full.
+pub trait Sealer: Send {
+    /// The active file has reached the size cap. Called once per file.
+    fn full(&mut self);
+    /// Returns once the seal is taken, or can't ever be. Waiting here for an uploader that is
+    /// behind is the backpressure section 7.3 asks for. One that has stopped drops it: the
+    /// cores keep their references, and the WAL keeps the file.
+    fn seal(&mut self, handoff: Handoff);
+    /// Gives a dedicated object back if it can't be taken now, and it stays in the seal.
+    #[allow(clippy::result_large_err)]
+    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff>;
+}
+
+/// Seals nothing, for a writer whose files nothing uploads.
+impl Sealer for () {
+    fn full(&mut self) {}
+
+    fn seal(&mut self, _handoff: Handoff) {}
+
+    fn dedicated(&mut self, _handoff: Handoff) -> Result<(), Handoff> {
+        Ok(())
     }
 }
 
@@ -152,6 +182,14 @@ pub struct WalConfig {
     pub closed_seqs: Vec<u64>,
     /// Bound of the channel, in commands. A full channel is backpressure.
     pub channel_capacity: usize,
+    /// The active file asks for a seal once it holds this many record bytes (section 7.3).
+    pub segment_cap_bytes: u64,
+    /// A stream with this many record bytes in the active file gets a dedicated object.
+    pub stream_buffer_bytes: u64,
+    /// What a former process left in closed files and no object holds. It goes into the first
+    /// seal, each extent as it is, since the caller splits a stream wherever another object's
+    /// extent lies between its records.
+    pub carried: Vec<SealExtent>,
 }
 
 /// What a finished writer did. `largest_group_count` and the totals are what the
@@ -186,8 +224,8 @@ impl fmt::Display for WalError {
 
 impl std::error::Error for WalError {}
 
-/// The files around a rotation. Every entry queued before the rotation command
-/// is in `closed_seq` or earlier.
+/// The files around a seal. Every entry queued before the seal command is in `closed_seq` or
+/// earlier. A seal of an empty file doesn't rotate, and then `new_seq` is the file still active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalRotated {
     pub closed_seq: u64,
@@ -196,8 +234,13 @@ pub struct WalRotated {
 
 enum WalCommand<R> {
     Append(WalEntry<R>),
-    Rotate(oneshot::Sender<WalRotated>),
-    Remove { up_to_seq: u64 },
+    Seal {
+        seal: u64,
+        done: oneshot::Sender<WalRotated>,
+    },
+    Remove {
+        up_to_seq: u64,
+    },
 }
 
 /// Why a `try_*` call didn't queue. It always returns at once, and gives the value back.
@@ -241,19 +284,25 @@ impl<R> WalSender<R> {
             })
     }
 
-    /// Asks for a new active file, as at a seal (D8). The receiver resolves once the
-    /// old file is durable and the new one is ready.
-    pub fn try_rotate(&self) -> Result<oneshot::Receiver<WalRotated>, WalSendError<()>> {
-        let (done_tx, done_rx) = oneshot::channel();
-        match self.tx.try_send(WalCommand::Rotate(done_tx)) {
+    /// Whether the writer has an active file. Without one, nothing more is written until a seal
+    /// frees room (D233).
+    pub fn has_file(&self) -> bool {
+        !self.no_file.load(Ordering::Acquire)
+    }
+
+    /// Seals the active file as `seal`: it is rotated and handed to the uploader (D8, D268).
+    /// The receiver resolves once the old file is durable and the new one is ready.
+    pub fn try_seal(&self, seal: u64) -> Result<oneshot::Receiver<WalRotated>, WalSendError<()>> {
+        let (done, done_rx) = oneshot::channel();
+        match self.tx.try_send(WalCommand::Seal { seal, done }) {
             Ok(()) => Ok(done_rx),
             Err(TrySendError::Full(_)) => Err(WalSendError::Full(())),
             Err(TrySendError::Disconnected(_)) => Err(WalSendError::Stopped(())),
         }
     }
 
-    /// Closed files up to `up_to_seq` are covered by uploaded segments and checkpoints,
-    /// so the next rotations may reuse them (D16). The active file is never affected.
+    /// Closed files up to `up_to_seq` are covered by uploaded segments and checkpoints, so they
+    /// can go (D16). The active file is never affected.
     pub fn try_remove(&self, up_to_seq: u64) -> Result<(), WalSendError<u64>> {
         match self.tx.try_send(WalCommand::Remove { up_to_seq }) {
             Ok(()) => Ok(()),
@@ -279,15 +328,17 @@ impl WalHandle {
 }
 
 /// Opens the first file and starts the writer thread.
-pub fn start_wal_writer<R, V, N>(
+pub fn start_wal_writer<R, V, N, S>(
     mut volume: V,
     notify: N,
+    sealer: S,
     config: WalConfig,
 ) -> io::Result<(WalSender<R>, WalHandle)>
 where
     R: AsRef<[u8]> + Send + 'static,
     V: WalVolume + 'static,
     N: DurableNotify + 'static,
+    S: Sealer + 'static,
 {
     // Closed files are what a seal uploads and then frees, so a full volume can drain (D233).
     let file = match volume.create(config.first_seq) {
@@ -314,6 +365,15 @@ where
         closed_seqs: config.closed_seqs.into(),
         channel_capacity: config.channel_capacity,
         stats: WalStats::default(),
+        sealer,
+        segment_cap_bytes: config.segment_cap_bytes,
+        stream_buffer_bytes: config.stream_buffer_bytes,
+        open: OpenFile {
+            extents: config.carried,
+            ..OpenFile::default()
+        },
+        last_tickets: Vec::new(),
+        dedicated_count: 0,
     };
     let thread = std::thread::Builder::new()
         .name("wal-writer".to_owned())
@@ -331,7 +391,7 @@ where
     Ok((WalSender { tx, no_file }, WalHandle { thread }))
 }
 
-struct Writer<V: WalVolume, N> {
+struct Writer<V: WalVolume, N, S> {
     volume: V,
     notify: N,
     /// `None` while the file `active_seq` names can't be opened yet (D233, D234).
@@ -341,10 +401,46 @@ struct Writer<V: WalVolume, N> {
     closed_seqs: VecDeque<u64>,
     channel_capacity: usize,
     stats: WalStats,
+    sealer: S,
+    segment_cap_bytes: u64,
+    stream_buffer_bytes: u64,
+    open: OpenFile,
+    /// Per core, the highest ticket written.
+    last_tickets: Vec<u64>,
+    dedicated_count: u64,
 }
 
-impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
-    fn run<R: AsRef<[u8]>>(mut self, rx: Receiver<WalCommand<R>>) -> Result<WalStats, WalError> {
+/// What the active file holds that no object has taken yet.
+#[derive(Default)]
+struct OpenFile {
+    /// In the order each stream first appeared. A stream's records are in id order.
+    extents: Vec<SealExtent>,
+    streams: HashMap<Arc<str>, OpenStream>,
+    entry_count: u64,
+    record_bytes: u64,
+    full_told: bool,
+}
+
+struct OpenStream {
+    /// Where its records are in `extents`.
+    at: usize,
+    record_bytes: u64,
+    /// Per core, the highest ticket among its entries.
+    tickets: Vec<u64>,
+}
+
+fn raise(tickets: &mut Vec<u64>, core: usize, ticket: u64) {
+    if tickets.len() <= core {
+        tickets.resize(core + 1, 0);
+    }
+    tickets[core] = tickets[core].max(ticket);
+}
+
+impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
+    fn run<R: AsRef<[u8]> + Send + 'static>(
+        mut self,
+        rx: Receiver<WalCommand<R>>,
+    ) -> Result<WalStats, WalError> {
         let mut batch = Vec::new();
         let mut heads = Vec::new();
         while let Ok(first) = rx.recv() {
@@ -369,11 +465,17 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
             }
             if !batch.is_empty() {
                 self.commit(&batch, &mut heads)?;
-                batch.clear();
+                for entry in batch.drain(..) {
+                    self.keep(entry);
+                }
+                if self.open.record_bytes >= self.segment_cap_bytes && !self.open.full_told {
+                    self.open.full_told = true;
+                    self.sealer.full();
+                }
             }
             match control {
-                Some(WalCommand::Rotate(done)) => {
-                    let rotated = self.rotate().map_err(WalError::Rotate)?;
+                Some(WalCommand::Seal { seal, done }) => {
+                    let rotated = self.seal(seal).map_err(WalError::Rotate)?;
                     // A core that stopped waiting doesn't matter to the writer.
                     let _ = done.send(rotated);
                 }
@@ -399,6 +501,86 @@ impl<V: WalVolume, N: DurableNotify> Writer<V, N> {
             }
         }
         Ok(self.stats)
+    }
+
+    /// Keeps a synced entry's records for the seal, and hands over its stream's as a dedicated
+    /// object once they fill its buffer.
+    fn keep<R: AsRef<[u8]> + Send + 'static>(&mut self, entry: WalEntry<R>) {
+        let (core, ticket) = (entry.core(), entry.ticket());
+        let stream = Arc::clone(entry.stream_arc());
+        let records = Bytes::from_owner(entry.into_records());
+        raise(&mut self.last_tickets, core, ticket);
+        let open = &mut self.open;
+        open.entry_count += 1;
+        open.record_bytes += records.len() as u64;
+        let at = open.extents.len();
+        let kept = open
+            .streams
+            .entry(Arc::clone(&stream))
+            .or_insert_with(|| OpenStream {
+                at,
+                record_bytes: 0,
+                tickets: Vec::new(),
+            });
+        if kept.at == at {
+            open.extents.push(SealExtent {
+                stream: Arc::clone(&stream),
+                records: Vec::new(),
+            });
+        }
+        kept.record_bytes += records.len() as u64;
+        raise(&mut kept.tickets, core, ticket);
+        open.extents[kept.at].records.push(records);
+        if kept.record_bytes >= self.stream_buffer_bytes && stream_fits_dedicated_path(&stream) {
+            self.hand_off_dedicated(stream);
+        }
+    }
+
+    /// One that can't be taken now stays in the seal (D59, D268).
+    fn hand_off_dedicated(&mut self, stream: Arc<str>) {
+        let Some(kept) = self.open.streams.remove(&stream) else {
+            return;
+        };
+        let records = std::mem::take(&mut self.open.extents[kept.at].records);
+        let handoff = Handoff::Dedicated {
+            stream: Arc::clone(&stream),
+            number: self.dedicated_count,
+            records,
+            tickets: kept.tickets.clone(),
+        };
+        match self.sealer.dedicated(handoff) {
+            Ok(()) => self.dedicated_count += 1,
+            Err(handoff) => {
+                if let Handoff::Dedicated { records, .. } = handoff {
+                    self.open.extents[kept.at].records = records;
+                }
+                self.open.streams.insert(stream, kept);
+            }
+        }
+    }
+
+    /// Rotates unless the file is empty, and hands what it holds to the uploader, even when
+    /// that is nothing, since the seal's checkpoint follows its upload event.
+    fn seal(&mut self, seal: u64) -> io::Result<WalRotated> {
+        let rotated = if self.file.is_some() && self.open.entry_count == 0 {
+            WalRotated {
+                closed_seq: self.active_seq - 1,
+                new_seq: self.active_seq,
+            }
+        } else {
+            self.rotate()?
+        };
+        let open = std::mem::take(&mut self.open);
+        self.sealer.seal(Handoff::Seal {
+            seal,
+            extents: open
+                .extents
+                .into_iter()
+                .filter(|extent| !extent.records.is_empty())
+                .collect(),
+            tickets: self.last_tickets.clone(),
+        });
+        Ok(rotated)
     }
 
     /// Tries again for the file `active_seq` names. Still none to be had isn't an error.

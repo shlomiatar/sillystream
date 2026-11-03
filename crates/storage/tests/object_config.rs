@@ -7,7 +7,7 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig, build_store,
+    Handoff, ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig, build_store,
     check_conditional_create, dedicated_path, parse_store_config, seal_path,
 };
 
@@ -124,11 +124,10 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     let server = answer_one_put(listener);
     let store = build_store(&fake_s3(endpoint)).unwrap();
     let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
-    let (sender, uploader) = Uploader::<bytes::Bytes>::start(UploaderConfig {
+    let (sender, uploader) = Uploader::start(UploaderConfig {
         store,
         node: "node-1".to_owned(),
         generation: 1,
-        section_count: 1,
         channel_capacity: 4,
         retry_initial_ms: 1,
         retry_max_ms: 4,
@@ -148,11 +147,19 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     };
     format::encode_record(&mut wire, &header, b"data").unwrap();
     sender
-        .try_send_dedicated(Arc::from("s"), 0, vec![bytes::Bytes::from(wire)])
+        .try_send(Handoff::Dedicated {
+            stream: Arc::from("s"),
+            number: 0,
+            records: vec![bytes::Bytes::from(wire)],
+            tickets: Vec::new(),
+        })
         .unwrap();
-    let len_bytes = match events.recv().await.unwrap() {
-        UploadEvent::Uploaded { len_bytes, .. } => len_bytes,
-        other => panic!("unexpected event: {other:?}"),
+    let len_bytes = loop {
+        match events.recv().await.unwrap() {
+            UploadEvent::Uploaded { len_bytes, .. } => break len_bytes,
+            UploadEvent::Sealed { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
     };
     let (head, content_length) = server.join().unwrap();
     assert!(head.starts_with("put /not-a-real-bucket/sealed/"), "{head}");

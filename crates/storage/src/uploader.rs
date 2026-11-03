@@ -1,13 +1,10 @@
 //! The uploader thread: one object per seal (SPEC section 6.4, D12, D55).
 //!
-//! Each core hands over one sorted section per seal. When every core's section for
-//! a seal has arrived, they become one segment, written to the local segment directory and
-//! uploaded from that file (D266). A failed PUT is retried with the references still held, so
+//! The WAL writer hands over each sealed file and each dedicated object (D268). A seal becomes
+//! one segment, written to the local segment directory and uploaded from that file (D266). A failed PUT is retried with the references still held, so
 //! nothing is lost and memory stays pinned while the store is down (Q9). An upload that no retry
 //! can help fails on its own, so one object can't stop the ones behind it (D59).
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,19 +25,32 @@ use crate::cache::{PendingWriter, SegmentCache};
 use crate::object::{path_fits_stores, sealed_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
+use crate::wal_writer::Sealer;
 
-/// One stream's records in one section, in id order. `records` are references to
-/// whole stamped records, as with the WAL.
+/// One stream's records in a seal, in id order. Each `Bytes` holds whole stamped records, and
+/// is a reference to what the WAL wrote.
 #[derive(Debug, Clone)]
-pub struct SectionExtent<R> {
+pub struct SealExtent {
     pub stream: Arc<str>,
-    pub records: Vec<R>,
+    pub records: Vec<Bytes>,
 }
 
-/// One core's references for one seal, sorted by stream.
+/// What the WAL writer hands over. `tickets` holds, per core, the highest ticket the object
+/// covers: for a seal, every entry that core sent up to it that no earlier object took, and
+/// for a dedicated object, that stream's entries up to it.
 #[derive(Debug, Clone)]
-pub struct Section<R> {
-    pub extents: Vec<SectionExtent<R>>,
+pub enum Handoff {
+    Seal {
+        seal: u64,
+        extents: Vec<SealExtent>,
+        tickets: Vec<u64>,
+    },
+    Dedicated {
+        stream: Arc<str>,
+        number: u64,
+        records: Vec<Bytes>,
+        tickets: Vec<u64>,
+    },
 }
 
 /// Which upload an event is about.
@@ -57,6 +67,12 @@ pub enum UploadKey {
 /// What cores hear from the uploader, through an awaitable channel.
 #[derive(Debug, Clone)]
 pub enum UploadEvent {
+    /// The object is under way, with the tickets it covers (see `Handoff`). It comes before any
+    /// other event for the same key, on the same channel.
+    Sealed {
+        key: UploadKey,
+        tickets: Arc<Vec<u64>>,
+    },
     /// The object is in the store. The extents are what level 3 acks and reads need.
     Uploaded {
         key: UploadKey,
@@ -64,7 +80,7 @@ pub enum UploadEvent {
         len_bytes: u64,
         extents: Arc<Vec<StreamExtent>>,
     },
-    /// A seal in which no core had any records. Nothing was written.
+    /// A seal with no records. Nothing was written.
     Empty { key: UploadKey },
     /// A PUT failed and will be retried. The references are still held.
     Retrying {
@@ -80,21 +96,39 @@ pub enum UploadEvent {
 /// What didn't get uploaded by the time the uploader exited. The references are
 /// handed back, not dropped.
 #[derive(Debug)]
-pub enum UnfinishedUpload<R> {
+pub enum UnfinishedUpload {
     Seal {
         seal: u64,
-        sections: BTreeMap<usize, Section<R>>,
+        extents: Vec<SealExtent>,
     },
     Dedicated {
         stream: Arc<str>,
         number: u64,
-        records: Vec<R>,
+        records: Vec<Bytes>,
     },
 }
 
+impl UnfinishedUpload {
+    fn of(handoff: Handoff) -> UnfinishedUpload {
+        match handoff {
+            Handoff::Seal { seal, extents, .. } => UnfinishedUpload::Seal { seal, extents },
+            Handoff::Dedicated {
+                stream,
+                number,
+                records,
+                ..
+            } => UnfinishedUpload::Dedicated {
+                stream,
+                number,
+                records,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
-pub struct UploaderExit<R> {
-    pub unfinished: Vec<UnfinishedUpload<R>>,
+pub struct UploaderExit {
+    pub unfinished: Vec<UnfinishedUpload>,
 }
 
 pub struct UploaderConfig {
@@ -102,8 +136,6 @@ pub struct UploaderConfig {
     /// Part of the object path (section 7.3).
     pub node: String,
     pub generation: u64,
-    /// How many cores send a section per seal. Each sends one, even if it is empty.
-    pub section_count: usize,
     pub channel_capacity: usize,
     pub retry_initial_ms: u64,
     pub retry_max_ms: u64,
@@ -117,17 +149,8 @@ pub struct UploaderConfig {
     pub events: Vec<UnboundedSender<UploadEvent>>,
 }
 
-enum UploadCommand<R> {
-    Section {
-        seal: u64,
-        core: usize,
-        section: Section<R>,
-    },
-    Dedicated {
-        stream: Arc<str>,
-        number: u64,
-        records: Vec<R>,
-    },
+enum UploadCommand {
+    Handoff(Handoff),
     /// Gets the thread out of `recv` so it sees the stop flag.
     Wake,
 }
@@ -139,15 +162,15 @@ pub enum UploadSendError<T> {
     Stopped(T),
 }
 
-pub struct UploaderSender<R> {
-    tx: Sender<UploadCommand<R>>,
+pub struct UploaderSender {
+    tx: Sender<UploadCommand>,
     stop: Arc<AtomicBool>,
     /// Sends that have passed the stop check and may not have reached the channel. See
     /// `send`.
     sending_count: Arc<AtomicUsize>,
 }
 
-impl<R> Clone for UploaderSender<R> {
+impl Clone for UploaderSender {
     fn clone(&self) -> Self {
         UploaderSender {
             tx: self.tx.clone(),
@@ -157,24 +180,14 @@ impl<R> Clone for UploaderSender<R> {
     }
 }
 
-fn unwrap_send<R, T>(
-    error: TrySendError<UploadCommand<R>>,
-    value: impl FnOnce(UploadCommand<R>) -> T,
-) -> UploadSendError<T> {
-    match error {
-        TrySendError::Full(command) => UploadSendError::Full(value(command)),
-        TrySendError::Closed(command) => UploadSendError::Stopped(value(command)),
-    }
-}
-
-impl<R> UploaderSender<R> {
+impl UploaderSender {
     /// A command the channel accepts must come back from `run` if it isn't uploaded,
     /// and `run` can only know it has them all if no more can arrive. So a sender
     /// announces itself and then checks the flag, and `run` sets the flag and then waits
     /// out the announced ones: with sequential consistency, either this sender sees the
     /// flag, or `run` sees this sender and drains after it. No sender ever waits, and
     /// the drain has an end however fast they send.
-    fn send(&self, command: UploadCommand<R>) -> Result<(), TrySendError<UploadCommand<R>>> {
+    fn send(&self, command: UploadCommand) -> Result<(), TrySendError<UploadCommand>> {
         self.sending_count.fetch_add(1, Ordering::SeqCst);
         let result = if self.stop.load(Ordering::SeqCst) {
             Err(TrySendError::Closed(command))
@@ -185,62 +198,64 @@ impl<R> UploaderSender<R> {
         result
     }
 
-    /// Hands over a core's section for a seal.
+    /// Hands over a sealed file or a dedicated object. Only the WAL writer does.
     #[allow(clippy::result_large_err)]
-    pub fn try_send_section(
-        &self,
-        seal: u64,
-        core: usize,
-        section: Section<R>,
-    ) -> Result<(), UploadSendError<Section<R>>> {
-        self.send(UploadCommand::Section {
-            seal,
-            core,
-            section,
-        })
-        .map_err(|error| {
-            unwrap_send(error, |command| match command {
-                UploadCommand::Section { section, .. } => section,
+    pub fn try_send(&self, handoff: Handoff) -> Result<(), UploadSendError<Handoff>> {
+        self.send(UploadCommand::Handoff(handoff))
+            .map_err(|error| match error {
+                TrySendError::Full(UploadCommand::Handoff(handoff)) => {
+                    UploadSendError::Full(handoff)
+                }
+                TrySendError::Closed(UploadCommand::Handoff(handoff)) => {
+                    UploadSendError::Stopped(handoff)
+                }
                 _ => unreachable!("try_send returns the command it was given"),
             })
-        })
+    }
+}
+
+/// How long a seal the uploader can't take yet waits before trying again.
+const SEAL_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The node's sealer: handoffs go to the uploader, and a full file asks for a seal.
+pub struct UploadSealer<F> {
+    pub uploads: UploaderSender,
+    pub on_full: F,
+}
+
+impl<F: FnMut() + Send> Sealer for UploadSealer<F> {
+    fn full(&mut self) {
+        (self.on_full)();
     }
 
-    /// Uploads a stream that filled its own buffer as its own object (section 7.3).
-    /// Deciding when is the core's job.
-    #[allow(clippy::result_large_err)]
-    pub fn try_send_dedicated(
-        &self,
-        stream: Arc<str>,
-        number: u64,
-        records: Vec<R>,
-    ) -> Result<(), UploadSendError<Vec<R>>> {
-        self.send(UploadCommand::Dedicated {
-            stream,
-            number,
-            records,
-        })
-        .map_err(|error| {
-            unwrap_send(error, |command| match command {
-                UploadCommand::Dedicated { records, .. } => records,
-                _ => unreachable!("try_send returns the command it was given"),
-            })
+    fn seal(&mut self, mut handoff: Handoff) {
+        loop {
+            match self.uploads.try_send(handoff) {
+                Ok(()) | Err(UploadSendError::Stopped(_)) => return,
+                Err(UploadSendError::Full(back)) => {
+                    handoff = back;
+                    std::thread::sleep(SEAL_RETRY);
+                }
+            }
+        }
+    }
+
+    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff> {
+        self.uploads.try_send(handoff).map_err(|error| match error {
+            UploadSendError::Full(handoff) | UploadSendError::Stopped(handoff) => handoff,
         })
     }
 }
 
-pub struct Uploader<R> {
+pub struct Uploader {
     /// Kept only to send `Wake`. `finish` drops it, so the channel can close.
-    wake: Option<Sender<UploadCommand<R>>>,
-    thread: Option<JoinHandle<UploaderExit<R>>>,
+    wake: Option<Sender<UploadCommand>>,
+    thread: Option<JoinHandle<UploaderExit>>,
     stop: Arc<AtomicBool>,
 }
 
-impl<R> Uploader<R>
-where
-    R: AsRef<[u8]> + Clone + Send + 'static,
-{
-    pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender<R>, Uploader<R>)> {
+impl Uploader {
+    pub fn start(config: UploaderConfig) -> std::io::Result<(UploaderSender, Uploader)> {
         let (tx, rx) = channel(config.channel_capacity);
         let stop = Arc::new(AtomicBool::new(false));
         let sending_count = Arc::new(AtomicUsize::new(0));
@@ -252,7 +267,6 @@ where
         let thread = std::thread::Builder::new()
             .name("uploader".to_owned())
             .spawn(move || {
-                let section_count = config.section_count;
                 let putter = Arc::new(Putter {
                     store: Arc::clone(&config.store),
                     stop: Arc::clone(&thread_stop),
@@ -267,8 +281,6 @@ where
                     putter,
                     stop: thread_stop,
                     sending_count: thread_sending_count,
-                    pending: BTreeMap::new(),
-                    last_seal_by_core: vec![None; section_count],
                     unfinished: Vec::new(),
                 };
                 let exit = runtime.block_on(worker.run(rx));
@@ -293,19 +305,19 @@ where
 
     /// Waits until everything queued is uploaded, once every sender has been dropped.
     /// With the store down this waits until it comes back, or forever.
-    pub fn finish(mut self) -> UploaderExit<R> {
+    pub fn finish(mut self) -> UploaderExit {
         self.wake = None;
         self.join()
     }
 
     /// Stops retrying, abandons a PUT in progress and exits soon, returning whatever
     /// wasn't uploaded.
-    pub fn shutdown(mut self) -> UploaderExit<R> {
+    pub fn shutdown(mut self) -> UploaderExit {
         self.request_stop();
         self.join()
     }
 
-    fn join(&mut self) -> UploaderExit<R> {
+    fn join(&mut self) -> UploaderExit {
         let thread = self.thread.take().expect("joined once, by value");
         match thread.join() {
             Ok(exit) => exit,
@@ -314,7 +326,7 @@ where
     }
 }
 
-impl<R> Uploader<R> {
+impl Uploader {
     /// If the channel is full, the thread has commands to wake it anyway.
     fn request_stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -324,7 +336,7 @@ impl<R> Uploader<R> {
     }
 }
 
-impl<R> Drop for Uploader<R> {
+impl Drop for Uploader {
     /// A dropped uploader must not leave a thread retrying forever. After `finish`
     /// the thread has already exited.
     fn drop(&mut self) {
@@ -366,25 +378,21 @@ enum PutEnd {
     Stopped,
 }
 
-struct Finished<R> {
+struct Finished {
     key: UploadKey,
     ended: PutEnd,
     /// The references, which go back if the object didn't reach the store.
-    keep: UnfinishedUpload<R>,
+    keep: UnfinishedUpload,
 }
 
-type Put<R> = Pin<Box<dyn Future<Output = Finished<R>>>>;
+type Put = Pin<Box<dyn Future<Output = Finished>>>;
 
-struct Worker<R> {
+struct Worker {
     config: UploaderConfig,
     putter: Arc<Putter>,
     stop: Arc<AtomicBool>,
     sending_count: Arc<AtomicUsize>,
-    pending: BTreeMap<u64, BTreeMap<usize, Section<R>>>,
-    /// The highest seal each core has handed over. A core's seals only go up, so this
-    /// recognises a repeat even after its seal has uploaded and left `pending`.
-    last_seal_by_core: Vec<Option<u64>>,
-    unfinished: Vec<UnfinishedUpload<R>>,
+    unfinished: Vec<UnfinishedUpload>,
 }
 
 #[derive(Debug)]
@@ -407,9 +415,9 @@ impl fmt::Display for PutError {
     }
 }
 
-impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
-    async fn run(mut self, mut rx: Receiver<UploadCommand<R>>) -> UploaderExit<R> {
-        let mut in_flight: FuturesOrdered<Put<R>> = FuturesOrdered::new();
+impl Worker {
+    async fn run(mut self, mut rx: Receiver<UploadCommand>) -> UploaderExit {
+        let mut in_flight: FuturesOrdered<Put> = FuturesOrdered::new();
         loop {
             let has_puts = !in_flight.is_empty();
             // With `pending/` full, seals wait here, and the channel fills behind them. What is
@@ -439,22 +447,8 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
                 self.keep_unfinished(command);
                 break;
             }
-            match command {
-                UploadCommand::Section {
-                    seal,
-                    core,
-                    section,
-                } => {
-                    if let Some(put) = self.receive_section(seal, core, section) {
-                        in_flight.push_back(put);
-                    }
-                }
-                UploadCommand::Dedicated {
-                    stream,
-                    number,
-                    records,
-                } => in_flight.push_back(self.start_dedicated(stream, number, records)),
-                UploadCommand::Wake => {}
+            if let UploadCommand::Handoff(handoff) = command {
+                in_flight.push_back(self.start_handoff(handoff));
             }
         }
         // These end soon if the flag is set. Otherwise they retry until they're in the store.
@@ -466,73 +460,18 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         while self.sending_count.load(Ordering::SeqCst) != 0 {
             std::thread::yield_now();
         }
-        // Whatever is left: stopped early, or a seal that never got all its sections.
+        // Whatever is left, when stopped early.
         while let Ok(command) = rx.try_recv() {
             self.keep_unfinished(command);
-        }
-        for (seal, sections) in std::mem::take(&mut self.pending) {
-            self.unfinished
-                .push(UnfinishedUpload::Seal { seal, sections });
         }
         UploaderExit {
             unfinished: self.unfinished,
         }
     }
 
-    /// The seal's upload, once this was its last section.
-    fn receive_section(&mut self, seal: u64, core: usize, section: Section<R>) -> Option<Put<R>> {
-        // Counting sections is what fires the upload, so a wrong one must not count,
-        // and replacing one would drop its references.
-        let in_order = self
-            .last_seal_by_core
-            .get_mut(core)
-            .filter(|last| last.is_none_or(|last| seal > last));
-        let Some(last) = in_order else {
-            self.unfinished.push(UnfinishedUpload::Seal {
-                seal,
-                sections: BTreeMap::from([(core, section)]),
-            });
-            self.emit(UploadEvent::Failed {
-                key: UploadKey::Seal(seal),
-                error: format!("unexpected section from core {core}"),
-            });
-            return None;
-        };
-        *last = Some(seal);
-        let sections = self.pending.entry(seal).or_default();
-        sections.insert(core, section);
-        if sections.len() != self.config.section_count {
-            return None;
-        }
-        let sections = self.pending.remove(&seal)?;
-        Some(self.start_seal(seal, sections))
-    }
-
-    fn keep_unfinished(&mut self, command: UploadCommand<R>) {
-        match command {
-            UploadCommand::Section {
-                seal,
-                core,
-                section,
-            } => match self.pending.entry(seal).or_default().entry(core) {
-                Entry::Vacant(slot) => {
-                    slot.insert(section);
-                }
-                Entry::Occupied(_) => self.unfinished.push(UnfinishedUpload::Seal {
-                    seal,
-                    sections: BTreeMap::from([(core, section)]),
-                }),
-            },
-            UploadCommand::Dedicated {
-                stream,
-                number,
-                records,
-            } => self.unfinished.push(UnfinishedUpload::Dedicated {
-                stream,
-                number,
-                records,
-            }),
-            UploadCommand::Wake => {}
+    fn keep_unfinished(&mut self, command: UploadCommand) {
+        if let UploadCommand::Handoff(handoff) = command {
+            self.unfinished.push(UnfinishedUpload::of(handoff));
         }
     }
 
@@ -545,7 +484,7 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
 
     /// Runs in the order uploads started, however their PUTs finish, because a seal's event
     /// lets its WAL files go and that seal's records have to be in the store by then (D261).
-    fn finish(&mut self, finished: Finished<R>) {
+    fn finish(&mut self, finished: Finished) {
         let Finished { key, ended, keep } = finished;
         match ended {
             PutEnd::Uploaded {
@@ -574,41 +513,56 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         }
     }
 
-    fn start_seal(&mut self, seal: u64, sections: BTreeMap<usize, Section<R>>) -> Put<R> {
-        let key = UploadKey::Seal(seal);
-        let built = build_seal(&sections);
-        let (node, generation) = (self.config.node.clone(), self.config.generation);
-        self.start(
-            key,
-            built,
-            Box::new(move |first_id, last_id| sealed_path(&node, generation, first_id, last_id)),
-            UnfinishedUpload::Seal { seal, sections },
-        )
-    }
-
-    fn start_dedicated(&mut self, stream: Arc<str>, number: u64, records: Vec<R>) -> Put<R> {
-        let key = UploadKey::Dedicated {
-            stream: Arc::clone(&stream),
-            number,
-        };
-        let parts = records.iter().cloned().map(Bytes::from_owner);
-        let mut builder = SegmentBuilder::new();
-        let built = match builder.add_extent(&stream, parts) {
-            Ok(()) => builder.finish(),
-            Err(error) => Err(error),
-        };
-        let name = Arc::clone(&stream);
-        let generation = self.config.generation;
-        self.start(
-            key,
-            built,
-            Box::new(move |first_id, last_id| sealed_path(&name, generation, first_id, last_id)),
-            UnfinishedUpload::Dedicated {
-                stream,
-                number,
-                records,
-            },
-        )
+    /// Tells the cores what the object covers before anything else is heard about it, so that
+    /// they know which of their records each event is about.
+    fn start_handoff(&mut self, handoff: Handoff) -> Put {
+        let (key, tickets, built, path_for): (_, _, _, Box<dyn Fn(u64, u64) -> Path>) =
+            match &handoff {
+                Handoff::Seal {
+                    seal,
+                    extents,
+                    tickets,
+                } => {
+                    let (node, generation) = (self.config.node.clone(), self.config.generation);
+                    (
+                        UploadKey::Seal(*seal),
+                        tickets,
+                        build_seal(extents),
+                        Box::new(move |first_id, last_id| {
+                            sealed_path(&node, generation, first_id, last_id)
+                        }),
+                    )
+                }
+                Handoff::Dedicated {
+                    stream,
+                    number,
+                    records,
+                    tickets,
+                } => {
+                    let mut builder = SegmentBuilder::new();
+                    let built = match builder.add_extent(stream, records.iter().cloned()) {
+                        Ok(()) => builder.finish(),
+                        Err(error) => Err(error),
+                    };
+                    let (name, generation) = (Arc::clone(stream), self.config.generation);
+                    (
+                        UploadKey::Dedicated {
+                            stream: Arc::clone(stream),
+                            number: *number,
+                        },
+                        tickets,
+                        built,
+                        Box::new(move |first_id, last_id| {
+                            sealed_path(&name, generation, first_id, last_id)
+                        }),
+                    )
+                }
+            };
+        self.emit(UploadEvent::Sealed {
+            key: key.clone(),
+            tickets: Arc::new(tickets.clone()),
+        });
+        self.start(key, built, path_for, UnfinishedUpload::of(handoff))
     }
 
     fn start(
@@ -616,8 +570,8 @@ impl<R: AsRef<[u8]> + Clone + Send + 'static> Worker<R> {
         key: UploadKey,
         built: Result<BuiltSegment, SegmentError>,
         path_for: Box<dyn Fn(u64, u64) -> Path>,
-        keep: UnfinishedUpload<R>,
-    ) -> Put<R> {
+        keep: UnfinishedUpload,
+    ) -> Put {
         let putter = Arc::clone(&self.putter);
         if let (Some(cache), Ok(built)) = (&mut self.config.cache, &built)
             && built.first_id.is_some()
@@ -810,23 +764,14 @@ impl Putter {
     }
 }
 
-/// Lays the sections out in core order, combining their footer indexes. A stream that
-/// moved cores appears in two sections, so it gets two entries.
-fn build_seal<R>(sections: &BTreeMap<usize, Section<R>>) -> Result<BuiltSegment, SegmentError>
-where
-    R: AsRef<[u8]> + Clone + Send + 'static,
-{
+/// Groups the extents by stream, keeping their order, so a stream with more than one extent
+/// keeps them in id order.
+fn build_seal(extents: &[SealExtent]) -> Result<BuiltSegment, SegmentError> {
+    let mut sorted: Vec<&SealExtent> = extents.iter().collect();
+    sorted.sort_by(|a, b| a.stream.cmp(&b.stream));
     let mut builder = SegmentBuilder::new();
-    for section in sections.values() {
-        let mut previous: Option<&str> = None;
-        for extent in &section.extents {
-            if previous.is_some_and(|stream| stream >= &*extent.stream) {
-                return Err(SegmentError::OutOfOrder("section streams"));
-            }
-            previous = Some(&extent.stream);
-            let parts = extent.records.iter().cloned().map(Bytes::from_owner);
-            builder.add_extent(&extent.stream, parts)?;
-        }
+    for extent in sorted {
+        builder.add_extent(&extent.stream, extent.records.iter().cloned())?;
     }
     builder.finish()
 }

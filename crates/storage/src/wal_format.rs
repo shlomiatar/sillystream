@@ -115,6 +115,14 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         self.records.as_ref()
     }
 
+    pub(crate) fn stream_arc(&self) -> &Arc<str> {
+        &self.stream
+    }
+
+    pub(crate) fn into_records(self) -> R {
+        self.records
+    }
+
     /// Appends the entry's head (everything before `records`) to `out`, computing
     /// the CRC over the records, and returns how much padding follows them.
     pub(crate) fn write_head(&self, seq: u64, out: &mut Vec<u8>) -> usize {

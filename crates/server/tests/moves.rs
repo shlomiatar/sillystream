@@ -18,7 +18,7 @@ fn check_ids(records: &[(u64, u64, u64, Vec<u8>)], acks: &[(u64, u64, u32)]) {
 }
 
 #[tokio::test]
-async fn a_stream_moved_mid_load_keeps_order_and_acks_and_shows_two_footer_entries() {
+async fn a_stream_moved_mid_load_keeps_order_and_acks_and_seals_as_one_extent() {
     let harness = Harness::new(manual_config(2));
     let node = harness.node();
     let mut client = node.client(0).await;
@@ -72,7 +72,8 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_shows_two_footer_entri
     let entries = harness.wal.stream_entries("moving");
     assert_eq!(entries.len() as u64, publisher_seq - 1);
 
-    // The segment has both cores' extents for the stream, and together they are all of it.
+    // The seal is the WAL file, which has the stream in id order whichever core wrote it, so it
+    // is one extent with all of it (D268).
     let (path, extents) = match node.seal().await {
         SealOutcome::Uploaded { path, extents, .. } => (path, extents),
         other => panic!("{other:?}"),
@@ -81,7 +82,7 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_shows_two_footer_entri
         .iter()
         .filter(|extent| &*extent.stream == "moving")
         .collect();
-    assert_eq!(own.len(), 2, "{extents:?}");
+    assert_eq!(own.len(), 1, "{extents:?}");
     let store: Arc<dyn object_store::ObjectStore> = harness.store.clone();
     let reader = SegmentReader::new(store, path);
     let top = reader.read_top_index().await.unwrap();
@@ -91,7 +92,7 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_shows_two_footer_entri
             .iter()
             .filter(|extent| &*extent.stream == "moving")
             .count(),
-        2
+        1
     );
     let stored = reader.read_stream("moving").await.unwrap();
     check_ids(&parse_records(&stored), &acks);

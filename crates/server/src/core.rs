@@ -17,8 +17,7 @@ use format::{
 };
 use proto::ErrorCode;
 use storage::{
-    MetaCursor, MetaDedupe, Section, SectionExtent, StreamMeta, UploadEvent, UploadKey,
-    UploadSendError, UploaderSender, WalEntry, WalSendError, WalSender, stream_fits_dedicated_path,
+    MetaCursor, MetaDedupe, StreamMeta, UploadEvent, UploadKey, WalEntry, WalSendError, WalSender,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -79,7 +78,7 @@ pub(crate) struct Links {
 /// What a core tells the node's control thread.
 #[derive(Debug)]
 pub(crate) enum CoreToNode {
-    /// This core's share of the segment cap is used up (Q18).
+    /// The WAL writer's active file has reached the segment cap (section 6.3).
     SealRequested,
     /// A delete, to answer once a checkpoint holds its tombstone (D20).
     DurableRequested(oneshot::Sender<bool>),
@@ -90,8 +89,6 @@ pub(crate) struct CoreConfig {
     pub virtual_shard_count: u32,
     pub override_shard_count: u32,
     pub core_count: usize,
-    pub segment_cap_share_bytes: u64,
-    pub stream_buffer_bytes: u64,
     pub last_valid_id: u64,
     /// How many unwatched streams this core keeps in RAM. `None` never evicts.
     pub active_stream_limit: Option<usize>,
@@ -186,9 +183,6 @@ struct Batch {
     first_id: u64,
     last_id: u64,
     ticket: u64,
-    /// Which stay on this core the batch was stamped in. A seal takes one stay at a time,
-    /// so that a stream moving away and back can't overlap another core's extent.
-    residency: u32,
     upload: BatchUpload,
     /// Level 3 acks.
     waiters: Vec<Waiter>,
@@ -199,13 +193,11 @@ const IDS_TOO_FAR_AHEAD: &str = "ids would run too far ahead of the clock; retry
 const NO_CURSOR_ROOM: &str = "this stream has too many named cursors";
 
 /// The batches this core has stamped for one stream and not yet seen uploaded. It stays
-/// here after the stream moves away, since this core's section is what covers them.
+/// here after the stream moves away, since only this core knows which object covers them.
 #[derive(Default)]
 struct StreamLog {
     batches: VecDeque<Batch>,
     first_unsealed: usize,
-    unsealed_bytes: u64,
-    residency: u32,
     dirty: bool,
 }
 
@@ -218,24 +210,20 @@ impl StreamLog {
             .map(|_| at)
     }
 
-    /// Takes what the WAL channel has accepted, from one stay on this core.
-    fn take_unsealed(&mut self, tag: UploadTag, sent_ticket: u64) -> (Vec<SlabBytes>, u64) {
-        let mut records = Vec::new();
-        let mut taken_bytes = 0;
-        let Some(residency) = self.batches.get(self.first_unsealed).map(|b| b.residency) else {
-            return (records, 0);
-        };
+    /// Marks what an object covers: the batches up to `through`, which come first among those
+    /// no object has taken, since a core's tickets go up and the WAL writes them in order. The
+    /// bytes marked.
+    fn mark(&mut self, tag: UploadTag, through: u64) -> u64 {
+        let mut marked_bytes = 0;
         while let Some(batch) = self.batches.get_mut(self.first_unsealed) {
-            if batch.ticket > sent_ticket || batch.residency != residency {
+            if batch.ticket > through {
                 break;
             }
             batch.upload = BatchUpload::Pending(tag);
-            records.push(batch.bytes.clone());
-            taken_bytes += batch.bytes.len() as u64;
+            marked_bytes += batch.bytes.len() as u64;
             self.first_unsealed += 1;
         }
-        self.unsealed_bytes -= taken_bytes;
-        (records, taken_bytes)
+        marked_bytes
     }
 
     /// Batches above `after`, up to `through`, and about `budget_bytes` of them. In id order.
@@ -302,18 +290,6 @@ struct Stream {
 struct Shard {
     streams: HashSet<Arc<str>>,
     counters: ShardCounters,
-}
-
-enum UploadOut {
-    Section {
-        seal: u64,
-        section: Section<SlabBytes>,
-    },
-    Dedicated {
-        stream: Arc<str>,
-        number: u64,
-        records: Vec<SlabBytes>,
-    },
 }
 
 enum Route {
@@ -435,7 +411,6 @@ pub(crate) struct Core {
     links: Links,
     inbox: CoreInbox,
     wal: WalSender<SlabBytes>,
-    uploader: UploaderSender<SlabBytes>,
     to_node: mpsc::UnboundedSender<CoreToNode>,
     pool: SlabPool,
 
@@ -462,6 +437,8 @@ pub(crate) struct Core {
     /// The highest ticket the WAL channel has taken.
     sent_ticket: u64,
     outbound: VecDeque<WalEntry<SlabBytes>>,
+    /// Who waits for `outbound` to empty, before a seal.
+    pass_waiters: Vec<oneshot::Sender<()>>,
     wal_stopped: bool,
     wal_waits: Vec<WalWait>,
     /// How far the WAL channel has taken each other core's entries, as far as it has said.
@@ -470,12 +447,8 @@ pub(crate) struct Core {
     wal_sent_owed: u64,
     durable_waiters: VecDeque<(u64, Waiter)>,
 
-    uploads_out: VecDeque<UploadOut>,
-    upload_stopped: bool,
     in_flight: HashMap<UploadTag, Vec<Arc<str>>>,
     unsealed_bytes: u64,
-    seal_requested: bool,
-    dedicated_count: u64,
 
     upload_failed_count: u64,
     duplicate_count: u64,
@@ -503,7 +476,7 @@ pub(crate) struct Core {
     parked_write_count: usize,
     /// Tombstones no checkpoint has yet, with their last ids.
     dirty_tombstones: Vec<(Arc<str>, u64)>,
-    /// `sent_ticket` when each seal not yet checkpointed reached this core.
+    /// This core's highest ticket in each seal not yet checkpointed.
     seal_sent: HashMap<u64, u64>,
     use_count: u64,
     evicted_count: u64,
@@ -517,7 +490,6 @@ pub(crate) struct CoreParts {
     pub links: Links,
     pub inbox: CoreInbox,
     pub wal: WalSender<SlabBytes>,
-    pub uploader: UploaderSender<SlabBytes>,
     pub to_node: mpsc::UnboundedSender<CoreToNode>,
     pub pool: SlabPool,
     pub settings: DeliverySettings,
@@ -556,7 +528,6 @@ impl Core {
             links: parts.links,
             inbox: parts.inbox,
             wal: parts.wal,
-            uploader: parts.uploader,
             to_node: parts.to_node,
             pool: parts.pool,
             location,
@@ -572,17 +543,14 @@ impl Core {
             next_ticket: 0,
             sent_ticket: 0,
             outbound: VecDeque::new(),
+            pass_waiters: Vec::new(),
             wal_stopped: false,
             wal_waits: Vec::new(),
             wal_sent_by_core: vec![0; core_count],
             wal_sent_owed: 0,
             durable_waiters: VecDeque::new(),
-            uploads_out: VecDeque::new(),
-            upload_stopped: false,
             in_flight: HashMap::new(),
             unsealed_bytes: 0,
-            seal_requested: false,
-            dedicated_count: 0,
             upload_failed_count: 0,
             duplicate_count: 0,
             forwarded_count: 0,
@@ -617,8 +585,7 @@ impl Core {
             // A stamped entry that doesn't fit stops new writes being read, and nothing else.
             let can_write =
                 !self.is_stalled() && self.parked_write_count < self.config.write_park_cap_count;
-            let need_retry = (!self.outbound.is_empty() && !self.wal_stopped)
-                || (!self.uploads_out.is_empty() && !self.upload_stopped);
+            let need_retry = !self.outbound.is_empty() && !self.wal_stopped;
             let home_deadline = self.home.next_deadline();
             let mut reads_this_turn = 1;
             tokio::select! {
@@ -683,7 +650,7 @@ impl Core {
             }
             self.home.flush();
             self.flush_outbound();
-            self.flush_uploads();
+            self.answer_passed();
             self.run_deferred();
         }
         self.drain_outbound_for_stop().await;
@@ -1343,7 +1310,6 @@ impl Core {
             first_id: ids.first_id,
             last_id: ids.last_id,
             ticket,
-            residency: log.residency,
             upload: BatchUpload::Unsealed,
             waiters: Vec::new(),
         };
@@ -1354,8 +1320,6 @@ impl Core {
             _ => batch.waiters.push(waiter),
         }
         log.batches.push_back(batch);
-        log.unsealed_bytes += len_bytes;
-        let over_stream_buffer = log.unsealed_bytes >= self.config.stream_buffer_bytes;
         if !log.dirty {
             log.dirty = true;
             self.dirty.push(Arc::clone(name));
@@ -1370,14 +1334,6 @@ impl Core {
             self.wal_visible.push_back((ticket, Arc::clone(name)));
         }
         self.drain_visible(name);
-
-        if over_stream_buffer && stream_fits_dedicated_path(name) {
-            self.send_dedicated(name);
-        }
-        if !self.seal_requested && self.unsealed_bytes >= self.config.segment_cap_share_bytes {
-            self.seal_requested = true;
-            let _ = self.to_node.send(CoreToNode::SealRequested);
-        }
     }
 
     /// In order, so a full channel keeps a stream's entries in id order, and behind what
@@ -1416,6 +1372,26 @@ impl Core {
                     self.on_wal_stopped();
                     return;
                 }
+            }
+        }
+    }
+
+    /// A stopped WAL takes nothing more, so waiting for it is over too. So does a WAL with no
+    /// file, which only the seal being waited for can give room: what is still queued isn't
+    /// acked, and goes in a later seal. A manifest waiting for its stream to load was sent
+    /// before the seal too, so the seal waits for it.
+    fn answer_passed(&mut self) {
+        let manifest_parked = self.loading.get(MANIFEST_STREAM).is_some_and(|loading| {
+            loading.parked.iter().any(|message| {
+                matches!(message, Parked::Control(ControlMsg::PublishManifest { .. }))
+            })
+        });
+        if self.wal_stopped
+            || !self.wal.has_file()
+            || (self.outbound.is_empty() && !manifest_parked)
+        {
+            for waiter in self.pass_waiters.drain(..) {
+                let _ = waiter.send(());
             }
         }
     }
@@ -1488,54 +1464,6 @@ impl Core {
             self.wal_sent_owed = self.wal_sent_owed.max(ticket);
         }
         waits
-    }
-
-    fn flush_uploads(&mut self) {
-        while let Some(out) = self.uploads_out.pop_front() {
-            let result = match out {
-                UploadOut::Section { seal, section } => self
-                    .uploader
-                    .try_send_section(seal, self.config.id, section)
-                    .map_err(|error| match error {
-                        UploadSendError::Full(section) => {
-                            (true, UploadOut::Section { seal, section })
-                        }
-                        UploadSendError::Stopped(section) => {
-                            (false, UploadOut::Section { seal, section })
-                        }
-                    }),
-                UploadOut::Dedicated {
-                    stream,
-                    number,
-                    records,
-                } => self
-                    .uploader
-                    .try_send_dedicated(Arc::clone(&stream), number, records)
-                    .map_err(|error| match error {
-                        UploadSendError::Full(records) => (
-                            true,
-                            UploadOut::Dedicated {
-                                stream: Arc::clone(&stream),
-                                number,
-                                records,
-                            },
-                        ),
-                        UploadSendError::Stopped(records) => (
-                            false,
-                            UploadOut::Dedicated {
-                                stream: Arc::clone(&stream),
-                                number,
-                                records,
-                            },
-                        ),
-                    }),
-            };
-            if let Err((full, out)) = result {
-                self.upload_stopped = !full;
-                self.uploads_out.push_front(out);
-                return;
-            }
-        }
     }
 
     fn on_durable(&mut self) {
@@ -2292,68 +2220,49 @@ impl Core {
         }
     }
 
-    fn on_seal(&mut self, seal: u64) {
-        self.seal_requested = false;
-        if self.loader.is_some() {
-            self.seal_sent.insert(seal, self.sent_ticket);
-        }
-        let tag = UploadTag::Seal(seal);
-        let mut names = std::mem::take(&mut self.dirty);
-        names.sort_unstable();
-        names.dedup();
-        let mut extents = Vec::new();
+    /// The WAL writer has handed over an object: a seal covers every core's batches up to its
+    /// ticket, and a dedicated object only its stream's (D268).
+    fn on_sealed(&mut self, key: UploadKey, tickets: &[u64]) {
+        let through = tickets.get(self.config.id).copied().unwrap_or(0);
+        let (tag, names) = match key {
+            UploadKey::Seal(seal) => {
+                if self.loader.is_some() {
+                    self.seal_sent.insert(seal, through);
+                }
+                let mut names = std::mem::take(&mut self.dirty);
+                names.sort_unstable();
+                names.dedup();
+                (UploadTag::Seal(seal), names)
+            }
+            UploadKey::Dedicated { stream, number } => {
+                self.dirty.retain(|name| *name != stream);
+                (UploadTag::Dedicated(number), vec![stream])
+            }
+        };
         let mut touched = Vec::new();
         for name in names {
             let Some(log) = self.logs.get_mut(&*name) else {
                 continue;
             };
-            let (records, taken_bytes) = log.take_unsealed(tag, self.sent_ticket);
-            self.unsealed_bytes -= taken_bytes;
-            let again = log.has_unsealed();
-            log.dirty = again;
-            if !records.is_empty() {
+            let first = log.first_unsealed;
+            self.unsealed_bytes -= log.mark(tag, through);
+            if log.first_unsealed > first {
                 touched.push(Arc::clone(&name));
-                extents.push(SectionExtent {
-                    stream: Arc::clone(&name),
-                    records,
-                });
             }
-            if again {
+            log.dirty = log.has_unsealed();
+            if log.dirty {
                 self.dirty.push(name);
             }
         }
         self.in_flight.insert(tag, touched);
-        self.uploads_out.push_back(UploadOut::Section {
-            seal,
-            section: Section { extents },
-        });
-        self.flush_uploads();
-    }
-
-    /// A stream that filled its own buffer gets its own object (section 7.3, D58).
-    fn send_dedicated(&mut self, name: &Arc<str>) {
-        let number = ((self.config.id as u64) << 48) | self.dedicated_count;
-        let tag = UploadTag::Dedicated(number);
-        let Some(log) = self.logs.get_mut(&**name) else {
-            return;
-        };
-        let (records, taken_bytes) = log.take_unsealed(tag, self.sent_ticket);
-        if records.is_empty() {
-            return;
-        }
-        self.dedicated_count += 1;
-        self.unsealed_bytes -= taken_bytes;
-        self.in_flight.insert(tag, vec![Arc::clone(name)]);
-        self.uploads_out.push_back(UploadOut::Dedicated {
-            stream: Arc::clone(name),
-            number,
-            records,
-        });
-        self.flush_uploads();
     }
 
     fn on_upload_event(&mut self, event: UploadEvent) {
         let (key, uploaded) = match event {
+            UploadEvent::Sealed { key, tickets } => {
+                self.on_sealed(key, &tickets);
+                return;
+            }
             UploadEvent::Uploaded {
                 key, path, extents, ..
             } => (key, Some((path, extents))),
@@ -2587,7 +2496,6 @@ impl Core {
                     });
                 }
             },
-            ControlMsg::Seal { seal } => self.on_seal(seal),
             ControlMsg::MoveShard { shard, to, done } => self.on_move_shard(shard, to, done),
             ControlMsg::SplitStream {
                 stream,
@@ -2611,7 +2519,6 @@ impl Core {
                     outbound_count: self.outbound.len(),
                     wal_stopped: self.wal_stopped,
                     upload_failed_count: self.upload_failed_count,
-                    uploads_waiting_count: self.uploads_out.len(),
                     unsealed_bytes: self.unsealed_bytes,
                     duplicate_count: self.duplicate_count,
                     forwarded_count: self.forwarded_count,
@@ -2756,6 +2663,11 @@ impl Core {
                 self.wal_sent_by_core[core] = self.wal_sent_by_core[core].max(ticket);
             }
             ControlMsg::Restore(restored) => self.on_restore(*restored),
+            ControlMsg::PassToWal { reply } => {
+                self.pass_waiters.push(reply);
+                self.flush_outbound();
+                self.answer_passed();
+            }
             ControlMsg::CheckpointClean { seal, reply } => {
                 let _ = reply.send(self.is_clean(seal));
             }
@@ -3173,27 +3085,16 @@ impl Core {
             return;
         }
         let log = self.logs.entry(Arc::clone(&name)).or_default();
-        let mut previous_last_id = None;
         for batch in restored.batches {
-            // One extent can't go around another's records: take these in separate seals.
-            if previous_last_id.is_some_and(|last_id| {
-                stream.delivery.extents.iter().any(|known| {
-                    last_id < known.extent.id_first && known.extent.id_first < batch.first_id
-                })
-            }) {
-                log.residency += 1;
-            }
-            previous_last_id = Some(batch.last_id);
             let bytes = self.pool.copy_in(&batch.bytes).freeze();
-            log.unsealed_bytes += bytes.len() as u64;
             self.unsealed_bytes += bytes.len() as u64;
             log.batches.push_back(Batch {
                 bytes,
                 first_id: batch.first_id,
                 last_id: batch.last_id,
-                // Already durable, in a closed file: nothing waits on its ticket.
+                // Already durable, in a closed file, and in the WAL writer's first seal: ticket 0
+                // is at or below any seal's.
                 ticket: 0,
-                residency: log.residency,
                 upload: BatchUpload::Unsealed,
                 waiters: Vec::new(),
             });
@@ -3716,9 +3617,6 @@ impl Core {
         shard.counters = handoff.counters;
         for stream in handoff.streams {
             shard.streams.insert(Arc::clone(&stream.name));
-            if let Some(log) = self.logs.get_mut(&*stream.name) {
-                log.residency += 1;
-            }
             // Anything already sent is dropped by the next `clear_wal_waits`.
             for (core, ticket) in stream.wal_waits {
                 self.wal_waits.push(WalWait {

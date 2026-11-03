@@ -305,13 +305,15 @@ fn build_server(bin_dir: &Path) -> PathBuf {
 
 /// A small run of every part of `bench`, to show the tables come out with numbers in them. The
 /// numbers themselves are in docs/BENCH.md, from a release build.
+///
+/// The parts run at once, each with its own servers, so the test takes as long as the slowest
+/// part, not all of them in turn. The ack matrix runs level 3 only: a flat-out level 0 row in a
+/// debug build spends most of a minute delivering what it published.
 #[test]
 fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
     let fixture = start();
     let server_bin = build_server(Path::new(BIN).parent().unwrap());
-    let output = fixture.ok(&[
-        "bench",
-        "all",
+    let small = [
         "--server-bin",
         server_bin.to_str().unwrap(),
         "--count",
@@ -320,6 +322,10 @@ fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
         "1",
         "--idle-count",
         "50",
+        "--idle-streams",
+        "2000",
+        "--connect-count",
+        "200",
         "--cores",
         "1",
         "--seal-windows",
@@ -330,7 +336,37 @@ fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
         "0,1",
         "--runs",
         "1",
-    ]);
+    ];
+    let parts: [&[&str]; 11] = [
+        &["latency"],
+        &["throughput"],
+        &["idle"],
+        &["catch-up"],
+        &["many-streams"],
+        &["puts"],
+        &["idle-streams"],
+        &["ack-matrix", "--levels", "3"],
+        &["fan-out"],
+        &["connect"],
+        &["recovery"],
+    ];
+    let runs: Vec<_> = parts
+        .iter()
+        .map(|part| {
+            let mut args = vec!["bench"];
+            args.extend_from_slice(part);
+            args.extend_from_slice(&small);
+            let mut command = fixture.command(&args);
+            let part = part.join(" ");
+            std::thread::spawn(move || (part, command.output().unwrap()))
+        })
+        .collect();
+    let mut output = String::new();
+    for run in runs {
+        let (part, run) = run.join().unwrap();
+        assert!(run.status.success(), "bench {part}: {run:?}");
+        output.push_str(&String::from_utf8(run.stdout).unwrap());
+    }
     for row in [
         "| 0 | publish to delivery",
         "| 1 | ack",

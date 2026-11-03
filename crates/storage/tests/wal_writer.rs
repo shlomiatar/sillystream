@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use storage::{
-    DirVolume, DurableNotify, WalConfig, WalEntry, WalError, WalFile, WalRotated, WalSendError,
-    WalVolume, durable_watches, encode_file_header, encode_wal_entry, replay_dir, start_wal_writer,
+    DirVolume, DurableNotify, Handoff, SealExtent, Sealer, WalConfig, WalEntry, WalError, WalFile,
+    WalRotated, WalSendError, WalVolume, durable_watches, encode_file_header, encode_wal_entry,
+    replay_dir, start_wal_writer,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +167,9 @@ fn config(channel_capacity: usize) -> WalConfig {
         first_seq: 1,
         closed_seqs: Vec::new(),
         channel_capacity,
+        segment_cap_bytes: u64::MAX,
+        stream_buffer_bytes: u64::MAX,
+        carried: Vec::new(),
     }
 }
 
@@ -187,7 +191,8 @@ fn no_notification_comes_before_the_sync_covering_it() {
     let script = Script::default();
     let log = Arc::clone(&script.log);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(64)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(64))
+            .unwrap();
     for ticket in 1..=200 {
         let mut pending = entry((ticket % 3) as usize, ticket);
         loop {
@@ -234,7 +239,8 @@ fn notification_is_held_back_exactly_while_the_sync_is_held() {
     let gate = Arc::clone(&script.gate);
     gate.hold();
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     gate.wait_for_entered(1);
     // The sync has started and can't finish: the entry is written and not durable.
@@ -256,7 +262,8 @@ fn a_sync_error_stops_notifications_and_the_writer() {
     let log = Arc::clone(&script.log);
     let gate = Arc::clone(&script.gate);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     gate.wait_for_entered(1);
     // Wait for the first notification, so that the next entry gets the second sync.
@@ -287,7 +294,8 @@ fn a_write_error_stops_before_any_sync_or_notification() {
     };
     let log = Arc::clone(&script.log);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     let error = handle.join().unwrap_err();
     assert!(matches!(error, WalError::Write(_)), "{error}");
@@ -301,7 +309,8 @@ async fn a_sync_error_wakes_awaiting_cores_with_an_error() {
         ..Script::default()
     };
     let (notify, mut receivers) = durable_watches(1);
-    let (sender, handle) = start_wal_writer::<Bytes, _, _>(script, notify, config(8)).unwrap();
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _, _>(script, notify, (), config(8)).unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     let mut receiver = receivers.pop().unwrap();
     assert!(receiver.changed().await.is_err());
@@ -316,7 +325,8 @@ fn entries_queued_during_a_sync_land_together_in_the_next_one() {
     let gate = Arc::clone(&script.gate);
     gate.hold();
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(1024)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(1024))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     gate.wait_for_entered(1);
     // The first sync is in progress. All of these queue during it.
@@ -361,7 +371,8 @@ fn try_append_on_a_full_channel_returns_at_once_with_a_stalled_writer() {
     let gate = Arc::clone(&script.gate);
     gate.hold();
     let (notify, _receivers) = durable_watches(1);
-    let (sender, handle) = start_wal_writer::<Bytes, _, _>(script, notify, config(16)).unwrap();
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _, _>(script, notify, (), config(16)).unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     gate.wait_for_entered(1);
     for ticket in 2..=17 {
@@ -401,7 +412,8 @@ fn partial_writes_still_produce_exact_bytes() {
     };
     let log = Arc::clone(&script.log);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     sender.try_append(entry(0, 2)).unwrap();
     drop(sender);
@@ -416,9 +428,10 @@ fn rotation_syncs_the_old_file_first_and_only_ever_creates_files() {
     let script = Script::default();
     let log = Arc::clone(&script.log);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
-    let first = sender.try_rotate().unwrap().blocking_recv().unwrap();
+    let first = sender.try_seal(0).unwrap().blocking_recv().unwrap();
     assert_eq!(
         first,
         WalRotated {
@@ -428,8 +441,17 @@ fn rotation_syncs_the_old_file_first_and_only_ever_creates_files() {
     );
     // The active file can't be removed.
     sender.try_remove(2).unwrap();
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    // An empty file isn't sealed, so this makes no file.
+    let empty = sender.try_seal(0).unwrap().blocking_recv().unwrap();
+    assert_eq!(
+        empty,
+        WalRotated {
+            closed_seq: 1,
+            new_seq: 2
+        }
+    );
+    sender.try_append(entry(0, 2)).unwrap();
+    sender.try_seal(0).unwrap().blocking_recv().unwrap();
     drop(sender);
     handle.join().unwrap();
     let calls = log.calls();
@@ -443,8 +465,10 @@ fn rotation_syncs_the_old_file_first_and_only_ever_creates_files() {
             Call::Create(2),
             Call::Remove(1),
             // 2 was active at the removal, so it stays.
+            Call::Write(calls_write_len()),
+            Call::Sync,
+            Call::Durable(0, 2),
             Call::Create(3),
-            Call::Create(4),
         ]
     );
 }
@@ -457,9 +481,13 @@ fn calls_write_len() -> usize {
 async fn a_real_file_end_to_end_wakes_the_core_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let (notify, mut receivers) = durable_watches(2);
-    let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(DirVolume::new(dir.path(), 1 << 20), notify, config(64))
-            .unwrap();
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
+        DirVolume::new(dir.path(), 1 << 20),
+        notify,
+        (),
+        config(64),
+    )
+    .unwrap();
     sender.try_append(entry(0, 1)).unwrap();
     sender.try_append(entry(1, 1)).unwrap();
     sender.try_append(entry(0, 2)).unwrap();
@@ -545,7 +573,8 @@ fn start_failing_opens() -> (
         os_error: Arc::clone(&os_error),
     };
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(volume, LogNotify(Arc::clone(&log)), config(8)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(volume, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
     (sender, handle, os_error, log)
 }
 
@@ -557,18 +586,18 @@ fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
         sender.try_append(entry(0, 1)).unwrap();
         os_error.store(code, std::sync::atomic::Ordering::SeqCst);
         // The old file is closed, as with a full volume, so the seal can still upload it.
-        let rotated = sender.try_rotate().unwrap().blocking_recv().unwrap();
+        let rotated = sender.try_seal(0).unwrap().blocking_recv().unwrap();
         assert_eq!(rotated.closed_seq, 1);
         assert!(matches!(
             sender.try_append(entry(0, 2)),
             Err(WalSendError::Full(_))
         ));
         // Still out: another seal is no worse.
-        sender.try_rotate().unwrap().blocking_recv().unwrap();
+        sender.try_seal(0).unwrap().blocking_recv().unwrap();
         sender.try_remove(0).unwrap();
 
         os_error.store(0, std::sync::atomic::Ordering::SeqCst);
-        sender.try_rotate().unwrap().blocking_recv().unwrap();
+        sender.try_seal(0).unwrap().blocking_recv().unwrap();
         sender.try_append(entry(0, 2)).unwrap();
         drop(sender);
         handle.join().unwrap();
@@ -580,8 +609,9 @@ fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
 #[test]
 fn a_rotation_with_another_error_still_stops_the_writer() {
     let (sender, handle, os_error, _log) = start_failing_opens();
+    sender.try_append(entry(0, 1)).unwrap();
     os_error.store(EIO, std::sync::atomic::Ordering::SeqCst);
-    let done = sender.try_rotate().unwrap();
+    let done = sender.try_seal(0).unwrap();
     assert!(done.blocking_recv().is_err());
     drop(sender);
     assert!(matches!(handle.join(), Err(WalError::Rotate(_))));
@@ -596,7 +626,7 @@ fn a_flood_cannot_grow_one_group_past_the_channel() {
     let script = Script::default();
     let log = Arc::clone(&script.log);
     let (sender, handle) =
-        start_wal_writer::<Bytes, _, _>(script, LogNotify(log), config(CAPACITY)).unwrap();
+        start_wal_writer::<Bytes, _, _, _>(script, LogNotify(log), (), config(CAPACITY)).unwrap();
     let mut sent = 0;
     let mut ticket = 0;
     while sent < ENTRY_COUNT {
@@ -626,18 +656,23 @@ fn a_removed_file_is_gone_and_the_next_one_is_new() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(storage::wal_file_name(1)), b"before").unwrap();
     let (notify, _receivers) = durable_watches(1);
-    let (sender, handle) = start_wal_writer::<Bytes, _, _>(
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
         DirVolume::new(dir.path(), 1 << 16),
         notify,
+        (),
         WalConfig {
             first_seq: 2,
             closed_seqs: vec![1],
             channel_capacity: 16,
+            segment_cap_bytes: u64::MAX,
+            stream_buffer_bytes: u64::MAX,
+            carried: Vec::new(),
         },
     )
     .unwrap();
     sender.try_remove(1).unwrap();
-    sender.try_rotate().unwrap().blocking_recv().unwrap();
+    sender.try_append(entry(0, 1)).unwrap();
+    sender.try_seal(0).unwrap().blocking_recv().unwrap();
     drop(sender);
     handle.join().unwrap();
     let files = storage::list_wal_files(dir.path()).unwrap();
@@ -655,4 +690,230 @@ fn a_removed_file_is_gone_and_the_next_one_is_new() {
             .iter()
             .all(|byte| *byte == 0)
     );
+}
+
+/// What the writer handed over and asked for, in order. A dedicated object is refused while
+/// `refuse_dedicated` is set.
+#[derive(Default)]
+struct Sealed {
+    handoffs: Mutex<Vec<Handoff>>,
+    full_count: Mutex<u64>,
+    refuse_dedicated: std::sync::atomic::AtomicBool,
+}
+
+struct RecordingSealer(Arc<Sealed>);
+
+impl Sealer for RecordingSealer {
+    fn full(&mut self) {
+        *self.0.full_count.lock().unwrap() += 1;
+    }
+
+    fn seal(&mut self, handoff: Handoff) {
+        self.0.handoffs.lock().unwrap().push(handoff);
+    }
+
+    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff> {
+        if self
+            .0
+            .refuse_dedicated
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(handoff);
+        }
+        self.0.handoffs.lock().unwrap().push(handoff);
+        Ok(())
+    }
+}
+
+fn entry_for(stream: &str, core: usize, ticket: u64) -> WalEntry<Bytes> {
+    let records = Bytes::from(vec![ticket as u8; 40]);
+    WalEntry::new(Arc::from(stream), 7, ticket, records, core, ticket).unwrap()
+}
+
+fn start_sealing(
+    config: WalConfig,
+) -> (storage::WalSender<Bytes>, storage::WalHandle, Arc<Sealed>) {
+    let sealed = Arc::new(Sealed::default());
+    let script = Script::default();
+    let log = Arc::clone(&script.log);
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
+        script,
+        LogNotify(log),
+        RecordingSealer(Arc::clone(&sealed)),
+        config,
+    )
+    .unwrap();
+    (sender, handle, sealed)
+}
+
+/// What a handoff holds, as (stream, first byte of each record) per extent, and its tickets.
+fn shape(handoff: &Handoff) -> (Vec<(String, Vec<u8>)>, Vec<u64>) {
+    let extents: Vec<(String, Vec<u8>)> = match handoff {
+        Handoff::Seal { extents, .. } => extents
+            .iter()
+            .map(|extent| {
+                (
+                    extent.stream.to_string(),
+                    extent.records.iter().map(|records| records[0]).collect(),
+                )
+            })
+            .collect(),
+        Handoff::Dedicated {
+            stream, records, ..
+        } => vec![(
+            stream.to_string(),
+            records.iter().map(|records| records[0]).collect(),
+        )],
+    };
+    let tickets = match handoff {
+        Handoff::Seal { tickets, .. } | Handoff::Dedicated { tickets, .. } => tickets.clone(),
+    };
+    (extents, tickets)
+}
+
+/// A seal is its file: every entry it holds, by stream in write order, with each core's highest
+/// ticket. An empty file isn't rotated, and its seal still reaches the uploader (D268).
+#[test]
+fn a_seal_hands_over_exactly_what_its_file_holds() {
+    let (sender, handle, sealed) = start_sealing(config(64));
+    sender.try_append(entry_for("b", 0, 1)).unwrap();
+    sender.try_append(entry_for("a", 1, 2)).unwrap();
+    sender.try_append(entry_for("b", 1, 3)).unwrap();
+    sender.try_append(entry_for("b", 0, 4)).unwrap();
+    let rotated = sender.try_seal(5).unwrap().blocking_recv().unwrap();
+    assert_eq!(rotated.closed_seq, 1);
+    let empty = sender.try_seal(6).unwrap().blocking_recv().unwrap();
+    assert_eq!(empty.new_seq, 2, "nothing was written, so nothing rotated");
+    drop(sender);
+    handle.join().unwrap();
+    let handoffs = sealed.handoffs.lock().unwrap();
+    assert!(matches!(handoffs[0], Handoff::Seal { seal: 5, .. }));
+    assert_eq!(
+        shape(&handoffs[0]),
+        (
+            vec![("b".to_owned(), vec![1, 3, 4]), ("a".to_owned(), vec![2])],
+            vec![4, 3]
+        )
+    );
+    assert!(matches!(handoffs[1], Handoff::Seal { seal: 6, .. }));
+    // Each core's ticket stays where it got to, so a core that wrote nothing since still knows
+    // what is covered.
+    assert_eq!(shape(&handoffs[1]), (vec![], vec![4, 3]));
+}
+
+/// The cap is one total for the file, whichever cores wrote it, and it asks once per file.
+#[test]
+fn the_size_cap_asks_for_a_seal_once_per_file() {
+    let (sender, handle, sealed) = start_sealing(WalConfig {
+        segment_cap_bytes: 100,
+        ..config(64)
+    });
+    sender.try_append(entry_for("a", 0, 1)).unwrap();
+    sender.try_append(entry_for("b", 1, 2)).unwrap();
+    sender.try_seal(1).unwrap().blocking_recv().unwrap();
+    assert_eq!(
+        *sealed.full_count.lock().unwrap(),
+        0,
+        "80 bytes is under it"
+    );
+    for ticket in 3..=6 {
+        sender
+            .try_append(entry_for("a", (ticket % 2) as usize, ticket))
+            .unwrap();
+    }
+    sender.try_seal(2).unwrap().blocking_recv().unwrap();
+    assert_eq!(*sealed.full_count.lock().unwrap(), 1);
+    sender.try_append(entry_for("a", 0, 7)).unwrap();
+    sender.try_append(entry_for("a", 0, 8)).unwrap();
+    sender.try_append(entry_for("a", 0, 9)).unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    assert_eq!(
+        *sealed.full_count.lock().unwrap(),
+        2,
+        "the next file asks again"
+    );
+}
+
+/// A stream that fills its buffer in one file goes alone, with only its own tickets, and what
+/// it writes after that goes in the seal.
+#[test]
+fn a_stream_filling_its_buffer_is_handed_over_alone() {
+    let (sender, handle, sealed) = start_sealing(WalConfig {
+        stream_buffer_bytes: 80,
+        ..config(64)
+    });
+    sender.try_append(entry_for("hot", 0, 1)).unwrap();
+    sender.try_append(entry_for("cold", 1, 2)).unwrap();
+    sender.try_append(entry_for("hot", 1, 3)).unwrap();
+    sender.try_append(entry_for("hot", 0, 4)).unwrap();
+    sender.try_seal(1).unwrap().blocking_recv().unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let handoffs = sealed.handoffs.lock().unwrap();
+    assert!(matches!(handoffs[0], Handoff::Dedicated { number: 0, .. }));
+    assert_eq!(
+        shape(&handoffs[0]),
+        (vec![("hot".to_owned(), vec![1, 3])], vec![1, 3])
+    );
+    assert_eq!(
+        shape(&handoffs[1]),
+        (
+            vec![("cold".to_owned(), vec![2]), ("hot".to_owned(), vec![4])],
+            vec![4, 3]
+        )
+    );
+}
+
+/// An uploader that can't take a dedicated object now leaves its records in the seal.
+#[test]
+fn a_dedicated_object_that_cannot_go_stays_in_the_seal() {
+    let (sender, handle, sealed) = start_sealing(WalConfig {
+        stream_buffer_bytes: 40,
+        ..config(64)
+    });
+    sealed
+        .refuse_dedicated
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    sender.try_append(entry_for("hot", 0, 1)).unwrap();
+    sender.try_append(entry_for("hot", 0, 2)).unwrap();
+    sender.try_seal(1).unwrap().blocking_recv().unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let handoffs = sealed.handoffs.lock().unwrap();
+    assert_eq!(handoffs.len(), 1);
+    assert_eq!(
+        shape(&handoffs[0]),
+        (vec![("hot".to_owned(), vec![1, 2])], vec![2])
+    );
+}
+
+/// What a former process left goes into the first seal ahead of anything new, each extent as
+/// it was given.
+#[test]
+fn carried_records_go_into_the_first_seal_first() {
+    let carried = |byte: u8| SealExtent {
+        stream: Arc::from("s"),
+        records: vec![Bytes::from(vec![byte; 40])],
+    };
+    let (sender, handle, sealed) = start_sealing(WalConfig {
+        carried: vec![carried(100), carried(101)],
+        ..config(64)
+    });
+    sender.try_append(entry_for("s", 0, 1)).unwrap();
+    sender.try_seal(1).unwrap().blocking_recv().unwrap();
+    sender.try_append(entry_for("s", 0, 2)).unwrap();
+    sender.try_seal(2).unwrap().blocking_recv().unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let handoffs = sealed.handoffs.lock().unwrap();
+    assert_eq!(
+        shape(&handoffs[0]).0,
+        [
+            ("s".to_owned(), vec![100]),
+            ("s".to_owned(), vec![101]),
+            ("s".to_owned(), vec![1])
+        ]
+    );
+    assert_eq!(shape(&handoffs[1]).0, [("s".to_owned(), vec![2])]);
 }

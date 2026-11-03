@@ -47,7 +47,7 @@ async fn changes_for_one_batch(record_count: usize) -> (u64, Arc<Counting>) {
     }
     client.publish(publish("s", &records, 1, 3)).await.unwrap();
     assert!(matches!(
-        harness.node().seal().await,
+        seal_published(harness.node()).await,
         SealOutcome::Uploaded { .. }
     ));
     expect_ack(&mut client).await;
@@ -91,7 +91,7 @@ async fn every_reference_is_dropped_and_each_slab_freed_exactly_once() {
     }
     let live_before: usize = hook.freed.lock().unwrap().len();
     assert!(matches!(
-        harness.node().seal().await,
+        seal_published(harness.node()).await,
         SealOutcome::Uploaded { .. }
     ));
     client.retire_slab();

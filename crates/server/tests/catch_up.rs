@@ -235,7 +235,10 @@ async fn without_a_local_tier_sealed_records_come_from_the_object_store() {
         .publish(publish(STREAM, &records, 1, 3))
         .await
         .unwrap();
-    assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
+    assert!(matches!(
+        seal_published(node).await,
+        SealOutcome::Uploaded { .. }
+    ));
     expect_ack(&mut client).await;
     wait_for_memory_to_empty(node, STREAM).await;
 
@@ -509,7 +512,10 @@ async fn a_store_read_that_fails_is_retried_until_it_works() {
         .publish(publish(STREAM, &records, 1, 3))
         .await
         .unwrap();
-    assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
+    assert!(matches!(
+        seal_published(node).await,
+        SealOutcome::Uploaded { .. }
+    ));
     expect_ack(&mut client).await;
     wait_for_memory_to_empty(node, STREAM).await;
 
@@ -554,7 +560,7 @@ async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
         .publish(publish(STREAM, &records, 1, 3))
         .await
         .unwrap();
-    let SealOutcome::Uploaded { path, .. } = node.seal().await else {
+    let SealOutcome::Uploaded { path, .. } = seal_published(node).await else {
         panic!("the seal should have uploaded");
     };
     expect_ack(&mut client).await;

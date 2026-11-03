@@ -1421,7 +1421,9 @@ fn wal_file_count(disk: &Disk) -> usize {
 
 /// The writer hears of a removal by message, and doesn't answer it.
 async fn wait_for_wal_files(disk: &Disk, count: usize, what: &str) {
-    for _ in 0..2_000 {
+    // A full suite's load can hold a removal back for seconds, so this goes by time.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
         if wal_file_count(disk) <= count {
             return;
         }

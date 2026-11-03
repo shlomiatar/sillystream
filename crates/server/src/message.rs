@@ -336,8 +336,6 @@ pub struct CoreStats {
     pub outbound_count: usize,
     pub wal_stopped: bool,
     pub upload_failed_count: u64,
-    /// Sections and dedicated objects waiting for room in the uploader's channel.
-    pub uploads_waiting_count: usize,
     /// Unsealed bytes the core holds.
     pub unsealed_bytes: u64,
     pub duplicate_count: u64,
@@ -444,9 +442,6 @@ pub(crate) enum ControlMsg {
         config: StreamConfig,
         reply: oneshot::Sender<()>,
     },
-    Seal {
-        seal: u64,
-    },
     MoveShard {
         shard: u32,
         to: usize,
@@ -522,6 +517,11 @@ pub(crate) enum ControlMsg {
     },
     /// Replayed at startup (section 8.1), before anything else reaches this core.
     Restore(Box<crate::recovery::RestoredStream>),
+    /// Answers once everything this core has stamped is in the WAL's channel, so a seal sent
+    /// after the answer holds it (D268).
+    PassToWal {
+        reply: oneshot::Sender<()>,
+    },
     /// Whether everything sent before this seal's rotation is sealed and at its owner (D137).
     CheckpointClean {
         seal: u64,

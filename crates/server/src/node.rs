@@ -16,9 +16,9 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    CheckpointSet, DirVolume, DurableWatch, MetadataStore, SegmentCache, StreamExtent, UploadEvent,
-    UploadKey, Uploader, UploaderConfig, WalConfig, WalError, WalHandle, WalSendError, WalSender,
-    WalStats, WalVolume, durable_watches, start_wal_writer,
+    CheckpointSet, DirVolume, DurableWatch, MetadataStore, SealExtent, SegmentCache, StreamExtent,
+    UploadEvent, UploadKey, UploadSealer, Uploader, UploaderConfig, WalConfig, WalError, WalHandle,
+    WalSendError, WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -232,7 +232,6 @@ pub(crate) enum NodeMsg {
         reply: oneshot::Sender<bool>,
     },
     CheckpointSaved(CheckpointDone),
-    RetryRotate,
     Rotated {
         seal: u64,
         closed_seq: Option<u64>,
@@ -267,6 +266,9 @@ struct Control {
     overrides: HashMap<Arc<str>, u32>,
     seal_count: u64,
     rotating: bool,
+    /// The seal being rotated, if its upload already ended: it finishes once the rotation
+    /// is answered (D270).
+    ended_before_rotated: Option<(u64, SealOutcome)>,
     seal_wanted: bool,
     seal_waiters: Vec<oneshot::Sender<SealOutcome>>,
     waiters_by_seal: HashMap<u64, Vec<oneshot::Sender<SealOutcome>>>,
@@ -371,19 +373,18 @@ impl Control {
                 self.seal_wanted = true;
                 self.begin_seal();
             }
-            NodeMsg::RetryRotate => {
-                self.rotating = false;
-                self.begin_seal();
-            }
             NodeMsg::Rotated { seal, closed_seq } => {
                 self.rotating = false;
+                let ended = self
+                    .ended_before_rotated
+                    .take_if(|(ended_seal, _)| *ended_seal == seal);
                 if let Some(closed_seq) = closed_seq {
                     storage::crash_point("seal.after_rotate");
                     if let Some(meta) = &mut self.meta {
                         meta.closed_seq_by_seal.insert(seal, closed_seq);
                     }
-                    for control in &self.links.control {
-                        let _ = control.send(ControlMsg::Seal { seal });
+                    if let Some((_, outcome)) = ended {
+                        self.finish_seal(seal, outcome).await;
                     }
                     self.begin_seal();
                 } else {
@@ -406,46 +407,47 @@ impl Control {
         }
     }
 
-    /// Rotate first, then each core seals what it holds once it hears (D56). A rotation
-    /// waits on the writer, so it runs on the side, and control keeps answering.
+    /// The WAL writer seals its active file and hands it to the uploader (D268). First every
+    /// core passes on what it has stamped, so the seal holds whatever control sent the cores
+    /// before it, such as a manifest. That waits on the cores and the writer, so it runs on the
+    /// side, and control keeps answering.
     fn begin_seal(&mut self) {
         if self.rotating || !self.seal_wanted {
             return;
         }
-        match self.wal.try_rotate() {
-            Ok(done) => {
-                self.rotating = true;
-                self.seal_wanted = false;
-                self.seal_count += 1;
-                let seal = self.seal_count;
-                self.waiters_by_seal
-                    .insert(seal, std::mem::take(&mut self.seal_waiters));
-                if let Some(meta) = &mut self.meta {
-                    let waiters = std::mem::take(&mut meta.next_waiters);
-                    meta.waiters_by_seal.insert(seal, waiters);
-                }
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    let closed_seq = done.await.ok().map(|rotated| rotated.closed_seq);
-                    let _ = tx.send(NodeMsg::Rotated { seal, closed_seq });
-                });
-            }
-            Err(WalSendError::Full(())) => {
-                self.rotating = true;
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    let _ = tx.send(NodeMsg::RetryRotate);
-                });
-            }
-            Err(WalSendError::Stopped(())) => {
-                self.seal_wanted = false;
-                for waiter in self.seal_waiters.drain(..) {
-                    let _ = waiter.send(SealOutcome::WalStopped);
-                }
-                self.fail_checkpoint_waiters();
-            }
+        self.rotating = true;
+        self.seal_wanted = false;
+        self.seal_count += 1;
+        let seal = self.seal_count;
+        self.waiters_by_seal
+            .insert(seal, std::mem::take(&mut self.seal_waiters));
+        if let Some(meta) = &mut self.meta {
+            let waiters = std::mem::take(&mut meta.next_waiters);
+            meta.waiters_by_seal.insert(seal, waiters);
         }
+        let mut passed = Vec::with_capacity(self.links.control.len());
+        for control in &self.links.control {
+            let (reply, answer) = oneshot::channel();
+            let _ = control.send(ControlMsg::PassToWal { reply });
+            passed.push(answer);
+        }
+        let (wal, tx) = (self.wal.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            for answer in passed {
+                // A core that has stopped has nothing more to pass on.
+                let _ = answer.await;
+            }
+            let closed_seq = loop {
+                match wal.try_seal(seal) {
+                    Ok(done) => break done.await.ok().map(|rotated| rotated.closed_seq),
+                    Err(WalSendError::Full(())) => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(WalSendError::Stopped(())) => break None,
+                }
+            };
+            let _ = tx.send(NodeMsg::Rotated { seal, closed_seq });
+        });
     }
 
     fn fail_seal_waiters(&mut self, seal: u64) {
@@ -608,6 +610,16 @@ impl Control {
             } => (seal, SealOutcome::Failed { seal, error }),
             _ => return,
         };
+        // The uploader can finish before the writer's answer to the seal gets here, and the
+        // checkpoint needs that answer's closed file to remove it (D270).
+        if self.rotating && seal == self.seal_count {
+            self.ended_before_rotated = Some((seal, outcome));
+            return;
+        }
+        self.finish_seal(seal, outcome).await;
+    }
+
+    async fn finish_seal(&mut self, seal: u64, outcome: SealOutcome) {
         self.checkpoint_seal(seal).await;
         for waiter in self.waiters_by_seal.remove(&seal).unwrap_or_default() {
             let _ = waiter.send(outcome.clone());
@@ -814,7 +826,7 @@ pub struct Node {
     accounts: Vec<SlabAccount>,
     threads: Vec<JoinHandle<()>>,
     client_count: Arc<AtomicU64>,
-    uploader: Option<Uploader<SlabBytes>>,
+    uploader: Option<Uploader>,
     wal: Option<WalHandle>,
     /// The metadata threads, which go last since cores and control send to them.
     meta_threads: Vec<JoinHandle<()>>,
@@ -963,16 +975,6 @@ impl Node {
             object: Arc::clone(&store),
         };
         let (notify, durable): (DurableWatch, _) = durable_watches(core_count);
-        let (wal, wal_handle) = start_wal_writer::<SlabBytes, _, _>(
-            volume,
-            notify,
-            WalConfig {
-                first_seq,
-                closed_seqs,
-                channel_capacity: config.wal_channel_capacity,
-            },
-        )?;
-
         let mut upload_txs = Vec::with_capacity(core_count + 1);
         let mut upload_rxs = Vec::with_capacity(core_count);
         for _ in 0..core_count {
@@ -982,11 +984,10 @@ impl Node {
         }
         let (control_uploads_tx, control_uploads) = mpsc::unbounded_channel();
         upload_txs.push(control_uploads_tx);
-        let (upload_sender, uploader) = Uploader::<SlabBytes>::start(UploaderConfig {
+        let (upload_sender, uploader) = Uploader::start(UploaderConfig {
             store: Arc::clone(&store),
             node: config.node_name.clone(),
             generation: config.generation,
-            section_count: core_count,
             channel_capacity: config.upload_channel_capacity,
             retry_initial_ms: config.upload_retry_initial_ms,
             retry_max_ms: config.upload_retry_max_ms,
@@ -994,6 +995,28 @@ impl Node {
             cache,
             events: upload_txs,
         })?;
+        let (core_to_node, core_rx) = mpsc::unbounded_channel();
+        let seal_requests = core_to_node.clone();
+        let (wal, wal_handle) = start_wal_writer::<SlabBytes, _, _, _>(
+            volume,
+            notify,
+            UploadSealer {
+                uploads: upload_sender,
+                on_full: move || {
+                    let _ = seal_requests.send(CoreToNode::SealRequested);
+                },
+            },
+            WalConfig {
+                first_seq,
+                closed_seqs,
+                channel_capacity: config.wal_channel_capacity,
+                segment_cap_bytes: config.segment_cap_bytes,
+                stream_buffer_bytes: config.stream_buffer_bytes,
+                carried: recovered
+                    .as_ref()
+                    .map_or_else(Vec::new, |parts| carried_extents(&parts.restored)),
+            },
+        )?;
 
         let mut links = Links {
             control: Vec::new(),
@@ -1025,7 +1048,6 @@ impl Node {
             });
         }
 
-        let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let accounts: Vec<SlabAccount> = (0..core_count).map(|_| SlabAccount::new()).collect();
         let settings = DeliverySettings {
             queue_bytes: delivery_bound_bytes(&config, config.subscriber_queue_bytes),
@@ -1052,8 +1074,6 @@ impl Node {
                     virtual_shard_count: config.virtual_shard_count,
                     override_shard_count: config.override_shard_count,
                     core_count,
-                    segment_cap_share_bytes: config.segment_cap_bytes / core_count as u64,
-                    stream_buffer_bytes: config.stream_buffer_bytes,
                     last_valid_id: config.last_valid_id,
                     active_stream_limit: core_limit,
                     write_park_cap_count: config.write_inbox_capacity,
@@ -1062,7 +1082,6 @@ impl Node {
                 links: links.clone(),
                 inbox,
                 wal: wal.clone(),
-                uploader: upload_sender.clone(),
                 to_node: core_to_node.clone(),
                 pool: SlabPool::new(
                     config.slab_bytes,
@@ -1089,7 +1108,6 @@ impl Node {
         }
         // Keeps its own copy of what a seal or rebalance needs.
         drop(core_to_node);
-        drop(upload_sender);
 
         let total_shards = config.virtual_shard_count + config.override_shard_count;
         let location = (0..total_shards)
@@ -1212,6 +1230,7 @@ impl Node {
             overrides: HashMap::new(),
             seal_count: 0,
             rotating: false,
+            ended_before_rotated: None,
             seal_wanted: false,
             seal_waiters: Vec::new(),
             waiters_by_seal: HashMap::new(),
@@ -1965,4 +1984,37 @@ impl Client {
     pub fn pinned_bytes(&self) -> u64 {
         self.pool.account().pinned_bytes()
     }
+}
+
+/// What startup replay found that no object holds, for the WAL writer's first seal. A stream's
+/// records split wherever an object's extent lies between them, since one extent can't go around
+/// another's records.
+fn carried_extents(restored: &[crate::recovery::RestoredStream]) -> Vec<SealExtent> {
+    let mut extents: Vec<SealExtent> = Vec::new();
+    for stream in restored {
+        let name: Arc<str> = Arc::from(stream.meta.name.as_str());
+        let mut previous_last_id: Option<u64> = None;
+        for batch in &stream.batches {
+            let split = previous_last_id.is_none_or(|last_id| {
+                stream
+                    .meta
+                    .extents
+                    .iter()
+                    .any(|known| last_id < known.id_first && known.id_first < batch.first_id)
+            });
+            if split {
+                extents.push(SealExtent {
+                    stream: Arc::clone(&name),
+                    records: Vec::new(),
+                });
+            }
+            previous_last_id = Some(batch.last_id);
+            extents
+                .last_mut()
+                .expect("pushed above")
+                .records
+                .push(batch.bytes.clone());
+        }
+    }
+    extents
 }

@@ -13,14 +13,13 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use storage::{
-    Section, SectionExtent, SegmentCache, SegmentReader, UnfinishedUpload, UploadEvent, UploadKey,
+    Handoff, SealExtent, SegmentCache, SegmentReader, UnfinishedUpload, UploadEvent, UploadKey,
     UploadSendError, Uploader, UploaderConfig, UploaderSender, dedicated_path, seal_path,
     stream_fits_dedicated_path,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const FIRST_ID: u64 = 1_800_000_000_000 << 16;
-const SECTIONS: usize = 4;
 
 /// A reference that shows when it is released, as a slab reference would.
 #[derive(Clone, Debug)]
@@ -32,17 +31,13 @@ impl AsRef<[u8]> for Tracked {
     }
 }
 
-fn config(
-    store: Arc<dyn ObjectStore>,
-    section_count: usize,
-) -> (UploaderConfig, UnboundedReceiver<UploadEvent>) {
+fn config(store: Arc<dyn ObjectStore>) -> (UploaderConfig, UnboundedReceiver<UploadEvent>) {
     let (tx, rx) = unbounded_channel();
     (
         UploaderConfig {
             store,
             node: "node-1".to_owned(),
             generation: 3,
-            section_count,
             channel_capacity: 64,
             retry_initial_ms: 1,
             retry_max_ms: 4,
@@ -54,29 +49,60 @@ fn config(
     )
 }
 
-/// `SECTIONS` sections over `stream_count` streams, spread by name.
-fn sections(stream_count: u64, base_id: u64) -> (Vec<Section<Bytes>>, Vec<(String, Bytes)>) {
+/// One extent per stream, for `stream_count` streams, sorted by name.
+fn extents(stream_count: u64, base_id: u64) -> (Vec<SealExtent>, Vec<(String, Bytes)>) {
     let mut names: Vec<(String, u64)> = (0..stream_count)
         .map(|index| (format!("logs.{index:08}"), index))
         .collect();
     names.sort();
-    let mut out: Vec<Section<Bytes>> = (0..SECTIONS)
-        .map(|_| Section {
-            extents: Vec::new(),
-        })
-        .collect();
+    let mut out = Vec::new();
     let mut expected = Vec::new();
     for (name, index) in names {
         let bytes = Bytes::from(record(base_id + index, index, 7, name.as_bytes()));
-        out[(index % SECTIONS as u64) as usize]
-            .extents
-            .push(SectionExtent {
-                stream: Arc::from(name.as_str()),
-                records: vec![bytes.clone()],
-            });
+        out.push(SealExtent {
+            stream: Arc::from(name.as_str()),
+            records: vec![bytes.clone()],
+        });
         expected.push((name, bytes));
     }
     (out, expected)
+}
+
+fn seal(seal: u64, extents: Vec<SealExtent>) -> Handoff {
+    Handoff::Seal {
+        seal,
+        extents,
+        tickets: Vec::new(),
+    }
+}
+
+fn one_stream_seal(number: u64, stream: &str, bytes: &Bytes) -> Handoff {
+    seal(
+        number,
+        vec![SealExtent {
+            stream: Arc::from(stream),
+            records: vec![bytes.clone()],
+        }],
+    )
+}
+
+fn dedicated(stream: &str, number: u64, records: Vec<Bytes>) -> Handoff {
+    Handoff::Dedicated {
+        stream: Arc::from(stream),
+        number,
+        records,
+        tickets: Vec::new(),
+    }
+}
+
+/// The next event that isn't `Sealed`.
+async fn next_event(events: &mut UnboundedReceiver<UploadEvent>) -> Option<UploadEvent> {
+    loop {
+        match events.recv().await {
+            Some(UploadEvent::Sealed { .. }) => {}
+            other => return other,
+        }
+    }
 }
 
 async fn next_uploaded(events: &mut UnboundedReceiver<UploadEvent>) -> (UploadKey, Path, u64) {
@@ -88,7 +114,7 @@ async fn next_uploaded(events: &mut UnboundedReceiver<UploadEvent>) -> (UploadKe
                 len_bytes,
                 ..
             } => return (key, path, len_bytes),
-            UploadEvent::Retrying { .. } => {}
+            UploadEvent::Retrying { .. } | UploadEvent::Sealed { .. } => {}
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -97,20 +123,16 @@ async fn next_uploaded(events: &mut UnboundedReceiver<UploadEvent>) -> (UploadKe
 async fn one_put_per_seal(inner: Arc<dyn ObjectStore>) {
     let counting = Arc::new(CountingStore::new(inner));
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(Arc::clone(&store), SECTIONS);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
 
-    for (seal, stream_count) in [(1u64, 10u64), (2, 1_000), (3, 20_000)] {
-        let base_id = FIRST_ID + seal * 1_000_000;
-        let (sections, expected) = sections(stream_count, base_id);
+    for (number, stream_count) in [(1u64, 10u64), (2, 1_000), (3, 20_000)] {
+        let base_id = FIRST_ID + number * 1_000_000;
+        let (extents, expected) = extents(stream_count, base_id);
         let before = counting.puts();
-        for (core, section) in sections.into_iter().enumerate() {
-            // Nothing is uploaded until the last section arrives.
-            assert_eq!(counting.puts(), before);
-            sender.try_send_section(seal, core, section).unwrap();
-        }
+        sender.try_send(seal(number, extents)).unwrap();
         let (key, path, len_bytes) = next_uploaded(&mut events).await;
-        assert_eq!(key, UploadKey::Seal(seal));
+        assert_eq!(key, UploadKey::Seal(number));
         assert_eq!(counting.puts(), before + 1, "{stream_count} streams, 1 PUT");
         assert_eq!(path, seal_path("node-1", 3, base_id));
         let hour = id_ms(base_id) / 3_600_000;
@@ -147,28 +169,37 @@ async fn one_put_per_seal_on_the_local_file_system() {
     .await;
 }
 
+/// Each extent is its own footer entry, in the order they came, even with another stream
+/// between them.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stream_that_moved_cores_gets_two_entries_in_one_object() {
+async fn one_stream_in_two_extents_of_a_seal_gets_two_entries_in_one_object() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (config, mut events) = config(Arc::clone(&store), 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let early = Bytes::from(record(FIRST_ID, 1, 7, b"early"));
-    let late = Bytes::from(record(FIRST_ID + 1, 1, 7, b"late"));
-    for (core, bytes) in [(1, late.clone()), (0, early.clone())] {
-        let section = Section {
-            extents: vec![SectionExtent {
-                stream: Arc::from("moved"),
-                records: vec![bytes],
-            }],
-        };
-        sender.try_send_section(9, core, section).unwrap();
-    }
+    let other = Bytes::from(record(FIRST_ID + 1, 1, 7, b"other"));
+    let late = Bytes::from(record(FIRST_ID + 2, 1, 7, b"late"));
+    let extent = |stream: &str, bytes: &Bytes| SealExtent {
+        stream: Arc::from(stream),
+        records: vec![bytes.clone()],
+    };
+    sender
+        .try_send(seal(
+            9,
+            vec![
+                extent("moved", &early),
+                extent("a.other", &other),
+                extent("moved", &late),
+            ],
+        ))
+        .unwrap();
     let (_, path, _) = next_uploaded(&mut events).await;
     let reader = SegmentReader::new(Arc::clone(&store), path);
     let top = reader.read_top_index().await.unwrap();
     assert_eq!(reader.lookup(&top, "moved").await.unwrap().len(), 2);
     let both = [early, late].concat();
     assert_eq!(reader.read_stream("moved").await.unwrap(), both);
+    assert_eq!(reader.read_stream("a.other").await.unwrap(), other);
     drop(sender);
     uploader.finish();
 }
@@ -177,16 +208,16 @@ async fn a_stream_that_moved_cores_gets_two_entries_in_one_object() {
 async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(Arc::clone(&store), SECTIONS);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let first = Bytes::from(record(FIRST_ID, 1, 7, b"one"));
     let second = Bytes::from(record(FIRST_ID + 1, 1, 7, b"two"));
     sender
-        .try_send_dedicated(
-            Arc::from("logs.busy"),
+        .try_send(dedicated(
+            "logs.busy",
             77,
             vec![first.clone(), second.clone()],
-        )
+        ))
         .unwrap();
     let (key, path, _) = next_uploaded(&mut events).await;
     assert_eq!(
@@ -210,23 +241,88 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() 
     uploader.finish();
 }
 
+/// The key an event is about.
+fn key_of(event: &UploadEvent) -> &UploadKey {
+    match event {
+        UploadEvent::Sealed { key, .. }
+        | UploadEvent::Uploaded { key, .. }
+        | UploadEvent::Empty { key }
+        | UploadEvent::Retrying { key, .. }
+        | UploadEvent::Failed { key, .. } => key,
+    }
+}
+
+/// Cores hear what an object covers before anything else about it, for seals and dedicated
+/// objects alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.fail_next_puts.store(2, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = counting.clone();
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    sender
+        .try_send(Handoff::Seal {
+            seal: 4,
+            extents: vec![SealExtent {
+                stream: Arc::from("s"),
+                records: vec![bytes.clone()],
+            }],
+            tickets: vec![3, 0, 9],
+        })
+        .unwrap();
+    sender
+        .try_send(Handoff::Dedicated {
+            stream: Arc::from("d"),
+            number: 8,
+            records: vec![bytes],
+            tickets: vec![5, 1, 0],
+        })
+        .unwrap();
+    let seal_key = UploadKey::Seal(4);
+    let dedicated_key = UploadKey::Dedicated {
+        stream: Arc::from("d"),
+        number: 8,
+    };
+    let mut seen = Vec::new();
+    let mut uploaded = 0;
+    while uploaded < 2 {
+        let event = events.recv().await.expect("the uploader stopped");
+        if matches!(event, UploadEvent::Uploaded { .. }) {
+            uploaded += 1;
+        }
+        seen.push(event);
+    }
+    for (key, wanted) in [(&seal_key, [3, 0, 9]), (&dedicated_key, [5, 1, 0])] {
+        let first = seen.iter().find(|event| key_of(event) == key).unwrap();
+        match first {
+            UploadEvent::Sealed { tickets, .. } => assert_eq!(**tickets, wanted),
+            other => panic!("{key:?} began with {other:?}"),
+        }
+        let sealed_count = seen
+            .iter()
+            .filter(|event| key_of(event) == key && matches!(event, UploadEvent::Sealed { .. }))
+            .count();
+        assert_eq!(sealed_count, 1, "{seen:?}");
+    }
+    drop(sender);
+    assert!(uploader.finish().unfinished.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn store_failures_retry_with_references_held_until_success() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(5, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(Arc::clone(&store), 1);
-    let (sender, uploader) = Uploader::<Tracked>::start(config).unwrap();
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
 
     let wire = record(FIRST_ID, 1, 7, b"precious");
     let reference = Arc::new(wire.clone());
-    let section = Section {
-        extents: vec![SectionExtent {
-            stream: Arc::from("s"),
-            records: vec![Tracked(Arc::clone(&reference))],
-        }],
-    };
-    sender.try_send_section(1, 0, section).unwrap();
+    let bytes = Bytes::from_owner(Tracked(Arc::clone(&reference)));
+    sender.try_send(one_stream_seal(1, "s", &bytes)).unwrap();
+    drop(bytes);
 
     let mut retries = 0;
     let path = loop {
@@ -241,6 +337,7 @@ async fn store_failures_retry_with_references_held_until_success() {
                 );
             }
             UploadEvent::Uploaded { path, .. } => break path,
+            UploadEvent::Sealed { .. } => {}
             other => panic!("unexpected event: {other:?}"),
         }
     };
@@ -259,56 +356,55 @@ async fn shutdown_during_an_outage_hands_every_reference_back() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    let section = |stream: &str| Section {
-        extents: vec![SectionExtent {
-            stream: Arc::from(stream),
-            records: vec![bytes.clone()],
-        }],
+    let extent = |stream: &str| SealExtent {
+        stream: Arc::from(stream),
+        records: vec![bytes.clone()],
     };
-    sender.try_send_section(1, 0, section("a")).unwrap();
-    sender.try_send_section(1, 1, section("b")).unwrap();
+    sender
+        .try_send(seal(1, vec![extent("a"), extent("b")]))
+        .unwrap();
     // Wait until it is really retrying, then queue more behind it.
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
     ));
     sender
-        .try_send_dedicated(Arc::from("c"), 1, vec![bytes.clone()])
+        .try_send(dedicated("c", 1, vec![bytes.clone()]))
         .unwrap();
-    sender.try_send_section(2, 0, section("d")).unwrap();
+    sender.try_send(seal(2, vec![extent("d")])).unwrap();
     // The sender stays alive: shutdown must not depend on the channel closing.
     let exit = uploader.shutdown();
     assert_eq!(counting.puts(), 0);
     let mut seals = Vec::new();
-    let mut dedicated = 0;
+    let mut dedicated_count = 0;
     for unfinished in exit.unfinished {
         match unfinished {
-            UnfinishedUpload::Seal { seal, sections } => seals.push((seal, sections.len())),
+            UnfinishedUpload::Seal { seal, extents } => seals.push((seal, extents.len())),
             UnfinishedUpload::Dedicated {
                 stream, records, ..
             } => {
                 assert_eq!(&*stream, "c");
                 assert_eq!(records.len(), 1);
-                dedicated += 1;
+                dedicated_count += 1;
             }
         }
     }
     seals.sort();
     assert_eq!(seals, [(1, 2), (2, 1)]);
-    assert_eq!(dedicated, 1);
+    assert_eq!(dedicated_count, 1);
     assert!(matches!(
-        sender.try_send_dedicated(Arc::from("e"), 2, Vec::new()),
+        sender.try_send(dedicated("e", 2, Vec::new())),
         Err(UploadSendError::Stopped(_))
     ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_with_nothing_to_do_returns_with_senders_alive() {
-    let (config, _events) = config(Arc::new(InMemory::new()), 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, _events) = config(Arc::new(InMemory::new()));
+    let (sender, uploader) = Uploader::start(config).unwrap();
     assert!(uploader.shutdown().unfinished.is_empty());
     drop(sender);
 }
@@ -317,16 +413,11 @@ async fn shutdown_with_nothing_to_do_returns_with_senders_alive() {
 async fn a_seal_with_no_records_writes_nothing() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    for core in 0..2 {
-        let section = Section {
-            extents: Vec::new(),
-        };
-        sender.try_send_section(5, core, section).unwrap();
-    }
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    sender.try_send(seal(5, Vec::new())).unwrap();
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Empty {
             key: UploadKey::Seal(5)
         })
@@ -336,48 +427,51 @@ async fn a_seal_with_no_records_writes_nothing() {
     uploader.finish();
 }
 
+/// Extents can come in any order. The object has them sorted, so every stream can be found.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unsorted_section_fails_and_keeps_its_references() {
-    let (config, mut events) = config(Arc::new(InMemory::new()), 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    let extent = |stream: &str| SectionExtent {
-        stream: Arc::from(stream),
-        records: vec![bytes.clone()],
-    };
-    let section = Section {
-        extents: vec![extent("b"), extent("a")],
-    };
-    sender.try_send_section(1, 0, section).unwrap();
-    assert!(matches!(
-        events.recv().await,
-        Some(UploadEvent::Failed { .. })
-    ));
+async fn unsorted_extents_are_uploaded_sorted_and_readable() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    let streams = ["c", "a", "b"];
+    let mut extents = Vec::new();
+    let mut expected = Vec::new();
+    for (index, stream) in streams.iter().enumerate() {
+        let bytes = Bytes::from(record(FIRST_ID + index as u64, 1, 7, stream.as_bytes()));
+        extents.push(SealExtent {
+            stream: Arc::from(*stream),
+            records: vec![bytes.clone()],
+        });
+        expected.push((*stream, bytes));
+    }
+    sender.try_send(seal(1, extents)).unwrap();
+    let (_, path, _) = next_uploaded(&mut events).await;
+    let reader = SegmentReader::new(store, path);
+    let top = reader.read_top_index().await.unwrap();
+    for (stream, bytes) in expected {
+        let found = reader.lookup(&top, stream).await.unwrap();
+        assert_eq!(found.len(), 1, "{stream}");
+        assert_eq!(reader.read_extent(&found[0]).await.unwrap(), bytes);
+    }
     drop(sender);
-    assert_eq!(uploader.finish().unfinished.len(), 1);
+    assert!(uploader.finish().unfinished.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retry_after_a_lost_response_counts_as_done_and_a_collision_takes_the_next_name() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    let section = |bytes: &Bytes| Section {
-        extents: vec![SectionExtent {
-            stream: Arc::from("s"),
-            records: vec![bytes.clone()],
-        }],
-    };
-    let (config_one, mut events_one) = config(Arc::clone(&store), 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config_one).unwrap();
-    sender.try_send_section(1, 0, section(&bytes)).unwrap();
+    let (config_one, mut events_one) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config_one).unwrap();
+    sender.try_send(one_stream_seal(1, "s", &bytes)).unwrap();
     let (_, path, _) = next_uploaded(&mut events_one).await;
     // The same bytes again, as after a PUT that succeeded with its response lost.
-    sender.try_send_section(2, 0, section(&bytes)).unwrap();
+    sender.try_send(one_stream_seal(2, "s", &bytes)).unwrap();
     assert_eq!(next_uploaded(&mut events_one).await.1, path);
     // Different bytes for the same path must not overwrite the first object, and still have
     // to reach the store.
     let other = Bytes::from(record(FIRST_ID, 1, 7, b"y"));
-    sender.try_send_section(3, 0, section(&other)).unwrap();
+    sender.try_send(one_stream_seal(3, "s", &other)).unwrap();
     let (_, other_path, _) = next_uploaded(&mut events_one).await;
     assert_eq!(other_path, seal_path("node-1", 3, FIRST_ID + 1));
     drop(sender);
@@ -393,20 +487,20 @@ async fn try_send_on_a_full_channel_returns_at_once() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (mut config, mut events) = config(store, 1);
+    let (mut config, mut events) = config(store);
     config.channel_capacity = 2;
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     sender
-        .try_send_dedicated(Arc::from("s"), 0, vec![bytes.clone()])
+        .try_send(dedicated("s", 0, vec![bytes.clone()]))
         .unwrap();
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
     ));
     let mut full_count = 0;
     for number in 1..1000 {
-        match sender.try_send_dedicated(Arc::from("s"), number, vec![bytes.clone()]) {
+        match sender.try_send(dedicated("s", number, vec![bytes.clone()])) {
             Ok(()) => {}
             Err(UploadSendError::Full(_)) => full_count += 1,
             Err(UploadSendError::Stopped(_)) => panic!("stopped"),
@@ -424,12 +518,12 @@ async fn uploaded_objects_reach_the_local_cache() {
     let cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
     let local = cache.store();
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let (mut config, mut events) = config(Arc::clone(&inner), 1);
+    let (mut config, mut events) = config(Arc::clone(&inner));
     config.cache = Some(cache);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"cached"));
     sender
-        .try_send_dedicated(Arc::from("s"), 0, vec![bytes.clone()])
+        .try_send(dedicated("s", 0, vec![bytes.clone()]))
         .unwrap();
     let (_, path, _) = next_uploaded(&mut events).await;
     // Same bytes from both tiers, through the same reader.
@@ -442,46 +536,8 @@ async fn uploaded_objects_reach_the_local_cache() {
     uploader.finish();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_second_section_from_one_core_keeps_both_and_does_not_fire_the_seal() {
-    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
-    let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let section = |id: u64| Section {
-        extents: vec![SectionExtent {
-            stream: Arc::from("s"),
-            records: vec![Bytes::from(record(id, 1, 7, b"x"))],
-        }],
-    };
-    sender.try_send_section(1, 0, section(FIRST_ID)).unwrap();
-    sender
-        .try_send_section(1, 0, section(FIRST_ID + 1))
-        .unwrap();
-    sender
-        .try_send_section(1, 9, section(FIRST_ID + 2))
-        .unwrap();
-    for _ in 0..2 {
-        assert!(matches!(
-            events.recv().await,
-            Some(UploadEvent::Failed { .. })
-        ));
-    }
-    assert_eq!(counting.puts(), 0);
-    drop(sender);
-    let unfinished = uploader.finish().unfinished;
-    let held: usize = unfinished
-        .iter()
-        .map(|upload| match upload {
-            UnfinishedUpload::Seal { sections, .. } => sections.len(),
-            UnfinishedUpload::Dedicated { .. } => 0,
-        })
-        .sum();
-    assert_eq!(held, 3, "every section comes back");
-}
-
-/// Events until `wanted` is `Uploaded`, failing if that takes longer than 5 s. A
-/// wedged uploader never gets there.
+/// Events other than `Sealed` until `wanted` is `Uploaded`, failing if that takes longer than
+/// 5 s. A wedged uploader never gets there.
 async fn events_until_uploaded(
     events: &mut UnboundedReceiver<UploadEvent>,
     wanted: &UploadKey,
@@ -489,7 +545,7 @@ async fn events_until_uploaded(
     let mut seen = Vec::new();
     let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let event = events.recv().await.expect("the uploader stopped");
+            let event = next_event(events).await.expect("the uploader stopped");
             let done = matches!(&event, UploadEvent::Uploaded { key, .. } if key == wanted);
             seen.push(event);
             if done {
@@ -507,18 +563,9 @@ async fn events_until_uploaded(
     seen
 }
 
-fn one_stream_section(stream: &str, bytes: &Bytes) -> Section<Bytes> {
-    Section {
-        extents: vec![SectionExtent {
-            stream: Arc::from(stream),
-            records: vec![bytes.clone()],
-        }],
-    }
-}
-
 async fn a_stream_id_too_long_for_a_path_fails_alone(store: Arc<dyn ObjectStore>) {
-    let (config, mut events) = config(store, 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     // Over the limit as encoded in a path, including ids short enough as raw bytes.
     let long_ids = [
@@ -530,16 +577,16 @@ async fn a_stream_id_too_long_for_a_path_fails_alone(store: Arc<dyn ObjectStore>
     for (number, id) in long_ids.iter().enumerate() {
         assert!(!stream_fits_dedicated_path(id));
         sender
-            .try_send_dedicated(Arc::from(id.as_str()), number as u64, vec![bytes.clone()])
+            .try_send(dedicated(id, number as u64, vec![bytes.clone()]))
             .unwrap();
     }
     // The longest id that fits, and a long id in a seal, which puts it in no path.
     assert!(stream_fits_dedicated_path(&"x".repeat(255)));
     sender
-        .try_send_dedicated(Arc::from("x".repeat(255)), 100, vec![bytes.clone()])
+        .try_send(dedicated(&"x".repeat(255), 100, vec![bytes.clone()]))
         .unwrap();
     sender
-        .try_send_section(1, 0, one_stream_section(&"y".repeat(300), &bytes))
+        .try_send(one_stream_seal(1, &"y".repeat(300), &bytes))
         .unwrap();
     let seen = events_until_uploaded(&mut events, &UploadKey::Seal(1)).await;
     let mut failed = Vec::new();
@@ -583,15 +630,13 @@ async fn a_stream_id_too_long_for_a_path_fails_alone_in_memory() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_name_too_long_for_a_path_fails_each_seal_without_retrying() {
-    let (mut config, mut events) = config(Arc::new(InMemory::new()), 1);
+    let (mut config, mut events) = config(Arc::new(InMemory::new()));
     config.node = "n".repeat(300);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_section(1, 0, one_stream_section("a", &bytes))
-        .unwrap();
+    sender.try_send(one_stream_seal(1, "a", &bytes)).unwrap();
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Failed {
             key: UploadKey::Seal(1),
             ..
@@ -605,14 +650,14 @@ async fn a_store_error_that_retrying_cannot_change_fails_alone() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.reject_next_puts.store(1, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     sender
-        .try_send_dedicated(Arc::from("rejected"), 1, vec![bytes.clone()])
+        .try_send(dedicated("rejected", 1, vec![bytes.clone()]))
         .unwrap();
     sender
-        .try_send_section(1, 0, one_stream_section("healthy", &bytes))
+        .try_send(one_stream_seal(1, "healthy", &bytes))
         .unwrap();
     let seen = events_until_uploaded(&mut events, &UploadKey::Seal(1)).await;
     assert!(matches!(seen[0], UploadEvent::Failed { .. }), "{seen:?}");
@@ -620,23 +665,21 @@ async fn a_store_error_that_retrying_cannot_change_fails_alone() {
     assert_eq!(uploader.shutdown().unfinished.len(), 1);
 }
 
-/// Sends a new seal's section until told to stop or until the uploader has stopped.
-/// With `section_count = 2` each stays pending, so an accepted one has to come back.
+/// Sends a new seal until told to stop or until the uploader has stopped. The store fails every
+/// PUT, so none is ever uploaded, and an accepted one has to come back.
 fn send_until_stopped(
-    sender: &UploaderSender<Bytes>,
+    sender: &UploaderSender,
     give_up: &AtomicBool,
     spins_between_sends: u32,
 ) -> usize {
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     let mut accepted = 0;
-    let mut seal = 0;
+    let mut number = 0;
     while !give_up.load(Ordering::Relaxed) {
-        let section = Section {
-            extents: Vec::new(),
-        };
-        match sender.try_send_section(seal, 0, section) {
+        match sender.try_send(one_stream_seal(number, "s", &bytes)) {
             Ok(()) => {
                 accepted += 1;
-                seal += 1;
+                number += 1;
             }
             Err(UploadSendError::Full(_)) => {}
             Err(UploadSendError::Stopped(_)) => break,
@@ -648,12 +691,18 @@ fn send_until_stopped(
     accepted
 }
 
+fn failing_store() -> Arc<dyn ObjectStore> {
+    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
+    counting
+}
+
 #[test]
-fn every_section_accepted_around_shutdown_comes_back() {
+fn every_handoff_accepted_around_shutdown_comes_back() {
     for run in 0..500 {
-        let (mut config, _events) = config(Arc::new(InMemory::new()), 2);
+        let (mut config, _events) = config(failing_store());
         config.channel_capacity = 1024;
-        let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+        let (sender, uploader) = Uploader::start(config).unwrap();
         let give_up = AtomicBool::new(false);
         let (accepted, returned) = std::thread::scope(|scope| {
             let sending = scope.spawn(|| send_until_stopped(&sender, &give_up, 200));
@@ -667,9 +716,9 @@ fn every_section_accepted_around_shutdown_comes_back() {
 
 #[test]
 fn a_sender_that_never_pauses_cannot_hold_up_shutdown() {
-    let (mut config, _events) = config(Arc::new(InMemory::new()), 2);
+    let (mut config, _events) = config(failing_store());
     config.channel_capacity = 1024;
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let give_up = AtomicBool::new(false);
     let (shut_down, returned_in_time, accepted) = std::thread::scope(|scope| {
         let sending = scope.spawn(|| send_until_stopped(&sender, &give_up, 0));
@@ -696,26 +745,24 @@ fn a_sender_that_never_pauses_cannot_hold_up_shutdown() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stuck_upload_leaves_room_for_the_sections_behind_it() {
+async fn a_stuck_upload_leaves_room_for_the_seals_behind_it() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (mut config, mut events) = config(store, 1);
+    let (mut config, mut events) = config(store);
     config.channel_capacity = 8;
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_section(1, 0, one_stream_section("s", &bytes))
-        .unwrap();
+    sender.try_send(one_stream_seal(1, "s", &bytes)).unwrap();
     // It is now stuck on seal 1, reading nothing, as during a long PUT or an outage.
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
     ));
-    for seal in 2..10 {
+    for number in 2..10 {
         sender
-            .try_send_section(seal, 0, one_stream_section("s", &bytes))
-            .unwrap_or_else(|error| panic!("seal {seal} refused: {error:?}"));
+            .try_send(one_stream_seal(number, "s", &bytes))
+            .unwrap_or_else(|error| panic!("seal {number} refused: {error:?}"));
     }
     assert_eq!(uploader.shutdown().unfinished.len(), 9);
 }
@@ -735,15 +782,15 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting;
-    let (mut config, mut events) = config(store, 1);
+    let (mut config, mut events) = config(store);
     config.cache = Some(cache);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (sender, uploader) = Uploader::start(config).unwrap();
     sender
-        .try_send_dedicated(Arc::from("s"), 0, vec![bytes.clone()])
+        .try_send(dedicated("s", 0, vec![bytes.clone()]))
         .unwrap();
     // The PUT is failing, so the file exists by now.
     assert!(matches!(
-        events.recv().await,
+        next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
     ));
     let mut files = Vec::new();
@@ -753,7 +800,7 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     for number in 1..4 {
         let later = Bytes::from(record(FIRST_ID + (number << 16), 1, 7, b"x"));
         sender
-            .try_send_dedicated(Arc::from("s"), number, vec![later])
+            .try_send(dedicated("s", number, vec![later]))
             .unwrap();
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -774,121 +821,9 @@ fn list_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn seal_sections_held(unfinished: &[UnfinishedUpload<Bytes>]) -> Vec<(u64, usize)> {
-    let mut held: Vec<(u64, usize)> = unfinished
-        .iter()
-        .filter_map(|upload| match upload {
-            UnfinishedUpload::Seal { seal, sections } => Some((*seal, sections.len())),
-            UnfinishedUpload::Dedicated { .. } => None,
-        })
-        .collect();
-    held.sort();
-    held
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_repeated_section_for_an_uploaded_seal_does_not_put_again() {
-    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
-    let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let first = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    let second = Bytes::from(record(FIRST_ID + 5, 1, 7, b"y"));
-    sender
-        .try_send_section(1, 0, one_stream_section("s", &first))
-        .unwrap();
-    assert_eq!(next_uploaded(&mut events).await.0, UploadKey::Seal(1));
-    sender
-        .try_send_section(1, 0, one_stream_section("s", &second))
-        .unwrap();
-    assert!(matches!(
-        events.recv().await,
-        Some(UploadEvent::Failed {
-            key: UploadKey::Seal(1),
-            ..
-        })
-    ));
-    drop(sender);
-    let exit = uploader.finish();
-    assert_eq!(counting.puts(), 1, "one PUT per seal");
-    assert_eq!(seal_sections_held(&exit.unfinished), [(1, 1)]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_repeated_section_with_more_cores_fails_at_once_and_does_not_sit_pending() {
-    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
-    let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    for core in 0..2 {
-        sender
-            .try_send_section(1, core, one_stream_section(&format!("s{core}"), &bytes))
-            .unwrap();
-    }
-    assert_eq!(next_uploaded(&mut events).await.0, UploadKey::Seal(1));
-    sender
-        .try_send_section(1, 1, one_stream_section("s", &bytes))
-        .unwrap();
-    let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await;
-    assert!(
-        matches!(event, Ok(Some(UploadEvent::Failed { .. }))),
-        "{event:?}"
-    );
-    drop(sender);
-    assert_eq!(seal_sections_held(&uploader.finish().unfinished), [(1, 1)]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_core_going_back_to_an_earlier_seal_is_refused() {
-    let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
-    let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, mut events) = config(store, 2);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_section(5, 0, one_stream_section("s", &bytes))
-        .unwrap();
-    sender
-        .try_send_section(4, 0, one_stream_section("s", &bytes))
-        .unwrap();
-    assert!(matches!(
-        events.recv().await,
-        Some(UploadEvent::Failed {
-            key: UploadKey::Seal(4),
-            ..
-        })
-    ));
-    // Another core's numbers are its own, so seal 4 from it is still accepted.
-    sender
-        .try_send_section(4, 1, one_stream_section("s", &bytes))
-        .unwrap();
-    drop(sender);
-    assert_eq!(
-        seal_sections_held(&uploader.finish().unfinished),
-        [(4, 1), (4, 1), (5, 1)]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_section_from_a_core_out_of_range_leaves_no_empty_seal_behind() {
-    let (config, mut events) = config(Arc::new(InMemory::new()), 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_section(9, 5, one_stream_section("s", &bytes))
-        .unwrap();
-    assert!(matches!(
-        events.recv().await,
-        Some(UploadEvent::Failed { .. })
-    ));
-    drop(sender);
-    assert_eq!(seal_sections_held(&uploader.finish().unfinished), [(9, 1)]);
-}
-
 /// Runs `shutdown` on its own thread, so a stuck one is a failure and not a hung test.
 /// The thread is left behind on failure, and ends with the test process.
-fn shutdown_within_5_s(uploader: Uploader<Bytes>) -> Vec<UnfinishedUpload<Bytes>> {
+fn shutdown_within_5_s(uploader: Uploader) -> Vec<UnfinishedUpload> {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = done_tx.send(uploader.shutdown());
@@ -910,15 +845,17 @@ async fn shutdown_interrupts_a_put_that_never_returns() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     counting.hang_puts.store(true, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, _events) = config(store, 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, _events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_section(1, 0, one_stream_section("s", &bytes))
-        .unwrap();
+    sender.try_send(one_stream_seal(1, "s", &bytes)).unwrap();
     wait_for_put_attempt(&counting).await;
     let unfinished = shutdown_within_5_s(uploader);
-    assert_eq!(seal_sections_held(&unfinished), [(1, 1)]);
+    assert_eq!(unfinished.len(), 1);
+    assert!(matches!(
+        &unfinished[0],
+        UnfinishedUpload::Seal { seal: 1, extents } if extents.len() == 1
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -927,12 +864,10 @@ async fn shutdown_does_not_wait_for_a_put_stuck_on_a_blocking_thread() {
     let (release, gate) = std::sync::mpsc::channel();
     *counting.block_next_put_on.lock().unwrap() = Some(gate);
     let store: Arc<dyn ObjectStore> = counting.clone();
-    let (config, _events) = config(store, 1);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, _events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender
-        .try_send_dedicated(Arc::from("s"), 7, vec![bytes])
-        .unwrap();
+    sender.try_send(dedicated("s", 7, vec![bytes])).unwrap();
     wait_for_put_attempt(&counting).await;
     let unfinished = shutdown_within_5_s(uploader);
     assert_eq!(unfinished.len(), 1);
@@ -1020,13 +955,11 @@ async fn a_put_that_hangs_times_out_and_retries() {
         inner: InMemory::new(),
         hung: AtomicBool::new(false),
     });
-    let (mut config, mut events) = config(Arc::clone(&store), SECTIONS);
+    let (mut config, mut events) = config(Arc::clone(&store));
     config.put_timeout_min_ms = 50;
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let (sections, _) = sections(4, FIRST_ID);
-    for (core, section) in sections.into_iter().enumerate() {
-        sender.try_send_section(1, core, section).unwrap();
-    }
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    let (extents, _) = extents(4, FIRST_ID);
+    sender.try_send(seal(1, extents)).unwrap();
     let mut retried = false;
     let path = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
@@ -1036,6 +969,7 @@ async fn a_put_that_hangs_times_out_and_retries() {
                     assert!(error.contains("took over"), "{error}");
                     retried = true;
                 }
+                UploadEvent::Sealed { .. } => {}
                 other => panic!("unexpected event: {other:?}"),
             }
         }
@@ -1136,12 +1070,10 @@ async fn an_idle_uploader_keeps_running_the_tasks_a_put_left() {
         ticks: Arc::clone(&ticks),
         started: AtomicBool::new(false),
     });
-    let (config, mut events) = config(store, SECTIONS);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let (sections, _) = sections(4, FIRST_ID);
-    for (core, section) in sections.into_iter().enumerate() {
-        sender.try_send_section(1, core, section).unwrap();
-    }
+    let (config, mut events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    let (extents, _) = extents(4, FIRST_ID);
+    sender.try_send(seal(1, extents)).unwrap();
     loop {
         if let UploadEvent::Uploaded { .. } = events.recv().await.expect("the uploader stopped") {
             break;
@@ -1236,9 +1168,10 @@ impl ObjectStore for HoldsPuts {
     }
 }
 
-fn dedicated_records(stream: &str, id: u64) -> (Arc<str>, Vec<Bytes>) {
-    (
-        Arc::from(stream),
+fn dedicated_records(stream: &str, number: u64, id: u64) -> Handoff {
+    dedicated(
+        stream,
+        number,
         vec![Bytes::from(record(id, 0, 7, b"held back"))],
     )
 }
@@ -1266,17 +1199,25 @@ async fn puts_overlap_and_their_events_stay_in_order() {
         release: Arc::clone(&release),
         waiting: Arc::clone(&waiting),
     });
-    let (config, mut events) = config(Arc::clone(&store), SECTIONS);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let (stream, records) = dedicated_records("slow.stream", FIRST_ID);
-    sender.try_send_dedicated(stream, 1, records).unwrap();
+    let (config, mut events) = config(Arc::clone(&store));
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    sender
+        .try_send(dedicated_records("slow.stream", 1, FIRST_ID))
+        .unwrap();
     wait_for("the held PUT", || waiting.load(Ordering::SeqCst) == 1).await;
-    let (stream, records) = dedicated_records("fast.stream", FIRST_ID + 1);
-    sender.try_send_dedicated(stream, 2, records).unwrap();
+    sender
+        .try_send(dedicated_records("fast.stream", 2, FIRST_ID + 1))
+        .unwrap();
 
     let fast = sealed_path_of(&store, "fast.stream").await;
     assert!(fast.is_some(), "the second PUT waited for the first");
-    assert!(events.try_recv().is_err(), "an event passed an earlier PUT");
+    // Only `Sealed` comes as an upload starts.
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            matches!(event, UploadEvent::Sealed { .. }),
+            "an event passed an earlier PUT: {event:?}"
+        );
+    }
 
     release.store(true, Ordering::SeqCst);
     let numbers = [
@@ -1306,7 +1247,7 @@ async fn sealed_path_of(store: &Arc<dyn ObjectStore>, stream: &str) -> Option<Pa
 }
 
 async fn next_number(events: &mut UnboundedReceiver<UploadEvent>) -> u64 {
-    match events.recv().await.expect("the uploader stopped") {
+    match next_event(events).await.expect("the uploader stopped") {
         UploadEvent::Uploaded {
             key: UploadKey::Dedicated { number, .. },
             ..
@@ -1326,11 +1267,11 @@ async fn a_stop_returns_every_put_under_way() {
         release,
         waiting: Arc::clone(&waiting),
     });
-    let (config, _events) = config(store, SECTIONS);
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
+    let (config, _events) = config(store);
+    let (sender, uploader) = Uploader::start(config).unwrap();
     for number in 0..3 {
-        let (stream, records) = dedicated_records(&format!("held.{number}"), FIRST_ID + number);
-        sender.try_send_dedicated(stream, number, records).unwrap();
+        let handoff = dedicated_records(&format!("held.{number}"), number, FIRST_ID + number);
+        sender.try_send(handoff).unwrap();
     }
     wait_for("three held PUTs", || waiting.load(Ordering::SeqCst) == 3).await;
     drop(sender);
@@ -1430,19 +1371,18 @@ async fn retries_back_off_exponentially_up_to_the_maximum() {
         inner: InMemory::new(),
         left: std::sync::atomic::AtomicU32::new(7),
     });
-    let (mut config, mut events) = config(store, SECTIONS);
+    let (mut config, mut events) = config(store);
     config.retry_initial_ms = 25;
     config.retry_max_ms = 100;
-    let (sender, uploader) = Uploader::<Bytes>::start(config).unwrap();
-    let (sections, _) = sections(4, FIRST_ID);
-    for (core, section) in sections.into_iter().enumerate() {
-        sender.try_send_section(1, core, section).unwrap();
-    }
+    let (sender, uploader) = Uploader::start(config).unwrap();
+    let (extents, _) = extents(4, FIRST_ID);
+    sender.try_send(seal(1, extents)).unwrap();
     let mut times = Vec::new();
     loop {
         match events.recv().await.expect("the uploader stopped") {
             UploadEvent::Retrying { .. } => times.push(std::time::Instant::now()),
             UploadEvent::Uploaded { .. } => break,
+            UploadEvent::Sealed { .. } => {}
             other => panic!("unexpected event: {other:?}"),
         }
     }

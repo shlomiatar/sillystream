@@ -48,8 +48,8 @@ pub use segment_format::{
 };
 pub use segment_reader::{SEGMENT_TAIL_READ_BYTES, SegmentReader};
 pub use uploader::{
-    Section, SectionExtent, UnfinishedUpload, UploadEvent, UploadKey, UploadSendError, Uploader,
-    UploaderConfig, UploaderExit, UploaderSender, put_new_object,
+    Handoff, SealExtent, UnfinishedUpload, UploadEvent, UploadKey, UploadSealer, UploadSendError,
+    Uploader, UploaderConfig, UploaderExit, UploaderSender, put_new_object,
 };
 pub use wal_format::{
     WAL_FILE_HEADER_BYTES, WAL_MAGIC, WalEntry, WalEntryError, encode_file_header, encode_wal_entry,
@@ -59,6 +59,6 @@ pub use wal_replay::{
     replay_file, replay_files, sync_wal_files, wal_file_name,
 };
 pub use wal_writer::{
-    DirVolume, DurableNotify, DurableWatch, WalConfig, WalError, WalFile, WalHandle, WalRotated,
-    WalSendError, WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
+    DirVolume, DurableNotify, DurableWatch, Sealer, WalConfig, WalError, WalFile, WalHandle,
+    WalRotated, WalSendError, WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
 };

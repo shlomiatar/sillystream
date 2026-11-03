@@ -527,6 +527,20 @@ pub async fn make_stream(client: &mut server::Client, stream: &str) {
 }
 
 /// Waits until no core holds a stream's batches, which means reads go to the extents.
+/// A seal that holds what was just published at level 3. The publish only reaches the WAL once
+/// its core has read it, and a seal holds what its WAL file holds, so a seal that came first is
+/// empty, and another follows.
+#[allow(dead_code)]
+pub async fn seal_published(node: &Node) -> server::SealOutcome {
+    for _ in 0..1_000 {
+        match node.seal().await {
+            server::SealOutcome::Empty { .. } => tokio::time::sleep(Duration::from_millis(5)).await,
+            outcome => return outcome,
+        }
+    }
+    panic!("nothing published reached a seal");
+}
+
 pub async fn wait_for_memory_to_empty(node: &Node, stream: &str) {
     let give_up = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
     loop {

@@ -26,13 +26,17 @@ struct Totals {
 fn run_once(entry_bytes: usize, sender_count: usize, entry_count: u64) -> (Duration, WalStats) {
     let dir = tempfile::tempdir_in(bench_dir()).unwrap();
     let (notify, _receivers) = durable_watches(sender_count);
-    let (sender, handle) = start_wal_writer::<Bytes, _, _>(
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
         DirVolume::new(dir.path(), PREALLOCATE_BYTES),
         notify,
+        (),
         WalConfig {
             first_seq: 1,
             closed_seqs: Vec::new(),
             channel_capacity: CHANNEL_CAPACITY,
+            segment_cap_bytes: u64::MAX,
+            stream_buffer_bytes: u64::MAX,
+            carried: Vec::new(),
         },
     )
     .unwrap();
@@ -143,13 +147,17 @@ fn one_at_a_time(c: &mut Criterion) {
         group.bench_function(format!("{entry_bytes}B"), |b| {
             let dir = tempfile::tempdir_in(bench_dir()).unwrap();
             let (notify, mut receivers) = durable_watches(1);
-            let (sender, handle) = start_wal_writer::<Bytes, _, _>(
+            let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
                 DirVolume::new(dir.path(), PREALLOCATE_BYTES),
                 notify,
+                (),
                 WalConfig {
                     first_seq: 1,
                     closed_seqs: Vec::new(),
                     channel_capacity: 16,
+                    segment_cap_bytes: u64::MAX,
+                    stream_buffer_bytes: u64::MAX,
+                    carried: Vec::new(),
                 },
             )
             .unwrap();
@@ -198,13 +206,17 @@ fn group_commit(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 let dir = tempfile::tempdir_in(bench_dir()).unwrap();
                 let (notify, receivers) = durable_watches(publisher_count);
-                let (sender, writer) = start_wal_writer::<Bytes, _, _>(
+                let (sender, writer) = start_wal_writer::<Bytes, _, _, _>(
                     DirVolume::new(dir.path(), PREALLOCATE_BYTES),
                     notify,
+                    (),
                     WalConfig {
                         first_seq: 1,
                         closed_seqs: Vec::new(),
                         channel_capacity: CHANNEL_CAPACITY,
+                        segment_cap_bytes: u64::MAX,
+                        stream_buffer_bytes: u64::MAX,
+                        carried: Vec::new(),
                     },
                 )
                 .unwrap();
