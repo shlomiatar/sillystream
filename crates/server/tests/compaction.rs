@@ -20,7 +20,8 @@ use server::{
     RetentionClass, SEALED_EXPIRY_MS, SealOutcome, StateOpRequest, StreamConfig, Subscription,
 };
 use storage::{
-    SegmentBuilder, SegmentReader, compacted_path, list_hour_objects, list_hours, seal_path,
+    ObjectId, SegmentBuilder, SegmentReader, list_hour_objects, list_hours, object_path,
+    sealed_path,
 };
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
@@ -75,6 +76,7 @@ impl Disk {
     }
 
     async fn objects(&self, root: &str) -> Vec<Path> {
+        let root = &class_root(root);
         let mut out = Vec::new();
         for hour in list_hours(self.store.as_ref(), root).await.unwrap() {
             for object in list_hour_objects(self.store.as_ref(), root, hour)
@@ -114,6 +116,15 @@ impl Disk {
         }
         out.sort();
         out
+    }
+}
+
+/// `sealed`, or where a class's compacted objects go: `7d` is `compacted/7d`.
+fn class_root(name: &str) -> String {
+    if name == "sealed" {
+        name.to_owned()
+    } else {
+        format!("compacted/{name}")
     }
 }
 
@@ -344,7 +355,7 @@ async fn compaction_keeps_every_record_byte_for_byte_and_deletes_nothing() {
         1,
         "one output for one hour: {report:?}"
     );
-    assert!(report.outputs[0].as_ref().starts_with("7d/"));
+    assert!(report.outputs[0].as_ref().starts_with("compacted/7d/"));
 
     for (at, stream) in streams.iter().enumerate() {
         // Every byte of every record, in the same order.
@@ -531,13 +542,18 @@ async fn the_1d_class_is_never_compacted_and_each_longer_class_has_its_own_prefi
     assert_eq!(report.errors, Vec::<String>::new());
     assert_eq!(report.outputs.len(), 3, "{report:?}");
 
-    let everything = disk.store.as_ref().list_with_delimiter(None).await.unwrap();
+    let everything = disk
+        .store
+        .as_ref()
+        .list_with_delimiter(Some(&Path::from("compacted")))
+        .await
+        .unwrap();
     let roots: BTreeSet<String> = everything
         .common_prefixes
         .iter()
         .map(|prefix| prefix.to_string())
         .collect();
-    assert!(!roots.contains("1d"), "{roots:?}");
+    assert!(!roots.contains("compacted/1d"), "{roots:?}");
     for (stream, _, prefix) in classes {
         match prefix {
             Some(prefix) => {
@@ -658,12 +674,12 @@ async fn partial_output_from_a_crash_is_never_readable() {
     let built = builder.finish().unwrap();
     let whole: Vec<u8> = built.parts.iter().flatten().copied().collect();
     let hour = format::id_ms(ids[0]) / HOUR_MS;
-    let at = compacted_path("7d", hour, "node", 2, ids[0]);
+    let at = object_path("compacted/7d", ObjectId::compacted(hour, 2, 0));
     disk.store
         .put(&at, PutPayload::from(whole[..whole.len() / 2].to_vec()))
         .await
         .unwrap();
-    let orphan = compacted_path("7d", hour, "node", 1, ids[0] + 100);
+    let orphan = object_path("compacted/7d", ObjectId::compacted(hour, 1, 0));
     disk.store
         .put(&orphan, PutPayload::from(whole))
         .await
@@ -742,7 +758,7 @@ async fn a_former_generations_records_above_its_limit_are_dropped_by_compaction(
         .flatten()
         .copied()
         .collect();
-    let late_path = seal_path("former", 1, limit - 1);
+    let late_path = sealed_path(ObjectId::new(format::id_ms(limit - 1), 1, 255));
     disk.store
         .put(&late_path, PutPayload::from(body))
         .await
@@ -828,7 +844,10 @@ async fn only_whole_expired_hour_prefixes_are_ever_deleted() {
         seen_deleted = deleted.len();
         let mut new_prefixes = BTreeSet::new();
         for path in new {
-            let parts: Vec<String> = path.parts().map(|p| p.as_ref().to_owned()).collect();
+            let mut parts: Vec<String> = path.parts().map(|p| p.as_ref().to_owned()).collect();
+            if parts[0] == "compacted" {
+                parts.remove(0);
+            }
             let hour: u64 = parts[1].parse().unwrap();
             let expiry_ms = match parts[0].as_str() {
                 "sealed" => SEALED_EXPIRY_MS,
@@ -875,7 +894,11 @@ async fn only_whole_expired_hour_prefixes_are_ever_deleted() {
             .iter()
             .any(|path| path.as_ref().starts_with("sealed/"))
     );
-    assert!(deleted.iter().any(|path| path.as_ref().starts_with("7d/")));
+    assert!(
+        deleted
+            .iter()
+            .any(|path| path.as_ref().starts_with("compacted/7d/"))
+    );
     // Ownership and checkpoints outlive records.
     assert!(deleted.iter().all(|path| {
         !path.as_ref().starts_with("ownership") && !path.as_ref().starts_with("checkpoints")
@@ -1044,7 +1067,10 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
     let report = node.expire_now().await.unwrap();
     assert_eq!(report.errors, Vec::<String>::new());
     assert!(
-        report.deleted_prefixes.iter().any(|p| p.starts_with("7d/")),
+        report
+            .deleted_prefixes
+            .iter()
+            .any(|p| p.starts_with("compacted/7d/")),
         "{report:?}"
     );
 
@@ -1725,7 +1751,10 @@ async fn a_former_generations_record_crossing_its_limit_does_not_stop_the_worker
         .copied()
         .collect();
     disk.store
-        .put(&seal_path("former", 1, limit - 1), PutPayload::from(body))
+        .put(
+            &sealed_path(ObjectId::new(format::id_ms(limit - 1), 1, 255)),
+            PutPayload::from(body),
+        )
         .await
         .unwrap();
 
@@ -1769,7 +1798,7 @@ async fn an_hour_whose_manifest_has_expired_can_still_go() {
     publish_one(&mut client, "d1", 1, b"x").await;
     let object = seal_path_of(&node).await;
     let hour = object.parts().nth(1).unwrap().as_ref().to_owned();
-    let stray = Path::from(format!("sealed/{hour}/stray/1-1.seg"));
+    let stray = Path::from(format!("sealed/{hour}/stray.seg"));
     disk.store
         .put(&stray, PutPayload::from_static(b"garbage"))
         .await

@@ -19,13 +19,13 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use object_store::path::{Path, PathPart};
+use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
 
-use crate::uploader::put_new_object;
+use crate::uploader::put_object;
 
 const PENDING_DIR: &str = "pending";
 const CACHED_DIR: &str = "cached";
@@ -227,16 +227,10 @@ impl SegmentCache {
         self.evict()
     }
 
-    /// A pending segment is in the store, under `path`, which a collision can have changed
-    /// since it was written as `written`. If this fails, the file stays in `pending/` and the
-    /// next startup finds the same bytes in the store.
-    pub fn uploaded(
-        &mut self,
-        written: &Path,
-        path: &Path,
-        len_bytes: u64,
-    ) -> Result<(), CacheError> {
-        let from = file_for(&self.root.join(PENDING_DIR), written);
+    /// A pending segment is in the store, under the same `path`. If this fails, the file stays
+    /// in `pending/` and the next startup finds the same bytes in the store.
+    pub fn uploaded(&mut self, path: &Path, len_bytes: u64) -> Result<(), CacheError> {
+        let from = file_for(&self.root.join(PENDING_DIR), path);
         let target = file_for(&self.root.join(CACHED_DIR), path);
         rename_into(&from, &target)?;
         remove_empty_parents(&self.root.join(PENDING_DIR), &from);
@@ -274,23 +268,6 @@ fn remove_empty_parents(root: &FsPath, file: &FsPath) {
     }
 }
 
-/// `sealed/.../<generation>-<first_id>.seg` under the first free `first_id` from the one in its
-/// name (D156).
-fn with_first_id(path: &Path, first_id: u64) -> Path {
-    let mut parts: Vec<PathPart<'_>> = path.parts().collect();
-    if let Some(name) = parts.last_mut()
-        && let Some((generation, _)) = name.as_ref().split_once('-')
-    {
-        *name = PathPart::from(format!("{generation}-{first_id:020}.seg"));
-    }
-    Path::from_iter(parts)
-}
-
-fn first_id_of(path: &Path) -> Option<u64> {
-    let name = path.filename()?.strip_suffix(".seg")?;
-    name.split_once('-')?.1.parse().ok()
-}
-
 async fn upload_one(
     root: &FsPath,
     store: &dyn ObjectStore,
@@ -301,16 +278,12 @@ async fn upload_one(
     let bytes = File::open(&file)
         .and_then(|handle| map_file(&handle))
         .map_err(|error| describe(&error))?;
-    let first_id = first_id_of(&written).ok_or_else(|| describe(&"not a segment's name"))?;
-    let path = put_new_object(
-        store,
-        |first_id| with_first_id(&written, first_id),
-        first_id,
-        std::slice::from_ref(&bytes),
-    )
-    .await
-    .map_err(|error| describe(&error))?;
-    rename_into(&file, &file_for(&root.join(CACHED_DIR), &path)).map_err(|error| describe(&error))
+    crate::ObjectId::of_path(&written).ok_or_else(|| describe(&"not an object's name"))?;
+    put_object(store, &written, std::slice::from_ref(&bytes))
+        .await
+        .map_err(|error| describe(&error))?;
+    rename_into(&file, &file_for(&root.join(CACHED_DIR), &written))
+        .map_err(|error| describe(&error))
 }
 
 /// Uploads what a former process left in `pending/` and moves it to `cached/`. A former

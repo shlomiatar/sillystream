@@ -14,9 +14,9 @@ use storage::{ObjectStoreConfig, build_store, check_conditional_create, parse_st
 
 const USAGE: &str = "\
 sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key PEM \\
-    --token-secret-file FILE --stream-key-file FILE
+    --token-secret-file FILE --stream-key-file FILE \\
     --object-store local:DIR|memory|gs:BUCKET|s3:BUCKET
-  [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
+  [--cores N] [--seal-window-ms N] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
   [--compact-merge-wait-ms N] [--sink-allow-private-addresses true|false]
@@ -84,7 +84,6 @@ fn run() -> Result<(), String> {
     let mut seal_window_ms = None;
     let mut max_connections = None;
     let mut listen_backlog = None;
-    let mut node_name = None;
     let mut memory_cap_bytes = None;
     let mut cache_cap_bytes = 10 * 1024 * 1024 * 1024u64;
     let mut preallocate_bytes = WAL_PREALLOCATE_DEFAULT_BYTES;
@@ -119,7 +118,6 @@ fn run() -> Result<(), String> {
             "--seal-window-ms" => seal_window_ms = Some(number(&value)?),
             "--max-connections" => max_connections = Some(number(&value)?),
             "--listen-backlog" => listen_backlog = Some(number(&value)? as i32),
-            "--node-name" => node_name = Some(value),
             "--memory-cap-bytes" => memory_cap_bytes = Some(number(&value)?),
             "--local-cache-cap-bytes" => cache_cap_bytes = number(&value)?,
             "--wal-preallocate-bytes" => preallocate_bytes = number(&value)?,
@@ -182,9 +180,6 @@ fn run() -> Result<(), String> {
     });
     let mut node = NodeConfig::new(core_count);
     node.keys = Keys::new(stream_key);
-    if let Some(name) = node_name {
-        node.node_name = name;
-    }
     // Section 7.1's range. A value outside it is a mistake to report, not to change quietly.
     let seal_window_ms = seal_window_ms.unwrap_or(10_000);
     if !(1_000..=120_000).contains(&seal_window_ms) {

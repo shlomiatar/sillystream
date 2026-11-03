@@ -58,6 +58,8 @@ pub enum OwnershipError {
     Lost {
         generation: u64,
     },
+    /// Every generation an object id can hold has been taken.
+    Exhausted,
 }
 
 impl fmt::Display for OwnershipError {
@@ -68,6 +70,11 @@ impl fmt::Display for OwnershipError {
             OwnershipError::Lost { generation } => {
                 write!(f, "another process took generation {generation} first")
             }
+            OwnershipError::Exhausted => write!(
+                f,
+                "every generation up to {} has been taken, so no object can be named",
+                crate::MAX_GENERATION
+            ),
         }
     }
 }
@@ -146,6 +153,9 @@ pub async fn claim_generation(
     last_valid_id: u64,
 ) -> Result<(u64, u64), OwnershipError> {
     let generation = known.current_generation().unwrap_or(0) + 1;
+    if generation > crate::MAX_GENERATION {
+        return Err(OwnershipError::Exhausted);
+    }
     let last_valid_id = last_valid_id.max(known.current_last_valid_id());
     crash_point("ownership.before_write");
     let options = PutOptions {

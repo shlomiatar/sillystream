@@ -53,7 +53,6 @@ pub struct LocalCacheConfig {
 
 #[derive(Clone)]
 pub struct NodeConfig {
-    pub node_name: String,
     /// The deployment's identity key and what is made with it (section 1). `new` gives an
     /// all-zero key, which only tests use: the binary doesn't start without one.
     pub keys: Keys,
@@ -158,7 +157,6 @@ impl NodeConfig {
 
     pub fn new(core_count: usize) -> NodeConfig {
         NodeConfig {
-            node_name: "node".to_owned(),
             keys: Keys::new(IdentityKey::new([0; IdentityKey::BYTES])),
             generation: 1,
             last_valid_id: 0,
@@ -991,7 +989,6 @@ impl Node {
         upload_txs.push(control_uploads_tx);
         let (upload_sender, uploader) = Uploader::start(UploaderConfig {
             store: Arc::clone(&store),
-            node: config.node_name.clone(),
             generation: config.generation,
             channel_capacity: config.upload_channel_capacity,
             retry_initial_ms: config.upload_retry_initial_ms,
@@ -1161,7 +1158,6 @@ impl Node {
             if let Some(compaction) = &config.compaction {
                 compactor = Some(Compactor {
                     config: compaction.clone(),
-                    node_name: config.node_name.clone(),
                     generation: config.generation,
                     ownership: parts.checkpoints.ownership.clone(),
                     store: Arc::clone(&store),

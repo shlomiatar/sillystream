@@ -89,7 +89,7 @@ impl Drop for Files {
                 let said = std::fs::read_to_string(self.path(&format!("{name}.stderr")));
                 eprintln!("--- {name}:\n{}", said.unwrap_or_default());
             }
-            for root in ["sealed", "7d"] {
+            for root in ["sealed", "compacted/7d"] {
                 eprintln!("--- {root}: {:?}", self.objects(root));
             }
         }
@@ -204,12 +204,12 @@ impl Files {
         assert_eq!(reply.status, 200, "{}", reply.text());
     }
 
-    /// Whether every acked record is in an object under `7d/`, which needs each manifest read.
+    /// Whether every acked record is in an object under `compacted/7d/`, which needs each manifest read.
     async fn all_compacted(&self, stream: &str, acked: &[(u64, u64)]) -> bool {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(self.path("objects")).unwrap());
         let mut ranges = Vec::new();
-        for file in self.objects("7d") {
+        for file in self.objects("compacted/7d") {
             let relative = file.strip_prefix(self.path("objects")).unwrap();
             let path = Path::from(relative.to_str().unwrap());
             let reader = SegmentReader::new(Arc::clone(&store), path);
@@ -371,7 +371,7 @@ async fn expiry_on_the_real_binary_survives_a_crash_before_its_deletes() {
         files.publish(running.port, "keep.day", seq).await.unwrap();
     }
     wait_until("compaction didn't run", async || {
-        !files.objects("7d").is_empty()
+        !files.objects("compacted/7d").is_empty()
     })
     .await;
     let sealed_before = files.objects("sealed");
@@ -397,5 +397,5 @@ async fn expiry_on_the_real_binary_survives_a_crash_before_its_deletes() {
         files.read_everything(running.port, "keep.day").await,
         vec![]
     );
-    assert!(!files.objects("7d").is_empty());
+    assert!(!files.objects("compacted/7d").is_empty());
 }

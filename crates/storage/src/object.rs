@@ -5,12 +5,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use format::{KeyHash, id_ms};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::path::{Path, PathPart};
+use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
 /// S3 or anything that speaks it, such as R2 or MinIO. Without keys, the credentials
@@ -177,67 +176,101 @@ pub fn parse_store_config(
 
 const HOUR_MS: u64 = 3_600_000;
 
-/// `sealed/<ingest_hour>/<node-or-stream>/<generation>-<first_id>.seg` (section 7.3).
-/// `ingest_hour` is hours since the epoch, from the object's highest id (D175), so nothing in
-/// it is newer than its hour and the delete job can go by the name. `PathPart` encodes anything
-/// in a stream id that isn't safe in a path.
-pub fn sealed_path(owner: &str, generation: u64, first_id: u64, last_id: u64) -> Path {
-    let hour = (id_ms(last_id) / HOUR_MS).to_string();
-    let name = format!("{generation:020}-{first_id:020}.seg");
-    Path::from_iter([
-        PathPart::from("sealed"),
-        PathPart::from(hour.as_str()),
-        PathPart::from(owner),
-        PathPart::from(name.as_str()),
-    ])
+/// 2026-01-01T00:00:00Z, where an object id's time starts (section 7.3).
+pub const OBJECT_EPOCH_MS: u64 = 1_767_225_600_000;
+
+const TIME_BITS: u32 = 40;
+const GENERATION_BITS: u32 = 16;
+const INDEX_BITS: u32 = 8;
+
+/// The highest generation an object id holds. A node past it can't name its objects.
+pub const MAX_GENERATION: u64 = (1 << GENERATION_BITS) - 1;
+
+/// An object's id: a time in ms since `OBJECT_EPOCH_MS` (40 bits), the generation (16) and an
+/// index (8) (section 7.3). Its path is computed from it, and printed as 16 hex digits, so that
+/// names sort as ids do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectId(pub u64);
+
+impl ObjectId {
+    /// `time_ms` is Unix time in ms. One before the epoch, which only a test's clock gives,
+    /// counts as the epoch.
+    pub fn new(time_ms: u64, generation: u64, index: u8) -> ObjectId {
+        assert!(
+            generation <= MAX_GENERATION,
+            "generation {generation} has no room in an id"
+        );
+        let time = time_ms.saturating_sub(OBJECT_EPOCH_MS);
+        assert!(
+            time < 1 << TIME_BITS,
+            "{time_ms} ms is past an object id's time"
+        );
+        ObjectId(
+            time << (GENERATION_BITS + INDEX_BITS) | generation << INDEX_BITS | u64::from(index),
+        )
+    }
+
+    /// Unix time in ms.
+    pub fn time_ms(self) -> u64 {
+        OBJECT_EPOCH_MS + (self.0 >> (GENERATION_BITS + INDEX_BITS))
+    }
+
+    pub fn generation(self) -> u64 {
+        (self.0 >> INDEX_BITS) & MAX_GENERATION
+    }
+
+    pub fn index(self) -> u8 {
+        self.0 as u8
+    }
+
+    /// Hours since the Unix epoch, the hour in its path.
+    pub fn hour(self) -> u64 {
+        self.time_ms() / HOUR_MS
+    }
+
+    /// The id a compacted object of `hour` takes: the hour's last ms (section 7.3).
+    pub fn compacted(hour: u64, generation: u64, index: u8) -> ObjectId {
+        ObjectId::new((hour + 1) * HOUR_MS - 1, generation, index)
+    }
+
+    /// The id in a path this module made.
+    pub fn of_path(path: &Path) -> Option<ObjectId> {
+        let name = path.filename()?.strip_suffix(".seg")?;
+        if name.len() != 16 {
+            return None;
+        }
+        u64::from_str_radix(name, 16).ok().map(ObjectId)
+    }
 }
 
-/// The longest path part any store here takes, as encoded in the path. It is the file
-/// name limit of common local file systems. With a part this long, a whole key stays
-/// well under S3's 1,024 bytes, so one limit gives the same result on every store (D59).
-pub const MAX_PATH_PART_BYTES: usize = 255;
-
-/// Whether a path has a part no store could hold, which no retry can change.
-pub(crate) fn path_fits_stores(path: &Path) -> bool {
-    path.parts()
-        .all(|part| part.as_ref().len() <= MAX_PATH_PART_BYTES)
+impl std::fmt::Display for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
 }
 
-/// The path of a node's shared object for one seal whose records are all in `first_id`'s hour.
-pub fn seal_path(node: &str, generation: u64, first_id: u64) -> Path {
-    sealed_path(node, generation, first_id, first_id)
+/// Where new objects go (section 7.4).
+pub const SEALED_PREFIX: &str = "sealed";
+
+/// `<root>/<hour>/<id in hex>.seg`, with `root` `sealed` or a class's `compacted/<class>`
+/// (section 7.3). The hour comes from the id, so nothing else is in the name.
+pub fn object_path(root: &str, id: ObjectId) -> Path {
+    Path::from(format!("{root}/{}/{id}.seg", id.hour()))
 }
 
-/// The path of a dedicated object whose records are all in `first_id`'s hour.
-pub fn dedicated_path(stream: KeyHash, generation: u64, first_id: u64) -> Path {
-    sealed_path(&stream.to_string(), generation, first_id, first_id)
+/// A sealed or dedicated object's path.
+pub fn sealed_path(id: ObjectId) -> Path {
+    object_path(SEALED_PREFIX, id)
 }
 
 /// The generation in an object's name (section 7.3).
 pub fn object_generation(path: &Path) -> Option<u64> {
-    let name = path.filename()?.strip_suffix(".seg")?;
-    name.split_once('-')?.0.parse().ok()
+    ObjectId::of_path(path).map(ObjectId::generation)
 }
 
-/// The prefix a compacted object goes in, or `sealed` for new ones (section 7.4).
-pub const SEALED_PREFIX: &str = "sealed";
-
-/// `<class>/<ingest_hour>/<node>/<generation>-<first_id>.seg`, the same form as `sealed/`. The
-/// hour is the sources', so a prefix holds what expires together.
-pub fn compacted_path(class: &str, hour: u64, node: &str, generation: u64, first_id: u64) -> Path {
-    let hour = hour.to_string();
-    let name = format!("{generation:020}-{first_id:020}.seg");
-    Path::from_iter([
-        PathPart::from(class),
-        PathPart::from(hour.as_str()),
-        PathPart::from(node),
-        PathPart::from(name.as_str()),
-    ])
-}
-
-/// The ingest hour in an object's path (D53).
+/// The ingest hour in an object's name (D53).
 pub fn object_hour(path: &Path) -> Option<u64> {
-    path.parts().nth(1)?.as_ref().parse().ok()
+    ObjectId::of_path(path).map(ObjectId::hour)
 }
 
 /// The hours under a prefix such as `sealed/`, oldest first.
@@ -258,28 +291,17 @@ pub async fn list_hour_objects(
     root: &str,
     hour: u64,
 ) -> object_store::Result<Vec<object_store::ObjectMeta>> {
-    let prefix = Path::from_iter([root, hour.to_string().as_str()]);
-    let owners = store.list_with_delimiter(Some(&prefix)).await?;
-    let mut out = owners.objects;
-    for owner in owners.common_prefixes {
-        out.extend(store.list_with_delimiter(Some(&owner)).await?.objects);
-    }
-    Ok(out)
+    let prefix = Path::from(format!("{root}/{hour}"));
+    Ok(store.list_with_delimiter(Some(&prefix)).await?.objects)
 }
 
-/// Every object under `sealed/`, listing hour by hour and owner by owner.
+/// Every object under `sealed/`, listing hour by hour.
 pub async fn list_sealed_objects(
     store: &dyn ObjectStore,
 ) -> object_store::Result<Vec<object_store::ObjectMeta>> {
     let mut out = Vec::new();
-    let hours = store
-        .list_with_delimiter(Some(&Path::from("sealed")))
-        .await?;
-    for hour in hours.common_prefixes {
-        let owners = store.list_with_delimiter(Some(&hour)).await?;
-        for owner in owners.common_prefixes {
-            out.extend(store.list_with_delimiter(Some(&owner)).await?.objects);
-        }
+    for hour in list_hours(store, SEALED_PREFIX).await? {
+        out.extend(list_hour_objects(store, SEALED_PREFIX, hour).await?);
     }
     Ok(out)
 }

@@ -15,7 +15,7 @@ use object_store::{ObjectStore, PutPayload};
 use server::{
     ManualClock, Node, NodeConfig, RecoverConfig, RecoveryReport, StateOpRequest, Subscription,
 };
-use storage::{Ownership, SegmentBuilder, claim_generation, read_ownership, seal_path};
+use storage::{ObjectId, Ownership, SegmentBuilder, claim_generation, read_ownership, sealed_path};
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
 fn key(name: &str) -> format::KeyHash {
@@ -345,9 +345,10 @@ async fn put_late_object(
     builder.add_extent(key("late"), records).unwrap();
     let built = builder.finish().unwrap();
     let body: Vec<u8> = built.parts.iter().flatten().copied().collect();
+    // Index 255, which no seal here takes, so it can't land on the former owner's own seal.
     store
         .put(
-            &seal_path("former", generation, first_id),
+            &sealed_path(ObjectId::new(format::id_ms(first_id), generation, 255)),
             PutPayload::from(body),
         )
         .await
@@ -1219,7 +1220,7 @@ async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
     let head = storage::CheckpointHead {
         full: false,
         max_id: limit + 1,
-        objects: vec![seal_path("former", 1, limit - 1).to_string()],
+        objects: vec![sealed_path(ObjectId::new(format::id_ms(limit - 1), 1, 255)).to_string()],
         sink_streams: Vec::new(),
     };
     let built = storage::build_checkpoint(&head, &[meta]).unwrap();
@@ -1618,7 +1619,7 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
         .collect();
     disk.store
         .put(
-            &storage::dedicated_path(key("s"), 1, r2),
+            &storage::sealed_path(ObjectId::new(format::id_ms(r2), 1, 1)),
             PutPayload::from(body),
         )
         .await

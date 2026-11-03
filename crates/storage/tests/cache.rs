@@ -35,7 +35,7 @@ fn pend(cache: &mut SegmentCache, object: &Path, parts: &[Bytes]) -> u64 {
 
 fn put(cache: &mut SegmentCache, object: &Path, parts: &[Bytes]) {
     let len_bytes = pend(cache, object, parts);
-    cache.uploaded(object, object, len_bytes).unwrap();
+    cache.uploaded(object, len_bytes).unwrap();
 }
 
 async fn is_cached(cache: &SegmentCache, path: &Path) -> bool {
@@ -85,9 +85,9 @@ async fn pending_segments_are_never_evicted_and_fill_the_cap() {
     for name in ["a", "b", "c"] {
         assert!(is_pending(dir.path(), &path(name)));
     }
-    cache.uploaded(&path("a"), &path("a"), 100).unwrap();
+    cache.uploaded(&path("a"), 100).unwrap();
     assert!(!cache.has_room(), "b and c still fill it");
-    cache.uploaded(&path("b"), &path("b"), 100).unwrap();
+    cache.uploaded(&path("b"), 100).unwrap();
     assert!(cache.has_room());
 }
 
@@ -98,21 +98,10 @@ async fn a_segment_over_the_cap_is_still_written_and_goes_once_uploaded() {
     let big = path("big");
     pend(&mut cache, &big, &parts(101));
     assert!(is_pending(dir.path(), &big));
-    cache.uploaded(&big, &big, 101).unwrap();
+    cache.uploaded(&big, 101).unwrap();
     assert!(!is_pending(dir.path(), &big));
     assert!(!is_cached(&cache, &big).await);
     assert_eq!(cache.used_bytes(), 0);
-}
-
-#[tokio::test]
-async fn a_collision_caches_it_under_the_name_it_got() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut cache = SegmentCache::open(dir.path(), 1000).unwrap();
-    pend(&mut cache, &path("wanted"), &parts(100));
-    cache.uploaded(&path("wanted"), &path("got"), 100).unwrap();
-    assert!(is_cached(&cache, &path("got")).await);
-    assert!(!is_cached(&cache, &path("wanted")).await);
-    assert!(!is_pending(dir.path(), &path("wanted")));
 }
 
 #[tokio::test]
@@ -226,8 +215,10 @@ fn eviction_and_uploads_remove_the_directories_they_empty() {
     assert_eq!(count_dirs(dir.path()), 5);
 }
 
+/// An object whose time is `first_id`'s ms after the epoch.
 fn segment_path(generation: u64, first_id: u64) -> Path {
-    storage::sealed_path("node", generation, first_id, first_id)
+    let time_ms = storage::OBJECT_EPOCH_MS + format::id_ms(first_id);
+    storage::sealed_path(storage::ObjectId::new(time_ms, generation, 0))
 }
 
 #[tokio::test]
@@ -268,8 +259,10 @@ async fn a_startup_counts_the_same_bytes_in_the_store_as_done() {
     assert_eq!(store.get(&object).await.unwrap().meta.size, 100);
 }
 
+/// No two objects get one id, so other bytes there are something else's, and nothing is lost by
+/// leaving them and the file for someone to look at.
 #[tokio::test]
-async fn a_startup_moves_past_a_name_held_by_other_bytes() {
+async fn a_startup_refuses_a_name_held_by_other_bytes_and_keeps_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
     let object = segment_path(1, 1 << 16);
@@ -280,12 +273,9 @@ async fn a_startup_moves_past_a_name_held_by_other_bytes() {
         .put(&object, Bytes::from_static(b"other").into())
         .await
         .unwrap();
-    assert_eq!(upload_pending(dir.path(), &store).await.unwrap(), 1);
-    let next = segment_path(1, (1 << 16) + 1);
-    assert_eq!(store.get(&next).await.unwrap().meta.size, 100);
+    assert!(upload_pending(dir.path(), &store).await.is_err());
     assert_eq!(store.get(&object).await.unwrap().meta.size, 5);
-    let cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
-    assert!(is_cached(&cache, &next).await);
+    assert!(is_pending(dir.path(), &object));
 }
 
 /// The file stays, so the next startup tries again.
@@ -293,7 +283,7 @@ async fn a_startup_moves_past_a_name_held_by_other_bytes() {
 async fn a_startup_that_cannot_upload_fails_and_keeps_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut cache = SegmentCache::open(dir.path(), 1 << 20).unwrap();
-    let object = Path::from("sealed/1/node/no-first-id-here.seg");
+    let object = Path::from("sealed/1/no-object-id-here.seg");
     pend(&mut cache, &object, &parts(100));
     drop(cache);
     assert!(upload_pending(dir.path(), &InMemory::new()).await.is_err());

@@ -1914,9 +1914,11 @@ async fn check_outlives_records(node: &Node, fill: &RetentionFill) {
 fn hours(files: &HashSet<String>) -> HashMap<String, HashSet<String>> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for file in files {
-        let mut parts = file.split('/');
-        let prefix = format!("{}/{}", parts.next().unwrap(), parts.next().unwrap());
-        out.entry(prefix).or_default().insert(file.clone());
+        // Everything but the file name: `sealed/<hour>` or `compacted/<class>/<hour>`.
+        let (prefix, _) = file.rsplit_once('/').unwrap();
+        out.entry(prefix.to_owned())
+            .or_default()
+            .insert(file.clone());
     }
     out
 }
@@ -1939,8 +1941,8 @@ async fn retention_and_compaction() {
     let mut node = Node::started(retention_options());
     let fill = fill_two_classes(&node).await;
     // A record of the 7d class only gets to `7d/` through a seal and a compaction.
-    wait_until("compaction to `7d/`", async || {
-        !node.objects("7d").is_empty()
+    wait_until("compaction to `compacted/7d/`", async || {
+        !node.objects("compacted/7d").is_empty()
     })
     .await;
     let http = node.http(&fill.admin);
@@ -1955,7 +1957,7 @@ async fn retention_and_compaction() {
     .await;
     node.stop();
     let sealed_before = node.objects("sealed");
-    let week_objects = node.objects("7d");
+    let week_objects = node.objects("compacted/7d");
     assert!(
         hours(&sealed_before).values().any(|files| files.len() >= 2),
         "no prefix to delete whole: {sealed_before:?}"
@@ -1973,7 +1975,7 @@ async fn retention_and_compaction() {
     watch_prefixes_go(&node, &sealed_before).await;
     assert_only_whole_prefixes(&sealed_before, &node.objects("sealed"), "sealed/ at 3 days");
     assert!(
-        node.objects("7d").is_superset(&week_objects),
+        node.objects("compacted/7d").is_superset(&week_objects),
         "7d/ has days to go"
     );
     let http = node.http(&fill.admin);
@@ -2009,15 +2011,19 @@ async fn retention_and_compaction() {
     node.stop();
 
     // Nine days on, `7d/` goes too, whole, and nothing of the stream with it.
-    let week_before = node.objects("7d");
+    let week_before = node.objects("compacted/7d");
     let sealed_now = node.objects("sealed");
     node.clock_offset_ms = 9 * DAY_MS;
     node.start();
     wait_until("the first `7d/` hour to expire", async || {
-        node.objects("7d").is_disjoint(&week_objects)
+        node.objects("compacted/7d").is_disjoint(&week_objects)
     })
     .await;
-    assert_only_whole_prefixes(&week_before, &node.objects("7d"), "7d/ at 9 days");
+    assert_only_whole_prefixes(
+        &week_before,
+        &node.objects("compacted/7d"),
+        "compacted/7d/ at 9 days",
+    );
     assert_only_whole_prefixes(&sealed_now, &node.objects("sealed"), "sealed/ at 9 days");
     let http = node.http(&fill.admin);
     let week_left = http.read_all("keep.week").await;
@@ -2032,9 +2038,10 @@ async fn retention_and_compaction() {
     assert!(head >= new_week);
     node.stop();
 
-    // Second, a blocked compactor: `7d/` can't be written, so its data must stay in `sealed/`.
+    // Second, a blocked compactor: `compacted/7d/` can't be written, so its data must stay in
+    // `sealed/`.
     let mut node = Node::new(retention_options());
-    let blocked = node.path("objects/7d");
+    let blocked = node.path("objects/compacted/7d");
     std::fs::create_dir_all(&blocked).unwrap();
     set_writable(&blocked, false);
     node.start();
@@ -2048,7 +2055,7 @@ async fn retention_and_compaction() {
     node.stop();
     let sealed_before = node.objects("sealed");
     assert!(!sealed_before.is_empty());
-    assert!(node.objects("7d").is_empty());
+    assert!(node.objects("compacted/7d").is_empty());
 
     node.clock_offset_ms = 3 * DAY_MS;
     node.start();
@@ -2076,7 +2083,7 @@ async fn retention_and_compaction() {
         node.objects("sealed").is_disjoint(&sealed_before)
     })
     .await;
-    assert!(!node.objects("7d").is_empty());
+    assert!(!node.objects("compacted/7d").is_empty());
     assert_only_whole_prefixes(
         &sealed_before,
         &node.objects("sealed"),

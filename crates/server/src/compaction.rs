@@ -19,8 +19,7 @@ use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
     Ownership, SEALED_PREFIX, SegmentBuilder, SegmentError, SegmentReader, StreamExtent,
-    compacted_path, list_hour_objects, list_hours, object_generation, object_hour, put_new_object,
-    read_ownership,
+    list_hour_objects, list_hours, object_generation, object_hour, put_compacted, read_ownership,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -63,11 +62,20 @@ impl RetentionClass {
         RetentionClass::Days365,
     ];
 
-    pub fn prefix(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             RetentionClass::Days7 => "7d",
             RetentionClass::Days30 => "30d",
             RetentionClass::Days365 => "365d",
+        }
+    }
+
+    /// Where its compacted objects go (section 7.3).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            RetentionClass::Days7 => "compacted/7d",
+            RetentionClass::Days30 => "compacted/30d",
+            RetentionClass::Days365 => "compacted/365d",
         }
     }
 
@@ -81,7 +89,7 @@ impl RetentionClass {
 
     /// The named cursor of this class's worker. Clients can't use these names.
     pub fn cursor_name(self) -> String {
-        format!("compact:{}", self.prefix())
+        format!("compact:{}", self.name())
     }
 
     /// `None` for what stays in `sealed/`.
@@ -233,7 +241,6 @@ struct Run {
 /// Runs on its own thread, and reaches everything through messages and the store.
 pub(crate) struct Compactor {
     pub config: CompactionConfig,
-    pub node_name: String,
     pub generation: u64,
     pub ownership: Ownership,
     pub store: Arc<dyn ObjectStore>,
@@ -817,20 +824,12 @@ impl Compactor {
         }
         if !runs.is_empty() {
             let built = builder.finish().map_err(|error| error.to_string())?;
-            let first_id = built.first_id.expect("at least one record was added");
             let hour = batch.hour;
-            let path = put_new_object(
+            let path = put_compacted(
                 self.store.as_ref(),
-                |first_id| {
-                    compacted_path(
-                        class.prefix(),
-                        hour,
-                        &self.node_name,
-                        self.generation,
-                        first_id,
-                    )
-                },
-                first_id,
+                class.prefix(),
+                hour,
+                self.generation,
                 &built.parts,
             )
             .await?;

@@ -447,14 +447,3 @@ async fn a_newer_entry_takes_away_what_it_drops_and_keeps_what_it_adds() {
     assert_eq!(merged[&key("s")].extents, found.extents);
     assert!(merged[&key("s")].dropped_extents.is_empty());
 }
-
-#[test]
-fn compacted_paths_keep_the_hour_and_generation_form() {
-    let path = storage::compacted_path("7d", 500_000, "node", 3, 77);
-    assert_eq!(
-        path.as_ref(),
-        "7d/500000/node/00000000000000000003-00000000000000000077.seg"
-    );
-    assert_eq!(storage::object_hour(&path), Some(500_000));
-    assert_eq!(storage::object_generation(&path), Some(3));
-}

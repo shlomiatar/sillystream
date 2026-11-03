@@ -10,7 +10,7 @@ use common::*;
 use format::id_ms;
 use object_store::ObjectStore;
 use server::SealOutcome;
-use storage::{SegmentReader, dedicated_path, seal_path};
+use storage::{ObjectId, SegmentReader, sealed_path};
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
 fn key(name: &str) -> format::KeyHash {
@@ -39,7 +39,8 @@ async fn one_put_per_seal_however_many_streams_and_cores() {
         other => panic!("{other:?}"),
     };
     assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 1);
-    assert_eq!(path, seal_path("node", 1, lowest));
+    // The clock stands still, so every record and the object share one ms.
+    assert_eq!(path, sealed_path(ObjectId::new(id_ms(lowest), 1, 0)));
     assert_eq!(id_ms(lowest), START_MS);
     assert_eq!(extents.len(), expected.len());
 
@@ -160,7 +161,7 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object() {
     assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 1);
 
     let store: Arc<dyn ObjectStore> = harness.store.clone();
-    let reader = SegmentReader::new(store, dedicated_path(key("busy"), 1, first_id));
+    let reader = SegmentReader::new(store, sealed_path(ObjectId::new(id_ms(first_id), 1, 1)));
     let stored = reader.read_stream(key("busy")).await.unwrap();
     assert_eq!(parse_records(&stored).len(), 2);
 

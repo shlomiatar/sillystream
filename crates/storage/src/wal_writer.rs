@@ -419,6 +419,8 @@ struct OpenFile {
     entry_count: u64,
     record_bytes: u64,
     full_told: bool,
+    /// The index the window's last dedicated object took, 0 before any (section 7.3).
+    last_dedicated_index: u8,
 }
 
 struct OpenStream {
@@ -533,8 +535,12 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
         }
     }
 
-    /// One that can't be taken now stays in the seal (D59, D268).
+    /// One that can't be taken now stays in the seal (D59, D268), as does one past the window's
+    /// 255th, which no object id's index could hold (section 7.3).
     fn hand_off_dedicated(&mut self, stream: KeyHash) {
+        let Some(index) = self.open.last_dedicated_index.checked_add(1) else {
+            return;
+        };
         let Some(kept) = self.open.streams.remove(&stream) else {
             return;
         };
@@ -542,11 +548,15 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
         let handoff = Handoff::Dedicated {
             stream,
             number: self.dedicated_count,
+            index,
             records,
             tickets: kept.tickets.clone(),
         };
         match self.sealer.dedicated(handoff) {
-            Ok(()) => self.dedicated_count += 1,
+            Ok(()) => {
+                self.dedicated_count += 1;
+                self.open.last_dedicated_index = index;
+            }
             Err(handoff) => {
                 if let Handoff::Dedicated { records, .. } = handoff {
                     self.open.extents[kept.at].records = records;

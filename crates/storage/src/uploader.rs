@@ -23,7 +23,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 
 use crate::cache::{PendingWriter, SegmentCache};
-use crate::object::{path_fits_stores, sealed_path};
+use crate::object::{ObjectId, sealed_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
 use crate::wal_writer::Sealer;
@@ -46,9 +46,11 @@ pub enum Handoff {
         extents: Vec<SealExtent>,
         tickets: Vec<u64>,
     },
+    /// `index` is its place among the window's dedicated objects, 1 to 255 (section 7.3).
     Dedicated {
         stream: KeyHash,
         number: u64,
+        index: u8,
         records: Vec<Bytes>,
         tickets: Vec<u64>,
     },
@@ -134,8 +136,6 @@ pub struct UploaderExit {
 
 pub struct UploaderConfig {
     pub store: Arc<dyn ObjectStore>,
-    /// Part of the object path (section 7.3).
-    pub node: String,
     pub generation: u64,
     pub channel_capacity: usize,
     pub retry_initial_ms: u64,
@@ -283,6 +283,7 @@ impl Uploader {
                     stop: thread_stop,
                     sending_count: thread_sending_count,
                     unfinished: Vec::new(),
+                    last_object_ms: 0,
                 };
                 let exit = runtime.block_on(worker.run(rx));
                 // Dropping the runtime would wait for a cancelled PUT's blocking thread,
@@ -367,8 +368,6 @@ struct Putter {
 
 enum PutEnd {
     Uploaded {
-        /// The name it has in `pending/`, which a collision can leave behind `path`.
-        written: Path,
         path: Path,
         len_bytes: u64,
         extents: Vec<StreamExtent>,
@@ -394,6 +393,8 @@ struct Worker {
     stop: Arc<AtomicBool>,
     sending_count: Arc<AtomicUsize>,
     unfinished: Vec<UnfinishedUpload>,
+    /// The time in the last object id given out, so that the next one's is later.
+    last_object_ms: u64,
 }
 
 #[derive(Debug)]
@@ -489,14 +490,13 @@ impl Worker {
         let Finished { key, ended, keep } = finished;
         match ended {
             PutEnd::Uploaded {
-                written,
                 path,
                 len_bytes,
                 extents,
             } => {
                 if let Some(cache) = &mut self.config.cache {
                     // The object is safe in the store, so a local failure only costs a read.
-                    let _ = cache.uploaded(&written, &path, len_bytes);
+                    let _ = cache.uploaded(&path, len_bytes);
                 }
                 self.emit(UploadEvent::Uploaded {
                     key,
@@ -517,63 +517,62 @@ impl Worker {
     /// Tells the cores what the object covers before anything else is heard about it, so that
     /// they know which of their records each event is about.
     fn start_handoff(&mut self, handoff: Handoff) -> Put {
-        let (key, tickets, built, path_for): (_, _, _, Box<dyn Fn(u64, u64) -> Path>) =
-            match &handoff {
-                Handoff::Seal {
-                    seal,
-                    extents,
-                    tickets,
-                } => {
-                    let (node, generation) = (self.config.node.clone(), self.config.generation);
-                    (
-                        UploadKey::Seal(*seal),
-                        tickets,
-                        build_seal(extents),
-                        Box::new(move |first_id, last_id| {
-                            sealed_path(&node, generation, first_id, last_id)
-                        }),
-                    )
-                }
-                Handoff::Dedicated {
-                    stream,
-                    number,
-                    records,
-                    tickets,
-                } => {
-                    let mut builder = SegmentBuilder::new();
-                    let built = match builder.add_extent(*stream, records.iter().cloned()) {
-                        Ok(()) => builder.finish(),
-                        Err(error) => Err(error),
-                    };
-                    let (name, generation) = (stream.to_string(), self.config.generation);
-                    (
-                        UploadKey::Dedicated {
-                            stream: *stream,
-                            number: *number,
-                        },
-                        tickets,
-                        built,
-                        Box::new(move |first_id, last_id| {
-                            sealed_path(&name, generation, first_id, last_id)
-                        }),
-                    )
-                }
-            };
+        let (key, tickets, built, index) = match &handoff {
+            Handoff::Seal {
+                seal,
+                extents,
+                tickets,
+            } => (UploadKey::Seal(*seal), tickets, build_seal(extents), 0),
+            Handoff::Dedicated {
+                stream,
+                number,
+                index,
+                records,
+                tickets,
+            } => {
+                let mut builder = SegmentBuilder::new();
+                let built = match builder.add_extent(*stream, records.iter().cloned()) {
+                    Ok(()) => builder.finish(),
+                    Err(error) => Err(error),
+                };
+                let key = UploadKey::Dedicated {
+                    stream: *stream,
+                    number: *number,
+                };
+                (key, tickets, built, *index)
+            }
+        };
         self.emit(UploadEvent::Sealed {
             key: key.clone(),
             tickets: Arc::new(tickets.clone()),
         });
-        self.start(key, built, path_for, UnfinishedUpload::of(handoff))
+        self.start(key, built, index, UnfinishedUpload::of(handoff))
+    }
+
+    /// The next object's id: at or after its newest record's ms, and after the last object's
+    /// (section 7.3). Handoffs come one at a time, so no two objects share one.
+    fn next_object_id(&mut self, last_id: u64, index: u8) -> ObjectId {
+        let time_ms = format::id_ms(last_id)
+            .max(self.last_object_ms + 1)
+            .max(crate::OBJECT_EPOCH_MS);
+        self.last_object_ms = time_ms;
+        ObjectId::new(time_ms, self.config.generation, index)
     }
 
     fn start(
         &mut self,
         key: UploadKey,
         built: Result<BuiltSegment, SegmentError>,
-        path_for: Box<dyn Fn(u64, u64) -> Path>,
+        index: u8,
         keep: UnfinishedUpload,
     ) -> Put {
         let putter = Arc::clone(&self.putter);
+        let path = match &built {
+            Ok(built) => built.first_id.map(|first_id| {
+                sealed_path(self.next_object_id(built.last_id.unwrap_or(first_id), index))
+            }),
+            Err(_) => None,
+        };
         if let (Some(cache), Ok(built)) = (&mut self.config.cache, &built)
             && built.first_id.is_some()
         {
@@ -581,16 +580,10 @@ impl Worker {
             let _ = cache.reserve(built.len_bytes);
         }
         Box::pin(async move {
-            let ended = match built {
-                Ok(built) => match built.first_id {
-                    Some(first_id) => {
-                        let last_id = built.last_id.unwrap_or(first_id);
-                        let path = |first_id| path_for(first_id, last_id);
-                        putter.upload(&key, &path, first_id, built).await
-                    }
-                    None => PutEnd::Empty,
-                },
-                Err(error) => PutEnd::Failed(error.to_string()),
+            let ended = match (built, path) {
+                (Ok(built), Some(path)) => putter.upload(&key, path, built).await,
+                (Ok(_), None) => PutEnd::Empty,
+                (Err(error), _) => PutEnd::Failed(error.to_string()),
             };
             Finished { key, ended, keep }
         })
@@ -598,21 +591,9 @@ impl Worker {
 }
 
 impl Putter {
-    /// Retries until the PUT succeeds or the uploader is stopped. A path held by different bytes
-    /// moves to the next `first_id`: the name only has to be unique, and readers find objects by
-    /// extent (D156).
-    async fn upload(
-        &self,
-        key: &UploadKey,
-        path_for: &dyn Fn(u64) -> Path,
-        mut first_id: u64,
-        built: BuiltSegment,
-    ) -> PutEnd {
-        let mut path = path_for(first_id);
-        if !path_fits_stores(&path) {
-            return PutEnd::Failed(format!("{path} has a part too long for an object path"));
-        }
-        let written = path.clone();
+    /// Retries until the PUT succeeds or the uploader is stopped. No two objects get one id, so
+    /// a path held by different bytes is something else's doing, and fails the upload.
+    async fn upload(&self, key: &UploadKey, path: Path, built: BuiltSegment) -> PutEnd {
         let BuiltSegment {
             parts,
             len_bytes,
@@ -621,7 +602,7 @@ impl Putter {
         } = built;
         // The references have done their job once it is a file, and the PUT reads that.
         let parts = match &self.local {
-            Some(local) => match self.write_pending(key, local, &written, parts).await {
+            Some(local) => match self.write_pending(key, local, &path, parts).await {
                 Some(file) => vec![file],
                 None => return PutEnd::Stopped,
             },
@@ -637,18 +618,14 @@ impl Putter {
             match put {
                 Ok(()) => {
                     return PutEnd::Uploaded {
-                        written,
                         path,
                         len_bytes,
                         extents,
                     };
                 }
-                Err(PutError::Collision) => {
-                    first_id += 1;
-                    path = path_for(first_id);
-                    continue;
+                Err(error @ (PutError::Collision | PutError::Permanent(_))) => {
+                    return PutEnd::Failed(format!("{path}: {error}"));
                 }
-                Err(error @ PutError::Permanent(_)) => return PutEnd::Failed(error.to_string()),
                 Err(error @ PutError::Retryable(_)) => {
                     for events in &self.events {
                         let _ = events.send(UploadEvent::Retrying {
@@ -785,21 +762,62 @@ async fn put_once(store: &dyn ObjectStore, path: &Path, parts: &[Bytes]) -> Resu
     put_create(store, path, parts).await
 }
 
-/// An object nobody else can overwrite, under the first free name from `first_id` on (D156). The
-/// same bytes at a path count as done. Compaction's outputs go through this. A store error is
-/// the caller's to retry.
-pub async fn put_new_object(
+/// One object under its own path, which nobody else can overwrite. The same bytes there count
+/// as done. A store error is the caller's to retry.
+pub async fn put_object(
     store: &dyn ObjectStore,
-    path_for: impl Fn(u64) -> Path,
-    mut first_id: u64,
+    path: &Path,
+    parts: &[Bytes],
+) -> Result<(), String> {
+    put_create(store, path, parts)
+        .await
+        .map_err(|error| format!("{path}: {error}"))
+}
+
+/// A compacted object of `hour` under `root` (section 7.3). The same bytes already under one of
+/// this generation's ids there are an earlier try that got that far, and count as done.
+/// Otherwise it takes the index after this generation's highest.
+pub async fn put_compacted(
+    store: &dyn ObjectStore,
+    root: &str,
+    hour: u64,
+    generation: u64,
     parts: &[Bytes],
 ) -> Result<Path, String> {
+    let len_bytes: usize = parts.iter().map(Bytes::len).sum();
+    let mut next = 0u16;
+    let listed = crate::list_hour_objects(store, root, hour)
+        .await
+        .map_err(|error| format!("{root}/{hour}: {error}"))?;
+    for object in listed {
+        let Some(id) = ObjectId::of_path(&object.location) else {
+            continue;
+        };
+        if id.generation() != generation {
+            continue;
+        }
+        next = next.max(u16::from(id.index()) + 1);
+        if object.size == len_bytes {
+            let existing = async { store.get(&object.location).await?.bytes().await };
+            let existing = existing
+                .await
+                .map_err(|error| format!("{}: {error}", object.location))?;
+            if same_bytes(&existing, parts) {
+                return Ok(object.location);
+            }
+        }
+    }
     loop {
-        let path = path_for(first_id);
+        let Ok(index) = u8::try_from(next) else {
+            return Err(format!(
+                "{root}/{hour} holds generation {generation}'s every index already"
+            ));
+        };
+        let path = crate::object_path(root, ObjectId::compacted(hour, generation, index));
         match put_create(store, &path, parts).await {
             Ok(()) => return Ok(path),
-            Err(PutError::Collision) => first_id += 1,
-            Err(error) => return Err(error.to_string()),
+            Err(PutError::Collision) => next += 1,
+            Err(error) => return Err(format!("{path}: {error}")),
         }
     }
 }

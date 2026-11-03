@@ -31,10 +31,9 @@ pub use meta_format::{
 };
 pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{
-    MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, SEALED_PREFIX, build_store,
-    check_conditional_create, compacted_path, dedicated_path, list_hour_objects, list_hours,
-    list_sealed_objects, object_generation, object_hour, parse_store_config, seal_path,
-    sealed_path,
+    MAX_GENERATION, OBJECT_EPOCH_MS, ObjectId, ObjectStoreConfig, S3Config, SEALED_PREFIX,
+    build_store, check_conditional_create, list_hour_objects, list_hours, list_sealed_objects,
+    object_generation, object_hour, object_path, parse_store_config, sealed_path,
 };
 pub use ownership::{
     OWNERSHIP_MAGIC, OWNERSHIP_RECORD_BYTES, Ownership, OwnershipError, claim_generation,
@@ -49,7 +48,7 @@ pub use segment_format::{
 pub use segment_reader::{SEGMENT_TAIL_READ_BYTES, SegmentReader};
 pub use uploader::{
     Handoff, SealExtent, UnfinishedUpload, UploadEvent, UploadKey, UploadSealer, UploadSendError,
-    Uploader, UploaderConfig, UploaderExit, UploaderSender, put_new_object,
+    Uploader, UploaderConfig, UploaderExit, UploaderSender, put_compacted, put_object,
 };
 pub use wal_format::{
     WAL_FILE_HEADER_BYTES, WAL_MAGIC, WalEntry, WalEntryError, encode_file_header, encode_wal_entry,

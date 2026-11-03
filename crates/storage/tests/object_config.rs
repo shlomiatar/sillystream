@@ -7,8 +7,8 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    Handoff, ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig, build_store,
-    check_conditional_create, dedicated_path, parse_store_config, seal_path,
+    Handoff, ObjectId, ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig,
+    build_store, check_conditional_create, parse_store_config, sealed_path,
 };
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
@@ -68,16 +68,45 @@ async fn memory_and_local_config_build_working_stores() {
 }
 
 #[test]
-fn paths_follow_section_7_3() {
-    let first_id = 7_200_000u64 << 16;
+fn object_ids_and_paths_follow_section_7_3() {
+    // 2027-01-15T10:00:00.123Z.
+    let time_ms = 1_800_007_200_123;
+    let id = ObjectId::new(time_ms, 0x1234, 7);
+    assert_eq!(id.time_ms(), time_ms);
+    assert_eq!((id.generation(), id.index()), (0x1234, 7));
     assert_eq!(
-        seal_path("node-1", 2, first_id).to_string(),
-        format!("sealed/2/node-1/{:020}-{first_id:020}.seg", 2)
+        id.0,
+        (time_ms - storage::OBJECT_EPOCH_MS) << 24 | 0x1234 << 8 | 7
     );
+    let path = sealed_path(id);
     assert_eq!(
-        dedicated_path(key("logs.a"), 2, first_id).to_string(),
-        format!("sealed/2/{}/{:020}-{first_id:020}.seg", key("logs.a"), 2)
+        path.as_ref(),
+        format!("sealed/{}/{:016x}.seg", time_ms / 3_600_000, id.0)
     );
+    assert_eq!(ObjectId::of_path(&path), Some(id));
+    assert_eq!(storage::object_generation(&path), Some(0x1234));
+    assert_eq!(storage::object_hour(&path), Some(time_ms / 3_600_000));
+
+    // A compacted object takes its hour's last ms, so it sorts after what it replaces.
+    let compacted = ObjectId::compacted(id.hour(), 3, 0);
+    assert_eq!(compacted.time_ms() + 1, (id.hour() + 1) * 3_600_000);
+    let path = storage::object_path("compacted/7d", compacted);
+    assert_eq!(
+        path.as_ref(),
+        format!("compacted/7d/{}/{compacted}.seg", id.hour())
+    );
+    assert_eq!(storage::object_hour(&path), Some(id.hour()));
+
+    // Names sort as ids do, and nothing else parses as one.
+    assert!(format!("{}", ObjectId(1)) < format!("{}", ObjectId(1 << 60)));
+    assert_eq!(ObjectId::of_path(&"sealed/1/abc.seg".into()), None);
+    assert_eq!(ObjectId::new(0, 1, 0).time_ms(), storage::OBJECT_EPOCH_MS);
+}
+
+#[test]
+#[should_panic(expected = "no room")]
+fn a_generation_past_16_bits_has_no_id() {
+    ObjectId::new(storage::OBJECT_EPOCH_MS, storage::MAX_GENERATION + 1, 0);
 }
 
 /// Answers exactly one HTTP request and returns its head and body length. This is not
@@ -122,7 +151,6 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let (sender, uploader) = Uploader::start(UploaderConfig {
         store,
-        node: "node-1".to_owned(),
         generation: 1,
         channel_capacity: 4,
         retry_initial_ms: 1,
@@ -146,6 +174,7 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
         .try_send(Handoff::Dedicated {
             stream: key("s"),
             number: 0,
+            index: 1,
             records: vec![bytes::Bytes::from(wire)],
             tickets: Vec::new(),
         })
