@@ -47,6 +47,7 @@ fn config(store: Arc<dyn ObjectStore>) -> (UploaderConfig, UnboundedReceiver<Upl
             put_timeout_min_ms: 60_000,
             cache: None,
             events: vec![tx],
+            last_object_ms: 0,
         },
         rx,
     )
@@ -175,7 +176,7 @@ async fn one_put_per_seal_on_the_local_file_system() {
 /// Each extent is its own footer entry, in the order they came, even with another stream
 /// between them.
 #[tokio::test(flavor = "multi_thread")]
-async fn one_stream_in_two_extents_of_a_seal_gets_two_entries_in_one_object() {
+async fn one_stream_in_two_extents_of_a_seal_gets_one_region() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (config, mut events) = config(Arc::clone(&store));
     let (sender, uploader) = Uploader::start(config).unwrap();
@@ -205,7 +206,7 @@ async fn one_stream_in_two_extents_of_a_seal_gets_two_entries_in_one_object() {
             .await
             .unwrap()
             .len(),
-        2
+        1
     );
     let both = [early, late].concat();
     assert_eq!(reader.read_stream(stream_key("moved")).await.unwrap(), both);

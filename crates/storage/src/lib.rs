@@ -43,7 +43,7 @@ pub use segment_builder::{BuiltSegment, SegmentBuilder};
 pub use segment_format::{
     BLOCK_ENTRY_BYTES, BlockEntry, BlockTable, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES,
     SEGMENT_MAGIC, SegmentError, StreamExtent, TRAILER_BYTES, TopIndex, decode_block_table,
-    decode_page, decode_top_index, stream_hash,
+    decode_last_ids, decode_top_index, stream_hash,
 };
 pub use segment_reader::{SEGMENT_TAIL_READ_BYTES, SegmentReader};
 pub use uploader::{

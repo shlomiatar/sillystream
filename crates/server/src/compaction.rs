@@ -765,11 +765,12 @@ impl Compactor {
         report: &mut CompactReport,
     ) -> Result<bool, String> {
         let through = batch.through;
-        let mut builder = SegmentBuilder::new();
-        let mut runs = Vec::new();
+        // A stream has one region per object, so its k-th run goes into the k-th output.
+        let mut outputs: Vec<(SegmentBuilder, Vec<Run>)> = Vec::new();
         for (stream, (mut sources, merge_below)) in batch.streams {
             sources.sort_by_key(|source| source.extent.id_first);
             sources.dedup_by_key(|source| source.extent.id_first);
+            let mut output = 0;
             let mut start = 0;
             while start < sources.len() {
                 // Neighbours become one extent, unless something unsealed could be between them.
@@ -801,6 +802,11 @@ impl Compactor {
                     let first_id = format::RecordHeader::read(first)
                         .map_err(|error| format!("a source of {stream}: {error}"))?
                         .id;
+                    if output == outputs.len() {
+                        outputs.push((SegmentBuilder::new(), Vec::new()));
+                    }
+                    let (builder, runs) = &mut outputs[output];
+                    output += 1;
                     builder
                         .add_extent(stream, pieces)
                         .map_err(|error| format!("building for {stream}: {error}"))?;
@@ -822,7 +828,8 @@ impl Compactor {
                 start = end;
             }
         }
-        if !runs.is_empty() {
+        let mut retry = false;
+        for (builder, runs) in outputs {
             let built = builder.finish().map_err(|error| error.to_string())?;
             let hour = batch.hour;
             let path = put_compacted(
@@ -840,7 +847,6 @@ impl Compactor {
                 .map(|extent| ((extent.stream, extent.id_first), extent))
                 .collect();
             let mut applied_count = 0;
-            let mut retry = false;
             for run in &runs {
                 let extent = by_first
                     .get(&(run.stream, run.first_id))
@@ -860,9 +866,9 @@ impl Compactor {
             if applied_count > 0 {
                 self.wait_for_checkpoint(forced).await?;
             }
-            if retry {
-                return Ok(false);
-            }
+        }
+        if retry {
+            return Ok(false);
         }
         storage::crash_point("compact.before_cursor");
         if let Some(through) = through {

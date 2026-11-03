@@ -1,35 +1,45 @@
-//! Bytes of a segment (SPEC section 7.3, D10, D52).
+//! Bytes of a segment (SPEC section 7.3, D10, D52, D275).
 //!
 //! ```text
-//! segment  := extent* page* top_index trailer
-//! extent   := table block*                   one stream's records in one section
+//! segment  := region* page* last_ids top_index trailer
+//! region   := key hash [u8; 16] | body        one stream's, in key hash order from offset 0
+//! body     := table block*                    for a segment; a checkpoint keeps metadata here
 //! table    := crc32c u32 | block_count u32 | block_count × entry
 //! entry    := options_or u64 | options_and u64 | id_first u64 | id_last u64 |
 //!             count u64 | bytes u64 | author u64 | author_mixed u32 | crc32c u32
 //! block    := whole records, exactly as on the wire
-//! page     := crc32c u32 | entry_count u32 | entry_count × index_entry
-//! index_entry := hash u64 | offset u64 | len u64 | id_first u64 | id_last u64 |
-//!             block_count u32 | 0 u32 | stream key hash [u8; 16]
-//! top_index:= page_count u32 | 0 u32 | page_count × (first_hash u64 | offset u64 | len u32 | 0 u32)
+//! page     := crc32c u32 | entry_count u32 | index_entry*
+//! index_entry := hash_delta varint | len varint | offset varint, only at every 64th entry
+//! last_ids := crc32c u32 | count u32 | count × (key hash [u8; 16] | last_id u64)
+//! top_index:= page_count u32 | 0 u32 | data_end u64 | last_ids_offset u64 | last_ids_len u64 |
+//!             page_count × (first_hash u64 | first_offset u64 | first_entry u64 |
+//!                           offset u64 | len u32 | 0 u32)
 //! trailer  := magic u64 | top_offset u64 | top_len u32 | crc32c u32
 //! ```
 //!
-//! Each CRC covers the bytes after it in its structure, the trailer's covers
-//! the top index and the trailer before it, and a block's covers the block.
+//! An index entry is a region's: its hash is the top 64 bits of the key hash, as a delta from
+//! the entry before it in the page (0 for a page's first, which the top index holds whole). A
+//! region's offset is the sum of the lengths before it. Every 64th entry of the object also
+//! holds it, and the top index holds each page's first. Entries with one hash stay in one page.
+//! Varints are LEB128. Each CRC covers the bytes after it in its structure, the trailer's covers
+//! the top index and the trailer before it, and a block's covers the block. A table's CRC covers
+//! its region's key as well.
 
 use std::fmt;
 
-use format::{BlockAuthor, BlockSummary, FormatError, KeyHash, crc32c};
+use format::{BlockAuthor, BlockSummary, FormatError, KeyHash, crc32c, crc32c_append};
 
-/// `SSSEG002` as little-endian bytes on disk.
-pub const SEGMENT_MAGIC: u64 = u64::from_le_bytes(*b"SSSEG002");
+/// `SSSEG003` as little-endian bytes on disk.
+pub const SEGMENT_MAGIC: u64 = u64::from_le_bytes(*b"SSSEG003");
 pub const TRAILER_BYTES: usize = 24;
 pub const BLOCK_ENTRY_BYTES: usize = 64;
 pub(crate) const TABLE_HEAD_BYTES: usize = 8;
 pub(crate) const PAGE_HEAD_BYTES: usize = 8;
-pub(crate) const INDEX_ENTRY_BYTES: usize = 48 + KeyHash::BYTES;
-const TOP_HEAD_BYTES: usize = 8;
-const TOP_ENTRY_BYTES: usize = 24;
+const TOP_HEAD_BYTES: usize = 32;
+const TOP_ENTRY_BYTES: usize = 40;
+const LAST_ID_BYTES: usize = KeyHash::BYTES + 8;
+/// Every this many index entries, one holds its region's offset whole.
+pub(crate) const OFFSET_EVERY: u64 = 64;
 /// D6d.
 pub const DEFAULT_BLOCK_BYTES: usize = 64 * 1024;
 /// D6d.
@@ -100,7 +110,8 @@ pub struct BlockTable {
     pub blocks: Vec<BlockEntry>,
 }
 
-pub(crate) fn encode_block_table(blocks: &[BlockEntry]) -> Vec<u8> {
+/// A region's table. Its CRC covers the region's key too.
+pub(crate) fn encode_block_table(stream: KeyHash, blocks: &[BlockEntry]) -> Vec<u8> {
     let mut out = Vec::with_capacity(TABLE_HEAD_BYTES + blocks.len() * BLOCK_ENTRY_BYTES);
     out.extend_from_slice(&[0; 4]);
     out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
@@ -124,12 +135,12 @@ pub(crate) fn encode_block_table(blocks: &[BlockEntry]) -> Vec<u8> {
         out.extend_from_slice(&mixed.to_le_bytes());
         out.extend_from_slice(&block.crc32c.to_le_bytes());
     }
-    let crc = crc32c(&out[4..]);
+    let crc = crc32c_append(crc32c(&stream.0), &out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
     out
 }
 
-pub fn decode_block_table(bytes: &[u8]) -> Result<BlockTable, SegmentError> {
+pub fn decode_block_table(stream: KeyHash, bytes: &[u8]) -> Result<BlockTable, SegmentError> {
     if bytes.len() < TABLE_HEAD_BYTES {
         return Err(SegmentError::Corrupt("block table is truncated"));
     }
@@ -141,7 +152,7 @@ pub fn decode_block_table(bytes: &[u8]) -> Result<BlockTable, SegmentError> {
     {
         return Err(SegmentError::Corrupt("block table has the wrong length"));
     }
-    if crc32c(&bytes[4..]) != u32_at(bytes, 0) {
+    if crc32c_append(crc32c(&stream.0), &bytes[4..]) != u32_at(bytes, 0) {
         return Err(SegmentError::Crc("block table"));
     }
     let mut blocks = Vec::with_capacity(count);
@@ -167,8 +178,8 @@ pub fn decode_block_table(bytes: &[u8]) -> Result<BlockTable, SegmentError> {
     Ok(BlockTable { blocks })
 }
 
-/// Where one stream's extent is: the stream index entry of section 7.3. Keeping one
-/// of these is the "stored extent" that lets a reader skip the footer.
+/// Where one stream's region is, and what it holds. Keeping one of these is the "stored
+/// extent" that lets a reader skip the footer. `offset` is the region's, at its key hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamExtent {
     pub stream: KeyHash,
@@ -183,37 +194,65 @@ impl StreamExtent {
     pub(crate) fn table_bytes(&self) -> u64 {
         TABLE_HEAD_BYTES as u64 + u64::from(self.block_count) * BLOCK_ENTRY_BYTES as u64
     }
+
+    /// Where its blocks start.
+    pub(crate) fn blocks_offset(&self) -> u64 {
+        self.offset + KeyHash::BYTES as u64 + self.table_bytes()
+    }
 }
 
-/// Encodes one page from entries already sorted by key hash.
-pub(crate) fn encode_page(entries: &[(u64, &StreamExtent)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PAGE_HEAD_BYTES + entries.len() * INDEX_ENTRY_BYTES);
+/// One region as the index has it: the top 64 bits of its key hash, where it is and how long.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub hash: u64,
+    pub offset: u64,
+    pub len_bytes: u64,
+}
+
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn varint_at(bytes: &[u8], at: &mut usize) -> Result<u64, SegmentError> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes
+            .get(*at)
+            .ok_or(SegmentError::Corrupt("index entry is truncated"))?;
+        *at += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(SegmentError::Corrupt("varint is too long"))
+}
+
+/// Encodes one page of entries in order, the first being entry `first_entry` of the object.
+pub(crate) fn encode_page(entries: &[IndexEntry], first_entry: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PAGE_HEAD_BYTES + entries.len() * 10);
     out.extend_from_slice(&[0; 4]);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (hash, extent) in entries {
-        for field in [
-            *hash,
-            extent.offset,
-            extent.len_bytes,
-            extent.id_first,
-            extent.id_last,
-        ] {
-            out.extend_from_slice(&field.to_le_bytes());
+    let mut previous = entries.first().map_or(0, |entry| entry.hash);
+    for (at, entry) in entries.iter().enumerate() {
+        put_varint(&mut out, entry.hash - previous);
+        put_varint(&mut out, entry.len_bytes);
+        if (first_entry + at as u64).is_multiple_of(OFFSET_EVERY) {
+            put_varint(&mut out, entry.offset);
         }
-        out.extend_from_slice(&extent.block_count.to_le_bytes());
-        out.extend_from_slice(&[0; 4]);
-        out.extend_from_slice(&extent.stream.0);
+        previous = entry.hash;
     }
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
     out
 }
 
-/// Decodes a page, keeping the extent of `only` when it is given, and every extent otherwise.
-pub fn decode_page(
-    bytes: &[u8],
-    only: Option<KeyHash>,
-) -> Result<Vec<(u64, StreamExtent)>, SegmentError> {
+/// Decodes the page `page` describes.
+pub(crate) fn decode_page(bytes: &[u8], page: &TopEntry) -> Result<Vec<IndexEntry>, SegmentError> {
     if bytes.len() < PAGE_HEAD_BYTES {
         return Err(SegmentError::Corrupt("page is truncated"));
     }
@@ -221,45 +260,111 @@ pub fn decode_page(
         return Err(SegmentError::Crc("footer page"));
     }
     let count = u32_at(bytes, 4) as usize;
-    if count.checked_mul(INDEX_ENTRY_BYTES) != Some(bytes.len() - PAGE_HEAD_BYTES) {
+    let mut entries = Vec::with_capacity(count);
+    let mut at = PAGE_HEAD_BYTES;
+    let (mut hash, mut offset) = (page.first_hash, page.first_offset);
+    for index in 0..count as u64 {
+        hash = hash
+            .checked_add(varint_at(bytes, &mut at)?)
+            .ok_or(SegmentError::Corrupt("index hash"))?;
+        let len_bytes = varint_at(bytes, &mut at)?;
+        if (page.first_entry + index).is_multiple_of(OFFSET_EVERY)
+            && varint_at(bytes, &mut at)? != offset
+        {
+            return Err(SegmentError::Corrupt("index offsets don't add up"));
+        }
+        entries.push(IndexEntry {
+            hash,
+            offset,
+            len_bytes,
+        });
+        offset = offset
+            .checked_add(len_bytes)
+            .ok_or(SegmentError::Corrupt("index offset"))?;
+    }
+    if at != bytes.len() {
         return Err(SegmentError::Corrupt("page has the wrong length"));
     }
-    let mut entries = Vec::new();
-    for fixed in bytes[PAGE_HEAD_BYTES..].as_chunks::<INDEX_ENTRY_BYTES>().0 {
-        let stream = KeyHash::from_slice(&fixed[48..]).unwrap();
-        if only.is_none_or(|wanted| wanted == stream) {
-            entries.push((
-                u64_at(fixed, 0),
-                StreamExtent {
-                    stream,
-                    offset: u64_at(fixed, 8),
-                    len_bytes: u64_at(fixed, 16),
-                    id_first: u64_at(fixed, 24),
-                    id_last: u64_at(fixed, 32),
-                    block_count: u32_at(fixed, 40),
-                },
-            ));
-        }
+    if offset > page.data_end {
+        return Err(SegmentError::Corrupt("region is past the data"));
     }
     Ok(entries)
+}
+
+/// Each region's full key hash and last id, in region order (section 7.3).
+pub(crate) fn encode_last_ids(last_ids: &[(KeyHash, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + last_ids.len() * LAST_ID_BYTES);
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(last_ids.len() as u32).to_le_bytes());
+    for (key, last_id) in last_ids {
+        out.extend_from_slice(&key.0);
+        out.extend_from_slice(&last_id.to_le_bytes());
+    }
+    let crc = crc32c(&out[4..]);
+    out[..4].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+pub fn decode_last_ids(bytes: &[u8]) -> Result<Vec<(KeyHash, u64)>, SegmentError> {
+    if bytes.len() < 8 {
+        return Err(SegmentError::Corrupt("last ids are truncated"));
+    }
+    if crc32c(&bytes[4..]) != u32_at(bytes, 0) {
+        return Err(SegmentError::Crc("last ids"));
+    }
+    let count = u32_at(bytes, 4) as usize;
+    if count
+        .checked_mul(LAST_ID_BYTES)
+        .and_then(|body| body.checked_add(8))
+        != Some(bytes.len())
+    {
+        return Err(SegmentError::Corrupt("last ids have the wrong length"));
+    }
+    Ok(bytes[8..]
+        .as_chunks::<LAST_ID_BYTES>()
+        .0
+        .iter()
+        .map(|entry| {
+            let key = KeyHash::from_slice(&entry[..KeyHash::BYTES]).unwrap();
+            (key, u64_at(entry, KeyHash::BYTES))
+        })
+        .collect())
 }
 
 /// The small index over the footer pages. A reader fetches it once and caches it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopIndex {
     pages: Vec<TopEntry>,
+    /// Where the regions end and the pages start.
+    pub(crate) data_end: u64,
+    pub(crate) last_ids_offset: u64,
+    pub(crate) last_ids_len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TopEntry {
     pub(crate) first_hash: u64,
+    pub(crate) first_offset: u64,
+    pub(crate) first_entry: u64,
     pub(crate) offset: u64,
     pub(crate) len_bytes: u32,
+    /// The top index's, so a page knows where the regions end.
+    pub(crate) data_end: u64,
 }
 
 impl TopIndex {
-    pub(crate) fn from_pages(pages: Vec<TopEntry>) -> TopIndex {
-        TopIndex { pages }
+    pub(crate) fn new(
+        pages: Vec<TopEntry>,
+        data_end: u64,
+        last_ids_offset: u64,
+        last_ids_len: u64,
+    ) -> TopIndex {
+        TopIndex {
+            pages,
+            data_end,
+            last_ids_offset,
+            last_ids_len,
+        }
     }
 
     pub fn page_count(&self) -> usize {
@@ -278,14 +383,23 @@ impl TopIndex {
     }
 }
 
-pub(crate) fn encode_footer(pages: &[TopEntry], top_offset: u64) -> Vec<u8> {
+pub(crate) fn encode_footer(top: &TopIndex, top_offset: u64) -> Vec<u8> {
     let mut out =
-        Vec::with_capacity(TOP_HEAD_BYTES + pages.len() * TOP_ENTRY_BYTES + TRAILER_BYTES);
-    out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+        Vec::with_capacity(TOP_HEAD_BYTES + top.pages.len() * TOP_ENTRY_BYTES + TRAILER_BYTES);
+    out.extend_from_slice(&(top.pages.len() as u32).to_le_bytes());
     out.extend_from_slice(&[0; 4]);
-    for page in pages {
-        out.extend_from_slice(&page.first_hash.to_le_bytes());
-        out.extend_from_slice(&page.offset.to_le_bytes());
+    for field in [top.data_end, top.last_ids_offset, top.last_ids_len] {
+        out.extend_from_slice(&field.to_le_bytes());
+    }
+    for page in &top.pages {
+        for field in [
+            page.first_hash,
+            page.first_offset,
+            page.first_entry,
+            page.offset,
+        ] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
         out.extend_from_slice(&page.len_bytes.to_le_bytes());
         out.extend_from_slice(&[0; 4]);
     }
@@ -337,17 +451,34 @@ pub fn decode_top_index(bytes: &[u8]) -> Result<TopIndex, SegmentError> {
     if count.checked_mul(TOP_ENTRY_BYTES) != Some(top.len() - TOP_HEAD_BYTES) {
         return Err(SegmentError::Corrupt("top index has the wrong length"));
     }
+    let (data_end, last_ids_offset, last_ids_len) =
+        (u64_at(top, 8), u64_at(top, 16), u64_at(top, 24));
+    if last_ids_offset.saturating_add(last_ids_len) > trailer.top_offset
+        || data_end > last_ids_offset
+    {
+        return Err(SegmentError::Corrupt("last ids are past the top index"));
+    }
     let mut pages = Vec::with_capacity(count);
     for entry in top[TOP_HEAD_BYTES..].as_chunks::<TOP_ENTRY_BYTES>().0 {
         let page = TopEntry {
             first_hash: u64_at(entry, 0),
-            offset: u64_at(entry, 8),
-            len_bytes: u32_at(entry, 16),
+            first_offset: u64_at(entry, 8),
+            first_entry: u64_at(entry, 16),
+            offset: u64_at(entry, 24),
+            len_bytes: u32_at(entry, 32),
+            data_end,
         };
-        if page.offset.saturating_add(u64::from(page.len_bytes)) > trailer.top_offset {
-            return Err(SegmentError::Corrupt("page is past the top index"));
+        if page.offset < data_end
+            || page.offset.saturating_add(u64::from(page.len_bytes)) > last_ids_offset
+        {
+            return Err(SegmentError::Corrupt("page is outside the index"));
         }
         pages.push(page);
     }
-    Ok(TopIndex { pages })
+    Ok(TopIndex::new(
+        pages,
+        data_end,
+        last_ids_offset,
+        last_ids_len,
+    ))
 }

@@ -1,9 +1,9 @@
 //! Checkpoints (SPEC section 7.6, D18): `checkpoints/<generation>-<seq>.ckpt`, one per seal,
-//! shared by every stream that changed, in the segment's paged footer format. An entry's
-//! `offset, len` point at the stream's metadata, and its `id_last` is the stream's last id.
+//! shared by every stream that changed, in the segment's format. Each region is a stream's key
+//! hash and then its metadata, and its last id is the stream's.
 //!
 //! ```text
-//! file := blob* page* top_index trailer
+//! file := (key hash | metadata)* page* last_ids top_index trailer
 //! ```
 //!
 //! An entry holds only the extents new since the stream's last entry. A *full* file holds
@@ -26,9 +26,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use crate::meta_format::{MetaError, StreamMeta, decode_meta, encode_meta};
 use crate::ownership::Ownership;
 use crate::segment_builder::encode_index;
-use crate::segment_format::{
-    DEFAULT_PAGE_BYTES, SegmentError, StreamExtent, TopIndex, decode_page, stream_hash,
-};
+use crate::segment_format::{DEFAULT_PAGE_BYTES, SegmentError, TopIndex};
 use crate::segment_reader::SegmentReader;
 
 const CHECKPOINT_PREFIX: &str = "checkpoints";
@@ -136,30 +134,20 @@ pub fn build_checkpoint(
     head: &CheckpointHead,
     metas: &[StreamMeta],
 ) -> Result<BuiltCheckpoint, SegmentError> {
-    let mut parts = Vec::with_capacity(metas.len() + 3);
-    let mut offset = 0u64;
-    let mut index: Vec<(u64, StreamExtent)> = Vec::with_capacity(metas.len() + 1);
+    let mut sorted: Vec<&StreamMeta> = metas.iter().collect();
+    sorted.sort_by_key(|meta| meta.stream);
+    let mut parts = Vec::with_capacity(2 * metas.len() + 5);
+    let mut regions = Vec::with_capacity(metas.len() + 1);
     let mut add = |stream: KeyHash, bytes: Vec<u8>, id_last: u64| {
-        let len_bytes = bytes.len() as u64;
-        index.push((
-            stream_hash(stream),
-            StreamExtent {
-                stream,
-                offset,
-                len_bytes,
-                id_first: 0,
-                id_last,
-                block_count: 0,
-            },
-        ));
-        offset += len_bytes;
+        regions.push((stream, (KeyHash::BYTES + bytes.len()) as u64, id_last));
+        parts.push(Bytes::copy_from_slice(&stream.0));
         parts.push(Bytes::from(bytes));
     };
     add(HEAD_KEY, encode_head(head), 0);
-    for meta in metas {
+    for meta in sorted {
         add(meta.stream, encode_meta(meta), meta.last_id);
     }
-    let top = encode_index(&mut index, DEFAULT_PAGE_BYTES, offset, &mut parts)?;
+    let (_, top) = encode_index(&regions, DEFAULT_PAGE_BYTES, &mut parts)?;
     Ok(BuiltCheckpoint { parts, top })
 }
 
@@ -251,26 +239,41 @@ impl CheckpointFile {
     }
 }
 
+/// A stream's metadata in `file`: a page read, then the region's.
 async fn read_entry(
     store: &Arc<dyn ObjectStore>,
     file: &CheckpointFile,
     stream: KeyHash,
-) -> Result<Option<(u64, Bytes)>, CheckpointError> {
-    let Some(page) = file.top.page_for(stream_hash(stream)) else {
-        return Ok(None);
+) -> Result<Option<Bytes>, CheckpointError> {
+    let reader = SegmentReader::new(Arc::clone(store), file.path.clone());
+    for entry in reader.candidates(&file.top, stream).await? {
+        let start = entry.offset as usize;
+        let region = store
+            .get_range(&file.path, start..start + entry.len_bytes as usize)
+            .await?;
+        let key = check_region_key(&region)?;
+        if key == stream {
+            return Ok(Some(region.slice(KeyHash::BYTES..)));
+        }
+    }
+    Ok(None)
+}
+
+/// A region's key, checked against what its CRC covers: the head's own, or the metadata's
+/// stream. Nothing else covers the key.
+fn check_region_key(region: &[u8]) -> Result<KeyHash, CheckpointError> {
+    let key = KeyHash::from_slice(region.get(..KeyHash::BYTES).unwrap_or_default())
+        .ok_or(SegmentError::Corrupt("region is truncated"))?;
+    let body = &region[KeyHash::BYTES..];
+    let matches = if key == HEAD_KEY {
+        decode_head(body).is_ok()
+    } else {
+        decode_meta(body)?.stream == key
     };
-    let start = page.offset as usize;
-    let bytes = store
-        .get_range(&file.path, start..start + page.len_bytes as usize)
-        .await?;
-    let Some((_, entry)) = decode_page(&bytes, Some(stream))?.into_iter().next() else {
-        return Ok(None);
-    };
-    let start = entry.offset as usize;
-    let blob = store
-        .get_range(&file.path, start..start + entry.len_bytes as usize)
-        .await?;
-    Ok(Some((entry.id_last, blob)))
+    if !matches {
+        return Err(SegmentError::Corrupt("region's key isn't its metadata's").into());
+    }
+    Ok(key)
 }
 
 /// The checkpoints that matter, newest first: down to the newest full file a reader can trust.
@@ -327,7 +330,7 @@ impl CheckpointSet {
                 top,
                 head: CheckpointHead::default(),
             };
-            if let Some((_, blob)) = read_entry(store, &file, HEAD_KEY).await? {
+            if let Some(blob) = read_entry(store, &file, HEAD_KEY).await? {
                 file.head = decode_head(&blob)?;
             }
             // A late full file from a former generation may hold what readers ignore.
@@ -385,13 +388,13 @@ impl CheckpointSet {
         // Taken away by a newer entry: compaction or retention (section 7.5, 7.4).
         let mut dropped: HashSet<u64> = HashSet::new();
         for file in &self.files {
-            let Some((id_last, blob)) = read_entry(store, file, stream).await? else {
+            let Some(blob) = read_entry(store, file, stream).await? else {
                 continue;
             };
-            if !self.accepts(file.generation, id_last) {
+            let meta = decode_meta(&blob)?;
+            if !self.accepts(file.generation, meta.last_id) {
                 continue;
             }
-            let meta = decode_meta(&blob)?;
             extents.extend(
                 meta.extents
                     .iter()
@@ -427,15 +430,25 @@ impl CheckpointSet {
         let mut all: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
         for file in self.files.iter().rev() {
             let reader = SegmentReader::new(Arc::clone(store), file.path.clone());
-            for entry in reader.all_extents(&file.top).await? {
-                if entry.stream == HEAD_KEY || !self.accepts(file.generation, entry.id_last) {
+            let (entries, data, last_ids) = reader.read_all(&file.top).await?;
+            for (entry, (stream, last_id)) in entries.iter().zip(last_ids) {
+                let start = entry.offset as usize;
+                let region = data
+                    .get(start..start + entry.len_bytes as usize)
+                    .ok_or(SegmentError::Corrupt("region is past the data"))?;
+                if check_region_key(region)? != stream {
+                    return Err(SegmentError::Corrupt("region isn't its last id's").into());
+                }
+                if stream == HEAD_KEY {
                     continue;
                 }
-                let start = entry.offset as usize;
-                let blob = store
-                    .get_range(&file.path, start..start + entry.len_bytes as usize)
-                    .await?;
-                merge_meta(&mut all, decode_meta(&blob)?);
+                let meta = decode_meta(&region[KeyHash::BYTES..])?;
+                if meta.last_id != last_id {
+                    return Err(SegmentError::Corrupt("metadata isn't its last id").into());
+                }
+                if self.accepts(file.generation, meta.last_id) {
+                    merge_meta(&mut all, meta);
+                }
             }
         }
         Ok(all)

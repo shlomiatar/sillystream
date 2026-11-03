@@ -12,9 +12,10 @@ use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    BlockEntry, CheckpointSet, MetaExtent, MetaSink, MetaSinkGap, Ownership, SegmentError,
-    SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects, list_wal_files,
-    object_generation, read_ownership, replay_files, sync_wal_files, upload_pending,
+    BlockEntry, BlockTable, CheckpointSet, MetaExtent, MetaSink, MetaSinkGap, Ownership,
+    SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects,
+    list_wal_files, object_generation, read_ownership, replay_files, sync_wal_files,
+    upload_pending,
 };
 
 use crate::dedupe::DedupeTable;
@@ -131,9 +132,11 @@ pub(crate) struct Prepared {
     pub checkpoints: CheckpointSet,
     pub max_id: u64,
     pub restored: Vec<RestoredStream>,
-    /// Objects this startup looked at, for the next checkpoint to record. Their extents are in
-    /// `restored`, or are ones nobody should read.
+    /// Objects this startup looked at or put, for the next checkpoint to record. Their extents
+    /// are in `restored`, or are ones nobody should read.
     pub scanned_objects: Vec<ScannedObject>,
+    /// The time in the id of the last object this startup put, for the uploader's to follow.
+    pub last_object_ms: u64,
 }
 
 /// One object no checkpoint recorded.
@@ -271,8 +274,8 @@ const CONCURRENT_OBJECT_SCANS: usize = 16;
 async fn read_system_blocks(
     reader: &SegmentReader,
     extent: &StreamExtent,
+    table: &BlockTable,
 ) -> Result<Vec<Bytes>, SegmentError> {
-    let table = reader.read_table(extent).await?;
     let may_hold = |block: &BlockEntry| !matches!(block.summary.author, BlockAuthor::Single(author) if author != 0);
     let mut blocks = Vec::new();
     let mut index = 0;
@@ -285,7 +288,7 @@ async fn read_system_blocks(
         while table.blocks.get(index).is_some_and(may_hold) {
             index += 1;
         }
-        blocks.push(reader.read_blocks(extent, &table, start..index).await?);
+        blocks.push(reader.read_blocks(extent, table, start..index).await?);
     }
     Ok(blocks)
 }
@@ -307,11 +310,11 @@ async fn scan_object(
     let describe = |error: SegmentError| format!("{path}: {error}");
     let reader = SegmentReader::new(store, path.clone());
     let top = reader.read_top_index().await.map_err(describe)?;
-    let extents = reader.all_extents(&top).await.map_err(describe)?;
+    let heads = reader.read_heads(&top).await.map_err(describe)?;
     let mut out = Vec::new();
     let mut needs_manifest = false;
     let mut ignored_extent_count = 0;
-    for extent in extents {
+    for (extent, table) in heads {
         if limit.is_some_and(|limit| extent.id_first > limit) {
             ignored_extent_count += 1;
             continue;
@@ -330,7 +333,7 @@ async fn scan_object(
             }
             _ => (
                 extent.id_last,
-                read_system_blocks(&reader, &extent)
+                read_system_blocks(&reader, &extent, &table)
                     .await
                     .map_err(describe)?,
             ),
@@ -671,6 +674,14 @@ pub(crate) async fn prepare(
             closed_seqs.retain(|seq| *seq != file.seq);
         }
     }
+    let last_object_ms = put_restored_parts(
+        store.as_ref(),
+        generation,
+        manifest,
+        &mut restored,
+        &mut scanned_objects,
+    )
+    .await?;
     ownership.record(generation, last_valid_id);
     checkpoints.ownership = ownership;
     report.generation = generation;
@@ -684,7 +695,74 @@ pub(crate) async fn prepare(
             max_id: last_valid_id,
             restored,
             scanned_objects,
+            last_object_ms,
         },
         local,
     ))
+}
+
+/// A stream's restored records split wherever an object's extent lies between them, and an
+/// object holds one region per stream (D157, D275). The first part goes into the first seal, and
+/// each later one goes up here as its own object, under this generation, and joins the stream's
+/// extents. Says the time in the last id put.
+async fn put_restored_parts(
+    store: &dyn ObjectStore,
+    generation: u64,
+    manifest: KeyHash,
+    restored: &mut [RestoredStream],
+    scanned_objects: &mut Vec<ScannedObject>,
+) -> Result<u64, String> {
+    let mut last_object_ms = 0;
+    for stream in restored {
+        let name = stream.meta.stream;
+        let mut parts: Vec<Vec<RestoredBatch>> = Vec::new();
+        for batch in std::mem::take(&mut stream.batches) {
+            let split = parts
+                .last()
+                .and_then(|part| part.last())
+                .is_none_or(|previous| {
+                    stream.meta.extents.iter().any(|known| {
+                        previous.last_id < known.id_first && known.id_first < batch.first_id
+                    })
+                });
+            if split {
+                parts.push(Vec::new());
+            }
+            parts.last_mut().expect("pushed above").push(batch);
+        }
+        let mut parts = parts.into_iter();
+        stream.batches = parts.next().unwrap_or_default();
+        for part in parts {
+            let mut builder = storage::SegmentBuilder::new();
+            builder
+                .add_extent(name, part.iter().map(|batch| batch.bytes.clone()))
+                .map_err(|error| format!("restoring {name}: {error}"))?;
+            let built = builder.finish().map_err(|error| error.to_string())?;
+            let last_id = built.last_id.expect("a part has records");
+            let time_ms = format::id_ms(last_id)
+                .max(last_object_ms + 1)
+                .max(storage::OBJECT_EPOCH_MS);
+            last_object_ms = time_ms;
+            let path = storage::sealed_path(storage::ObjectId::new(time_ms, generation, 0));
+            storage::put_object(store, &path, &built.parts).await?;
+            let extent = &built.extents[0];
+            let extent = MetaExtent {
+                path: path.to_string(),
+                offset: extent.offset,
+                len_bytes: extent.len_bytes,
+                id_first: extent.id_first,
+                id_last: extent.id_last,
+                block_count: extent.block_count,
+            };
+            stream.meta.extents.push(extent.clone());
+            stream.meta.extents.sort_by_key(|extent| extent.id_first);
+            stream.new_extents.push(extent);
+            scanned_objects.push(ScannedObject {
+                path: path.to_string(),
+                len_bytes: built.len_bytes,
+                needs_manifest: name != manifest,
+            });
+        }
+    }
+    Ok(last_object_ms)
 }

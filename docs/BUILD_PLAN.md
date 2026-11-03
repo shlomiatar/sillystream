@@ -95,7 +95,7 @@ Benchmarks are a deliverable, not an afterthought. SPEC.md says its latency figu
 - Group commit: with slow sync, entries queued during a sync all land in the next one (1 sync, not N), with no timer in the code path.
 - `try_send` on a full channel returns at once: a test with a stalled writer shows the sender never blocks.
 - Recovery reader: for a WAL truncated at every byte of its last entries and with a flipped bit in any position, replay returns exactly the valid prefix. A reused file's stale entries are not returned (D8).
-- Segment: property round trip; a lookup across 1M synthetic streams makes at most one top index read, one page read and two data reads, counted through a wrapper store. A cached top index or stored extent drops the footer reads. A stream with two sections returns both entries. Hash collisions are resolved by name. A flipped bit fails the CRC.
+- Segment: property round trip; reading a stream across 1M synthetic streams makes one top index read, one page read and one read of its region, counted through a wrapper store. A cached top index or stored extent drops the footer reads. A stream added twice is one region in id order. Index hash collisions are resolved by the full key hash. A flipped bit fails the CRC.
 - Record bytes in a segment equal the wire bytes exactly.
 - Uploader: N sections over many streams produce exactly one PUT per seal, and a dedicated object for a stream filling its buffer, at the section 7.3 path. Store failures retry without losing references.
 - Everything runs on `LocalFileSystem` and `InMemory`. A test proves the S3 config builds a client without connecting.
@@ -114,7 +114,7 @@ Tested through in-process message APIs, without sockets. Shard moves and crash-r
 - Consecutive ids across a publish, in SDK sort order. A stable-order property test covers many publishes per stream.
 - Backpressure: with a full WAL channel, a core keeps serving other work, such as a ping, delivery and non-publish messages (asserted by a test with a stalled writer), no publish is dropped, and order is preserved on release.
 - Slabs: a counting hook shows reference count changes per slab per batch, not per record, and a slab is freed exactly once all references are gone. Any `unsafe` has a comment and a test.
-- A stream moved between cores mid-load keeps its ids in order with none lost, pending acks arrive, and the seal shows the footer's two entries for it.
+- A stream moved between cores mid-load keeps its ids in order with none lost, pending acks arrive, and the seal holds one region for it, in id order.
 - Rebalancing: under a skewed scripted load, the check moves shards off the overloaded core. A hot stream can get its own shard through the override table.
 - State: each op, including nested merge deletes by null, incr creation and failure on non-numbers, 64 KB limit (over limit rejected and state unchanged), `expect_ver` mismatch gives version conflict, and `version` equals the system record's id. Property test: replaying the system records gives the same state as applying them live.
 - Atomic publish: a failed `expect_ver` commits no records and no ids are visible; on success ids are consecutive with the state record last (D5). The WAL holds it as one entry.

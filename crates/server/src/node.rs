@@ -847,6 +847,7 @@ struct RecoveredParts {
     closed_seqs: Vec<u64>,
     restored: Vec<RestoredStream>,
     scanned_objects: Vec<ScannedObject>,
+    last_object_ms: u64,
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
@@ -946,6 +947,7 @@ impl Node {
                 closed_seqs: prepared.closed_seqs,
                 restored: prepared.restored,
                 scanned_objects: prepared.scanned_objects,
+                last_object_ms: prepared.last_object_ms,
             }),
         )?;
         Ok((node, report))
@@ -996,6 +998,7 @@ impl Node {
             put_timeout_min_ms: config.upload_put_timeout_min_ms,
             cache,
             events: upload_txs,
+            last_object_ms: recovered.as_ref().map_or(0, |parts| parts.last_object_ms),
         })?;
         let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let seal_requests = core_to_node.clone();
@@ -1983,35 +1986,19 @@ impl Client {
     }
 }
 
-/// What startup replay found that no object holds, for the WAL writer's first seal. A stream's
-/// records split wherever an object's extent lies between them, since one extent can't go around
-/// another's records.
+/// What startup replay found that no object holds, for the WAL writer's first seal: one extent
+/// per stream, since recovery put any part past an object's extent up itself.
 fn carried_extents(restored: &[crate::recovery::RestoredStream]) -> Vec<SealExtent> {
-    let mut extents: Vec<SealExtent> = Vec::new();
-    for stream in restored {
-        let name = stream.meta.stream;
-        let mut previous_last_id: Option<u64> = None;
-        for batch in &stream.batches {
-            let split = previous_last_id.is_none_or(|last_id| {
-                stream
-                    .meta
-                    .extents
-                    .iter()
-                    .any(|known| last_id < known.id_first && known.id_first < batch.first_id)
-            });
-            if split {
-                extents.push(SealExtent {
-                    stream: name,
-                    records: Vec::new(),
-                });
-            }
-            previous_last_id = Some(batch.last_id);
-            extents
-                .last_mut()
-                .expect("pushed above")
-                .records
-                .push(batch.bytes.clone());
-        }
-    }
-    extents
+    restored
+        .iter()
+        .filter(|stream| !stream.batches.is_empty())
+        .map(|stream| SealExtent {
+            stream: stream.meta.stream,
+            records: stream
+                .batches
+                .iter()
+                .map(|batch| batch.bytes.clone())
+                .collect(),
+        })
+        .collect()
 }

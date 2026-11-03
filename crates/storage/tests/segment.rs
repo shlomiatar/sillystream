@@ -1,4 +1,4 @@
-//! Segments: round trips, read counts, two-section streams, collisions and CRCs.
+//! Segments: round trips, read counts, streams added twice, collisions and CRCs.
 
 mod common;
 
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::{CountingStore, concat, put_parts, record};
-use format::{Clause, Filter, RecordHeader, Records, crc32c};
+use format::{Clause, Filter, RecordHeader, Records, crc32c, crc32c_append};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
@@ -15,7 +15,7 @@ use object_store::path::Path;
 use proptest::prelude::*;
 use storage::{
     BLOCK_ENTRY_BYTES, SegmentBuilder, SegmentError, SegmentReader, TRAILER_BYTES,
-    decode_block_table, decode_page, decode_top_index, stream_hash,
+    decode_block_table, decode_last_ids, decode_top_index, stream_hash,
 };
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
@@ -103,9 +103,8 @@ proptest! {
 
     #[test]
     fn decoders_never_panic_on_random_bytes(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
-        let _ = decode_block_table(&bytes);
-        let _ = decode_page(&bytes, Some(key("s")));
-        let _ = decode_page(&bytes, None);
+        let _ = decode_block_table(key("s"), &bytes);
+        let _ = decode_last_ids(&bytes);
         let _ = decode_top_index(&bytes);
     }
 }
@@ -113,26 +112,26 @@ proptest! {
 /// `decode_*` also see valid CRCs over nonsense, the case a CRC doesn't catch.
 #[test]
 fn decoders_refuse_nonsense_that_has_a_valid_crc() {
-    let mut page = vec![0u8; 8];
-    page[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-    let crc = crc32c(&page[4..]);
-    page[..4].copy_from_slice(&crc.to_le_bytes());
+    let mut last_ids = vec![0u8; 8];
+    last_ids[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+    let crc = crc32c(&last_ids[4..]);
+    last_ids[..4].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(
-        decode_page(&page, None),
+        decode_last_ids(&last_ids),
         Err(SegmentError::Corrupt(_))
     ));
     let mut table = vec![0u8; 8];
     table[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-    let crc = crc32c(&table[4..]);
+    let crc = crc32c_append(crc32c(&key("s").0), &table[4..]);
     table[..4].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(
-        decode_block_table(&table),
+        decode_block_table(key("s"), &table),
         Err(SegmentError::Corrupt(_))
     ));
 }
 
-/// The acceptance figure: at most one top index read, one page read and two data reads,
-/// across 1M streams.
+/// The acceptance figure of section 7.3: one top index read, one page read and one read of the
+/// region, across 1M streams.
 #[tokio::test(flavor = "multi_thread")]
 async fn lookup_across_a_million_streams_makes_the_promised_reads() {
     let dir = tempfile::tempdir().unwrap();
@@ -164,24 +163,25 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
             assert_eq!(counting.gets(), 1, "one top index read");
             assert!(top.page_count() > 100, "the footer really has pages");
 
-            let extents = reader.lookup(&top, key(&name)).await.unwrap();
-            assert_eq!(counting.gets(), 2, "one page read");
-            assert_eq!(extents.len(), 1);
-
-            let bytes = reader.read_extent(&extents[0]).await.unwrap();
-            assert_eq!(counting.gets(), 4, "two data reads");
+            let (extent, bytes) = reader.read_region(&top, key(&name)).await.unwrap().unwrap();
+            assert_eq!(counting.gets(), 3, "one page read and one of the region");
             assert_eq!(bytes, payload);
 
             // With the top index cached, the top index read goes away.
             counting.reset_gets();
+            reader.read_region(&top, key(&name)).await.unwrap().unwrap();
+            assert_eq!(counting.gets(), 2, "cached top index: page and region");
+
+            // A lookup reads the region's key and table, for an extent to keep.
+            counting.reset_gets();
             let extents = reader.lookup(&top, key(&name)).await.unwrap();
-            reader.read_extent(&extents[0]).await.unwrap();
-            assert_eq!(counting.gets(), 3, "cached top index: page and two data");
+            assert_eq!(extents, std::slice::from_ref(&extent));
+            assert_eq!(counting.gets(), 2, "page, then key and table");
 
             // With a stored extent, the whole footer goes away.
             counting.reset_gets();
-            assert_eq!(reader.read_extent(&extents[0]).await.unwrap(), payload);
-            assert_eq!(counting.gets(), 2, "stored extent: two data reads");
+            assert_eq!(reader.read_extent(&extent).await.unwrap(), payload);
+            assert_eq!(counting.gets(), 1, "stored extent: one read of the region");
         }
         counting.reset_gets();
         let top = reader.read_top_index().await.unwrap();
@@ -197,9 +197,8 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
 }
 
 #[tokio::test]
-async fn a_stream_in_two_sections_returns_both_entries() {
+async fn a_stream_added_twice_is_one_region() {
     for (store, _dir) in stores() {
-        // Tiny pages, so that the run has to be kept together on purpose.
         let mut builder = SegmentBuilder::with_limits(1024, 64);
         let early = Bytes::from(record(FIRST_ID, 1, 7, b"on the old core"));
         let late = Bytes::from(record(FIRST_ID + 1, 1, 7, b"on the new core"));
@@ -215,17 +214,17 @@ async fn a_stream_in_two_sections_returns_both_entries() {
         let reader = SegmentReader::new(store, path);
         let top = reader.read_top_index().await.unwrap();
         let extents = reader.lookup(&top, key("moved")).await.unwrap();
-        assert_eq!(extents.len(), 2);
-        assert_eq!(reader.read_extent(&extents[0]).await.unwrap(), early);
-        assert_eq!(reader.read_extent(&extents[1]).await.unwrap(), late);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].block_count, 2, "each add closes its own block");
         let mut both = early.to_vec();
         both.extend_from_slice(&late);
+        assert_eq!(reader.read_extent(&extents[0]).await.unwrap(), both);
         assert_eq!(reader.read_stream(key("moved")).await.unwrap(), both);
     }
 }
 
 /// Two key hashes sharing their top 64 bits can't be found on demand, so this writes the bytes
-/// of section 7.3 by hand, independently of the builder, with `b` claiming `a`'s index hash.
+/// of section 7.3 by hand, independently of the builder, with `b` under `a`'s index hash.
 #[tokio::test]
 async fn an_index_hash_shared_resolves_by_the_full_key_hash() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -234,9 +233,9 @@ async fn an_index_hash_shared_resolves_by_the_full_key_hash() {
     let record_a = record(FIRST_ID, 1, 7, b"aaaa");
     let record_b = record(FIRST_ID, 2, 7, b"bbbb");
     let mut object = Vec::new();
-    let mut extent = |stream_records: &[u8]| {
+    let mut region = |name: &str, stream_records: &[u8]| {
         let header = RecordHeader::read(stream_records).unwrap();
-        let offset = object.len() as u64;
+        let start = object.len();
         let mut table = vec![0u8; 8];
         table[4..8].copy_from_slice(&1u32.to_le_bytes());
         for field in [
@@ -252,42 +251,65 @@ async fn an_index_hash_shared_resolves_by_the_full_key_hash() {
         }
         table.extend_from_slice(&0u32.to_le_bytes());
         table.extend_from_slice(&crc32c(stream_records).to_le_bytes());
-        let crc = crc32c(&table[4..]);
+        let crc = crc32c_append(crc32c(&key(name).0), &table[4..]);
         table[..4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(table.len(), 8 + BLOCK_ENTRY_BYTES);
+        object.extend_from_slice(&key(name).0);
         object.extend_from_slice(&table);
         object.extend_from_slice(stream_records);
-        (
-            offset,
-            (table.len() + stream_records.len()) as u64,
-            header.id,
-        )
+        (object.len() - start) as u64
     };
-    let a = extent(&record_a);
-    let b = extent(&record_b);
-
-    let mut page = vec![0u8; 8];
-    page[4..8].copy_from_slice(&2u32.to_le_bytes());
     // `b` first, so that a lookup for `a` has to skip a matching hash.
-    for (name, (offset, len, id)) in [("b", b), ("a", a)] {
-        for field in [hash, offset, len, id, id] {
-            page.extend_from_slice(&field.to_le_bytes());
+    let len_b = region("b", &record_b);
+    let len_a = region("a", &record_a);
+    let data_end = object.len() as u64;
+
+    // Both entries: hash delta 0, then the length; the first also has its offset, 0.
+    let mut page = vec![0u8; 4];
+    page.extend_from_slice(&2u32.to_le_bytes());
+    for (at, len) in [len_b, len_a].into_iter().enumerate() {
+        page.push(0);
+        let mut value = len;
+        while value >= 0x80 {
+            page.push(value as u8 | 0x80);
+            value >>= 7;
         }
-        page.extend_from_slice(&1u32.to_le_bytes());
-        page.extend_from_slice(&[0; 4]);
-        page.extend_from_slice(&key(name).0);
+        page.push(value as u8);
+        if at == 0 {
+            page.push(0);
+        }
     }
     let crc = crc32c(&page[4..]);
     page[..4].copy_from_slice(&crc.to_le_bytes());
     let page_offset = object.len() as u64;
     object.extend_from_slice(&page);
 
+    let mut last_ids = vec![0u8; 4];
+    last_ids.extend_from_slice(&2u32.to_le_bytes());
+    for name in ["b", "a"] {
+        last_ids.extend_from_slice(&key(name).0);
+        last_ids.extend_from_slice(&FIRST_ID.to_le_bytes());
+    }
+    let crc = crc32c(&last_ids[4..]);
+    last_ids[..4].copy_from_slice(&crc.to_le_bytes());
+    let last_ids_offset = object.len() as u64;
+    object.extend_from_slice(&last_ids);
+
     let top_offset = object.len() as u64;
     let mut footer = Vec::new();
     footer.extend_from_slice(&1u32.to_le_bytes());
     footer.extend_from_slice(&[0; 4]);
-    footer.extend_from_slice(&hash.to_le_bytes());
-    footer.extend_from_slice(&page_offset.to_le_bytes());
+    for field in [
+        data_end,
+        last_ids_offset,
+        last_ids.len() as u64,
+        hash,
+        0,
+        0,
+        page_offset,
+    ] {
+        footer.extend_from_slice(&field.to_le_bytes());
+    }
     footer.extend_from_slice(&(page.len() as u32).to_le_bytes());
     footer.extend_from_slice(&[0; 4]);
     let top_len = footer.len() as u32;
@@ -306,13 +328,26 @@ async fn an_index_hash_shared_resolves_by_the_full_key_hash() {
     let found = reader.lookup(&top, key("a")).await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].stream, key("a"));
+    assert_eq!(found[0].offset, len_b);
     assert_eq!(
         reader.read_extent(&found[0]).await.unwrap()[..],
         record_a[..]
     );
-    let only_a = decode_page(&page, Some(key("a"))).unwrap();
-    assert_eq!(only_a.len(), 1);
-    assert_eq!(decode_page(&page, None).unwrap().len(), 2);
+    assert!(reader.lookup(&top, key("c")).await.unwrap().is_empty());
+}
+
+#[test]
+fn overlapping_adds_of_one_stream_are_refused() {
+    let mut builder = SegmentBuilder::new();
+    let both = [
+        record(FIRST_ID, 1, 7, b"x"),
+        record(FIRST_ID + 1, 1, 7, b"x"),
+    ]
+    .concat();
+    builder.add_extent(key("s"), [Bytes::from(both)]).unwrap();
+    let again = Bytes::from(record(FIRST_ID + 1, 1, 7, b"x"));
+    builder.add_extent(key("s"), [again]).unwrap();
+    assert!(matches!(builder.finish(), Err(SegmentError::OutOfOrder(_))));
 }
 
 /// Reads everything a reader can read, returning the first failure.
@@ -342,14 +377,14 @@ async fn a_flipped_bit_anywhere_fails() {
     for stream in streams {
         builder.add_extent(key(stream), [bytes.clone()]).unwrap();
     }
-    let object = concat(&builder.finish().unwrap().parts);
+    let built = builder.finish().unwrap();
+    let object = concat(&built.parts);
     let path = Path::from("flip.seg");
 
     let clean: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     clean.put(&path, object.clone().into()).await.unwrap();
     read_everything(clean, &path, &streams).await.unwrap();
 
-    let mut crc_failures = 0;
     for bit in 0..object.len() * 8 {
         let mut flipped = object.clone();
         flipped[bit / 8] ^= 1 << (bit % 8);
@@ -358,13 +393,19 @@ async fn a_flipped_bit_anywhere_fails() {
         let error = read_everything(store, &path, &streams)
             .await
             .expect_err(&format!("bit {bit} went unnoticed"));
-        if matches!(error, SegmentError::Crc(_)) {
-            crc_failures += 1;
-        }
+        let byte = bit / 8;
+        // A trailer flip may instead fail the magic or a range check, and a table's block
+        // count its length, which the CRC is found by. All else is a CRC.
+        let in_count = built.extents.iter().any(|extent| {
+            let at = (extent.offset + 16 + 4) as usize;
+            (at..at + 4).contains(&byte)
+        });
+        let in_trailer = byte >= object.len() - TRAILER_BYTES;
+        assert!(
+            matches!(error, SegmentError::Crc(_)) || in_count || in_trailer,
+            "bit {bit}: {error}"
+        );
     }
-    // A trailer flip may instead fail the magic or a range check. All else is a CRC.
-    let non_crc = object.len() * 8 - crc_failures;
-    assert!(non_crc <= TRAILER_BYTES * 8, "{non_crc} non-CRC failures");
 }
 
 #[tokio::test]
@@ -375,8 +416,8 @@ async fn a_flipped_bit_in_a_block_is_named_as_a_crc_failure() {
     builder.add_extent(key("s"), [bytes.clone()]).unwrap();
     let built = builder.finish().unwrap();
     let mut object = concat(&built.parts);
-    let table_bytes = 8 + BLOCK_ENTRY_BYTES;
-    object[table_bytes + 33] ^= 4;
+    let region_head_bytes = 16 + 8 + BLOCK_ENTRY_BYTES;
+    object[region_head_bytes + 33] ^= 4;
     let path = Path::from("x.seg");
     store.put(&path, object.into()).await.unwrap();
     let error = SegmentReader::new(store, path)
@@ -427,9 +468,9 @@ async fn record_bytes_in_a_segment_equal_the_wire_bytes() {
         );
         let reader = SegmentReader::new(Arc::clone(&store), path.clone());
         assert_eq!(reader.read_stream(key("s")).await.unwrap(), wire);
-        // In the object itself: table, then the wire bytes as one run.
+        // In the object itself: key, table, then the wire bytes as one run.
         let whole = store.get(&path).await.unwrap().bytes().await.unwrap();
-        let start = 8 + built.extents[0].block_count as usize * BLOCK_ENTRY_BYTES;
+        let start = 16 + 8 + built.extents[0].block_count as usize * BLOCK_ENTRY_BYTES;
         assert_eq!(&whole[start..start + wire.len()], &wire[..]);
     }
 }
@@ -606,7 +647,7 @@ async fn an_empty_block_range_on_the_local_file_system() {
     .await;
 }
 
-/// A stream moving from a higher core to a lower one: the later ids are in the earlier section.
+/// A stream moving from a higher core to a lower one: the later ids are added first.
 #[tokio::test]
 async fn a_stream_in_two_sections_reads_in_id_order_either_way() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

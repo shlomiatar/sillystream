@@ -148,6 +148,9 @@ pub struct UploaderConfig {
     pub cache: Option<SegmentCache>,
     /// Every core's event channel. Each event goes to all.
     pub events: Vec<UnboundedSender<UploadEvent>>,
+    /// The time in this generation's last object id from before the uploader started, which
+    /// its own ids come after (section 7.3). 0 if there is none.
+    pub last_object_ms: u64,
 }
 
 enum UploadCommand {
@@ -277,13 +280,14 @@ impl Uploader {
                     put_timeout_min_ms: config.put_timeout_min_ms,
                     local: config.cache.as_ref().map(SegmentCache::writer),
                 });
+                let last_object_ms = config.last_object_ms;
                 let worker = Worker {
                     config,
                     putter,
                     stop: thread_stop,
                     sending_count: thread_sending_count,
                     unfinished: Vec::new(),
-                    last_object_ms: 0,
+                    last_object_ms,
                 };
                 let exit = runtime.block_on(worker.run(rx));
                 // Dropping the runtime would wait for a cancelled PUT's blocking thread,
