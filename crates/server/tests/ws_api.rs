@@ -466,6 +466,37 @@ async fn a_wrong_protocol_version_is_refused() {
     server.server.shutdown();
 }
 
+/// The cores hold only cursor key hashes, so reserved and over-long names are refused here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscribe_under_a_reserved_or_long_cursor_name_is_error_8() {
+    let server = start();
+    let mut ws = server.ws(&token(ALL)).await;
+    let long = "n".repeat(server::CURSOR_NAME_MAX_BYTES + 1);
+    for (sub, name) in [(1, "sink:7"), (2, "compact:7d"), (3, long.as_str())] {
+        ws.send(&ClientFrame::Subscribe(proto::Subscribe {
+            sub,
+            from: 0,
+            linger_ms: 0,
+            author: None,
+            clauses: proto::WireClauses::default(),
+            stream: "named",
+            name: Some(name),
+            with_state: false,
+            state_only: false,
+            include_system: false,
+        }))
+        .await;
+        assert_eq!(
+            ws.recv_owned().await,
+            Owned::Error {
+                reference: sub,
+                code: ErrorCode::Malformed
+            }
+        );
+    }
+    server.server.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_malformed_frame_is_error_8_and_the_connection_goes_on() {
     let server = start();
@@ -571,6 +602,12 @@ async fn try_op(server: &TestServer, op: Op, perms: u8, stream: &str, seq: u64) 
                         reference: 3,
                         code: ErrorCode::Unauthorized,
                     } => allowed = false,
+                    // Past the token check: the core refuses it for having no cursor name, and
+                    // that can come before or after the PONG.
+                    Owned::Error {
+                        reference: 3,
+                        code: ErrorCode::Malformed,
+                    } => {}
                     Owned::Error { code, .. } => panic!("{code:?}"),
                     _ => {}
                 }

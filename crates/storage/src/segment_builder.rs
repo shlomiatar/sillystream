@@ -2,15 +2,13 @@
 //! (SPEC sections 6.4, 7.3). It reads record headers and takes CRCs over the bytes,
 //! and never parses data.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
-use format::{BlockSummary, RecordHeader, crc32c_append};
+use format::{BlockSummary, KeyHash, RecordHeader, crc32c_append};
 
 use crate::segment_format::{
-    BlockEntry, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES, PAGE_HEAD_BYTES, SegmentError,
-    StreamExtent, TopEntry, TopIndex, encode_block_table, encode_footer, encode_page,
-    index_entry_bytes, stream_hash,
+    BlockEntry, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES, INDEX_ENTRY_BYTES, PAGE_HEAD_BYTES,
+    SegmentError, StreamExtent, TopEntry, TopIndex, encode_block_table, encode_footer, encode_page,
+    stream_hash,
 };
 
 /// A finished segment, as the pieces of one PUT. Together they are the whole object.
@@ -22,7 +20,7 @@ pub struct BuiltSegment {
     pub first_id: Option<u64>,
     /// The highest id in the segment, for the hour in its path. `None` if it holds no records.
     pub last_id: Option<u64>,
-    /// The stream index, sorted by `(hash, name, offset)`.
+    /// The stream index, sorted by `(key hash, offset)`.
     pub extents: Vec<StreamExtent>,
 }
 
@@ -78,13 +76,10 @@ impl SegmentBuilder {
     /// Adds one stream's records, in id order. Each `Bytes` holds whole records.
     /// Nothing is added for a stream with no records. A stream may be added more than
     /// once, which is how a stream that moved cores gets its two entries.
-    pub fn add_extent<I>(&mut self, stream: &str, records: I) -> Result<(), SegmentError>
+    pub fn add_extent<I>(&mut self, stream: KeyHash, records: I) -> Result<(), SegmentError>
     where
         I: IntoIterator<Item = Bytes>,
     {
-        if stream.len() > usize::from(u16::MAX) {
-            return Err(SegmentError::TooLong("stream id"));
-        }
         let table_slot = self.parts.len();
         self.parts.push(Bytes::new());
         let mut blocks: Vec<BlockEntry> = Vec::new();
@@ -144,7 +139,7 @@ impl SegmentBuilder {
         let len_bytes = table.len() as u64 + blocks_bytes;
         self.parts[table_slot] = Bytes::from(table);
         let extent = StreamExtent {
-            stream: Arc::from(stream),
+            stream,
             offset: self.offset,
             len_bytes,
             id_first,
@@ -202,11 +197,11 @@ pub(crate) fn encode_index_parts(
         let mut page_used_bytes = PAGE_HEAD_BYTES;
         while end < extents.len() {
             let hash = extents[end].0;
-            // A run of one hash, from collisions and two-section streams, stays whole.
+            // A run of one hash, from two-section streams, stays whole.
             let mut run_end = end;
             let mut run_bytes = 0;
             while run_end < extents.len() && extents[run_end].0 == hash {
-                run_bytes += index_entry_bytes(&extents[run_end].1.stream);
+                run_bytes += INDEX_ENTRY_BYTES;
                 run_end += 1;
             }
             if end > start && page_used_bytes + run_bytes > page_bytes {

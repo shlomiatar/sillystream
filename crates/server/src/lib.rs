@@ -13,6 +13,7 @@ mod connection;
 mod core;
 mod dedupe;
 mod delivery;
+mod keys;
 mod message;
 mod metadata;
 pub mod net;
@@ -25,14 +26,14 @@ mod state;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use compaction::{
-    CLASS_GRACE_MS, CompactReport, CompactionConfig, ExpireReport, MANIFEST_STREAM, RetentionClass,
-    SEALED_EXPIRY_MS,
+    CLASS_GRACE_MS, CompactReport, CompactionConfig, ExpireReport, RetentionClass, SEALED_EXPIRY_MS,
 };
 pub use connection::{Connection, DataFrame, DataPart, Event, Subscription};
 pub use dedupe::{
     DEDUPE_CAP_COUNT, DEDUPE_ENTRY_BYTES, DEDUPE_IDLE_MS, DedupeCheck, DedupeEntry, DedupeTable,
 };
 pub use delivery::{CURSOR_NAME_MAX_BYTES, Matched, NAMED_CURSOR_CAP_COUNT};
+pub use keys::{Keys, MANIFEST_STREAM};
 pub use message::{
     CoreStats, Reply, SinkGap, SinkOp, SinkReport, SinkSpec, SinkStart, SnapshotReply, StateChange,
     StreamConfig, StreamConfigPatch, StreamInfo,

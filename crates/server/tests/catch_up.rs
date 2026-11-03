@@ -9,6 +9,11 @@ use proptest::prelude::*;
 use proto::ErrorCode;
 use server::{Event, LocalCacheConfig, SealOutcome, Subscription};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "catch.stream";
 const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 
@@ -128,7 +133,12 @@ proptest! {
 
             let mut connection = node.connection(1).await.unwrap();
             let mut heard = Heard::default();
-            connection.subscribe(Subscription::new(1, STREAM, from));
+            connection.subscribe(Subscription::new(1, key(STREAM), from));
+            if from == u64::MAX {
+                // "From the head" is the head when the owner takes the subscribe, so nothing
+                // may be published before then. It can be another core's, a hop away.
+                subscribed(&mut connection, &mut heard, 1).await;
+            }
 
             // Publishing carries on while it reads.
             let mut later = Vec::new();
@@ -137,7 +147,7 @@ proptest! {
             hear_for(&mut connection, &mut heard, 2).await;
             if move_while_reading {
                 // The owner changes under it, and some batches stay behind on the old core.
-                let shard = server::shard_of(STREAM, node.virtual_shard_count());
+                let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
                 let at = node.placement().await[shard as usize] as usize;
                 assert!(node.move_shard(shard, 1 - at).await);
             }
@@ -194,7 +204,7 @@ async fn each_tier_is_read_from_where_it_is_and_bytes_are_identical() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     let last_id = tiers.records.last().unwrap().1;
     hear_until(&mut connection, &mut heard, |heard| {
         heard
@@ -244,7 +254,7 @@ async fn without_a_local_tier_sealed_records_come_from_the_object_store() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == 1
     })
@@ -280,7 +290,7 @@ async fn a_rare_filter_reads_fewer_blocks_than_a_full_scan() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() as u64 == total_count
     })
@@ -293,7 +303,7 @@ async fn a_rare_filter_reads_fewer_blocks_than_a_full_scan() {
         mask: 0xFF,
         value: 0x42,
     }];
-    let mut subscription = Subscription::new(2, STREAM, 0);
+    let mut subscription = Subscription::new(2, key(STREAM), 0);
     subscription.clauses = &rare;
     connection.subscribe(subscription);
     hear_until(&mut connection, &mut heard, |heard| {
@@ -341,7 +351,7 @@ async fn a_filtered_catch_up_ends_in_progress_at_the_head() {
         mask: 0xFF,
         value: 0x42,
     }];
-    let mut subscription = Subscription::new(1, STREAM, 0);
+    let mut subscription = Subscription::new(1, key(STREAM), 0);
     subscription.clauses = &rare;
     connection.subscribe(subscription);
     hear_until(&mut connection, &mut heard, |heard| {
@@ -376,7 +386,7 @@ async fn catch_up_does_not_see_what_is_not_visible_yet() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == 1
     })
@@ -399,7 +409,7 @@ async fn a_stream_that_moved_is_read_from_every_core_that_stamped_it() {
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let mut all = Vec::new();
     let mut seq = 0;
     for (round, core) in [1usize, 2, 0, 1, 2].into_iter().enumerate() {
@@ -420,7 +430,7 @@ async fn a_stream_that_moved_is_read_from_every_core_that_stamped_it() {
     }
     let mut connection = node.connection(1).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == all.len()
     })
@@ -468,7 +478,7 @@ async fn reading_before_retention_by_explicit_id_is_error_7() {
     let mut heard = Heard::default();
 
     // Records it would have had to read have expired.
-    connection.subscribe(Subscription::new(1, STREAM, old_id - 1));
+    connection.subscribe(Subscription::new(1, key(STREAM), old_id - 1));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.error_code(1).is_some()
     })
@@ -476,11 +486,11 @@ async fn reading_before_retention_by_explicit_id_is_error_7() {
     assert_eq!(heard.error_code(1), Some(ErrorCode::RetentionExpired));
 
     // Holding the head misses nothing, however old it is.
-    connection.subscribe(Subscription::new(2, STREAM, old_head));
+    connection.subscribe(Subscription::new(2, key(STREAM), old_head));
     assert_eq!(subscribed(&mut connection, &mut heard, 2).await, old_head);
 
     // `from = 0` is the start of retention, which has nothing older in it.
-    connection.subscribe(Subscription::new(3, STREAM, 0));
+    connection.subscribe(Subscription::new(3, key(STREAM), 0));
     subscribed(&mut connection, &mut heard, 3).await;
     let records = record_with(1, b"new");
     client
@@ -526,7 +536,7 @@ async fn a_store_read_that_fails_is_retried_until_it_works() {
     let started = std::time::Instant::now();
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == 1
     })
@@ -578,7 +588,7 @@ async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, 0));
+    connection.subscribe(Subscription::new(1, key(STREAM), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == 1
     })

@@ -6,6 +6,11 @@ mod common;
 use common::*;
 use server::{SealOutcome, Subscription};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "stress.stream";
 
 /// An owner on the subscribers' own core delivers directly, which would overtake what the
@@ -16,10 +21,10 @@ async fn live_delivery_survives_moves_onto_and_off_the_home_core() {
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let mut connection = node.connection(1).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, u64::MAX));
+    connection.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
     subscribed(&mut connection, &mut heard, 1).await;
 
     let mut count = 0u64;
@@ -66,7 +71,7 @@ async fn readers_during_seals_and_moves_miss_nothing() {
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let mut ids = Vec::new();
     let mut count = 0u64;
     let mut connection = node.connection(2).await.unwrap();
@@ -83,7 +88,7 @@ async fn readers_during_seals_and_moves_miss_nothing() {
         }
         assert!(node.move_shard(shard, round as usize % 3).await);
         // A reader starts while the seal is going on.
-        connection.subscribe(Subscription::new(round, STREAM, 0));
+        connection.subscribe(Subscription::new(round, key(STREAM), 0));
         let seal = node.seal().await;
         assert!(matches!(
             seal,

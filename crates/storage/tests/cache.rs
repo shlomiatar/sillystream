@@ -9,6 +9,11 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use storage::{SegmentBuilder, SegmentCache, SegmentReader, upload_pending};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 fn path(name: &str) -> Path {
     Path::from(format!("sealed/1/node/{name}.seg"))
 }
@@ -152,17 +157,17 @@ async fn a_segment_reader_works_on_mapped_files_and_sees_eviction_as_not_found()
     };
     format::encode_record(&mut record, &header, b"data").unwrap();
     let record = Bytes::from(record);
-    builder.add_extent("s", [record.clone()]).unwrap();
+    builder.add_extent(key("s"), [record.clone()]).unwrap();
     let built = builder.finish().unwrap();
     let first = path("first");
     put(&mut cache, &first, &built.parts);
     let store: Arc<dyn ObjectStore> = cache.store();
     let reader = SegmentReader::new(store, first.clone());
-    let read = reader.read_stream("s").await.unwrap();
+    let read = reader.read_stream(key("s")).await.unwrap();
     assert_eq!(read, record);
     put(&mut cache, &path("big"), &parts(4096));
     assert!(matches!(
-        reader.read_stream("s").await,
+        reader.read_stream(key("s")).await,
         Err(storage::SegmentError::Store(
             object_store::Error::NotFound { .. }
         ))

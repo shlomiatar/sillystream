@@ -21,6 +21,7 @@ path = "tests/shared_target.rs"
 
 [dependencies]
 ciborium.workspace = true
+format.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 proto.workspace = true

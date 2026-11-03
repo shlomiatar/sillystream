@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use format::IdAllocator;
+use format::{IdAllocator, KeyHash};
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,11 +44,11 @@ pub enum Reply {
     },
     /// This stream's messages are being forwarded, so the route is out of date.
     Moved {
-        stream: Arc<str>,
+        stream: KeyHash,
     },
     /// All of this client's earlier messages for the stream have been handled, on `core`.
     RouteDone {
-        stream: Arc<str>,
+        stream: KeyHash,
         core: usize,
     },
 }
@@ -89,7 +89,7 @@ pub struct SinkSpec {
     /// `webhook.*`: where it goes.
     pub url: Option<String>,
     /// `forward`: the stream it writes into.
-    pub target: Option<String>,
+    pub target: Option<KeyHash>,
     /// `D26`'s filter text, already checked.
     pub filter: Option<String>,
     pub on_expire: String,
@@ -225,7 +225,7 @@ pub struct StateChange {
 
 #[derive(Debug)]
 pub(crate) struct PublishMsg {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub handle: u32,
     pub producer_id: u64,
     pub producer_seq: u64,
@@ -244,7 +244,7 @@ pub(crate) struct PublishMsg {
 
 #[derive(Debug)]
 pub(crate) struct StateOpMsg {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub req: u32,
     pub author: NonZeroU64,
     pub change: StateChange,
@@ -260,7 +260,7 @@ pub(crate) enum WriteMsg {
     StateOp(Box<StateOpMsg>),
     /// Passes through the route that this client's earlier messages took.
     Barrier {
-        stream: Arc<str>,
+        stream: KeyHash,
         reply: ReplyTx,
         /// As on `PublishMsg`.
         passed: Vec<(u16, u64)>,
@@ -278,16 +278,16 @@ pub(crate) enum WriteMsg {
 #[derive(Debug)]
 pub(crate) enum ProbeTarget {
     Shard(u32),
-    Stream(Arc<str>),
+    Stream(KeyHash),
 }
 
 impl WriteMsg {
     /// The stream it is for. A probe isn't for one in this sense.
-    pub(crate) fn stream(&self) -> Option<&str> {
+    pub(crate) fn stream(&self) -> Option<KeyHash> {
         match self {
-            WriteMsg::Publish(publish) => Some(&publish.stream),
-            WriteMsg::StateOp(op) => Some(&op.stream),
-            WriteMsg::Barrier { stream, .. } => Some(stream),
+            WriteMsg::Publish(publish) => Some(publish.stream),
+            WriteMsg::StateOp(op) => Some(op.stream),
+            WriteMsg::Barrier { stream, .. } => Some(*stream),
             WriteMsg::Probe { .. } => None,
         }
     }
@@ -364,7 +364,7 @@ pub struct CoreStats {
 /// are sealed, along with any acks waiting on them.
 #[derive(Debug)]
 pub(crate) struct StreamHandoff {
-    pub name: Arc<str>,
+    pub name: KeyHash,
     pub ids: IdAllocator,
     pub state: StreamState,
     pub dedupe: DedupeTable,
@@ -383,9 +383,9 @@ pub(crate) struct ShardHandoff {
     pub streams: Vec<StreamHandoff>,
     pub counters: ShardCounters,
     /// Override entries that this shard's owner answers for, with where each one was.
-    pub overrides: Vec<(Arc<str>, u32, u16)>,
+    pub overrides: Vec<(KeyHash, u32, u16)>,
     /// Deleted streams in this shard, with the id a new one must stay above.
-    pub tombstones: Vec<(Arc<str>, u64)>,
+    pub tombstones: Vec<(KeyHash, u64)>,
     pub done: oneshot::Sender<()>,
 }
 
@@ -404,24 +404,24 @@ pub(crate) enum ControlMsg {
     Run(RunOnCore),
     /// A load that retried and gave up (D243).
     LoadFailed {
-        stream: Arc<str>,
+        stream: KeyHash,
         ticket: u64,
     },
     StreamInfo {
-        stream: Arc<str>,
+        stream: KeyHash,
         reply: oneshot::Sender<Result<StreamInfo, ErrorCode>>,
     },
     ConfigurePatch {
-        stream: Arc<str>,
+        stream: KeyHash,
         patch: StreamConfigPatch,
         reply: oneshot::Sender<StreamConfig>,
     },
     DeleteStream {
-        stream: Arc<str>,
+        stream: KeyHash,
         reply: oneshot::Sender<bool>,
     },
     Sink {
-        stream: Arc<str>,
+        stream: KeyHash,
         op: SinkOp,
         reply: oneshot::Sender<Result<(), ErrorCode>>,
     },
@@ -429,16 +429,16 @@ pub(crate) enum ControlMsg {
         reply: oneshot::Sender<usize>,
     },
     Snapshot {
-        stream: Arc<str>,
+        stream: KeyHash,
         reply: oneshot::Sender<Result<SnapshotReply, ErrorCode>>,
     },
     /// Stamped batches this core still holds, in id order.
     ReadMemory {
-        stream: Arc<str>,
+        stream: KeyHash,
         reply: oneshot::Sender<Vec<SlabBytes>>,
     },
     Configure {
-        stream: Arc<str>,
+        stream: KeyHash,
         config: StreamConfig,
         reply: oneshot::Sender<()>,
     },
@@ -449,7 +449,7 @@ pub(crate) enum ControlMsg {
     },
     /// Gives a stream its own shard, through the override table.
     SplitStream {
-        stream: Arc<str>,
+        stream: KeyHash,
         new_shard: u32,
         to: usize,
         done: oneshot::Sender<()>,
@@ -465,7 +465,7 @@ pub(crate) enum ControlMsg {
     /// A retry for ids this core stamped before the stream moved: reply once those ids
     /// reach `level` (`Reply` is the ack to send).
     AckWhenReached {
-        stream: Arc<str>,
+        stream: KeyHash,
         last_id: u64,
         level: u8,
         ack: Reply,
@@ -476,13 +476,13 @@ pub(crate) enum ControlMsg {
     /// An explicit id's retention check, asking a stream's earlier owners (D100).
     AttachWalk(Box<AttachMsg>),
     Detach {
-        stream: Arc<str>,
+        stream: KeyHash,
         filter_id: u32,
         home: usize,
     },
     Cursor {
-        stream: Arc<str>,
-        name: Arc<str>,
+        stream: KeyHash,
+        name: KeyHash,
         op: CursorOp,
         /// Where an error goes.
         report: Option<CursorReport>,
@@ -492,14 +492,14 @@ pub(crate) enum ControlMsg {
     /// An upload's extents for a stream whose owner is elsewhere. Goes back to `origin`
     /// when noted, which is what lets it drop its batches (D83).
     AddExtents {
-        stream: Arc<str>,
+        stream: KeyHash,
         path: object_store::path::Path,
         extents: Vec<storage::StreamExtent>,
         origin: usize,
         tag: UploadTag,
     },
     ExtentsNoted {
-        stream: Arc<str>,
+        stream: KeyHash,
         tag: UploadTag,
     },
     /// `core`'s entries are durable up to `ticket`, for streams that moved away while an
@@ -543,7 +543,7 @@ pub(crate) enum ControlMsg {
     },
     /// What the compactor needs of a stream, for one source object.
     CompactView {
-        stream: Arc<str>,
+        stream: KeyHash,
         path: object_store::path::Path,
         /// Id ranges the object's footer holds for this stream.
         footer: Vec<(u64, u64)>,
@@ -551,7 +551,7 @@ pub(crate) enum ControlMsg {
     },
     /// Readers follow a compacted extent from here on (section 7.5).
     ReplaceExtents {
-        stream: Arc<str>,
+        stream: KeyHash,
         path: object_store::path::Path,
         /// `(path, id_first, id_last)`, neighbours in id order.
         sources: Vec<(object_store::path::Path, u64, u64)>,
@@ -560,13 +560,13 @@ pub(crate) enum ControlMsg {
     },
     /// An object is about to expire, so nothing may point at it.
     DropExtents {
-        stream: Arc<str>,
+        stream: KeyHash,
         path: object_store::path::Path,
         reply: oneshot::Sender<bool>,
     },
     /// The metadata a load found, or `None` if there is no such stream (section 7.6).
     Loaded {
-        stream: Arc<str>,
+        stream: KeyHash,
         ticket: u64,
         meta: Option<Box<storage::StreamMeta>>,
         rebuilt: bool,
@@ -632,12 +632,12 @@ pub(crate) enum ConnCmd {
     Subscribe {
         conn: usize,
         sub: u32,
-        stream: Arc<str>,
+        stream: KeyHash,
         from: u64,
         linger_ms: u16,
         /// `None` if the clauses didn't make a filter.
         filter: Option<format::Filter>,
-        name: Option<Arc<str>>,
+        name: Option<KeyHash>,
         with_state: bool,
         state_only: bool,
         tag: u64,
@@ -656,13 +656,13 @@ pub(crate) enum ConnCmd {
     },
     ResetCursor {
         conn: usize,
-        stream: Arc<str>,
-        name: Arc<str>,
+        stream: KeyHash,
+        name: KeyHash,
         id: u64,
     },
     ReadCursor {
-        stream: Arc<str>,
-        name: Arc<str>,
+        stream: KeyHash,
+        name: KeyHash,
         reply: oneshot::Sender<Option<u64>>,
     },
     /// The socket has taken this many bytes.
@@ -695,11 +695,11 @@ pub(crate) enum CursorOp {
 
 #[derive(Debug)]
 pub(crate) struct AttachMsg {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub sub: SubRef,
     pub filter: format::Filter,
     pub from: u64,
-    pub name: Option<Arc<str>>,
+    pub name: Option<KeyHash>,
     pub with_state: bool,
     pub state_only: bool,
     /// Set while the check of an explicit id is asking earlier owners (D100).
@@ -722,7 +722,7 @@ pub(crate) struct AttachWalk {
 /// "What comes after `after`?", from a catching-up subscriber to the stream's owner.
 #[derive(Debug)]
 pub(crate) struct ReadStepMsg {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub sub: SubRef,
     pub filter: format::Filter,
     pub after: u64,
@@ -736,7 +736,7 @@ pub(crate) struct ReadStepMsg {
 /// ends at the owner (D83).
 #[derive(Debug)]
 pub(crate) struct ReadChain {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub sub: SubRef,
     pub after: u64,
     pub limit: u64,
@@ -803,7 +803,7 @@ pub(crate) enum StreamBody {
 #[derive(Debug)]
 pub(crate) enum DeliveryMsg {
     Stream {
-        stream: Arc<str>,
+        stream: KeyHash,
         seq: u64,
         body: StreamBody,
     },

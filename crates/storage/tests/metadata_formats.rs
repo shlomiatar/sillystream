@@ -13,8 +13,16 @@ use storage::{
     encode_extent, encode_meta, encode_ownership, put_checkpoint,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 fn cursor() -> impl Strategy<Value = MetaCursor> {
-    (".{0,8}", any::<u64>()).prop_map(|(name, id)| MetaCursor { name, id })
+    (".{0,8}", any::<u64>()).prop_map(|(name, id)| MetaCursor {
+        name: key(&name),
+        id,
+    })
 }
 
 fn sink() -> impl Strategy<Value = MetaSink> {
@@ -33,7 +41,7 @@ fn sink() -> impl Strategy<Value = MetaSink> {
                 sink_id,
                 kind,
                 url: url.clone(),
-                target: target.clone(),
+                target: target.as_deref().map(key),
                 filter,
                 on_expire,
                 concurrency,
@@ -89,7 +97,7 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 sinks,
                 (extents, dropped_extents),
             )| StreamMeta {
-                name,
+                stream: key(&name),
                 deleted,
                 last_id,
                 floor_id,
@@ -171,7 +179,7 @@ fn ownership_bytes_are_exact() {
 #[test]
 fn meta_bytes_are_exact() {
     let meta = StreamMeta {
-        name: "s".to_owned(),
+        stream: key("s"),
         deleted: true,
         last_id: 2,
         floor_id: 3,
@@ -183,14 +191,14 @@ fn meta_bytes_are_exact() {
         min_ack_level: 1,
         retention_ms: 6,
         cursors: vec![MetaCursor {
-            name: "c".to_owned(),
+            name: key("c"),
             id: 7,
         }],
         sinks: vec![MetaSink {
             sink_id: 12,
             kind: "k".to_owned(),
             url: Some("u".to_owned()),
-            target: None,
+            target: Some(key("t")),
             filter: None,
             on_expire: "e".to_owned(),
             concurrency: 13,
@@ -223,7 +231,7 @@ fn meta_bytes_are_exact() {
         out.extend_from_slice(value);
     };
     u32le(&mut body, 1);
-    text(&mut body, b"s");
+    body.extend_from_slice(&key("s").0);
     for value in [2, 3, 20, 4, 5] {
         u64le(&mut body, value);
     }
@@ -231,14 +239,16 @@ fn meta_bytes_are_exact() {
     body.extend_from_slice(&[2, 1, 0, 0, 0, 0, 0, 0]);
     u64le(&mut body, 6);
     u32le(&mut body, 1);
-    text(&mut body, b"c");
+    body.extend_from_slice(&key("c").0);
     u64le(&mut body, 7);
     u32le(&mut body, 1);
     u64le(&mut body, 12);
     text(&mut body, b"k");
     body.push(1);
     text(&mut body, b"u");
-    body.extend_from_slice(&[0, 0]);
+    body.push(1);
+    body.extend_from_slice(&key("t").0);
+    body.push(0);
     text(&mut body, b"e");
     u32le(&mut body, 13);
     body.push(1);
@@ -268,7 +278,7 @@ fn meta_bytes_are_exact() {
 
 fn stream(name: &str, last_id: u64, extent_ids: &[(u64, u64)]) -> StreamMeta {
     StreamMeta {
-        name: name.to_owned(),
+        stream: key(name),
         last_id,
         extents: extent_ids
             .iter()
@@ -294,7 +304,7 @@ async fn put(
     metas: &[StreamMeta],
 ) -> CheckpointFile {
     let head = CheckpointHead {
-        sink_streams: vec!["with.sink".to_owned()],
+        sink_streams: vec![key("with.sink")],
         full,
         max_id,
         objects: vec![format!("obj-{seq}")],
@@ -335,18 +345,24 @@ async fn deltas_add_up_and_a_tombstone_ends_the_walk() {
         .unwrap();
     assert_eq!(set.files.len(), 2);
     assert_eq!(set.max_id(), 20);
-    let a = set.lookup(&store, "a").await.unwrap().unwrap();
+    let a = set.lookup(&store, key("a")).await.unwrap().unwrap();
     assert_eq!(a.last_id, 20);
     let mut ids: Vec<_> = a.extents.iter().map(|extent| extent.id_first).collect();
     ids.sort_unstable();
     assert_eq!(ids, [1, 11]);
-    assert!(set.lookup(&store, "gone").await.unwrap().unwrap().deleted);
-    assert_eq!(set.lookup(&store, "nobody").await.unwrap(), None);
+    assert!(
+        set.lookup(&store, key("gone"))
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted
+    );
+    assert_eq!(set.lookup(&store, key("nobody")).await.unwrap(), None);
 
     let merged = set.merge_all(&store).await.unwrap();
-    assert_eq!(merged["a"].extents.len(), 2);
-    assert!(merged["gone"].deleted);
-    assert!(merged["gone"].extents.is_empty());
+    assert_eq!(merged[&key("a")].extents.len(), 2);
+    assert!(merged[&key("gone")].deleted);
+    assert!(merged[&key("gone")].extents.is_empty());
 }
 
 #[tokio::test]
@@ -369,7 +385,7 @@ async fn a_full_file_ends_the_walk_and_older_files_are_marked_to_go() {
     assert_eq!(set.files.len(), 2);
     assert_eq!(set.superseded, vec![checkpoint_path(1, 1)]);
     assert_eq!(
-        set.lookup(&store, "a")
+        set.lookup(&store, key("a"))
             .await
             .unwrap()
             .unwrap()
@@ -388,20 +404,9 @@ async fn a_former_generations_file_counts_up_to_its_limit() {
     let set = CheckpointSet::read(&store, Ownership::from_records([(1, 0), (2, 10)]))
         .await
         .unwrap();
-    let a = set.lookup(&store, "a").await.unwrap().unwrap();
+    let a = set.lookup(&store, key("a")).await.unwrap().unwrap();
     assert_eq!(a.extents.len(), 1);
     assert_eq!(a.extents[0].id_last, 10);
-}
-
-#[test]
-fn a_checkpoint_refuses_a_name_its_pages_cannot_hold() {
-    let meta = |len: usize| StreamMeta {
-        name: "n".repeat(len),
-        ..StreamMeta::default()
-    };
-    let head = CheckpointHead::default();
-    assert!(build_checkpoint(&head, &[meta(65_535)]).is_ok());
-    assert!(build_checkpoint(&head, &[meta(65_536)]).is_err());
 }
 
 /// Compaction's update and retention's removal, through the walk and through a full file.
@@ -429,7 +434,7 @@ async fn a_newer_entry_takes_away_what_it_drops_and_keeps_what_it_adds() {
         files: vec![third, second, first],
         ..CheckpointSet::default()
     };
-    let found = set.lookup(&store, "s").await.unwrap().unwrap();
+    let found = set.lookup(&store, key("s")).await.unwrap().unwrap();
     let ranges: Vec<(u64, u64)> = found
         .extents
         .iter()
@@ -439,8 +444,8 @@ async fn a_newer_entry_takes_away_what_it_drops_and_keeps_what_it_adds() {
     assert!(found.dropped_extents.is_empty());
 
     let merged = set.merge_all(&store).await.unwrap();
-    assert_eq!(merged["s"].extents, found.extents);
-    assert!(merged["s"].dropped_extents.is_empty());
+    assert_eq!(merged[&key("s")].extents, found.extents);
+    assert!(merged[&key("s")].dropped_extents.is_empty());
 }
 
 #[test]

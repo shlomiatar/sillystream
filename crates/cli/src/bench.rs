@@ -115,9 +115,9 @@ fn start_server_with(bin: &Path, settings: ServerSettings) -> Result<ServerChild
     };
     // As text: the server trims whitespace from the end of its secret file, and raw bytes end
     // in whitespace often enough to fail a run with a wrong signature.
-    let secret: Vec<u8> = {
+    let random_hex = |words: usize| -> Vec<u8> {
         use std::hash::{BuildHasher, Hasher};
-        (0..8)
+        (0..words)
             .map(|_| {
                 let word = std::collections::hash_map::RandomState::new()
                     .build_hasher()
@@ -127,9 +127,11 @@ fn start_server_with(bin: &Path, settings: ServerSettings) -> Result<ServerChild
             .collect::<String>()
             .into_bytes()
     };
+    let secret = random_hex(8);
     write("cert.pem", &ca_pem)?;
     write("key.pem", certified.key_pair.serialize_pem().as_bytes())?;
     write("secret", &secret)?;
+    write("stream-key", &random_hex(4))?;
     let (child, port) = spawn_server(bin, settings, dir.path())?;
     let token = auth::Token {
         expiry_ms: u64::MAX,
@@ -166,6 +168,7 @@ fn spawn_server(
         .args(["--listen", "127.0.0.1:0", "--cert", &path("cert.pem")])
         .args(["--key", &path("key.pem")])
         .args(["--token-secret-file", &path("secret")])
+        .args(["--stream-key-file", &path("stream-key")])
         .args(["--wal-dir", &path("wal"), "--data-dir", &path("data")])
         .arg("--object-store")
         .arg(format!("local:{}", path("objects")))

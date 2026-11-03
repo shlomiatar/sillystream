@@ -4,15 +4,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use format::IdentityKey;
 use server::net::{Server, ServerConfig};
 use server::{
-    Clock, CompactionConfig, LocalCacheConfig, NodeConfig, RecoverConfig, SinkConfig, SystemClock,
+    Clock, CompactionConfig, Keys, LocalCacheConfig, NodeConfig, RecoverConfig, SinkConfig,
+    SystemClock,
 };
 use storage::{ObjectStoreConfig, build_store, check_conditional_create, parse_store_config};
 
 const USAGE: &str = "\
 sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key PEM \\
-    --token-secret-file FILE --object-store local:DIR|memory|gs:BUCKET|s3:BUCKET
+    --token-secret-file FILE --stream-key-file FILE
+    --object-store local:DIR|memory|gs:BUCKET|s3:BUCKET
   [--cores N] [--seal-window-ms N] [--node-name NAME] [--memory-cap-bytes N]
   [--local-cache-cap-bytes N] [--wal-preallocate-bytes N] [--max-frame-bytes N]
   [--active-stream-limit N] [--compact-period-ms N] [--expire-period-ms N]
@@ -20,6 +23,10 @@ sillystream-server --listen ADDR --wal-dir DIR --data-dir DIR --cert PEM --key P
   [--sink-ca-file PEM] [--sink-archive-store local:DIR|memory|gs:BUCKET|s3:BUCKET]
   [--sink-pool-threads N] [--sink-max-in-flight N] [--trace-catch-up true|false]
   [--max-connections N] [--listen-backlog N]
+
+--stream-key-file holds the deployment's stream identity key as 64 hex digits, such as the output
+of `openssl rand -hex 32`. Every stream is stored under a hash made with it, so it can never change,
+and it must not be kept in the bucket.
 
 --wal-dir decides what a level 2 ack survives: an acked record survives machine loss only if
 EBS is mounted there. On local disk, machine loss can take up to one seal window. See
@@ -39,6 +46,20 @@ const WAL_PREALLOCATE_DEFAULT_BYTES: u64 = 64 * 1024 * 1024;
 /// How long a clean stop waits for a last seal. A restart replays whatever this leaves.
 const LAST_SEAL_WAIT_MS: u64 = 10_000;
 
+/// 64 hex digits, with any whitespace around them.
+fn parse_stream_key(text: &[u8]) -> Result<IdentityKey, String> {
+    let refused = || "--stream-key-file holds 64 hex digits".to_owned();
+    let text = std::str::from_utf8(text).map_err(|_| refused())?.trim();
+    if text.len() != 2 * IdentityKey::BYTES || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(refused());
+    }
+    let mut key = [0u8; IdentityKey::BYTES];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).map_err(|_| refused())?;
+    }
+    Ok(IdentityKey::new(key))
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -57,6 +78,7 @@ fn run() -> Result<(), String> {
     let mut cert = None;
     let mut key = None;
     let mut secret_file = None;
+    let mut stream_key_file = None;
     let mut object_store = None;
     let mut cores = None;
     let mut seal_window_ms = None;
@@ -91,6 +113,7 @@ fn run() -> Result<(), String> {
             "--cert" => cert = Some(PathBuf::from(value)),
             "--key" => key = Some(PathBuf::from(value)),
             "--token-secret-file" => secret_file = Some(PathBuf::from(value)),
+            "--stream-key-file" => stream_key_file = Some(PathBuf::from(value)),
             "--object-store" => object_store = Some(value),
             "--cores" => cores = Some(number(&value)? as usize),
             "--seal-window-ms" => seal_window_ms = Some(number(&value)?),
@@ -146,6 +169,7 @@ fn run() -> Result<(), String> {
     while token_secret.last().is_some_and(u8::is_ascii_whitespace) {
         token_secret.pop();
     }
+    let stream_key = parse_stream_key(&read(stream_key_file, "--stream-key-file")?)?;
     let store_config = parse_store(&object_store.ok_or_else(|| need("--object-store"))?, "")?;
     check_store(&store_config)?;
     let store = build_store(&store_config).map_err(|error| error.to_string())?;
@@ -157,6 +181,7 @@ fn run() -> Result<(), String> {
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     });
     let mut node = NodeConfig::new(core_count);
+    node.keys = Keys::new(stream_key);
     if let Some(name) = node_name {
         node.node_name = name;
     }

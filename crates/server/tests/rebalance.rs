@@ -6,13 +6,18 @@ mod common;
 use common::*;
 use server::{SealOutcome, shard_of};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// `count` stream names whose shards all sit on `core` at start.
 fn names_on_core(core: usize, cores: usize, virtual_shards: u32, count: usize) -> Vec<String> {
     let mut names = Vec::new();
     let mut index = 0;
     while names.len() < count {
         let name = format!("skew.{index}");
-        if shard_of(&name, virtual_shards) as usize % cores == core {
+        if shard_of(key(&name), virtual_shards) as usize % cores == core {
             names.push(name);
         }
         index += 1;
@@ -63,7 +68,7 @@ async fn skewed_load_moves_shards_off_the_overloaded_core_and_loses_nothing() {
     let per_core = |placement: &[u16]| {
         let mut per_core = vec![0; cores];
         for name in &names {
-            per_core[placement[shard_of(name, shards) as usize] as usize] += 1;
+            per_core[placement[shard_of(key(name), shards) as usize] as usize] += 1;
         }
         per_core
     };
@@ -102,7 +107,7 @@ async fn skewed_load_moves_shards_off_the_overloaded_core_and_loses_nothing() {
             .map(|entry| parse_records(&entry.records)[0].0)
             .collect();
         assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
-        let core = final_placement[shard_of(name, shards) as usize] as usize;
+        let core = final_placement[shard_of(key(name), shards) as usize] as usize;
         assert!(core < cores);
     }
     assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
@@ -119,8 +124,8 @@ async fn a_hot_stream_gets_its_own_shard_and_its_neighbours_stay() {
     let node = harness.node();
     let names = names_on_core(0, cores, 2, 2);
     let (hot, neighbour) = (names[0].as_str(), names[1].as_str());
-    let shard = shard_of(hot, 2);
-    assert_eq!(shard, shard_of(neighbour, 2));
+    let shard = shard_of(key(hot), 2);
+    assert_eq!(shard, shard_of(key(neighbour), 2));
 
     let records = record_with(1, b"data");
     let mut client = node.client(0).await;
@@ -132,7 +137,10 @@ async fn a_hot_stream_gets_its_own_shard_and_its_neighbours_stay() {
         .unwrap();
     expect_ack(&mut client).await;
 
-    let own_shard = node.set_override(hot, 1).await.expect("the table has room");
+    let own_shard = node
+        .set_override(key(hot), 1)
+        .await
+        .expect("the table has room");
     assert!(own_shard >= 2);
     assert_eq!(node.placement().await[own_shard as usize], 1);
     // The hashed shard didn't move, and took only the hot stream's name with it.
@@ -147,11 +155,11 @@ async fn a_hot_stream_gets_its_own_shard_and_its_neighbours_stay() {
     fresh.publish(publish(hot, &records, 2, 1)).await.unwrap();
     assert!(expect_ack(&mut fresh).await.1 > first.1);
     // A second override of the same stream is the same shard.
-    assert_eq!(node.set_override(hot, 1).await, Some(own_shard));
+    assert_eq!(node.set_override(key(hot), 1).await, Some(own_shard));
 
     // The hashed shard moves on; the override still works, through its new owner.
     node.move_shard(shard, 1).await;
-    node.set_override(hot, 0).await;
+    node.set_override(key(hot), 0).await;
     fresh.publish(publish(hot, &records, 3, 2)).await.unwrap();
     assert!(expect_ack(&mut fresh).await.1 > first.1);
     let mut late = node.client(1).await;
@@ -167,9 +175,9 @@ async fn an_override_for_a_stream_with_no_records_yet_applies_when_it_appears() 
     let cores = 2;
     let harness = Harness::new(manual_config(cores));
     let node = harness.node();
-    let shard = shard_of("new", node.virtual_shard_count());
+    let shard = shard_of(key("new"), node.virtual_shard_count());
     let home = node.placement().await[shard as usize] as usize;
-    let own = node.set_override("new", 1 - home).await.unwrap();
+    let own = node.set_override(key("new"), 1 - home).await.unwrap();
     assert_eq!(node.placement().await[own as usize] as usize, 1 - home);
     let mut client = node.client(0).await;
     let records = record_with(1, b"data");
@@ -188,8 +196,8 @@ async fn the_override_table_is_small_and_says_when_it_is_full() {
     let mut config = manual_config(1);
     config.override_shard_count = 1;
     let harness = Harness::new(config);
-    assert!(harness.node().set_override("a", 0).await.is_some());
-    assert_eq!(harness.node().set_override("b", 0).await, None);
+    assert!(harness.node().set_override(key("a"), 0).await.is_some());
+    assert_eq!(harness.node().set_override(key("b"), 0).await, None);
     harness.finish();
 }
 

@@ -27,6 +27,7 @@ use storage::WalVolume;
 use tokio::sync::Notify;
 
 use crate::clock::Clock;
+use crate::keys::Keys;
 use crate::node::{Node, NodeConfig, NodeExit, NodeHandle};
 use crate::recovery::{RecoverConfig, RecoveryReport};
 use crate::slab::SlabPool;
@@ -73,6 +74,8 @@ pub(crate) struct IoCounters {
 /// What every connection shares. Read only.
 pub(crate) struct Shared {
     pub secret: Vec<u8>,
+    /// Names become key hashes here, once a token has been checked against them (section 1).
+    pub keys: Keys,
     pub clock: Arc<dyn Clock>,
     pub node: NodeHandle,
     pub max_frame_bytes: u64,
@@ -176,9 +179,11 @@ impl Server {
         let progress_interval_ms = config.node.progress_interval_ms;
         let core_count = config.node.core_count;
         let held_response_cap_bytes = config.node.memory_cap_bytes / 4;
+        let keys = config.node.keys.clone();
         let node = start(config.node, Arc::clone(&clock))?;
         let shared = Arc::new(Shared {
             secret: config.token_secret,
+            keys,
             clock,
             node: node.handle(),
             max_frame_bytes,

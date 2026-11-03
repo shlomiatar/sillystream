@@ -2,18 +2,20 @@
 //! blob in a checkpoint. All little-endian.
 //!
 //! ```text
-//! meta   := crc32c u32 | flags u32 | name str32 | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
+//! meta   := crc32c u32 | flags u32 | stream key | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
 //!           n u32 | n × cursor | n u32 | n × sink | n u32 | n × extent |
 //!           n u32 | n × dropped_id_first u64
-//! cursor := name str32 | id u64
-//! sink   := sink_id u64 | kind str32 | url opt | target opt | filter opt | on_expire str32 |
+//! cursor := name key | id u64
+//! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
 //!           concurrency u32 | paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
 //!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
 //! extent := path str32 | offset u64 | len_bytes u64 | id_first u64 | id_last u64 | block_count u32
 //! str32  := len u32 | bytes        bytes32 likewise
 //! opt    := present u8 | str32 if present
+//! key    := a key hash, 16 bytes (SPEC section 1)
+//! optkey := present u8 | key if present
 //! ```
 //!
 //! `flags` bit 0 is "deleted" (D20). The CRC covers everything after it.
@@ -21,13 +23,14 @@
 use std::fmt;
 
 use bytes::Bytes;
-use format::crc32c;
+use format::{KeyHash, crc32c};
 
 const FLAG_DELETED: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaCursor {
-    pub name: String,
+    /// The cursor name's key hash (section 5.1).
+    pub name: KeyHash,
     pub id: u64,
 }
 
@@ -36,7 +39,8 @@ pub struct MetaSink {
     pub sink_id: u64,
     pub kind: String,
     pub url: Option<String>,
-    pub target: Option<String>,
+    /// `forward`: the target stream (section 9.1).
+    pub target: Option<KeyHash>,
     pub filter: Option<String>,
     pub on_expire: String,
     pub concurrency: u32,
@@ -73,8 +77,8 @@ pub struct MetaExtent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamMeta {
-    pub name: String,
-    /// A tombstone (D20): `last_id` is what a stream made under this name must stay above.
+    pub stream: KeyHash,
+    /// A tombstone (D20): `last_id` is what a stream made under this id must stay above.
     pub deleted: bool,
     pub last_id: u64,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
@@ -142,10 +146,10 @@ pub fn encode_extent(out: &mut Vec<u8>, extent: &MetaExtent) {
 }
 
 pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128 + meta.name.len() + meta.state.len());
+    let mut out = Vec::with_capacity(128 + meta.state.len());
     put_u32(&mut out, 0);
     put_u32(&mut out, if meta.deleted { FLAG_DELETED } else { 0 });
-    put_bytes(&mut out, meta.name.as_bytes());
+    out.extend_from_slice(&meta.stream.0);
     put_u64(&mut out, meta.last_id);
     put_u64(&mut out, meta.floor_id);
     put_u64(&mut out, meta.expired_through);
@@ -158,7 +162,7 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     put_u64(&mut out, meta.retention_ms);
     put_u32(&mut out, meta.cursors.len() as u32);
     for cursor in &meta.cursors {
-        put_bytes(&mut out, cursor.name.as_bytes());
+        out.extend_from_slice(&cursor.name.0);
         put_u64(&mut out, cursor.id);
     }
     put_u32(&mut out, meta.sinks.len() as u32);
@@ -166,7 +170,13 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
         put_u64(&mut out, sink.sink_id);
         put_bytes(&mut out, sink.kind.as_bytes());
         put_opt(&mut out, sink.url.as_deref());
-        put_opt(&mut out, sink.target.as_deref());
+        match sink.target {
+            Some(target) => {
+                out.push(1);
+                out.extend_from_slice(&target.0);
+            }
+            None => out.push(0),
+        }
         put_opt(&mut out, sink.filter.as_deref());
         put_bytes(&mut out, sink.on_expire.as_bytes());
         put_u32(&mut out, sink.concurrency);
@@ -248,6 +258,18 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn key(&mut self) -> Result<KeyHash, MetaError> {
+        Ok(KeyHash::from_slice(self.take(KeyHash::BYTES)?).unwrap())
+    }
+
+    fn opt_key(&mut self) -> Result<Option<KeyHash>, MetaError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.key().map(Some),
+            _ => Err(MetaError("an option flag isn't 0 or 1")),
+        }
+    }
+
     fn extent(&mut self) -> Result<MetaExtent, MetaError> {
         Ok(MetaExtent {
             path: self.text()?,
@@ -289,7 +311,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     if flags & !FLAG_DELETED != 0 {
         return Err(MetaError("an unknown flag"));
     }
-    let name = reader.text()?;
+    let stream = reader.key()?;
     let (last_id, floor_id, expired_through, applied_id, state_ver) = (
         reader.u64()?,
         reader.u64()?,
@@ -304,7 +326,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     }
     let retention_ms = reader.u64()?;
     let mut meta = StreamMeta {
-        name,
+        stream,
         deleted: flags & FLAG_DELETED != 0,
         last_id,
         floor_id,
@@ -317,16 +339,16 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
         retention_ms,
         ..StreamMeta::default()
     };
-    for _ in 0..reader.count(12)? {
+    for _ in 0..reader.count(KeyHash::BYTES + 8)? {
         meta.cursors.push(MetaCursor {
-            name: reader.text()?,
+            name: reader.key()?,
             id: reader.u64()?,
         });
     }
     for _ in 0..reader.count(55)? {
         let sink_id = reader.u64()?;
         let kind = reader.text()?;
-        let (url, target, filter) = (reader.opt()?, reader.opt()?, reader.opt()?);
+        let (url, target, filter) = (reader.opt()?, reader.opt_key()?, reader.opt()?);
         let on_expire = reader.text()?;
         let concurrency = reader.u32()?;
         let paused = match reader.u8()? {

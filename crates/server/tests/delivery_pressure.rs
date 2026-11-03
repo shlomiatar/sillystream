@@ -12,6 +12,11 @@ use format::Clause;
 use proto::ErrorCode;
 use server::{Event, SealOutcome, Subscription};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "pressure.stream";
 const MS_PER_DAY: u64 = 24 * 60 * 60 * 1000;
 /// Options no published record has.
@@ -57,7 +62,7 @@ async fn publish_large(node: &server::Node, client: &mut server::Client, seq: u6
 /// start at different points to add up.
 async fn stalled_connection(node: &server::Node) -> server::Connection {
     let connection = node.connection(0).await.unwrap();
-    connection.subscribe(Subscription::new(1, STREAM, u64::MAX));
+    connection.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
     connection
 }
 
@@ -71,7 +76,7 @@ async fn stalled_subscribers_do_not_stop_publishers_or_a_reader_that_keeps_up() 
     make_stream(&mut client, STREAM).await;
 
     let mut reader = node.connection(0).await.unwrap();
-    reader.subscribe(Subscription::new(1, STREAM, u64::MAX));
+    reader.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
     let mut heard = Heard::default();
     subscribed(&mut reader, &mut heard, 1).await;
     let reading = tokio::spawn(async move {
@@ -119,7 +124,7 @@ async fn a_stalled_subscriber_that_wakes_misses_nothing() {
 
     let mut sleepy = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    sleepy.subscribe(Subscription::new(1, STREAM, u64::MAX));
+    sleepy.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
     subscribed(&mut sleepy, &mut heard, 1).await;
     let mut others = Vec::new();
 
@@ -167,7 +172,7 @@ async fn taking_back_frames_takes_back_the_progress_behind_them() {
     let mut heard = Heard::default();
     // Record 1 in 2 matches, and the others leave something for PROGRESS to report.
     let every_other = [Clause::Eq { mask: 1, value: 1 }];
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &every_other;
     sleepy.subscribe(subscription);
     subscribed(&mut sleepy, &mut heard, 1).await;
@@ -244,7 +249,7 @@ async fn catching_up_does_not_hold_up_writes() {
 
     let mut connection = node.connection(0).await.unwrap();
     for sub in 0..SUB_COUNT {
-        let mut subscription = Subscription::new(sub, STREAM, 0);
+        let mut subscription = Subscription::new(sub, key(STREAM), 0);
         subscription.clauses = &NEVER;
         connection.subscribe(subscription);
     }
@@ -289,7 +294,7 @@ async fn subscribe_and_hear(
 ) -> (Option<ErrorCode>, Vec<u64>) {
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, from));
+    connection.subscribe(Subscription::new(1, key(STREAM), from));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.error_code(1).is_some()
             || heard
@@ -311,7 +316,7 @@ async fn an_expired_id_is_error_7_with_its_records_on_a_previous_owner() {
     make_stream(&mut client, STREAM).await;
     let old_id = publish_small(&mut client, 1).await;
     publish_small(&mut client, 2).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let from_core = node.placement().await[shard as usize] as usize;
     assert!(node.move_shard(shard, 1 - from_core).await);
     harness.clock.advance(2 * MS_PER_DAY);
@@ -335,7 +340,7 @@ async fn an_expired_id_is_error_7_inside_a_previous_owners_later_stretch() {
     let old_id = publish_small(&mut client, 1).await;
     harness.clock.advance(2 * MS_PER_DAY);
     let newer_id = publish_small(&mut client, 2).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let from_core = node.placement().await[shard as usize] as usize;
     assert!(node.move_shard(shard, 1 - from_core).await);
     publish_small(&mut client, 3).await;
@@ -358,7 +363,7 @@ async fn a_cursor_in_retention_is_served_across_a_move() {
     harness.clock.advance(2 * MS_PER_DAY);
     let kept_id = publish_small(&mut client, 2).await;
     let last_there = publish_small(&mut client, 3).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let from_core = node.placement().await[shard as usize] as usize;
     assert!(node.move_shard(shard, 1 - from_core).await);
     let new_id = publish_small(&mut client, 4).await;
@@ -425,7 +430,7 @@ async fn unread_progress_is_bounded_by_the_window() {
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &NEVER;
     connection.subscribe(subscription);
     let mut heard = Heard::default();

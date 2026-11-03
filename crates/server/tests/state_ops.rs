@@ -9,15 +9,14 @@ use proptest::prelude::*;
 use proto::ErrorCode;
 use server::{MAX_STATE_BYTES, Reply, StateChange, StateOp, StateOpRequest, StreamState};
 
-fn op<'a>(
-    stream: &'a str,
-    req: u32,
-    expect_ver: u64,
-    op: StateOp,
-    doc: &Value,
-) -> StateOpRequest<'a> {
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
+fn op(stream: &str, req: u32, expect_ver: u64, op: StateOp, doc: &Value) -> StateOpRequest {
     StateOpRequest {
-        stream,
+        stream: key(stream),
         req,
         author: AUTHOR,
         expect_ver,
@@ -98,7 +97,7 @@ async fn each_op_applies_and_its_version_is_its_system_records_id() {
     assert!(ok);
     assert!(set_ver < merge_ver && merge_ver < incr_ver && incr_ver < created_ver);
 
-    let snapshot = client.snapshot("s").await.unwrap();
+    let snapshot = client.snapshot(key("s")).await.unwrap();
     assert_eq!(snapshot.state_ver, created_ver);
     assert_eq!(snapshot.head, created_ver);
     assert_eq!(
@@ -147,7 +146,7 @@ async fn a_failure_leaves_the_state_and_the_log_alone() {
         .await
         .unwrap();
     let (_, _, ver) = expect_result(&mut client).await;
-    let before = client.snapshot("s").await.unwrap();
+    let before = client.snapshot(key("s")).await.unwrap();
 
     // Incr on a non-number.
     client
@@ -174,13 +173,13 @@ async fn a_failure_leaves_the_state_and_the_log_alone() {
         .await
         .unwrap();
     assert!(expect_result(&mut client).await.1);
-    let before_big = client.snapshot("s").await.unwrap();
+    let before_big = client.snapshot(key("s")).await.unwrap();
     client
         .state_op(op("s", 6, 0, StateOp::Merge, &map(&[("b", half)])))
         .await
         .unwrap();
     assert_eq!(expect_error(&mut client, 6).await, ErrorCode::Malformed);
-    assert_eq!(client.snapshot("s").await.unwrap(), before_big);
+    assert_eq!(client.snapshot(key("s")).await.unwrap(), before_big);
 
     // Version conflict: `ok = 0` carrying the current version (D6b).
     let current = before_big.state_ver;
@@ -189,7 +188,7 @@ async fn a_failure_leaves_the_state_and_the_log_alone() {
         .await
         .unwrap();
     assert_eq!(expect_result(&mut client).await, (7, false, current));
-    assert_eq!(client.snapshot("s").await.unwrap(), before_big);
+    assert_eq!(client.snapshot(key("s")).await.unwrap(), before_big);
     assert!(before.state_ver < current);
 
     // The matching version works, and is the only record those attempts left.
@@ -207,19 +206,19 @@ async fn a_failure_leaves_the_state_and_the_log_alone() {
 async fn the_first_state_write_creates_the_stream_and_expect_ver_guards_it() {
     let harness = Harness::new(manual_config(1));
     let mut client = harness.node().client(0).await;
-    assert_eq!(client.snapshot("s").await, Err(ErrorCode::NotFound));
+    assert_eq!(client.snapshot(key("s")).await, Err(ErrorCode::NotFound));
     client
         .state_op(op("s", 1, 5, StateOp::Set, &int(1)))
         .await
         .unwrap();
     assert_eq!(expect_result(&mut client).await, (1, false, 0));
-    assert_eq!(client.snapshot("s").await, Err(ErrorCode::NotFound));
+    assert_eq!(client.snapshot(key("s")).await, Err(ErrorCode::NotFound));
     client
         .state_op(op("s", 2, 0, StateOp::Set, &int(1)))
         .await
         .unwrap();
     assert!(expect_result(&mut client).await.1);
-    assert!(client.snapshot("s").await.is_ok());
+    assert!(client.snapshot(key("s")).await.is_ok());
     harness.finish();
 }
 
@@ -250,7 +249,7 @@ async fn a_snapshot_is_state_and_head_as_one_step() {
     let (_, _, ver) = expect_result(&mut client).await;
     client.publish(publish("s", &records, 1, 1)).await.unwrap();
     let (_, id, _) = expect_ack(&mut client).await;
-    let snapshot = client.snapshot("s").await.unwrap();
+    let snapshot = client.snapshot(key("s")).await.unwrap();
     assert_eq!(snapshot.state_ver, ver);
     assert_eq!(snapshot.head, id);
     assert!(snapshot.head > snapshot.state_ver);
@@ -280,7 +279,7 @@ async fn a_failed_expect_ver_commits_nothing_and_shows_no_ids() {
         .await
         .unwrap();
     let (_, first_id, _) = expect_ack(&mut client).await;
-    let before = client.snapshot("s").await.unwrap();
+    let before = client.snapshot(key("s")).await.unwrap();
     let entries_before = harness.wal.stream_entries("s").len();
 
     client
@@ -301,7 +300,7 @@ async fn a_failed_expect_ver_commits_nothing_and_shows_no_ids() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(client.snapshot("s").await.unwrap(), before);
+    assert_eq!(client.snapshot(key("s")).await.unwrap(), before);
     assert_eq!(harness.wal.stream_entries("s").len(), entries_before);
     // No ids were used, with the clock not moving.
     client.publish(publish("s", &records, 2, 1)).await.unwrap();
@@ -331,7 +330,7 @@ async fn a_rejected_doc_commits_nothing_on_a_new_stream_either() {
             ..
         }
     ));
-    assert_eq!(client.snapshot("s").await, Err(ErrorCode::NotFound));
+    assert_eq!(client.snapshot(key("s")).await, Err(ErrorCode::NotFound));
     assert!(harness.wal.stream_entries("s").is_empty());
     harness.finish();
 }
@@ -372,7 +371,7 @@ async fn success_has_consecutive_ids_with_the_state_record_last_in_one_wal_entry
     assert_eq!(parsed.actor, AUTHOR.get());
     assert_eq!(parsed.doc, &cbor(&doc)[..]);
 
-    let snapshot = client.snapshot("s").await.unwrap();
+    let snapshot = client.snapshot(key("s")).await.unwrap();
     assert_eq!(snapshot.state_ver, first_id + 4);
     assert_eq!(snapshot.head, first_id + 4);
     assert_eq!(from_cbor(&snapshot.state), doc);
@@ -395,7 +394,7 @@ async fn a_state_only_publish_is_allowed() {
         .unwrap();
     let (_, first_id, count) = expect_ack(&mut client).await;
     assert_eq!(count, 1);
-    assert_eq!(client.snapshot("s").await.unwrap().state_ver, first_id);
+    assert_eq!(client.snapshot(key("s")).await.unwrap().state_ver, first_id);
     harness.finish();
 }
 
@@ -433,7 +432,7 @@ async fn live_against_replay(ops: Vec<(u8, Value, bool)>) {
         .unwrap();
     expect_ack(&mut client).await;
 
-    let live = client.snapshot("s").await.unwrap();
+    let live = client.snapshot(key("s")).await.unwrap();
     let mut replayed = StreamState::new();
     for entry in harness.wal.stream_entries("s") {
         for view in Records::new(&entry.records) {
@@ -486,7 +485,7 @@ async fn a_state_op_waits_for_the_wal_whatever_the_streams_default_level() {
         let mut client = harness.node().client(0).await;
         client
             .configure(
-                "s",
+                key("s"),
                 server::StreamConfig {
                     default_ack_level,
                     min_ack_level: 0,
@@ -497,7 +496,7 @@ async fn a_state_op_waits_for_the_wal_whatever_the_streams_default_level() {
         harness.wal.hold();
         client
             .state_op(StateOpRequest {
-                stream: "s",
+                stream: key("s"),
                 req: 1,
                 author: AUTHOR,
                 expect_ver: 0,

@@ -25,6 +25,7 @@ server = { path = "crates/server" }
 sdk = { path = "crates/sdk" }
 ciborium = "0.2"
 crc32c = "0.6"
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
 hmac = "0.12"
 sha2 = "0.10"
 criterion = { version = "0.5", default-features = false }

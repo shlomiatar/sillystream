@@ -7,7 +7,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use format::{BlockAuthor, Records};
+use format::{BlockAuthor, KeyHash, Records};
 use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
@@ -17,7 +17,6 @@ use storage::{
     object_generation, read_ownership, replay_files, sync_wal_files, upload_pending,
 };
 
-use crate::compaction::MANIFEST_STREAM;
 use crate::dedupe::DedupeTable;
 use crate::delivery::ExtentRef;
 use crate::message::{SinkGap, SinkSpec, StreamConfig};
@@ -146,11 +145,11 @@ pub(crate) struct ScannedObject {
     pub needs_manifest: bool,
 }
 
-pub(crate) fn extent_ref(stream: &Arc<str>, extent: &MetaExtent) -> ExtentRef {
+pub(crate) fn extent_ref(stream: &KeyHash, extent: &MetaExtent) -> ExtentRef {
     ExtentRef {
         path: Path::parse(&extent.path).unwrap_or_else(|_| Path::from(extent.path.as_str())),
         extent: StreamExtent {
-            stream: Arc::clone(stream),
+            stream: *stream,
             offset: extent.offset,
             len_bytes: extent.len_bytes,
             id_first: extent.id_first,
@@ -175,7 +174,7 @@ pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
     SinkSpec {
         kind: sink.kind.clone(),
         url: sink.url.clone(),
-        target: sink.target.clone(),
+        target: sink.target,
         filter: sink.filter.clone(),
         on_expire: sink.on_expire.clone(),
         concurrency: sink.concurrency,
@@ -202,7 +201,7 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
         sink_id,
         kind: spec.kind.clone(),
         url: spec.url.clone(),
-        target: spec.target.clone(),
+        target: spec.target,
         filter: spec.filter.clone(),
         on_expire: spec.on_expire.clone(),
         concurrency: spec.concurrency,
@@ -223,10 +222,10 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
     }
 }
 
-fn new_meta(name: &str) -> StreamMeta {
+fn new_meta(name: KeyHash) -> StreamMeta {
     let config = StreamConfig::default();
     StreamMeta {
-        name: name.to_owned(),
+        stream: name,
         default_ack_level: config.default_ack_level,
         min_ack_level: config.min_ack_level,
         retention_ms: config.retention_ms,
@@ -259,7 +258,7 @@ fn entry_is_above(entry: &storage::ReplayedEntry, limit: u64) -> bool {
 }
 
 struct ScannedExtent {
-    stream: Arc<str>,
+    stream: KeyHash,
     extent: MetaExtent,
     /// The blocks that may hold system records, in order. Replay needs nothing else (D264).
     system_blocks: Vec<Bytes>,
@@ -303,6 +302,7 @@ async fn scan_object(
     path: Path,
     len_bytes: u64,
     limit: Option<u64>,
+    manifest: KeyHash,
 ) -> Result<ScannedOne, String> {
     let describe = |error: SegmentError| format!("{path}: {error}");
     let reader = SegmentReader::new(store, path.clone());
@@ -335,9 +335,9 @@ async fn scan_object(
                     .map_err(describe)?,
             ),
         };
-        needs_manifest |= &*extent.stream != MANIFEST_STREAM;
+        needs_manifest |= extent.stream != manifest;
         out.push(ScannedExtent {
-            stream: Arc::clone(&extent.stream),
+            stream: extent.stream,
             extent: MetaExtent {
                 path: path.to_string(),
                 offset: extent.offset,
@@ -369,6 +369,7 @@ async fn scan_objects(
     ownership: &Ownership,
     objects_seen: &mut Vec<ScannedObject>,
     report: &mut RecoveryReport,
+    manifest: KeyHash,
 ) -> Result<Vec<ScannedExtent>, String> {
     let known: HashSet<&str> = checkpoints.recorded_objects().collect();
     let mut objects: Vec<(u64, Path, u64)> = list_sealed_objects(store.as_ref())
@@ -388,7 +389,7 @@ async fn scan_objects(
     let mut scans =
         futures_util::stream::iter(objects.into_iter().map(|(generation, path, len_bytes)| {
             let limit = ownership.limit_for(generation);
-            scan_object(Arc::clone(store), path, len_bytes, limit)
+            scan_object(Arc::clone(store), path, len_bytes, limit, manifest)
         }))
         .buffered(CONCURRENT_OBJECT_SCANS);
     let mut out = Vec::new();
@@ -416,7 +417,7 @@ fn replay_stream(
     now_ms: u64,
     report: &mut RecoveryReport,
 ) -> Result<Option<RestoredStream>, String> {
-    let name = meta.name.clone();
+    let name = meta.stream;
     let was_deleted = meta.deleted;
     let floor_id = if was_deleted {
         meta.last_id
@@ -502,7 +503,7 @@ fn replay_stream(
         if !alive {
             // Made again after the delete: what the tombstone said is the floor now.
             alive = true;
-            let fresh = new_meta(&name);
+            let fresh = new_meta(name);
             meta.default_ack_level = fresh.default_ack_level;
             meta.min_ack_level = fresh.min_ack_level;
             meta.retention_ms = fresh.retention_ms;
@@ -559,6 +560,7 @@ pub(crate) async fn prepare(
     local_store: storage::MetadataStore,
     store: &Arc<dyn ObjectStore>,
     now_ms: u64,
+    manifest: KeyHash,
 ) -> Result<(Prepared, Arc<LocalMeta>), String> {
     let mut report = RecoveryReport::default();
     // Before the scan, which then finds them as it finds any object no checkpoint records.
@@ -593,13 +595,14 @@ pub(crate) async fn prepare(
         &ownership,
         &mut scanned_objects,
         &mut report,
+        manifest,
     )
     .await?;
 
-    let mut pending: BTreeMap<String, Pending> = BTreeMap::new();
+    let mut pending: BTreeMap<KeyHash, Pending> = BTreeMap::new();
     for extent in scanned {
         pending
-            .entry(extent.stream.to_string())
+            .entry(extent.stream)
             .or_default()
             .scanned
             .push(extent);
@@ -632,18 +635,14 @@ pub(crate) async fn prepare(
                 continue;
             }
             report.replayed_entry_count += 1;
-            pending
-                .entry(entry.stream.clone())
-                .or_default()
-                .wal
-                .push(entry);
+            pending.entry(entry.stream).or_default().wal.push(entry);
         }
     }
 
     let mut restored = Vec::with_capacity(pending.len());
     for (name, one) in pending {
-        let (meta, _) = load_stream(&local, &checkpoints, store, &name).await?;
-        let meta = meta.unwrap_or_else(|| new_meta(&name));
+        let (meta, _) = load_stream(&local, &checkpoints, store, name).await?;
+        let meta = meta.unwrap_or_else(|| new_meta(name));
         if let Some(stream) = replay_stream(meta, one, now_ms, &mut report)? {
             restored.push(stream);
         }

@@ -11,6 +11,11 @@ use server::{Client, NodeConfig, SinkOp, SinkSpec, SinkStart};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "stall.source";
 const RECORD_COUNT: u64 = 30_000;
 const RECORD_BYTES: usize = 1024;
@@ -86,7 +91,7 @@ async fn one_run(sink_count: u64, url: &str) -> Run {
     for sink_id in 1..=sink_count {
         client
             .sink_op(
-                STREAM,
+                key(STREAM),
                 SinkOp::Put {
                     sink_id,
                     spec: Box::new(SinkSpec {
@@ -107,7 +112,7 @@ async fn one_run(sink_count: u64, url: &str) -> Run {
     // Let the sinks take what they will. Sealing lets the slabs go if nothing else holds them.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (rate, slowest) = run_publishes(&mut client, 1 + WARM_RECORD_COUNT, RECORD_COUNT).await;
-    let info = client.stream_info(STREAM).await.unwrap();
+    let info = client.stream_info(key(STREAM)).await.unwrap();
     for (_, _, cursor) in &info.sinks {
         assert_eq!(*cursor, Some(0), "these sinks really are stalled");
     }

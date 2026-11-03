@@ -10,6 +10,11 @@ use server::{
     Reply,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 #[test]
 fn entries_stay_28_bytes() {
     assert_eq!(size_of::<DedupeEntry>(), 28);
@@ -26,12 +31,12 @@ async fn a_retry_of_the_latest_gets_the_original_ack_and_writes_nothing() {
     client.publish(publish("s", &records, 5, 2)).await.unwrap();
     let original = expect_ack(&mut client).await;
     let entries_before = harness.wal.stream_entries("s").len();
-    let head_before = client.snapshot("s").await.unwrap().head;
+    let head_before = client.snapshot(key("s")).await.unwrap().head;
 
     client.publish(publish("s", &records, 5, 2)).await.unwrap();
     assert_eq!(expect_ack(&mut client).await, original);
     assert_eq!(harness.wal.stream_entries("s").len(), entries_before);
-    assert_eq!(client.snapshot("s").await.unwrap().head, head_before);
+    assert_eq!(client.snapshot(key("s")).await.unwrap().head, head_before);
     harness.finish();
 }
 
@@ -114,7 +119,7 @@ async fn a_rejected_publish_does_not_use_up_its_seq() {
         Reply::Nack { .. }
     ));
     // The stream wasn't even created by that.
-    assert!(client.snapshot("s").await.is_err());
+    assert!(client.snapshot(key("s")).await.is_err());
 
     let good = record_with(1, b"hello");
     client.publish(publish("s", &good, 5, 2)).await.unwrap();

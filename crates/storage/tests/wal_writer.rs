@@ -14,6 +14,11 @@ use storage::{
     replay_dir, start_wal_writer,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
     Create(u64),
@@ -175,7 +180,7 @@ fn config(channel_capacity: usize) -> WalConfig {
 
 fn entry(core: usize, ticket: u64) -> WalEntry<Bytes> {
     let records = Bytes::from(vec![ticket as u8; 40]);
-    WalEntry::new(Arc::from("stream"), 7, ticket, records, core, ticket).unwrap()
+    WalEntry::new(key("stream"), 7, ticket, records, core, ticket).unwrap()
 }
 
 fn durable_calls(calls: &[Call]) -> Vec<Call> {
@@ -418,8 +423,8 @@ fn partial_writes_still_produce_exact_bytes() {
     sender.try_append(entry(0, 2)).unwrap();
     drop(sender);
     handle.join().unwrap();
-    let mut expected = encode_wal_entry(1, "stream", 7, 1, &[1; 40]).unwrap();
-    expected.extend(encode_wal_entry(1, "stream", 7, 2, &[2; 40]).unwrap());
+    let mut expected = encode_wal_entry(1, key("stream"), 7, 1, &[1; 40]).unwrap();
+    expected.extend(encode_wal_entry(1, key("stream"), 7, 2, &[2; 40]).unwrap());
     assert_eq!(*log.written.lock().unwrap(), expected);
 }
 
@@ -474,7 +479,9 @@ fn rotation_syncs_the_old_file_first_and_only_ever_creates_files() {
 }
 
 fn calls_write_len() -> usize {
-    encode_wal_entry(1, "stream", 7, 1, &[1; 40]).unwrap().len()
+    encode_wal_entry(1, key("stream"), 7, 1, &[1; 40])
+        .unwrap()
+        .len()
 }
 
 #[tokio::test]
@@ -511,18 +518,8 @@ async fn a_real_file_end_to_end_wakes_the_core_and_replays() {
 #[test]
 fn entries_that_the_format_cannot_hold_are_refused() {
     use storage::WalEntryError;
-    let records = Bytes::from_static(&[0; 8]);
-    let long: Arc<str> = Arc::from("x".repeat(65_536));
     assert_eq!(
-        WalEntry::new(Arc::from(""), 0, 0, records.clone(), 0, 0).unwrap_err(),
-        WalEntryError::EmptyStream
-    );
-    assert_eq!(
-        WalEntry::new(long, 0, 0, records, 0, 0).unwrap_err(),
-        WalEntryError::StreamTooLong
-    );
-    assert_eq!(
-        WalEntry::new(Arc::from("s"), 0, 0, Bytes::new(), 0, 0).unwrap_err(),
+        WalEntry::new(key("s"), 0, 0, Bytes::new(), 0, 0).unwrap_err(),
         WalEntryError::EmptyRecords
     );
 }
@@ -727,7 +724,7 @@ impl Sealer for RecordingSealer {
 
 fn entry_for(stream: &str, core: usize, ticket: u64) -> WalEntry<Bytes> {
     let records = Bytes::from(vec![ticket as u8; 40]);
-    WalEntry::new(Arc::from(stream), 7, ticket, records, core, ticket).unwrap()
+    WalEntry::new(key(stream), 7, ticket, records, core, ticket).unwrap()
 }
 
 fn start_sealing(
@@ -747,23 +744,20 @@ fn start_sealing(
 }
 
 /// What a handoff holds, as (stream, first byte of each record) per extent, and its tickets.
-fn shape(handoff: &Handoff) -> (Vec<(String, Vec<u8>)>, Vec<u64>) {
-    let extents: Vec<(String, Vec<u8>)> = match handoff {
+fn shape(handoff: &Handoff) -> (Vec<(format::KeyHash, Vec<u8>)>, Vec<u64>) {
+    let extents: Vec<(format::KeyHash, Vec<u8>)> = match handoff {
         Handoff::Seal { extents, .. } => extents
             .iter()
             .map(|extent| {
                 (
-                    extent.stream.to_string(),
+                    extent.stream,
                     extent.records.iter().map(|records| records[0]).collect(),
                 )
             })
             .collect(),
         Handoff::Dedicated {
             stream, records, ..
-        } => vec![(
-            stream.to_string(),
-            records.iter().map(|records| records[0]).collect(),
-        )],
+        } => vec![(*stream, records.iter().map(|records| records[0]).collect())],
     };
     let tickets = match handoff {
         Handoff::Seal { tickets, .. } | Handoff::Dedicated { tickets, .. } => tickets.clone(),
@@ -791,7 +785,7 @@ fn a_seal_hands_over_exactly_what_its_file_holds() {
     assert_eq!(
         shape(&handoffs[0]),
         (
-            vec![("b".to_owned(), vec![1, 3, 4]), ("a".to_owned(), vec![2])],
+            vec![(key("b"), vec![1, 3, 4]), (key("a"), vec![2])],
             vec![4, 3]
         )
     );
@@ -854,12 +848,12 @@ fn a_stream_filling_its_buffer_is_handed_over_alone() {
     assert!(matches!(handoffs[0], Handoff::Dedicated { number: 0, .. }));
     assert_eq!(
         shape(&handoffs[0]),
-        (vec![("hot".to_owned(), vec![1, 3])], vec![1, 3])
+        (vec![(key("hot"), vec![1, 3])], vec![1, 3])
     );
     assert_eq!(
         shape(&handoffs[1]),
         (
-            vec![("cold".to_owned(), vec![2]), ("hot".to_owned(), vec![4])],
+            vec![(key("cold"), vec![2]), (key("hot"), vec![4])],
             vec![4, 3]
         )
     );
@@ -884,7 +878,7 @@ fn a_dedicated_object_that_cannot_go_stays_in_the_seal() {
     assert_eq!(handoffs.len(), 1);
     assert_eq!(
         shape(&handoffs[0]),
-        (vec![("hot".to_owned(), vec![1, 2])], vec![2])
+        (vec![(key("hot"), vec![1, 2])], vec![2])
     );
 }
 
@@ -893,7 +887,7 @@ fn a_dedicated_object_that_cannot_go_stays_in_the_seal() {
 #[test]
 fn carried_records_go_into_the_first_seal_first() {
     let carried = |byte: u8| SealExtent {
-        stream: Arc::from("s"),
+        stream: key("s"),
         records: vec![Bytes::from(vec![byte; 40])],
     };
     let (sender, handle, sealed) = start_sealing(WalConfig {
@@ -910,10 +904,10 @@ fn carried_records_go_into_the_first_seal_first() {
     assert_eq!(
         shape(&handoffs[0]).0,
         [
-            ("s".to_owned(), vec![100]),
-            ("s".to_owned(), vec![101]),
-            ("s".to_owned(), vec![1])
+            (key("s"), vec![100]),
+            (key("s"), vec![101]),
+            (key("s"), vec![1])
         ]
     );
-    assert_eq!(shape(&handoffs[1]).0, [("s".to_owned(), vec![2])]);
+    assert_eq!(shape(&handoffs[1]).0, [(key("s"), vec![2])]);
 }

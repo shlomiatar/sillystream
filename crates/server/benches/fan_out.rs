@@ -65,18 +65,22 @@ fn record(options: u64) -> Vec<u8> {
     out
 }
 
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// A stream on a core other than the connections' home whenever there is one.
-fn stream_on_core_zero(virtual_shard_count: u32, core_count: usize) -> String {
+fn stream_on_core_zero(virtual_shard_count: u32, core_count: usize) -> format::KeyHash {
     (0..)
-        .map(|n| format!("fan.{n}"))
-        .find(|name| (shard_of(name, virtual_shard_count) as usize).is_multiple_of(core_count))
+        .map(|n| key(&format!("fan.{n}")))
+        .find(|name| (shard_of(*name, virtual_shard_count) as usize).is_multiple_of(core_count))
         .unwrap()
 }
 
 struct Rig {
     node: Node,
     client: Client,
-    stream: String,
+    stream: format::KeyHash,
     received_bytes: Arc<AtomicU64>,
     readers: Vec<tokio::task::JoinHandle<()>>,
     seq: u64,
@@ -102,7 +106,7 @@ async fn start(core_count: usize, subscriber_count: usize, filter_count: usize) 
     let mut client = node.client(0).await;
     let stream = stream_on_core_zero(node.virtual_shard_count(), core_count);
     client
-        .configure(&stream, server::StreamConfig::default())
+        .configure(stream, server::StreamConfig::default())
         .await;
 
     let received_bytes = Arc::new(AtomicU64::new(0));
@@ -121,7 +125,7 @@ async fn start(core_count: usize, subscriber_count: usize, filter_count: usize) 
         })
         .collect();
     for sub in 0..subscriber_count {
-        let mut subscription = Subscription::new(sub as u32, &stream, u64::MAX);
+        let mut subscription = Subscription::new(sub as u32, stream, u64::MAX);
         subscription.clauses = &clauses[sub % filter_count];
         handles[sub % connection_count].1.subscribe(subscription);
     }
@@ -168,7 +172,7 @@ async fn run(rig: &mut Rig, iters: u64, subscriber_count: u64) -> Duration {
             rig.seq += 1;
             rig.client
                 .publish(Publish {
-                    stream: &rig.stream,
+                    stream: rig.stream,
                     handle: 1,
                     producer_id: 1,
                     producer_seq: rig.seq,

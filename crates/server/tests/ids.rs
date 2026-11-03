@@ -7,6 +7,11 @@ use common::*;
 use format::Records;
 use proptest::prelude::*;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// `(options, data, count)` of one record.
 type Item = (u64, Vec<u8>, u16);
 
@@ -152,7 +157,10 @@ async fn a_publish_with_more_items_than_an_ack_can_count_is_rejected_whole() {
         server::Reply::Nack { code, .. } => assert_eq!(code, proto::ErrorCode::Malformed),
         other => panic!("expected a nack, got {other:?}"),
     }
-    assert_eq!(client.snapshot("s").await, Err(proto::ErrorCode::NotFound));
+    assert_eq!(
+        client.snapshot(key("s")).await,
+        Err(proto::ErrorCode::NotFound)
+    );
 
     // Without it, the same records fit exactly.
     client.publish(publish("s", &records, 1, 1)).await.unwrap();
@@ -184,14 +192,9 @@ async fn malformed_publishes_are_rejected_whole() {
     let truncated = &record_with(1, b"hello")[..20];
     client.publish(publish("s", truncated, 1, 2)).await.unwrap();
     malformed(expect_reply(&mut client).await);
-    // A stream id no WAL entry can hold.
-    let long = "x".repeat(70_000);
-    let records = record_with(1, b"hello");
-    client
-        .publish(publish(&long, &records, 1, 2))
-        .await
-        .unwrap();
-    malformed(expect_reply(&mut client).await);
-    assert_eq!(client.snapshot("s").await, Err(proto::ErrorCode::NotFound));
+    assert_eq!(
+        client.snapshot(key("s")).await,
+        Err(proto::ErrorCode::NotFound)
+    );
     harness.finish();
 }

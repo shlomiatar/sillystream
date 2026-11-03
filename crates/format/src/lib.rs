@@ -9,6 +9,7 @@ mod crc;
 mod error;
 mod filter;
 mod id;
+mod key;
 mod publish;
 mod record;
 mod summary;
@@ -21,6 +22,7 @@ pub use id::{
     COUNTER_BITS, IdAllocator, MAX_ID_LEAD_MS, MAX_ID_MS, RESTART_ID_CREDIT_MS, id_counter, id_ms,
     make_id,
 };
+pub use key::{IdentityKey, KeyHash};
 pub use publish::{ValidatedForward, ValidatedPublish, validate_forward, validate_publish};
 pub use record::{
     AUTHOR_OFFSET, CODEC_OFFSET, COUNT_OFFSET, DATA_OFFSET, HEADER_BYTES, ID_OFFSET, LEN_OFFSET,
@@ -39,9 +41,9 @@ pub const FORWARD_PRODUCER_BIT: u64 = 1 << 63;
 
 /// The producer id a forward from `source` under `sink_id` publishes with. FNV-1a, because it
 /// must stay the same across restarts and releases.
-pub fn forward_producer_id(source: &str, sink_id: u64) -> u64 {
+pub fn forward_producer_id(source: KeyHash, sink_id: u64) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in source.bytes().chain(sink_id.to_le_bytes()) {
+    for byte in source.0.into_iter().chain(sink_id.to_le_bytes()) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }

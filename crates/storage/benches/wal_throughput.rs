@@ -41,25 +41,18 @@ fn run_once(entry_bytes: usize, sender_count: usize, entry_count: u64) -> (Durat
     )
     .unwrap();
     let records = Bytes::from(vec![0xABu8; entry_bytes]);
-    let stream: Arc<str> = Arc::from("bench.stream");
+    let stream = format::IdentityKey::new([0; 32]).hash("bench.stream");
     let per_sender = entry_count.div_ceil(sender_count as u64);
     let start = Instant::now();
     let threads: Vec<_> = (0..sender_count)
         .map(|core| {
             let sender = sender.clone();
             let records = records.clone();
-            let stream = Arc::clone(&stream);
             std::thread::spawn(move || {
                 for ticket in 1..=per_sender {
-                    let mut entry = WalEntry::new(
-                        Arc::clone(&stream),
-                        core as u64,
-                        ticket,
-                        records.clone(),
-                        core,
-                        ticket,
-                    )
-                    .unwrap();
+                    let mut entry =
+                        WalEntry::new(stream, core as u64, ticket, records.clone(), core, ticket)
+                            .unwrap();
                     loop {
                         match sender.try_append(entry) {
                             Ok(()) => break,
@@ -162,14 +155,12 @@ fn one_at_a_time(c: &mut Criterion) {
             )
             .unwrap();
             let records = Bytes::from(vec![0xABu8; entry_bytes]);
-            let stream: Arc<str> = Arc::from("bench.stream");
+            let stream = format::IdentityKey::new([0; 32]).hash("bench.stream");
             let mut receiver = receivers.pop().unwrap();
             let mut ticket = 0;
             b.iter(|| {
                 ticket += 1;
-                let entry =
-                    WalEntry::new(Arc::clone(&stream), 1, ticket, records.clone(), 0, ticket)
-                        .unwrap();
+                let entry = WalEntry::new(stream, 1, ticket, records.clone(), 0, ticket).unwrap();
                 sender.try_append(entry).unwrap();
                 runtime.block_on(async {
                     while *receiver.borrow_and_update() < ticket {
@@ -221,7 +212,7 @@ fn group_commit(c: &mut Criterion) {
                 )
                 .unwrap();
                 let records = Bytes::from(vec![0xABu8; ENTRY_BYTES]);
-                let stream: Arc<str> = Arc::from("bench.stream");
+                let stream = format::IdentityKey::new([0; 32]).hash("bench.stream");
                 let per_publisher = iters.div_ceil(publisher_count as u64);
                 let start = Instant::now();
                 let tasks: Vec<_> = receivers
@@ -230,11 +221,10 @@ fn group_commit(c: &mut Criterion) {
                     .map(|(core, mut receiver)| {
                         let sender = sender.clone();
                         let records = records.clone();
-                        let stream = Arc::clone(&stream);
                         handle.spawn(async move {
                             for ticket in 1..=per_publisher {
                                 let entry = WalEntry::new(
-                                    Arc::clone(&stream),
+                                    stream,
                                     core as u64,
                                     ticket,
                                     records.clone(),

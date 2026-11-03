@@ -11,6 +11,11 @@ use std::time::Duration;
 use common::*;
 use server::{SealOutcome, SlabHook};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 #[derive(Default)]
 struct Counting {
     changes: AtomicU64,
@@ -129,7 +134,7 @@ async fn nothing_in_the_write_path_copies_a_plain_publish() {
     client.publish(publish("s", &records, 2, 1)).await.unwrap();
     expect_ack(&mut client).await;
     // Neighbours in one slab: the core kept the bytes where the client read them to.
-    let batches = harness.node().read_memory(0, "s").await;
+    let batches = harness.node().read_memory(0, key("s")).await;
     assert_eq!(batches.len(), 2);
     assert_eq!(batches[0].slab_id(), batches[1].slab_id());
     let gap = batches[1].as_ptr() as usize - batches[0].as_ptr() as usize;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::{Clause, RecordHeader, id_ms};
+use format::{Clause, KeyHash, RecordHeader, id_ms};
 use object_store::path::Path;
 use object_store::{PutMode, PutOptions, PutPayload};
 use proto::ErrorCode;
@@ -22,7 +22,6 @@ use super::{PoolContext, SinkAction, SinkKey, SinkStep, WorkerExit, backoff_ms};
 use crate::connection::{Connection, Event, Subscription};
 use crate::delivery::retention_start_id;
 use crate::message::{Reply, SinkOp, SinkReport, SinkSpec};
-use crate::net::json::quoted;
 use crate::node::{Client, ClientError};
 
 const CONTENT_RECORDS: &str = "application/x-sillystream-records";
@@ -47,7 +46,7 @@ pub(crate) async fn run(
     // If this task panics, the guard still reports it, and a new one takes over.
     let mut guard = ExitGuard {
         exits,
-        key: key.clone(),
+        key,
         seen_note_count: 0,
         restart: true,
     };
@@ -77,7 +76,7 @@ struct ExitGuard {
 impl Drop for ExitGuard {
     fn drop(&mut self) {
         let _ = self.exits.send(WorkerExit {
-            key: self.key.clone(),
+            key: self.key,
             seen_note_count: self.seen_note_count,
             restart: self.restart,
         });
@@ -170,7 +169,7 @@ impl Worker {
     }
 
     async fn op(&self, op: SinkOp) -> Result<(), ErrorCode> {
-        self.client.lock().await.sink_op(&self.key.0, op).await
+        self.client.lock().await.sink_op(self.key.0, op).await
     }
 
     async fn report(&self, report: SinkReport) {
@@ -188,7 +187,7 @@ impl Worker {
     async fn run(&mut self, home: usize, seen_note_count: &mut u64) -> End {
         loop {
             *seen_note_count = *self.notes.borrow_and_update();
-            let info = self.client.lock().await.stream_info(&self.key.0).await;
+            let info = self.client.lock().await.stream_info(self.key.0).await;
             let info = match info {
                 Ok(info) => info,
                 // Its metadata can't be read just now (D243).
@@ -272,7 +271,7 @@ impl Worker {
                 }
                 () = tokio::time::sleep(check) => {}
             }
-            let info = self.client.lock().await.stream_info(&self.key.0).await;
+            let info = self.client.lock().await.stream_info(self.key.0).await;
             let Ok(info) = info else {
                 return Spell::Reload;
             };
@@ -407,7 +406,7 @@ impl<'a> Reading<'a> {
 
     fn subscribe(&mut self, connection: &Connection, from: u64) {
         self.sub += 1;
-        let mut subscription = Subscription::new(self.sub, &self.worker.key.0, from);
+        let mut subscription = Subscription::new(self.sub, self.worker.key.0, from);
         subscription.clauses = &self.clauses;
         subscription.author = self.author;
         connection.subscribe(subscription);
@@ -652,7 +651,7 @@ impl<'a> Reading<'a> {
             .client
             .lock()
             .await
-            .stream_info(&self.worker.key.0)
+            .stream_info(self.worker.key.0)
             .await;
         if let Ok(info) = info {
             self.closed_window = Some((window, info.stamped_id));
@@ -718,7 +717,7 @@ impl<'a> Reading<'a> {
             let attempt = Attempt {
                 context: Arc::clone(&self.worker.context),
                 client: Arc::clone(&self.worker.send_client),
-                stream: Arc::clone(&self.worker.key.0),
+                stream: self.worker.key.0,
                 sink_id: self.worker.key.1,
                 kind: self.kind,
                 spec: self.spec.clone(),
@@ -909,7 +908,7 @@ impl<'a> Reading<'a> {
                 .client
                 .lock()
                 .await
-                .stream_info(&self.worker.key.0)
+                .stream_info(self.worker.key.0)
                 .await;
             if let Ok(info) = info {
                 self.retention_ms = info.config.retention_ms;
@@ -986,7 +985,7 @@ impl<'a> Reading<'a> {
 struct Attempt {
     context: Arc<PoolContext>,
     client: Arc<Mutex<Client>>,
-    stream: Arc<str>,
+    stream: KeyHash,
     sink_id: u64,
     kind: Kind,
     spec: SinkSpec,
@@ -1057,14 +1056,13 @@ impl Attempt {
 
     /// `{stream, head, unread}`, with ids as strings like everywhere else in JSON (D111).
     async fn notify(&self) -> Outcome {
-        let head = match self.client.lock().await.stream_info(&self.stream).await {
+        let head = match self.client.lock().await.stream_info(self.stream).await {
             Ok(info) => info.head,
             Err(code) => return Outcome::Retry(format!("reading the head: {code:?}")),
         };
         let body = format!(
-            "{{\"stream\":{},\"head\":\"{head}\",\"unread\":{}}}",
-            quoted(&self.stream),
-            self.item_count
+            "{{\"sink_id\":\"{}\",\"head\":\"{head}\",\"unread\":{}}}",
+            self.sink_id, self.item_count
         );
         self.post(CONTENT_JSON, body.as_bytes()).await
     }
@@ -1075,7 +1073,7 @@ impl Attempt {
         let Some(record) = self.bytes.first() else {
             return Outcome::Delivered;
         };
-        let Some(target) = self.spec.target.as_deref() else {
+        let Some(target) = self.spec.target else {
             return Outcome::Permanent("the sink has no target".to_owned());
         };
         let wait = Duration::from_millis(self.context.config.request_timeout_ms);
@@ -1084,7 +1082,7 @@ impl Attempt {
             .publish_forward(
                 target,
                 record,
-                format::forward_producer_id(&self.stream, self.sink_id),
+                format::forward_producer_id(self.stream, self.sink_id),
                 self.first_id,
                 FORWARD_ACK_LEVEL,
             )

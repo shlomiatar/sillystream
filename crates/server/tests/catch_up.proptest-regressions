@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b83b3df6c41ecd2fa07ca6ceaf6aa339e551da7f99818826bbe8046609f4fb2d # shrinks to start = 0, offset_percent = 0, small_share = false, live_count = 0, seal_while_reading = false, move_while_reading = false
+cc dd7e13f7b02987b8f9dad66ddfcdfad4a77b16289f620496e825b42c5f30215d # shrinks to start = 2, offset_percent = 87, small_share = false, live_count = 1, seal_while_reading = true, move_while_reading = true

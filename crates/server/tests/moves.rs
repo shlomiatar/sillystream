@@ -9,6 +9,11 @@ use common::*;
 use server::{Reply, SealOutcome, shard_of};
 use storage::SegmentReader;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// Ids that go up, with none missing, against the acks.
 fn check_ids(records: &[(u64, u64, u64, Vec<u8>)], acks: &[(u64, u64, u32)]) {
     let ids: Vec<u64> = records.iter().map(|record| record.0).collect();
@@ -23,7 +28,7 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_seals_as_one_extent() 
     let node = harness.node();
     let mut client = node.client(0).await;
     let records = record_with(1, b"payload");
-    let shard = shard_of("moving", node.virtual_shard_count());
+    let shard = shard_of(key("moving"), node.virtual_shard_count());
     let from = node.placement().await[shard as usize] as usize;
     let to = 1 - from;
 
@@ -80,7 +85,7 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_seals_as_one_extent() 
     };
     let own: Vec<_> = extents
         .iter()
-        .filter(|extent| &*extent.stream == "moving")
+        .filter(|extent| extent.stream == key("moving"))
         .collect();
     assert_eq!(own.len(), 1, "{extents:?}");
     let store: Arc<dyn object_store::ObjectStore> = harness.store.clone();
@@ -90,11 +95,11 @@ async fn a_stream_moved_mid_load_keeps_order_and_acks_and_seals_as_one_extent() 
     assert_eq!(
         in_footer
             .iter()
-            .filter(|extent| &*extent.stream == "moving")
+            .filter(|extent| extent.stream == key("moving"))
             .count(),
         1
     );
-    let stored = reader.read_stream("moving").await.unwrap();
+    let stored = reader.read_stream(key("moving")).await.unwrap();
     check_ids(&parse_records(&stored), &acks);
     harness.finish();
 }
@@ -113,14 +118,14 @@ async fn state_dedupe_and_config_move_with_the_stream() {
     });
     client.publish(request.clone()).await.unwrap();
     let original = expect_ack(&mut client).await;
-    let before = client.snapshot("s").await.unwrap();
+    let before = client.snapshot(key("s")).await.unwrap();
 
-    let shard = shard_of("s", node.virtual_shard_count());
+    let shard = shard_of(key("s"), node.virtual_shard_count());
     let from = node.placement().await[shard as usize] as usize;
     node.move_shard(shard, 1 - from).await;
 
     // A snapshot follows the stream even from a stale route.
-    assert_eq!(client.snapshot("s").await.unwrap(), before);
+    assert_eq!(client.snapshot(key("s")).await.unwrap(), before);
     // The retry is recognised on the new core, and so doesn't commit or re-check state.
     request.ack_level = Some(1);
     client.publish(request.clone()).await.unwrap();
@@ -141,7 +146,7 @@ async fn a_retry_after_a_move_waits_for_the_core_that_stamped_it() {
     let node = harness.node();
     let mut client = node.client(0).await;
     let records = record_with(1, b"payload");
-    let shard = shard_of("s", node.virtual_shard_count());
+    let shard = shard_of(key("s"), node.virtual_shard_count());
     let from = node.placement().await[shard as usize] as usize;
 
     harness.wal.hold();
@@ -173,7 +178,7 @@ async fn moving_there_and_back_in_one_window_never_overlaps_extents() {
     let node = harness.node();
     let mut client = node.client(0).await;
     let records = record_with(1, b"payload");
-    let shard = shard_of("s", node.virtual_shard_count());
+    let shard = shard_of(key("s"), node.virtual_shard_count());
     let home = node.placement().await[shard as usize] as usize;
     let mut seq = 1;
     let mut acks = Vec::new();
@@ -196,7 +201,7 @@ async fn moving_there_and_back_in_one_window_never_overlaps_extents() {
             SealOutcome::Uploaded { path, extents, .. } => {
                 let mut own: Vec<_> = extents
                     .iter()
-                    .filter(|extent| &*extent.stream == "s")
+                    .filter(|extent| extent.stream == key("s"))
                     .collect();
                 own.sort_by_key(|extent| extent.id_first);
                 assert!(
@@ -206,7 +211,7 @@ async fn moving_there_and_back_in_one_window_never_overlaps_extents() {
                 );
                 let store: Arc<dyn object_store::ObjectStore> = harness.store.clone();
                 let stored = SegmentReader::new(store, path)
-                    .read_stream("s")
+                    .read_stream(key("s"))
                     .await
                     .unwrap();
                 seen.extend(parse_records(&stored));
@@ -226,12 +231,12 @@ async fn a_client_learns_the_new_route_and_keeps_order_doing_so() {
     let node = harness.node();
     let mut client = node.client(0).await;
     let records = record_with(1, b"payload");
-    let shard = shard_of("s", node.virtual_shard_count());
+    let shard = shard_of(key("s"), node.virtual_shard_count());
     let from = node.placement().await[shard as usize] as usize;
     let to = 1 - from;
     client.publish(publish("s", &records, 1, 1)).await.unwrap();
     expect_ack(&mut client).await;
-    assert_eq!(client.route_of("s"), from);
+    assert_eq!(client.route_of(key("s")), from);
     node.move_shard(shard, to).await;
 
     // Pipelined across the route change: if any overtook another, the older one would come
@@ -239,7 +244,7 @@ async fn a_client_learns_the_new_route_and_keeps_order_doing_so() {
     let mut seq = 2;
     let mut acks = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
-    while client.route_of("s") != to {
+    while client.route_of(key("s")) != to {
         assert!(
             std::time::Instant::now() < deadline,
             "the route never changed"
@@ -297,7 +302,7 @@ async fn publishers_racing_many_moves_lose_nothing() {
                 .await
                 .unwrap();
             seqs[index] += 1;
-            let shard = shard_of(stream, node.virtual_shard_count());
+            let shard = shard_of(key(stream), node.virtual_shard_count());
             if round % 3 == index as u64 % 3 {
                 node.move_shard(shard, (round as usize + index) % cores)
                     .await;
@@ -341,7 +346,7 @@ fn name_on_core(core: usize, node: &server::Node, prefix: &str) -> String {
     (0..)
         .map(|n| format!("{prefix}{n}"))
         .find(|name| {
-            shard_of(name, node.virtual_shard_count()) as usize % node.core_count() == core
+            shard_of(key(name), node.virtual_shard_count()) as usize % node.core_count() == core
         })
         .expect("names go on for ever")
 }
@@ -373,7 +378,7 @@ async fn a_publish_sent_while_the_barrier_is_out_cant_be_overtaken() {
     let harness = Harness::new(stalled_two_cores());
     let node = harness.node();
     let name = name_on_core(0, node, "m");
-    let shard = shard_of(&name, node.virtual_shard_count());
+    let shard = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
     let mut client = node.client(0).await;
 
@@ -403,7 +408,7 @@ async fn a_publish_sent_while_the_barrier_is_out_cant_be_overtaken() {
     {
         acks.push((producer_seq, first_id, count));
     }
-    assert_eq!(client.route_of(&name), 1);
+    assert_eq!(client.route_of(key(&name)), 1);
     client
         .publish(publish(&name, &records, 3, 1))
         .await
@@ -445,7 +450,7 @@ async fn a_write_waits_for_a_barrier_still_on_its_way() {
     let harness = Harness::new(stalled_two_cores());
     let node = harness.node();
     let name = name_on_core(0, node, "m");
-    let shard = shard_of(&name, node.virtual_shard_count());
+    let shard = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
     let mut client = node.client(0).await;
 
@@ -474,7 +479,7 @@ async fn a_write_waits_for_a_barrier_still_on_its_way() {
     let state_op = tokio::time::timeout(
         Duration::from_millis(50),
         client.state_op(server::StateOpRequest {
-            stream: &name,
+            stream: key(&name),
             req: 1,
             author: AUTHOR,
             expect_ver: 0,
@@ -490,7 +495,7 @@ async fn a_write_waits_for_a_barrier_still_on_its_way() {
         .publish(publish(&name, &records, 2, 1))
         .await
         .unwrap();
-    assert_eq!(client.route_of(&name), 1);
+    assert_eq!(client.route_of(key(&name)), 1);
     let (seq, first_id, _) = expect_ack(&mut client).await;
     assert_eq!(seq, 2);
     assert!(first_id > 0);
@@ -502,7 +507,7 @@ async fn a_write_waiting_for_a_barrier_ends_when_the_node_stops() {
     let harness = Harness::new(stalled_two_cores());
     let node = harness.node();
     let name = name_on_core(0, node, "m");
-    let shard = shard_of(&name, node.virtual_shard_count());
+    let shard = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
     let mut client = node.client(0).await;
 
@@ -567,9 +572,9 @@ fn assert_wal_in_id_order(harness: &Harness, stream: &str) -> Vec<u64> {
     ids
 }
 
-fn set_op<'a>(stream: &'a str, req: u32, value: i64) -> server::StateOpRequest<'a> {
+fn set_op(stream: &str, req: u32, value: i64) -> server::StateOpRequest {
     server::StateOpRequest {
-        stream,
+        stream: key(stream),
         req,
         author: AUTHOR,
         expect_ver: 0,
@@ -604,7 +609,7 @@ async fn a_move_with_a_parked_entry_keeps_the_wal_in_id_order_and_replay_equal_t
     let harness = Harness::new(config);
     let node = harness.node();
     let name = name_on_core(0, node, "m");
-    let shard = shard_of(&name, node.virtual_shard_count());
+    let shard = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
     let mut client = node.client(0).await;
 
@@ -645,7 +650,7 @@ async fn a_move_with_a_parked_entry_keeps_the_wal_in_id_order_and_replay_equal_t
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     hook.armed.store(true, std::sync::atomic::Ordering::SeqCst);
-    node.read_memory(0, &name).await;
+    node.read_memory(0, key(&name)).await;
     harness.wal.release();
 
     let ver = match expect_reply(&mut moved).await {
@@ -657,7 +662,7 @@ async fn a_move_with_a_parked_entry_keeps_the_wal_in_id_order_and_replay_equal_t
     }
     let ids = assert_wal_in_id_order(&harness, &name);
     assert_eq!(ids.len(), 4);
-    let live = client.snapshot(&name).await.unwrap();
+    let live = client.snapshot(key(&name)).await.unwrap();
     assert_eq!(live.state_ver, ver);
     let replayed = replay_state(&harness, &name);
     assert_eq!(replayed.doc(), &live.state);
@@ -673,7 +678,7 @@ async fn a_parked_entry_keeps_its_place_across_many_moves() {
         let harness = Harness::new(config);
         let node = harness.node();
         let name = name_on_core(0, node, "m");
-        let shard = shard_of(&name, node.virtual_shard_count());
+        let shard = shard_of(key(&name), node.virtual_shard_count());
         let records = record_with(1, b"payload");
         let mut client = node.client(0).await;
 
@@ -740,9 +745,9 @@ async fn parked_streams_swapping_cores_all_get_through() {
         seq += 1;
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    node.move_shard(shard_of(&on_zero, node.virtual_shard_count()), 1)
+    node.move_shard(shard_of(key(&on_zero), node.virtual_shard_count()), 1)
         .await;
-    node.move_shard(shard_of(&on_one, node.virtual_shard_count()), 0)
+    node.move_shard(shard_of(key(&on_one), node.virtual_shard_count()), 0)
         .await;
     harness.wal.release();
 
@@ -772,7 +777,7 @@ fn one_slot_wal() -> server::NodeConfig {
 /// Moves the stream to core 1 and leaves core 1 unable to read writes, with the WAL held.
 async fn own_on_stalled_core_1(harness: &Harness, name: &str) {
     let node = harness.node();
-    node.move_shard(shard_of(name, node.virtual_shard_count()), 1)
+    node.move_shard(shard_of(key(name), node.virtual_shard_count()), 1)
         .await;
     harness.wal.hold();
     let filler = record_with(1, b"filler");
@@ -788,7 +793,7 @@ async fn move_back_behind_the_forward(harness: &Harness, name: &str, forwarded_b
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
-    node.move_shard(shard_of(name, node.virtual_shard_count()), 0)
+    node.move_shard(shard_of(key(name), node.virtual_shard_count()), 0)
         .await;
 }
 
@@ -811,7 +816,7 @@ async fn a_forward_stays_ahead_after_its_stream_moves_back(hear_moved_first: boo
         .await
         .unwrap();
     move_back_behind_the_forward(&harness, &name, forwarded).await;
-    assert_eq!(client.route_of(&name), 0);
+    assert_eq!(client.route_of(key(&name)), 0);
 
     let mut acks = Vec::new();
     if hear_moved_first
@@ -917,7 +922,7 @@ async fn state_ops_keep_their_order_across_a_move_back() {
             Reply::StateResult { ok: true, .. }
         ));
     }
-    let snapshot = client.snapshot(&name).await.unwrap();
+    let snapshot = client.snapshot(key(&name)).await.unwrap();
     assert_eq!(from_cbor(&snapshot.state), int(20));
     assert_eq!(replay_state(&harness, &name), {
         let mut live = server::StreamState::new();
@@ -936,7 +941,7 @@ async fn a_shard_bouncing_under_stalls_keeps_every_client_in_order() {
     let harness = Harness::new(config);
     let node = harness.node();
     let name = name_on_core(0, node, "bounce");
-    let shard = shard_of(&name, node.virtual_shard_count());
+    let shard = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
     let mut clients = Vec::new();
     for home in 0..3 {

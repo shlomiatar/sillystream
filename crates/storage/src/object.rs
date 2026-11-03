@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use format::id_ms;
+use format::{KeyHash, id_ms};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
@@ -203,20 +203,14 @@ pub(crate) fn path_fits_stores(path: &Path) -> bool {
         .all(|part| part.as_ref().len() <= MAX_PATH_PART_BYTES)
 }
 
-/// Whether a stream can have a dedicated object. A stream whose id can't be a path part
-/// stays in the node's shared seals, where the id appears only in the footer (D59).
-pub fn stream_fits_dedicated_path(stream: &str) -> bool {
-    PathPart::from(stream).as_ref().len() <= MAX_PATH_PART_BYTES
-}
-
 /// The path of a node's shared object for one seal whose records are all in `first_id`'s hour.
 pub fn seal_path(node: &str, generation: u64, first_id: u64) -> Path {
     sealed_path(node, generation, first_id, first_id)
 }
 
 /// The path of a dedicated object whose records are all in `first_id`'s hour.
-pub fn dedicated_path(stream: &str, generation: u64, first_id: u64) -> Path {
-    sealed_path(stream, generation, first_id, first_id)
+pub fn dedicated_path(stream: KeyHash, generation: u64, first_id: u64) -> Path {
+    sealed_path(&stream.to_string(), generation, first_id, first_id)
 }
 
 /// The generation in an object's name (section 7.3).

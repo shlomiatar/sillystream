@@ -8,8 +8,8 @@
 //!
 //! An entry holds only the extents new since the stream's last entry. A *full* file holds
 //! every stream's whole metadata and every object recorded so far, and nothing older is needed
-//! once a reader can trust one. A file's entry under the empty name, which no stream can have,
-//! holds its head.
+//! once a reader can trust one. A file's entry under the all-zero key hash, which no stream has
+//! in practice, holds its head.
 //!
 //! A former generation can still upload one of these after losing ownership. An entry from
 //! generation `g` whose last id is above `limit_for(g)` is ignored (section 8.1).
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::crc32c;
+use format::{KeyHash, crc32c};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
@@ -32,7 +32,7 @@ use crate::segment_format::{
 use crate::segment_reader::SegmentReader;
 
 const CHECKPOINT_PREFIX: &str = "checkpoints";
-const HEAD_NAME: &str = "";
+const HEAD_KEY: KeyHash = KeyHash([0; KeyHash::BYTES]);
 
 pub fn checkpoint_path(generation: u64, seq: u64) -> Path {
     Path::from(format!(
@@ -57,7 +57,7 @@ pub struct CheckpointHead {
     pub objects: Vec<String>,
     /// Every stream with a sink as of this file, so a startup can start them without loading
     /// every stream (D198).
-    pub sink_streams: Vec<String>,
+    pub sink_streams: Vec<KeyHash>,
 }
 
 fn encode_head(head: &CheckpointHead) -> Vec<u8> {
@@ -72,8 +72,7 @@ fn encode_head(head: &CheckpointHead) -> Vec<u8> {
     }
     out.extend_from_slice(&(head.sink_streams.len() as u32).to_le_bytes());
     for stream in &head.sink_streams {
-        out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
-        out.extend_from_slice(stream.as_bytes());
+        out.extend_from_slice(&stream.0);
     }
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
@@ -109,10 +108,15 @@ fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
     let sink_count =
         u32::from_le_bytes([sink_count[0], sink_count[1], sink_count[2], sink_count[3]]) as usize;
     at += 4;
-    let sink_streams = read_list(sink_count, &mut at)?;
-    if at != bytes.len() {
+    if sink_count.checked_mul(KeyHash::BYTES) != bytes.len().checked_sub(at) {
         return Err(BAD);
     }
+    let sink_streams = bytes[at..]
+        .as_chunks::<{ KeyHash::BYTES }>()
+        .0
+        .iter()
+        .map(|key| KeyHash(*key))
+        .collect();
     Ok(CheckpointHead {
         full: bytes[4] == 1,
         max_id: u64::from_le_bytes(max_id),
@@ -132,21 +136,15 @@ pub fn build_checkpoint(
     head: &CheckpointHead,
     metas: &[StreamMeta],
 ) -> Result<BuiltCheckpoint, SegmentError> {
-    if metas
-        .iter()
-        .any(|meta| meta.name.len() > usize::from(u16::MAX))
-    {
-        return Err(SegmentError::TooLong("stream id"));
-    }
     let mut parts = Vec::with_capacity(metas.len() + 3);
     let mut offset = 0u64;
     let mut index: Vec<(u64, StreamExtent)> = Vec::with_capacity(metas.len() + 1);
-    let mut add = |name: &str, bytes: Vec<u8>, id_last: u64| {
+    let mut add = |stream: KeyHash, bytes: Vec<u8>, id_last: u64| {
         let len_bytes = bytes.len() as u64;
         index.push((
-            stream_hash(name),
+            stream_hash(stream),
             StreamExtent {
-                stream: Arc::from(name),
+                stream,
                 offset,
                 len_bytes,
                 id_first: 0,
@@ -157,9 +155,9 @@ pub fn build_checkpoint(
         offset += len_bytes;
         parts.push(Bytes::from(bytes));
     };
-    add(HEAD_NAME, encode_head(head), 0);
+    add(HEAD_KEY, encode_head(head), 0);
     for meta in metas {
-        add(&meta.name, encode_meta(meta), meta.last_id);
+        add(meta.stream, encode_meta(meta), meta.last_id);
     }
     let top = encode_index(&mut index, DEFAULT_PAGE_BYTES, offset, &mut parts)?;
     Ok(BuiltCheckpoint { parts, top })
@@ -256,16 +254,16 @@ impl CheckpointFile {
 async fn read_entry(
     store: &Arc<dyn ObjectStore>,
     file: &CheckpointFile,
-    name: &str,
+    stream: KeyHash,
 ) -> Result<Option<(u64, Bytes)>, CheckpointError> {
-    let Some(page) = file.top.page_for(stream_hash(name)) else {
+    let Some(page) = file.top.page_for(stream_hash(stream)) else {
         return Ok(None);
     };
     let start = page.offset as usize;
     let bytes = store
         .get_range(&file.path, start..start + page.len_bytes as usize)
         .await?;
-    let Some((_, entry)) = decode_page(&bytes, Some(name))?.into_iter().next() else {
+    let Some((_, entry)) = decode_page(&bytes, Some(stream))?.into_iter().next() else {
         return Ok(None);
     };
     let start = entry.offset as usize;
@@ -329,7 +327,7 @@ impl CheckpointSet {
                 top,
                 head: CheckpointHead::default(),
             };
-            if let Some((_, blob)) = read_entry(store, &file, HEAD_NAME).await? {
+            if let Some((_, blob)) = read_entry(store, &file, HEAD_KEY).await? {
                 file.head = decode_head(&blob)?;
             }
             // A late full file from a former generation may hold what readers ignore.
@@ -340,7 +338,7 @@ impl CheckpointSet {
     }
 
     /// The newest list of streams with sinks that a reader can trust (section 8.1).
-    pub fn sink_streams(&self) -> Vec<String> {
+    pub fn sink_streams(&self) -> Vec<KeyHash> {
         self.files
             .iter()
             .find(|file| self.accepts(file.generation, file.head.max_id))
@@ -380,14 +378,14 @@ impl CheckpointSet {
     pub async fn lookup(
         &self,
         store: &Arc<dyn ObjectStore>,
-        name: &str,
+        stream: KeyHash,
     ) -> Result<Option<StreamMeta>, CheckpointError> {
         let mut found: Option<StreamMeta> = None;
         let mut extents = Vec::new();
         // Taken away by a newer entry: compaction or retention (section 7.5, 7.4).
         let mut dropped: HashSet<u64> = HashSet::new();
         for file in &self.files {
-            let Some((id_last, blob)) = read_entry(store, file, name).await? else {
+            let Some((id_last, blob)) = read_entry(store, file, stream).await? else {
                 continue;
             };
             if !self.accepts(file.generation, id_last) {
@@ -425,12 +423,12 @@ impl CheckpointSet {
     pub async fn merge_all(
         &self,
         store: &Arc<dyn ObjectStore>,
-    ) -> Result<BTreeMap<String, StreamMeta>, CheckpointError> {
-        let mut all: BTreeMap<String, StreamMeta> = BTreeMap::new();
+    ) -> Result<BTreeMap<KeyHash, StreamMeta>, CheckpointError> {
+        let mut all: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
         for file in self.files.iter().rev() {
             let reader = SegmentReader::new(Arc::clone(store), file.path.clone());
             for entry in reader.all_extents(&file.top).await? {
-                if entry.stream.is_empty() || !self.accepts(file.generation, entry.id_last) {
+                if entry.stream == HEAD_KEY || !self.accepts(file.generation, entry.id_last) {
                     continue;
                 }
                 let start = entry.offset as usize;
@@ -446,8 +444,8 @@ impl CheckpointSet {
 
 /// `newer` on top of what `all` has for its stream: its fields, and the union of extents
 /// above its floor, less what it drops. A tombstone clears them.
-pub fn merge_meta(all: &mut BTreeMap<String, StreamMeta>, newer: StreamMeta) {
-    let mut extents = match all.remove(&newer.name) {
+pub fn merge_meta(all: &mut BTreeMap<KeyHash, StreamMeta>, newer: StreamMeta) {
+    let mut extents = match all.remove(&newer.stream) {
         Some(older) if !newer.deleted => older.extents,
         _ => Vec::new(),
     };
@@ -459,7 +457,7 @@ pub fn merge_meta(all: &mut BTreeMap<String, StreamMeta>, newer: StreamMeta) {
     extents.sort_by_key(|extent| extent.id_first);
     extents.dedup_by_key(|extent| extent.id_first);
     newer.extents = extents;
-    all.insert(newer.name.clone(), newer);
+    all.insert(newer.stream, newer);
 }
 
 /// The wait before a retry of store work that must not be given up on.

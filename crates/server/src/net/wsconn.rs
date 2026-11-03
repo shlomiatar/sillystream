@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
+use format::KeyHash;
 use proto::{
     ClientFrame, DATA_PREFIX_BYTES, ErrorCode, PROTOCOL_VERSION, ServerFrame, data_prefix,
     decode_client,
@@ -238,7 +239,7 @@ struct Session {
     token: auth::Token,
     client: Client,
     connection: Connection,
-    handles: HashMap<u32, Arc<str>>,
+    handles: HashMap<u32, (Arc<str>, KeyHash)>,
     handle_name_bytes: usize,
     /// Each subscription the core may hold, with the tag that tells it from an earlier one under
     /// the same id.
@@ -780,7 +781,7 @@ impl WsConn<'_> {
                 let Some(session) = &mut self.session else {
                     return Ok(());
                 };
-                let replaced_bytes = session.handles.get(&handle).map(|name| name.len());
+                let replaced_bytes = session.handles.get(&handle).map(|(name, _)| name.len());
                 let name_bytes =
                     session.handle_name_bytes - replaced_bytes.unwrap_or(0) + stream.len();
                 if (session.handles.len() >= OPEN_HANDLES_MAX_COUNT && replaced_bytes.is_none())
@@ -790,7 +791,8 @@ impl WsConn<'_> {
                     return Ok(());
                 }
                 session.handle_name_bytes = name_bytes;
-                session.handles.insert(handle, Arc::from(stream));
+                let key = self.shared.keys.hash(stream);
+                session.handles.insert(handle, (Arc::from(stream), key));
             }
             ClientFrame::Subscribe(subscribe) => {
                 let Some(session) = &mut self.session else {
@@ -842,12 +844,12 @@ impl WsConn<'_> {
                     .insert(subscribe.sub, (Arc::from(subscribe.stream), tag));
                 session.connection.subscribe(Subscription {
                     sub: subscribe.sub,
-                    stream: subscribe.stream,
+                    stream: self.shared.keys.hash(subscribe.stream),
                     from: subscribe.from,
                     linger_ms: subscribe.linger_ms,
                     author: subscribe.author,
                     clauses: filter.clauses(),
-                    name: subscribe.name,
+                    name: subscribe.name.map(|name| self.shared.keys.hash(name)),
                     with_state: subscribe.with_state,
                     state_only: subscribe.state_only,
                     include_system: subscribe.include_system,
@@ -895,7 +897,7 @@ impl WsConn<'_> {
                 let Some(session) = &mut self.session else {
                     return Ok(());
                 };
-                let Some(stream) = session.handles.get(&handle).cloned() else {
+                let Some((stream, key)) = session.handles.get(&handle).cloned() else {
                     self.send_error(req, ErrorCode::Malformed, "handle isn't open");
                     return Ok(());
                 };
@@ -911,7 +913,7 @@ impl WsConn<'_> {
                 };
                 let author = session.token.author;
                 self.submit(PendingOp::State(OwnedStateOp {
-                    stream,
+                    stream: key,
                     req,
                     author,
                     change,
@@ -922,7 +924,7 @@ impl WsConn<'_> {
                     return Ok(());
                 };
                 let (handle, producer_seq) = (publish.handle, publish.producer_seq);
-                let Some(stream) = session.handles.get(&handle).cloned() else {
+                let Some((stream, key)) = session.handles.get(&handle).cloned() else {
                     self.send_nack(
                         handle,
                         producer_seq,
@@ -951,7 +953,7 @@ impl WsConn<'_> {
                 let records_start = message.len() - publish.records.len();
                 let records = message.split_off(records_start);
                 self.submit(PendingOp::Publish(RegionPublish {
-                    stream,
+                    stream: key,
                     handle,
                     producer_id,
                     producer_seq,

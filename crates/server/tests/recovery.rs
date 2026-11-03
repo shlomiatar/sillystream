@@ -17,6 +17,11 @@ use server::{
 };
 use storage::{Ownership, SegmentBuilder, claim_generation, read_ownership, seal_path};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 struct Disk {
     dir: tempfile::TempDir,
     store: Arc<ScriptStore>,
@@ -66,7 +71,7 @@ impl Disk {
 async fn read_all(node: &Node, stream: &str, count: usize) -> Vec<(u64, Vec<u8>)> {
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, stream, 0));
+    connection.subscribe(Subscription::new(1, key(stream), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= count
     })
@@ -98,7 +103,7 @@ async fn publish_one(
 async fn set_state(client: &mut server::Client, stream: &str, doc: &ciborium::value::Value) {
     client
         .state_op(StateOpRequest {
-            stream,
+            stream: key(stream),
             req: 1,
             author: AUTHOR,
             expect_ver: 0,
@@ -137,20 +142,23 @@ async fn a_restart_restores_state_dedupe_and_cursors() {
 
     let mut connection = node.connection(1).await.unwrap();
     let mut heard = Heard::default();
-    let mut named = Subscription::new(1, "a", 0);
-    named.name = Some("worker");
+    let mut named = Subscription::new(1, key("a"), 0);
+    named.name = Some(key("worker"));
     connection.subscribe(named);
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= 2
     })
     .await;
     connection.commit(1, first);
-    assert_eq!(connection.read_cursor("a", "worker").await, Some(first));
+    assert_eq!(
+        connection.read_cursor(key("a"), key("worker")).await,
+        Some(first)
+    );
     assert!(node.seal_and_checkpoint().await);
 
     // Above the seal: only the WAL has these.
     let (third, count) = publish_one(&mut client, "a", 3, b"three").await;
-    let before = client.snapshot("a").await.unwrap();
+    let before = client.snapshot(key("a")).await.unwrap();
     drop((client, connection));
     node.shutdown();
 
@@ -158,7 +166,7 @@ async fn a_restart_restores_state_dedupe_and_cursors() {
     assert_eq!(report.generation, 2);
     assert!(report.last_valid_id >= third);
     let mut client = node.client(0).await;
-    let after = client.snapshot("a").await.unwrap();
+    let after = client.snapshot(key("a")).await.unwrap();
     assert_eq!(after.state_ver, before.state_ver);
     assert_eq!(after.state, before.state);
     assert_eq!(after.head, before.head);
@@ -170,7 +178,10 @@ async fn a_restart_restores_state_dedupe_and_cursors() {
     );
 
     let connection = node.connection(1).await.unwrap();
-    assert_eq!(connection.read_cursor("a", "worker").await, Some(first));
+    assert_eq!(
+        connection.read_cursor(key("a"), key("worker")).await,
+        Some(first)
+    );
 
     let records = read_all(&node, "a", 3).await;
     let ids: Vec<u64> = records.iter().map(|(id, _)| *id).collect();
@@ -331,7 +342,7 @@ async fn put_late_object(
     records: Vec<bytes::Bytes>,
 ) {
     let mut builder = SegmentBuilder::new();
-    builder.add_extent("late", records).unwrap();
+    builder.add_extent(key("late"), records).unwrap();
     let built = builder.finish().unwrap();
     let body: Vec<u8> = built.parts.iter().flatten().copied().collect();
     store
@@ -450,7 +461,7 @@ async fn a_late_record_across_the_last_valid_id_is_ignored_whole() {
     assert_eq!(report.ignored_extent_count, 1);
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("late").await.unwrap_err(),
+        client.snapshot(key("late")).await.unwrap_err(),
         proto::ErrorCode::NotFound
     );
     drop(client);
@@ -507,7 +518,7 @@ async fn cold_streams_leave_oldest_first_and_a_live_subscriber_keeps_one_here() 
     }
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "watched", 0));
+    connection.subscribe(Subscription::new(1, key("watched"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() == 1
     })
@@ -516,11 +527,11 @@ async fn cold_streams_leave_oldest_first_and_a_live_subscriber_keeps_one_here() 
     assert!(node.seal_and_checkpoint().await);
     // The oldest three of what can go, which `watched` can't, though it is the oldest of all.
     assert_eq!(total_stats(&node).await.evicted_count, 3);
-    assert_eq!(client.snapshot("watched").await.unwrap().state_ver, 0);
-    assert_eq!(client.snapshot("s4").await.unwrap().state_ver, 0);
+    assert_eq!(client.snapshot(key("watched")).await.unwrap().state_ver, 0);
+    assert_eq!(client.snapshot(key("s4")).await.unwrap().state_ver, 0);
     assert_eq!(total_stats(&node).await.loaded_count, 0, "those two stayed");
     for stream in ["s1", "s2", "s3"] {
-        client.snapshot(stream).await.unwrap();
+        client.snapshot(key(stream)).await.unwrap();
     }
     assert_eq!(total_stats(&node).await.loaded_count, 3, "those went");
 
@@ -544,12 +555,12 @@ struct Seen {
 
 async fn see(node: &Node, client: &mut server::Client, stream: &str, count: usize) -> Seen {
     let connection = node.connection(0).await.unwrap();
-    let info = client.snapshot(stream).await.unwrap();
+    let info = client.snapshot(key(stream)).await.unwrap();
     let records = read_all(node, stream, count).await;
     Seen {
-        info: client.stream_info(stream).await.unwrap(),
+        info: client.stream_info(key(stream)).await.unwrap(),
         snapshot: info,
-        cursor: connection.read_cursor(stream, "worker").await,
+        cursor: connection.read_cursor(key(stream), key("worker")).await,
         records,
     }
 }
@@ -567,7 +578,7 @@ fn assert_same(one: &Seen, other: &Seen) {
 async fn make_full_stream(node: &Node, client: &mut server::Client, stream: &str) {
     client
         .configure(
-            stream,
+            key(stream),
             server::StreamConfig {
                 default_ack_level: 1,
                 min_ack_level: 1,
@@ -580,15 +591,18 @@ async fn make_full_stream(node: &Node, client: &mut server::Client, stream: &str
     publish_one(client, stream, 2, b"two").await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut named = Subscription::new(1, stream, 0);
-    named.name = Some("worker");
+    let mut named = Subscription::new(1, key(stream), 0);
+    named.name = Some(key("worker"));
     connection.subscribe(named);
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= 2
     })
     .await;
     connection.commit(1, first);
-    assert_eq!(connection.read_cursor(stream, "worker").await, Some(first));
+    assert_eq!(
+        connection.read_cursor(key(stream), key("worker")).await,
+        Some(first)
+    );
     connection.unsubscribe(1);
     drop(connection);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -663,7 +677,7 @@ async fn with_the_local_store_gone_a_stream_is_rebuilt_from_checkpoints() {
     let (node, _) = disk.start(config);
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("never").await.unwrap_err(),
+        client.snapshot(key("never")).await.unwrap_err(),
         proto::ErrorCode::NotFound
     );
     drop(client);
@@ -718,14 +732,14 @@ async fn deleted_streams_stay_deleted_and_a_new_one_cannot_read_the_old() {
     assert!(node.seal_and_checkpoint().await);
     let (old_id, _) = publish_one(&mut client, "gone", 2, b"unsealed").await;
     // Answered once a checkpoint has it, so a crash right here can't bring it back.
-    assert!(client.delete_stream("gone").await);
+    assert!(client.delete_stream(key("gone")).await);
     drop(client);
     node.shutdown();
 
     let (node, _) = disk.start(manual_config(2));
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("gone").await.unwrap_err(),
+        client.snapshot(key("gone")).await.unwrap_err(),
         proto::ErrorCode::NotFound
     );
     drop(client);
@@ -737,7 +751,7 @@ async fn deleted_streams_stay_deleted_and_a_new_one_cannot_read_the_old() {
     let (node, _) = disk.start(manual_config(2));
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("gone").await.unwrap_err(),
+        client.snapshot(key("gone")).await.unwrap_err(),
         proto::ErrorCode::NotFound
     );
 
@@ -773,7 +787,7 @@ async fn a_delete_with_only_the_wal_is_not_lost_nor_a_later_recreate() {
     let (node, _) = disk.start(manual_config(1));
     let mut client = node.client(0).await;
     let (old_id, _) = publish_one(&mut client, "gone", 1, b"old").await;
-    assert!(client.delete_stream("gone").await);
+    assert!(client.delete_stream(key("gone")).await);
     let (new_id, _) = publish_one(&mut client, "gone", 1, b"new").await;
     assert!(new_id > old_id);
     drop(client);
@@ -798,14 +812,14 @@ async fn an_evicted_stream_loads_on_the_core_its_shard_moved_to() {
         publish_one(&mut client, &format!("filler.{seq}"), 1, b"y").await;
     }
     assert!(node.seal_and_checkpoint().await);
-    let shard = server::shard_of("wanderer", node.virtual_shard_count());
+    let shard = server::shard_of(key("wanderer"), node.virtual_shard_count());
     let at = (shard as usize) % 2;
     let before = node.stats(at).await.unwrap().evicted_count;
     assert!(before > 0);
     assert!(node.move_shard(shard, 1 - at).await);
 
     let mut fresh = node.client(1).await;
-    assert_eq!(fresh.snapshot("wanderer").await.unwrap().head, id);
+    assert_eq!(fresh.snapshot(key("wanderer")).await.unwrap().head, id);
     // Eviction dropped its dedupe entries (section 3), so the same seq is a new record.
     let again = publish_one(&mut fresh, "wanderer", 1, b"x").await.0;
     assert!(again > id);
@@ -908,7 +922,7 @@ async fn a_running_owners_load_survives_a_former_owners_full_file() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut client = new.client(0).await;
-    let answer = tokio::time::timeout(Duration::from_secs(5), client.snapshot("s")).await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), client.snapshot(key("s"))).await;
     drop((client, old_client));
     old.shutdown();
     let hung = answer.is_err();
@@ -956,7 +970,7 @@ async fn a_late_object_at_the_limit_stays_out_of_a_deleted_stream_and_its_succes
     let limit = report.last_valid_id;
     assert!(limit > old_id);
     let mut client = node.client(0).await;
-    assert!(client.delete_stream("late").await);
+    assert!(client.delete_stream(key("late")).await);
     drop(client);
     // Generation 1's, finishing after the delete, with an id the limit accepts.
     let object_records = vec![stamped(limit, 1, b"old generation")];
@@ -966,7 +980,7 @@ async fn a_late_object_at_the_limit_stays_out_of_a_deleted_stream_and_its_succes
     let (node, _) = disk.start(manual_config(1));
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("late").await.err(),
+        client.snapshot(key("late")).await.err(),
         Some(proto::ErrorCode::NotFound),
         "deleted stream came back"
     );
@@ -986,7 +1000,7 @@ async fn a_late_object_at_the_limit_stays_out_of_a_deleted_stream_and_its_succes
     let (node, report) = disk.start(manual_config(1));
     let limit = report.last_valid_id;
     let mut client = node.client(0).await;
-    assert!(client.delete_stream("late").await);
+    assert!(client.delete_stream(key("late")).await);
     let (new_id, _) = publish_one(&mut client, "late", 1, b"new").await;
     assert!(new_id > limit);
     assert!(node.seal_and_checkpoint().await);
@@ -1051,7 +1065,7 @@ async fn a_delete_saved_only_locally_reaches_the_checkpoints_after_a_restart() {
 
     fail_checkpoint_puts(&disk, 0);
     let mut deleter = node.client(0).await;
-    let unanswered = tokio::spawn(async move { deleter.delete_stream("gone").await });
+    let unanswered = tokio::spawn(async move { deleter.delete_stream(key("gone")).await });
     tokio::time::sleep(Duration::from_millis(400)).await;
     drop(client);
     node.shutdown();
@@ -1060,9 +1074,9 @@ async fn a_delete_saved_only_locally_reaches_the_checkpoints_after_a_restart() {
     fail_checkpoint_puts(&disk, -1);
     let (node, _) = disk.start(full_every(2));
     let mut client = node.client(0).await;
-    assert!(!client.delete_stream("gone").await);
+    assert!(!client.delete_stream(key("gone")).await);
     assert_eq!(
-        client.snapshot("gone").await.err(),
+        client.snapshot(key("gone")).await.err(),
         Some(proto::ErrorCode::NotFound)
     );
     drop(client);
@@ -1073,7 +1087,7 @@ async fn a_delete_saved_only_locally_reaches_the_checkpoints_after_a_restart() {
     let (node, _) = disk.start(full_every(2));
     let mut client = node.client(0).await;
     assert_eq!(
-        client.snapshot("gone").await.err(),
+        client.snapshot(key("gone")).await.err(),
         Some(proto::ErrorCode::NotFound),
         "deleted stream is back"
     );
@@ -1197,7 +1211,7 @@ async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
     )
     .await;
     let meta = storage::StreamMeta {
-        name: "late".into(),
+        stream: key("late"),
         last_id: limit + 1,
         applied_id: limit + 1,
         ..Default::default()
@@ -1247,20 +1261,23 @@ async fn a_local_store_left_from_before_a_replacement_is_not_trusted() {
     let (x2, _) = publish_one(&mut client, "x", 2, b"x2").await;
     set_state(&mut client, "x", &map(&[("n", int(2))])).await;
     publish_one(&mut client, "y", 1, b"y1").await;
-    assert!(client.delete_stream("z").await);
+    assert!(client.delete_stream(key("z")).await);
     assert!(node.seal_and_checkpoint().await);
-    let before = client.snapshot("x").await.unwrap();
+    let before = client.snapshot(key("x")).await.unwrap();
     drop(client);
     node.shutdown();
 
     disk_a.clock.advance(20_000);
     let (node, _) = disk_a.start(manual_config(2));
     let mut client = node.client(0).await;
-    let after = client.snapshot("x").await.unwrap();
+    let after = client.snapshot(key("x")).await.unwrap();
     assert_eq!(after.state_ver, before.state_ver, "x's state went back");
     assert_eq!(after.head, before.head, "x's head went back");
-    assert!(client.snapshot("y").await.is_ok(), "y is gone");
-    assert!(client.snapshot("z").await.is_err(), "deleted z is back");
+    assert!(client.snapshot(key("y")).await.is_ok(), "y is gone");
+    assert!(
+        client.snapshot(key("z")).await.is_err(),
+        "deleted z is back"
+    );
     let got: Vec<u64> = read_all(&node, "x", 2)
         .await
         .into_iter()
@@ -1285,7 +1302,7 @@ async fn a_restart_with_no_other_generation_keeps_its_local_store() {
 
     let (node, _) = disk.start(manual_config(1));
     let mut client = node.client(0).await;
-    assert!(client.snapshot("a").await.is_ok());
+    assert!(client.snapshot(key("a")).await.is_ok());
     assert_eq!(total_stats(&node).await.rebuilt_count, 0);
     drop(client);
     node.shutdown();
@@ -1355,7 +1372,7 @@ async fn move_in_upload_window(
     client: &mut server::Client,
     stream: &str,
 ) -> (u64, u64, usize) {
-    let shard = server::shard_of(stream, node.virtual_shard_count());
+    let shard = server::shard_of(key(stream), node.virtual_shard_count());
     let from = shard as usize % 2;
     let to = 1 - from;
     let (first, _) = publish_one(client, stream, 1, b"one").await;
@@ -1374,7 +1391,7 @@ async fn move_in_upload_window(
         while made < 3 {
             filler += 1;
             let name = format!("filler.{filler}");
-            if server::shard_of(&name, node.virtual_shard_count()) as usize % 2 == to {
+            if server::shard_of(key(&name), node.virtual_shard_count()) as usize % 2 == to {
                 disk.clock.advance(1);
                 publish_one(client, &name, 1, b"f").await;
                 made += 1;
@@ -1421,7 +1438,7 @@ async fn a_reader_gets_a_record_its_former_core_still_holds() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "m", 0));
+    connection.subscribe(Subscription::new(1, key("m"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         !heard.records(1).is_empty()
     })
@@ -1589,7 +1606,7 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
 
     let mut builder = SegmentBuilder::new();
     builder
-        .add_extent("s", vec![stamped(r2, 1, b"r2")])
+        .add_extent(key("s"), vec![stamped(r2, 1, b"r2")])
         .unwrap();
     let body: Vec<u8> = builder
         .finish()
@@ -1600,7 +1617,10 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
         .copied()
         .collect();
     disk.store
-        .put(&storage::dedicated_path("s", 1, r2), PutPayload::from(body))
+        .put(
+            &storage::dedicated_path(key("s"), 1, r2),
+            PutPayload::from(body),
+        )
         .await
         .unwrap();
 
@@ -1793,9 +1813,9 @@ async fn a_checkpoint_that_stays_bad_refuses_what_waits_for_it() {
         other => panic!("expected a refusal, got {other:?}"),
     }
     // Another stream the WAL does hold still answers.
-    let busy = tokio::time::timeout(Duration::from_secs(30), client.stream_info("busy")).await;
+    let busy = tokio::time::timeout(Duration::from_secs(30), client.stream_info(key("busy"))).await;
     assert!(busy.unwrap().is_ok());
-    let info = tokio::time::timeout(Duration::from_secs(30), client.stream_info("kept")).await;
+    let info = tokio::time::timeout(Duration::from_secs(30), client.stream_info(key("kept"))).await;
     assert_eq!(info.unwrap().err(), Some(proto::ErrorCode::RateLimited));
     drop(client);
     node.shutdown();

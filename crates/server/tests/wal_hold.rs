@@ -12,6 +12,11 @@ use common::*;
 use server::{ManualClock, Node, NodeConfig, RecoverConfig, RecoveryReport, Subscription};
 use tokio::sync::Mutex;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 static TURN: Mutex<()> = Mutex::const_new(());
 
 fn start(
@@ -59,7 +64,7 @@ async fn publish_at(client: &mut server::Client, seq: u64, data: &[u8], level: u
 async fn read_ids(node: &Node, want: usize) -> Vec<u64> {
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "s", 0));
+    connection.subscribe(Subscription::new(1, key("s"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= want
     })

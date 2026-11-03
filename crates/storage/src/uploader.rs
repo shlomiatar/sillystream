@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
+use format::KeyHash;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
 use object_store::path::Path;
@@ -31,7 +32,7 @@ use crate::wal_writer::Sealer;
 /// is a reference to what the WAL wrote.
 #[derive(Debug, Clone)]
 pub struct SealExtent {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub records: Vec<Bytes>,
 }
 
@@ -46,7 +47,7 @@ pub enum Handoff {
         tickets: Vec<u64>,
     },
     Dedicated {
-        stream: Arc<str>,
+        stream: KeyHash,
         number: u64,
         records: Vec<Bytes>,
         tickets: Vec<u64>,
@@ -59,7 +60,7 @@ pub enum UploadKey {
     Seal(u64),
     /// A dedicated object: its stream, and the caller's number for it.
     Dedicated {
-        stream: Arc<str>,
+        stream: KeyHash,
         number: u64,
     },
 }
@@ -102,7 +103,7 @@ pub enum UnfinishedUpload {
         extents: Vec<SealExtent>,
     },
     Dedicated {
-        stream: Arc<str>,
+        stream: KeyHash,
         number: u64,
         records: Vec<Bytes>,
     },
@@ -540,14 +541,14 @@ impl Worker {
                     tickets,
                 } => {
                     let mut builder = SegmentBuilder::new();
-                    let built = match builder.add_extent(stream, records.iter().cloned()) {
+                    let built = match builder.add_extent(*stream, records.iter().cloned()) {
                         Ok(()) => builder.finish(),
                         Err(error) => Err(error),
                     };
-                    let (name, generation) = (Arc::clone(stream), self.config.generation);
+                    let (name, generation) = (stream.to_string(), self.config.generation);
                     (
                         UploadKey::Dedicated {
-                            stream: Arc::clone(stream),
+                            stream: *stream,
                             number: *number,
                         },
                         tickets,
@@ -768,10 +769,10 @@ impl Putter {
 /// keeps them in id order.
 fn build_seal(extents: &[SealExtent]) -> Result<BuiltSegment, SegmentError> {
     let mut sorted: Vec<&SealExtent> = extents.iter().collect();
-    sorted.sort_by(|a, b| a.stream.cmp(&b.stream));
+    sorted.sort_by_key(|a| a.stream);
     let mut builder = SegmentBuilder::new();
     for extent in sorted {
-        builder.add_extent(&extent.stream, extent.records.iter().cloned())?;
+        builder.add_extent(extent.stream, extent.records.iter().cloned())?;
     }
     builder.finish()
 }

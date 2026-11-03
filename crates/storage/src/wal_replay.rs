@@ -8,14 +8,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use format::{crc32c, crc32c_append, crc32c_seeded};
+use format::{KeyHash, crc32c, crc32c_append, crc32c_seeded};
 
 use crate::wal_format::{ENTRY_FIXED_BYTES, WAL_FILE_HEADER_BYTES, WAL_MAGIC};
 
 /// One valid entry found by replay. `records` shares the file's buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayedEntry {
-    pub stream: String,
+    pub stream: KeyHash,
     pub producer_id: u64,
     pub producer_seq: u64,
     pub records: Bytes,
@@ -48,7 +48,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 /// Parses the entry at `offset`, returning it and the next entry's offset. `None`
 /// for anything other than one whole valid entry, which is where the prefix ends:
-/// the zeros of a preallocated tail have `stream_len = 0`. A CRC can't reject bytes
+/// the zeros of a preallocated tail have `len = 0`. A CRC can't reject bytes
 /// a publisher chose, so stale bytes must not be in the file at all (D60); the `seq`
 /// seed is what still rejects an old file's entries if they are found.
 fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, usize)> {
@@ -56,11 +56,7 @@ fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, 
     if bytes.len() < ENTRY_FIXED_BYTES {
         return None;
     }
-    let stream_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-    if stream_len == 0 || bytes.len() < ENTRY_FIXED_BYTES + stream_len {
-        return None;
-    }
-    let fields_end = 2 + stream_len + 8 + 8 + 4;
+    let fields_end = ENTRY_FIXED_BYTES - 4;
     let len = read_u32(bytes, fields_end - 4) as usize;
     if len == 0 {
         return None;
@@ -77,11 +73,10 @@ fn parse_entry(file: &Bytes, offset: usize, seq: u64) -> Option<(ReplayedEntry, 
     if crc != read_u32(bytes, fields_end) {
         return None;
     }
-    let stream = std::str::from_utf8(&bytes[2..2 + stream_len]).ok()?;
     let entry = ReplayedEntry {
-        stream: stream.to_owned(),
-        producer_id: read_u64(bytes, 2 + stream_len),
-        producer_seq: read_u64(bytes, 2 + stream_len + 8),
+        stream: KeyHash::from_slice(&bytes[..KeyHash::BYTES])?,
+        producer_id: read_u64(bytes, KeyHash::BYTES),
+        producer_seq: read_u64(bytes, KeyHash::BYTES + 8),
         records: file.slice(offset + records_start..offset + records_end),
     };
     Some((entry, offset + total))

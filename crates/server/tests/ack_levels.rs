@@ -5,6 +5,11 @@ mod common;
 use common::*;
 use server::{Reply, SealOutcome, StreamConfig};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 #[tokio::test]
 async fn level_2_never_acks_while_the_fsync_is_held() {
     let harness = Harness::new(manual_config(2));
@@ -87,7 +92,7 @@ async fn level_0_sends_nothing_but_still_commits_and_a_rejection_still_nacks() {
     let records = record_with(1, b"hello");
     client.publish(publish("s", &records, 1, 0)).await.unwrap();
     expect_quiet(&mut client).await;
-    let snapshot = client.snapshot("s").await.unwrap();
+    let snapshot = client.snapshot(key("s")).await.unwrap();
     assert!(snapshot.head > 0);
 
     let mut bad = record_with(1, b"hello");
@@ -111,7 +116,7 @@ async fn a_publish_below_the_streams_minimum_is_raised_to_it() {
     let mut client = harness.node().client(0).await;
     client
         .configure(
-            "s",
+            key("s"),
             StreamConfig {
                 default_ack_level: 2,
                 min_ack_level: 2,
@@ -148,7 +153,7 @@ async fn no_ack_level_takes_the_streams_default() {
 
     client
         .configure(
-            "s",
+            key("s"),
             StreamConfig {
                 default_ack_level: 1,
                 min_ack_level: 0,
@@ -217,7 +222,7 @@ async fn a_dead_wal_is_reported_to_every_publisher_instead_of_looking_like_backp
     }
     client
         .state_op(server::StateOpRequest {
-            stream: "s",
+            stream: key("s"),
             req: 7,
             author: AUTHOR,
             expect_ver: 0,
@@ -263,7 +268,7 @@ async fn a_dead_wal_ends_level_3_waits_and_reaches_a_core_with_nothing_queued() 
     // The other core has never tried the WAL.
     let name = (0..)
         .map(|n| format!("t{n}"))
-        .find(|name| server::shard_of(name, harness.node().virtual_shard_count()) % 2 == 1)
+        .find(|name| server::shard_of(key(name), harness.node().virtual_shard_count()) % 2 == 1)
         .unwrap();
     let mut other = harness.node().client(1).await;
     tokio::time::sleep(std::time::Duration::from_millis(QUIET_MS)).await;

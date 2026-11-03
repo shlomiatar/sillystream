@@ -36,8 +36,10 @@ A flipped bit in a closed WAL file can't be told from the file's normal end, so 
 ```
 sillystream-server --listen 0.0.0.0:443 --wal-dir /mnt/ebs/wal --data-dir /mnt/nvme/data \
     --cert cert.pem --key key.pem --token-secret-file secret \
-    --object-store s3:my-bucket
+    --stream-key-file stream-key --object-store s3:my-bucket
 ```
+
+- **The stream key.** `--stream-key-file` holds 64 hex digits, one 32-byte key for the whole deployment (sections 1 and 13). Every stream id, cursor name and sink target is stored as a keyed hash of it, so the bucket never holds a name. Keep it outside the bucket, give every node the same one, and never change it: a different key finds none of the existing streams. Make one with `head -c 32 /dev/urandom | xxd -p -c 64`.
 
 - **Attach before you start.** Have the supervisor attach and mount the WAL volume before it starts the process. A start that finds `--wal-dir` empty while the ownership record already has a generation logs that the WAL was lost, and takes a new generation with the last valid id from the checkpoints. Acked entries above that id are then fenced: they stay unreadable even after the volume comes back (BUILD_NOTES D228, Q43). The server warns on each later start that finds such entries and keeps their files. There is no tool yet that restores them. Don't delete those files if you may want them back.
 - **Machine loss.** Something external, such as an auto-scaling group, starts the replacement. With EBS, it reattaches the volume; force-detaching is what stops the old machine's WAL writes (section 8.1).

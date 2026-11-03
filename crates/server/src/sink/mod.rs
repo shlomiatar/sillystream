@@ -13,6 +13,7 @@ mod worker;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use format::KeyHash;
 use object_store::ObjectStore;
 use rustls::ClientConfig;
 use tokio::runtime::Handle;
@@ -123,7 +124,7 @@ pub trait SinkHook: Send + Sync {
 /// A core saying that a sink changed.
 #[derive(Debug, Clone)]
 pub(crate) struct SinkNote {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub sink_id: u64,
 }
 
@@ -147,7 +148,7 @@ pub(crate) struct PoolContext {
     pub in_flight: Semaphore,
 }
 
-type SinkKey = (Arc<str>, u64);
+type SinkKey = (KeyHash, u64);
 
 const RESTART_DELAY_MS: u64 = 5;
 
@@ -177,8 +178,7 @@ struct Registry {
 impl Registry {
     fn spawn(&mut self, key: SinkKey, note_count: u64, start_delay_ms: u64) {
         let (notes, notes_rx) = watch::channel(note_count);
-        self.running
-            .insert(key.clone(), Running { notes, note_count });
+        self.running.insert(key, Running { notes, note_count });
         let thread = self.next_thread % self.handles.len();
         self.next_thread = self.next_thread.wrapping_add(1);
         let (context, exits) = (Arc::clone(&self.context), self.exits_tx.clone());
@@ -240,7 +240,7 @@ impl SinkPool {
         store: Arc<dyn ObjectStore>,
         notes_tx: mpsc::UnboundedSender<SinkNote>,
         notes: mpsc::UnboundedReceiver<SinkNote>,
-        streams: Vec<String>,
+        streams: Vec<KeyHash>,
     ) -> std::io::Result<SinkPool> {
         let mut stops = Vec::new();
         let mut threads = Vec::new();
@@ -287,10 +287,9 @@ impl SinkPool {
             let mut found = Vec::new();
             for stream in streams {
                 // Asking loads the stream, and its load is retried until it works (D140).
-                if let Ok(info) = client.stream_info(&stream).await {
-                    let stream: Arc<str> = Arc::from(stream);
+                if let Ok(info) = client.stream_info(stream).await {
                     for (sink_id, _, _) in info.sinks {
-                        found.push((Arc::clone(&stream), sink_id));
+                        found.push((stream, sink_id));
                     }
                 }
             }

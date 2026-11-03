@@ -24,6 +24,11 @@ use object_store::{
 use server::{ManualClock, Node, NodeConfig, Publish, Reply};
 use storage::{ReplayedEntry, WalFile, WalVolume, encode_file_header, replay_bytes};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 pub const START_MS: u64 = 1_800_000_000_000;
 pub const AUTHOR: NonZeroU64 = NonZeroU64::new(77).unwrap();
 
@@ -60,7 +65,7 @@ impl WalScript {
     pub fn stream_entries(&self, stream: &str) -> Vec<ReplayedEntry> {
         self.entries()
             .into_iter()
-            .filter(|entry| entry.stream == stream)
+            .filter(|entry| entry.stream == key(stream))
             .collect()
     }
 }
@@ -346,7 +351,7 @@ pub fn add_record(out: &mut Vec<u8>, options: u64, data: &[u8], count: u16) {
 
 pub fn publish<'a>(stream: &'a str, records: &'a [u8], producer_seq: u64, ack: u8) -> Publish<'a> {
     Publish {
-        stream,
+        stream: key(stream),
         handle: 9,
         producer_id: 1,
         producer_seq,
@@ -522,7 +527,7 @@ pub async fn total_stat(node: &Node, stat: impl Fn(&server::CoreStats) -> u64) -
 /// Makes a stream by publishing nothing into it yet.
 pub async fn make_stream(client: &mut server::Client, stream: &str) {
     client
-        .configure(stream, server::StreamConfig::default())
+        .configure(key(stream), server::StreamConfig::default())
         .await;
 }
 
@@ -546,7 +551,7 @@ pub async fn wait_for_memory_to_empty(node: &Node, stream: &str) {
     loop {
         let mut held = 0;
         for core in 0..node.core_count() {
-            held += node.read_memory(core, stream).await.len();
+            held += node.read_memory(core, key(stream)).await.len();
         }
         if held == 0 {
             return;

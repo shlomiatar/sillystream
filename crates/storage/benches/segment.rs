@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::{CountingStore, put_parts, record};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use format::KeyHash;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -19,16 +20,17 @@ use storage::{BuiltSegment, SegmentBuilder, SegmentReader};
 const STREAM_COUNTS: [u64; 3] = [1, 1_000, 1_000_000];
 const FIRST_ID: u64 = 1_800_000_000_000 << 16;
 
-fn names(stream_count: u64) -> Vec<String> {
+fn names(stream_count: u64) -> Vec<KeyHash> {
+    let identity = format::IdentityKey::new([0; 32]);
     (0..stream_count)
-        .map(|index| format!("logs.{index}"))
+        .map(|index| identity.hash(&format!("logs.{index}")))
         .collect()
 }
 
-fn build(names: &[String], payload: &Bytes) -> BuiltSegment {
+fn build(names: &[KeyHash], payload: &Bytes) -> BuiltSegment {
     let mut builder = SegmentBuilder::new();
     for name in names {
-        builder.add_extent(name, [payload.clone()]).unwrap();
+        builder.add_extent(*name, [payload.clone()]).unwrap();
     }
     builder.finish().unwrap()
 }
@@ -60,7 +62,12 @@ fn build_rate(c: &mut Criterion) {
     group.bench_function("one_stream_32MiB", |b| {
         b.iter(|| {
             let mut builder = SegmentBuilder::new();
-            builder.add_extent("logs.big", [wire.clone()]).unwrap();
+            builder
+                .add_extent(
+                    format::IdentityKey::new([0; 32]).hash("logs.big"),
+                    [wire.clone()],
+                )
+                .unwrap();
             black_box(builder.finish().unwrap())
         })
     });
@@ -97,7 +104,7 @@ fn lookup(c: &mut Criterion) {
         let top = runtime.block_on(reader.read_top_index()).unwrap();
         let top_reads = counting.gets();
         counting.reset_gets();
-        let extents = runtime.block_on(reader.lookup(&top, middle)).unwrap();
+        let extents = runtime.block_on(reader.lookup(&top, *middle)).unwrap();
         let page_reads = counting.gets();
         counting.reset_gets();
         runtime.block_on(reader.read_extent(&extents[0])).unwrap();
@@ -112,14 +119,14 @@ fn lookup(c: &mut Criterion) {
         let mut index = 0usize;
         let mut next = move || {
             index = (index + 7919) % names.len();
-            names[index].clone()
+            names[index]
         };
         group.bench_function(BenchmarkId::new("full", stream_count), |b| {
             b.iter(|| {
                 let name = next();
                 runtime.block_on(async {
                     let top = reader.read_top_index().await.unwrap();
-                    let extents = reader.lookup(&top, &name).await.unwrap();
+                    let extents = reader.lookup(&top, name).await.unwrap();
                     black_box(reader.read_extent(&extents[0]).await.unwrap())
                 })
             })
@@ -128,7 +135,7 @@ fn lookup(c: &mut Criterion) {
             b.iter(|| {
                 let name = next();
                 runtime.block_on(async {
-                    let extents = reader.lookup(&top, &name).await.unwrap();
+                    let extents = reader.lookup(&top, name).await.unwrap();
                     black_box(reader.read_extent(&extents[0]).await.unwrap())
                 })
             })

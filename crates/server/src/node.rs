@@ -12,6 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bytes::Bytes;
+use format::{IdentityKey, KeyHash};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
@@ -25,11 +26,11 @@ use tokio::time::Instant;
 
 use crate::clock::Clock;
 use crate::compaction::{
-    CompactCmd, CompactReport, CompactionConfig, Compactor, ExpireReport, MANIFEST_STREAM,
-    RetentionClass,
+    CompactCmd, CompactReport, CompactionConfig, Compactor, ExpireReport, RetentionClass,
 };
 use crate::connection::{Connection, DeliverySettings, Stores};
 use crate::core::{Core, CoreConfig, CoreInbox, CoreParts, CoreToNode, Links};
+use crate::keys::Keys;
 use crate::message::{
     ControlMsg, CoreStats, CursorOp, PublishMsg, Reply, RunOnCore, SinkOp, SnapshotReply,
     StateChange, StateOpMsg, StreamConfig, StreamConfigPatch, StreamInfo, WriteMsg,
@@ -53,6 +54,9 @@ pub struct LocalCacheConfig {
 #[derive(Clone)]
 pub struct NodeConfig {
     pub node_name: String,
+    /// The deployment's identity key and what is made with it (section 1). `new` gives an
+    /// all-zero key, which only tests use: the binary doesn't start without one.
+    pub keys: Keys,
     pub generation: u64,
     pub last_valid_id: u64,
     pub core_count: usize,
@@ -155,6 +159,7 @@ impl NodeConfig {
     pub fn new(core_count: usize) -> NodeConfig {
         NodeConfig {
             node_name: "node".to_owned(),
+            keys: Keys::new(IdentityKey::new([0; IdentityKey::BYTES])),
             generation: 1,
             last_valid_id: 0,
             core_count,
@@ -245,7 +250,7 @@ pub(crate) enum NodeMsg {
         reply: oneshot::Sender<bool>,
     },
     SetOverride {
-        stream: Arc<str>,
+        stream: KeyHash,
         to: usize,
         reply: oneshot::Sender<Option<u32>>,
     },
@@ -263,7 +268,7 @@ struct Control {
     wal: WalSender<SlabBytes>,
     tx: mpsc::UnboundedSender<NodeMsg>,
     location: Vec<u16>,
-    overrides: HashMap<Arc<str>, u32>,
+    overrides: HashMap<KeyHash, u32>,
     seal_count: u64,
     rotating: bool,
     /// The seal being rotated, if its upload already ended: it finishes once the rotation
@@ -579,7 +584,7 @@ impl Control {
             // each manifest would make an object that makes a manifest (Q4).
             let others = extents
                 .iter()
-                .any(|extent| &*extent.stream != MANIFEST_STREAM);
+                .any(|extent| extent.stream != self.config.keys.manifest);
             if self.manifests && others {
                 self.publish_manifest(path.to_string(), *len_bytes);
             } else if let Some(meta) = &mut self.meta {
@@ -633,7 +638,7 @@ impl Control {
     fn publish_manifest(&mut self, path: String, len_bytes: u64) {
         storage::crash_point("manifest.before_publish");
         let (reply, answer) = mpsc::unbounded_channel();
-        let shard = shard_of(MANIFEST_STREAM, self.config.virtual_shard_count);
+        let shard = shard_of(self.config.keys.manifest, self.config.virtual_shard_count);
         let core = self.location[shard as usize] as usize;
         let doc = format::encode_manifest_doc(len_bytes, &path);
         let _ = self.links.control[core].send(ControlMsg::PublishManifest { doc, reply });
@@ -694,11 +699,11 @@ impl Control {
         moves
     }
 
-    async fn set_override(&mut self, stream: Arc<str>, to: usize) -> Option<u32> {
+    async fn set_override(&mut self, stream: KeyHash, to: usize) -> Option<u32> {
         if to >= self.config.core_count {
             return None;
         }
-        if let Some(shard) = self.overrides.get(&*stream).copied() {
+        if let Some(shard) = self.overrides.get(&stream).copied() {
             self.move_shard(shard, to).await;
             return Some(shard);
         }
@@ -707,11 +712,11 @@ impl Control {
             return None;
         }
         let new_shard = self.config.virtual_shard_count + used;
-        let at = self.location[shard_of(&stream, self.config.virtual_shard_count) as usize];
+        let at = self.location[shard_of(stream, self.config.virtual_shard_count) as usize];
         let (done, finished) = oneshot::channel();
         self.links.control[at as usize]
             .send(ControlMsg::SplitStream {
-                stream: Arc::clone(&stream),
+                stream,
                 new_shard,
                 to,
                 done,
@@ -762,13 +767,11 @@ impl NodeHandle {
     }
 
     /// `Node::set_override`, for a socket task.
-    pub(crate) async fn set_override(&self, stream: &str, to: usize) -> Option<u32> {
+    pub(crate) async fn set_override(&self, stream: KeyHash, to: usize) -> Option<u32> {
         let (reply, answer) = oneshot::channel();
-        let _ = self.to_control.send(NodeMsg::SetOverride {
-            stream: Arc::from(stream),
-            to,
-            reply,
-        });
+        let _ = self
+            .to_control
+            .send(NodeMsg::SetOverride { stream, to, reply });
         answer.await.ok().flatten()
     }
 
@@ -903,6 +906,7 @@ impl Node {
         let prepared = {
             // On its own thread, since the caller may already be inside a runtime.
             let (wal_dir, store) = (recover.wal_dir.clone(), Arc::clone(&store));
+            let manifest = config.keys.manifest;
             let segment_dir = config.local_cache.as_ref().map(|local| local.dir.clone());
             std::thread::spawn(move || {
                 runtime()?
@@ -912,6 +916,7 @@ impl Node {
                         local_store,
                         &store,
                         now_ms,
+                        manifest,
                     ))
                     .map_err(io::Error::other)
             })
@@ -1071,6 +1076,7 @@ impl Node {
             let core = Core::new(CoreParts {
                 config: CoreConfig {
                     id,
+                    keys: config.keys.clone(),
                     virtual_shard_count: config.virtual_shard_count,
                     override_shard_count: config.override_shard_count,
                     core_count,
@@ -1127,19 +1133,19 @@ impl Node {
         let mut sink_streams = Vec::new();
         if let (Some(parts), Some((loader_tx, loader_rx))) = (recovered, loader) {
             // The newest saved list, and anything only the WAL's replay has found (D198).
-            let saved_sink_streams: BTreeSet<String> =
+            let saved_sink_streams: BTreeSet<KeyHash> =
                 parts.checkpoints.sink_streams().into_iter().collect();
             let mut known_sink_streams = saved_sink_streams;
             for stream in &parts.restored {
                 if !stream.meta.sinks.is_empty() {
-                    known_sink_streams.insert(stream.meta.name.clone());
+                    known_sink_streams.insert(stream.meta.stream);
                 }
             }
-            sink_streams = known_sink_streams.iter().cloned().collect();
+            sink_streams = known_sink_streams.iter().copied().collect();
             // Before anything can reach the cores: these come first in each one's control
             // channel, and control is what a core reads first (D134).
             for stream in parts.restored {
-                let shard = shard_of(&stream.meta.name, config.virtual_shard_count);
+                let shard = shard_of(stream.meta.stream, config.virtual_shard_count);
                 let core = shard as usize % core_count;
                 let _ = links.control[core].send(ControlMsg::Restore(Box::new(stream)));
             }
@@ -1161,6 +1167,7 @@ impl Node {
                     store: Arc::clone(&store),
                     clock: Arc::clone(&clock),
                     links: links.clone(),
+                    keys: config.keys.clone(),
                     virtual_shard_count: config.virtual_shard_count,
                     core_count,
                     window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
@@ -1375,12 +1382,9 @@ impl Node {
     }
 
     /// Stamped batches `core` holds for a stream, in id order.
-    pub async fn read_memory(&self, core: usize, stream: &str) -> Vec<SlabBytes> {
+    pub async fn read_memory(&self, core: usize, stream: KeyHash) -> Vec<SlabBytes> {
         let (reply, answer) = oneshot::channel();
-        let _ = self.links.control[core].send(ControlMsg::ReadMemory {
-            stream: Arc::from(stream),
-            reply,
-        });
+        let _ = self.links.control[core].send(ControlMsg::ReadMemory { stream, reply });
         answer.await.unwrap_or_default()
     }
 
@@ -1441,13 +1445,11 @@ impl Node {
 
     /// Gives a stream its own shard, on core `to`. `None` if the table is full or the core
     /// doesn't exist.
-    pub async fn set_override(&self, stream: &str, to: usize) -> Option<u32> {
+    pub async fn set_override(&self, stream: KeyHash, to: usize) -> Option<u32> {
         let (reply, answer) = oneshot::channel();
-        let _ = self.to_control.send(NodeMsg::SetOverride {
-            stream: Arc::from(stream),
-            to,
-            reply,
-        });
+        let _ = self
+            .to_control
+            .send(NodeMsg::SetOverride { stream, to, reply });
         answer.await.ok().flatten()
     }
 
@@ -1507,7 +1509,7 @@ impl Drop for Node {
 /// One publish, as a `PUBLISH` frame carries it.
 #[derive(Debug, Clone)]
 pub struct Publish<'a> {
-    pub stream: &'a str,
+    pub stream: KeyHash,
     pub handle: u32,
     pub producer_id: u64,
     pub producer_seq: u64,
@@ -1520,8 +1522,8 @@ pub struct Publish<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub struct StateOpRequest<'a> {
-    pub stream: &'a str,
+pub struct StateOpRequest {
+    pub stream: KeyHash,
     pub req: u32,
     pub author: NonZeroU64,
     pub expect_ver: u64,
@@ -1532,7 +1534,7 @@ pub struct StateOpRequest<'a> {
 /// A `PUBLISH` read off a socket. Its records are already in a slab, so nothing is copied.
 #[derive(Debug)]
 pub(crate) struct RegionPublish {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub handle: u32,
     pub producer_id: u64,
     pub producer_seq: u64,
@@ -1545,7 +1547,7 @@ pub(crate) struct RegionPublish {
 /// A `STATE_OP` read off a socket.
 #[derive(Debug)]
 pub(crate) struct OwnedStateOp {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub req: u32,
     pub author: NonZeroU64,
     pub change: StateChange,
@@ -1559,7 +1561,7 @@ pub enum ClientError {
 }
 
 struct ClientRoute {
-    stream: Arc<str>,
+    stream: KeyHash,
     core: usize,
     barrier_pending: bool,
 }
@@ -1575,7 +1577,7 @@ pub struct Client {
     links: Arc<Links>,
     virtual_shard_count: u32,
     location_hint: Arc<Vec<u16>>,
-    routes: HashMap<Arc<str>, ClientRoute>,
+    routes: HashMap<KeyHash, ClientRoute>,
     reply_tx: mpsc::UnboundedSender<Reply>,
     reply_rx: mpsc::UnboundedReceiver<Reply>,
     /// Replies that arrived while a write waited for a barrier, for `recv` to return.
@@ -1585,30 +1587,29 @@ pub struct Client {
 }
 
 impl Client {
-    fn route(&mut self, stream: &str) -> (Arc<str>, usize) {
-        if let Some(route) = self.routes.get(stream) {
-            return (Arc::clone(&route.stream), route.core);
+    fn route(&mut self, stream: KeyHash) -> (KeyHash, usize) {
+        if let Some(route) = self.routes.get(&stream) {
+            return (route.stream, route.core);
         }
         let shard = shard_of(stream, self.virtual_shard_count);
         let core = self.location_hint[shard as usize] as usize;
-        let name: Arc<str> = Arc::from(stream);
         self.routes.insert(
-            Arc::clone(&name),
+            stream,
             ClientRoute {
-                stream: Arc::clone(&name),
+                stream,
                 core,
                 barrier_pending: false,
             },
         );
-        (name, core)
+        (stream, core)
     }
 
     /// Waits for a barrier out on this stream's route, so that a write can't be sent behind
     /// it. Safe to cancel: what has arrived is kept.
-    async fn wait_for_barrier(&mut self, stream: &str) -> Result<(), ClientError> {
+    async fn wait_for_barrier(&mut self, stream: KeyHash) -> Result<(), ClientError> {
         while let Some(route) = self
             .routes
-            .get(stream)
+            .get(&stream)
             .filter(|route| route.barrier_pending)
         {
             let core = route.core;
@@ -1626,10 +1627,10 @@ impl Client {
     }
 
     /// `wait_for_barrier`, with only what has already arrived. True if none is out.
-    fn barrier_is_back(&mut self, stream: &str) -> bool {
+    fn barrier_is_back(&mut self, stream: KeyHash) -> bool {
         while self
             .routes
-            .get(stream)
+            .get(&stream)
             .is_some_and(|route| route.barrier_pending)
         {
             let Ok(reply) = self.reply_rx.try_recv() else {
@@ -1698,8 +1699,8 @@ impl Client {
     /// memory cap, while a barrier is out, or with the core's inbox full.
     fn write_permit(
         &mut self,
-        stream: &str,
-    ) -> Result<(Arc<str>, mpsc::Permit<'_, WriteMsg>), ClientError> {
+        stream: KeyHash,
+    ) -> Result<(KeyHash, mpsc::Permit<'_, WriteMsg>), ClientError> {
         if self.pool.account().pinned_bytes() >= self.memory_cap_bytes {
             return Err(ClientError::Full);
         }
@@ -1725,7 +1726,7 @@ impl Client {
         publish: RegionPublish,
     ) -> Result<(), (ClientError, RegionPublish)> {
         let reply = self.reply_tx.clone();
-        match self.write_permit(&publish.stream) {
+        match self.write_permit(publish.stream) {
             Err(error) => Err((error, publish)),
             Ok((stream, permit)) => {
                 permit.send(WriteMsg::Publish(Box::new(PublishMsg {
@@ -1753,7 +1754,7 @@ impl Client {
         op: OwnedStateOp,
     ) -> Result<(), (ClientError, OwnedStateOp)> {
         let reply = self.reply_tx.clone();
-        match self.write_permit(&op.stream) {
+        match self.write_permit(op.stream) {
             Err(error) => Err((error, op)),
             Ok((stream, permit)) => {
                 permit.send(WriteMsg::StateOp(Box::new(StateOpMsg {
@@ -1769,7 +1770,7 @@ impl Client {
         }
     }
 
-    pub async fn stream_info(&mut self, stream: &str) -> Result<StreamInfo, ErrorCode> {
+    pub async fn stream_info(&mut self, stream: KeyHash) -> Result<StreamInfo, ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::StreamInfo { stream, reply });
@@ -1779,7 +1780,7 @@ impl Client {
     /// Creates the stream if needed, and changes what the patch sets.
     pub(crate) async fn configure_patch(
         &mut self,
-        stream: &str,
+        stream: KeyHash,
         patch: StreamConfigPatch,
     ) -> Option<StreamConfig> {
         let (stream, core) = self.route(stream);
@@ -1794,7 +1795,7 @@ impl Client {
 
     /// False if there was no such stream. On a node with a metadata store this answers once a
     /// checkpoint holds the delete (D20).
-    pub async fn delete_stream(&mut self, stream: &str) -> bool {
+    pub async fn delete_stream(&mut self, stream: KeyHash) -> bool {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::DeleteStream { stream, reply });
@@ -1806,7 +1807,7 @@ impl Client {
     /// slab partly filled against the memory cap (D246).
     pub(crate) async fn publish_forward(
         &mut self,
-        target: &str,
+        target: KeyHash,
         record: &[u8],
         producer_id: u64,
         producer_seq: u64,
@@ -1841,7 +1842,7 @@ impl Client {
 
     /// A change to a stream's sinks. Stream and sink ops from a person are answered once a
     /// checkpoint holds them, on a node with a store (D196).
-    pub async fn sink_op(&mut self, stream: &str, op: SinkOp) -> Result<(), ErrorCode> {
+    pub async fn sink_op(&mut self, stream: KeyHash, op: SinkOp) -> Result<(), ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::Sink { stream, op, reply });
@@ -1851,8 +1852,8 @@ impl Client {
     /// `PUT .../cursor/<name>`: forward only unless `reset`. Answers with where it ended up.
     pub(crate) async fn put_cursor(
         &mut self,
-        stream: &str,
-        name: &str,
+        stream: KeyHash,
+        name: KeyHash,
         id: u64,
         reset: bool,
     ) -> Result<u64, ErrorCode> {
@@ -1860,7 +1861,7 @@ impl Client {
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::Cursor {
             stream,
-            name: Arc::from(name),
+            name,
             op: CursorOp::Put { id, reset, reply },
             report: None,
             ticket: None,
@@ -1881,7 +1882,7 @@ impl Client {
         None
     }
 
-    pub async fn state_op(&mut self, request: StateOpRequest<'_>) -> Result<(), ClientError> {
+    pub async fn state_op(&mut self, request: StateOpRequest) -> Result<(), ClientError> {
         self.wait_for_barrier(request.stream).await?;
         let (stream, core) = self.route(request.stream);
         let message = WriteMsg::StateOp(Box::new(StateOpMsg {
@@ -1903,7 +1904,7 @@ impl Client {
     }
 
     /// State and head as one step. Error 2 if the stream doesn't exist.
-    pub async fn snapshot(&mut self, stream: &str) -> Result<SnapshotReply, ErrorCode> {
+    pub async fn snapshot(&mut self, stream: KeyHash) -> Result<SnapshotReply, ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::Snapshot { stream, reply });
@@ -1911,7 +1912,7 @@ impl Client {
     }
 
     /// Creates the stream if needed, and sets its config.
-    pub async fn configure(&mut self, stream: &str, config: StreamConfig) {
+    pub async fn configure(&mut self, stream: KeyHash, config: StreamConfig) {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
         let _ = self.links.control[core].send(ControlMsg::Configure {
@@ -1923,14 +1924,14 @@ impl Client {
     }
 
     /// The core this client currently sends a stream's messages to.
-    pub fn route_of(&mut self, stream: &str) -> usize {
+    pub fn route_of(&mut self, stream: KeyHash) -> usize {
         self.route(stream).1
     }
 
     fn on_internal(&mut self, reply: Reply) -> Option<Reply> {
         match reply {
             Reply::Moved { stream } => {
-                if let Some(route) = self.routes.get_mut(&*stream)
+                if let Some(route) = self.routes.get_mut(&stream)
                     && !route.barrier_pending
                 {
                     // If the inbox is full, the next forwarded message tries again.
@@ -1944,7 +1945,7 @@ impl Client {
                 None
             }
             Reply::RouteDone { stream, core } => {
-                if let Some(route) = self.routes.get_mut(&*stream) {
+                if let Some(route) = self.routes.get_mut(&stream) {
                     route.core = core;
                     route.barrier_pending = false;
                 }
@@ -1992,7 +1993,7 @@ impl Client {
 fn carried_extents(restored: &[crate::recovery::RestoredStream]) -> Vec<SealExtent> {
     let mut extents: Vec<SealExtent> = Vec::new();
     for stream in restored {
-        let name: Arc<str> = Arc::from(stream.meta.name.as_str());
+        let name = stream.meta.stream;
         let mut previous_last_id: Option<u64> = None;
         for batch in &stream.batches {
             let split = previous_last_id.is_none_or(|last_id| {
@@ -2004,7 +2005,7 @@ fn carried_extents(restored: &[crate::recovery::RestoredStream]) -> Vec<SealExte
             });
             if split {
                 extents.push(SealExtent {
-                    stream: Arc::clone(&name),
+                    stream: name,
                     records: Vec::new(),
                 });
             }

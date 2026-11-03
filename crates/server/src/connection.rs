@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::{Clause, Decision, Filter};
+use format::{Clause, Decision, Filter, KeyHash};
 use object_store::ObjectStore;
 use proto::ErrorCode;
 use storage::{BlockTable, SegmentError, SegmentReader};
@@ -20,8 +20,7 @@ use tokio::time::Instant;
 
 use crate::core::Links;
 use crate::delivery::{
-    CURSOR_NAME_REFUSED, ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
-    cursor_name_is_allowed, walk_records,
+    ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, walk_records,
 };
 use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
@@ -129,12 +128,12 @@ pub enum Event {
 #[derive(Debug, Clone, Copy)]
 pub struct Subscription<'a> {
     pub sub: u32,
-    pub stream: &'a str,
+    pub stream: KeyHash,
     pub from: u64,
     pub linger_ms: u16,
     pub author: Option<u64>,
     pub clauses: &'a [Clause],
-    pub name: Option<&'a str>,
+    pub name: Option<KeyHash>,
     pub with_state: bool,
     pub state_only: bool,
     pub include_system: bool,
@@ -144,7 +143,7 @@ pub struct Subscription<'a> {
 
 impl<'a> Subscription<'a> {
     /// Everything but system records, from `from`, with no linger.
-    pub fn new(sub: u32, stream: &'a str, from: u64) -> Subscription<'a> {
+    pub fn new(sub: u32, stream: KeyHash, from: u64) -> Subscription<'a> {
         Subscription {
             sub,
             stream,
@@ -332,11 +331,11 @@ impl Connection {
         self.send(ConnCmd::Subscribe {
             conn: self.conn,
             sub: subscription.sub,
-            stream: Arc::from(subscription.stream),
+            stream: subscription.stream,
             from: subscription.from,
             linger_ms: subscription.linger_ms,
             filter: filter.ok(),
-            name: subscription.name.map(Arc::from),
+            name: subscription.name,
             with_state: subscription.with_state,
             state_only: subscription.state_only,
             tag: subscription.tag,
@@ -368,21 +367,21 @@ impl Connection {
     }
 
     /// The explicit reset of section 5.1, which alone can move a cursor back.
-    pub fn reset_cursor(&self, stream: &str, name: &str, id: u64) {
+    pub fn reset_cursor(&self, stream: KeyHash, name: KeyHash, id: u64) {
         self.send(ConnCmd::ResetCursor {
             conn: self.conn,
-            stream: Arc::from(stream),
-            name: Arc::from(name),
+            stream,
+            name,
             id,
         });
     }
 
     /// Where a named cursor is. In order with this connection's commits and resets.
-    pub async fn read_cursor(&self, stream: &str, name: &str) -> Option<u64> {
+    pub async fn read_cursor(&self, stream: KeyHash, name: KeyHash) -> Option<u64> {
         let (reply, answer) = oneshot::channel();
         self.send(ConnCmd::ReadCursor {
-            stream: Arc::from(stream),
-            name: Arc::from(name),
+            stream,
+            name,
             reply,
         });
         answer.await.ok().flatten()
@@ -505,10 +504,10 @@ struct Sub {
     serial: u64,
     conn: usize,
     id: u32,
-    stream: Arc<str>,
+    stream: KeyHash,
     filter: Filter,
     linger_ms: u16,
-    name: Option<Arc<str>>,
+    name: Option<KeyHash>,
     tag: u64,
     mode: Mode,
     subscribed_sent: bool,
@@ -752,11 +751,11 @@ pub(crate) struct Home {
     subs: Vec<Option<Sub>>,
     free_subs: Vec<usize>,
     next_uid: u64,
-    streams: HashMap<Arc<str>, HomeStream>,
+    streams: HashMap<KeyHash, HomeStream>,
     ready: Vec<usize>,
     linger: BinaryHeap<Reverse<(Instant, usize, u64)>>,
     /// Streams whose subscribers may owe a `PROGRESS`.
-    skipping: HashSet<Arc<str>>,
+    skipping: HashSet<KeyHash>,
     next_progress_check: Instant,
     spans: Vec<RecordSpan>,
     after_turn: Vec<usize>,
@@ -893,18 +892,6 @@ impl Home {
                 name,
                 id,
             } => {
-                if !cursor_name_is_allowed(&name) {
-                    self.send_event(
-                        conn,
-                        Event::Error {
-                            reference: 0,
-                            code: ErrorCode::Malformed,
-                            msg: CURSOR_NAME_REFUSED.to_owned(),
-                            ended: None,
-                        },
-                    );
-                    return;
-                }
                 let report = self.cursor_report(conn, 0);
                 self.post_cursor(stream, name, CursorOp::Reset(id), report, None);
             }
@@ -949,8 +936,8 @@ impl Home {
 
     fn post_cursor(
         &self,
-        stream: Arc<str>,
-        name: Arc<str>,
+        stream: KeyHash,
+        name: KeyHash,
         op: CursorOp,
         report: Option<CursorReport>,
         ticket: Option<CommandTicket>,
@@ -970,7 +957,7 @@ impl Home {
             .and_then(|c| c.subs.get(&sub).copied());
         let target = key
             .and_then(|key| self.subs[key].as_ref())
-            .and_then(|sub| sub.name.clone().map(|name| (Arc::clone(&sub.stream), name)));
+            .and_then(|sub| sub.name.map(|name| (sub.stream, name)));
         let Some((stream, name)) = target else {
             self.send_event(
                 conn,
@@ -992,11 +979,11 @@ impl Home {
         &mut self,
         conn: usize,
         id: u32,
-        stream: Arc<str>,
+        stream: KeyHash,
         from: u64,
         linger_ms: u16,
         filter: Option<Filter>,
-        name: Option<Arc<str>>,
+        name: Option<KeyHash>,
         with_state: bool,
         state_only: bool,
         tag: u64,
@@ -1020,11 +1007,6 @@ impl Home {
             ))
         } else if filter.is_none() {
             Some(error(ErrorCode::Malformed, "more than 4 clauses"))
-        } else if name
-            .as_deref()
-            .is_some_and(|name| !cursor_name_is_allowed(name))
-        {
-            Some(error(ErrorCode::Malformed, CURSOR_NAME_REFUSED))
         } else {
             None
         };
@@ -1039,10 +1021,10 @@ impl Home {
             serial: uid,
             conn,
             id,
-            stream: Arc::clone(&stream),
+            stream,
             filter: filter.expect("checked above"),
             linger_ms,
-            name: name.clone(),
+            name,
             tag,
             mode: Mode::Attaching,
             subscribed_sent: false,
@@ -1092,9 +1074,9 @@ impl Home {
         })));
     }
 
-    fn detach_from_owner(&self, stream: &Arc<str>, filter_id: u32) {
+    fn detach_from_owner(&self, stream: &KeyHash, filter_id: u32) {
         let _ = self.links.control[self.me].send(ControlMsg::Detach {
-            stream: Arc::clone(stream),
+            stream: *stream,
             filter_id,
             home: self.me,
         });
@@ -1105,7 +1087,7 @@ impl Home {
         let Some(sub) = self.subs[key].as_ref() else {
             return;
         };
-        let stream = Arc::clone(&sub.stream);
+        let stream = sub.stream;
         let filter_id = match sub.mode {
             Mode::Live { filter_id } => filter_id,
             Mode::StateOnly => STATE_ONLY_FILTER_ID,
@@ -1428,8 +1410,8 @@ impl Home {
     }
 
     /// From an owner: `seq` puts its messages in order, whichever owner sent each.
-    pub fn on_stream(&mut self, stream: Arc<str>, seq: u64, body: StreamBody) {
-        let home_stream = self.streams.entry(Arc::clone(&stream)).or_default();
+    pub fn on_stream(&mut self, stream: KeyHash, seq: u64, body: StreamBody) {
+        let home_stream = self.streams.entry(stream).or_default();
         if seq != home_stream.next_seq {
             home_stream.reorder.insert(seq, body);
             return;
@@ -1437,7 +1419,7 @@ impl Home {
         home_stream.next_seq += 1;
         self.apply(&stream, body);
         loop {
-            let home_stream = self.streams.entry(Arc::clone(&stream)).or_default();
+            let home_stream = self.streams.entry(stream).or_default();
             let next = home_stream.next_seq;
             let Some(body) = home_stream.reorder.remove(&next) else {
                 return;
@@ -1447,7 +1429,7 @@ impl Home {
         }
     }
 
-    fn apply(&mut self, stream: &Arc<str>, body: StreamBody) {
+    fn apply(&mut self, stream: &KeyHash, body: StreamBody) {
         match body {
             StreamBody::Attached {
                 sub,
@@ -1465,7 +1447,7 @@ impl Home {
 
     /// Every subscription on the stream ends with error 2, and the owner's numbering starts
     /// over. What is in `reorder` overtook this, so it belongs to a new stream of this name.
-    fn on_deleted(&mut self, stream: &Arc<str>) {
+    fn on_deleted(&mut self, stream: &KeyHash) {
         let keys: Vec<(usize, usize, u32, u64)> = self
             .subs
             .iter()
@@ -1496,7 +1478,7 @@ impl Home {
 
     /// The stream left RAM with no live subscriber, and its numbering starts over when it
     /// comes back. A subscriber still catching up attaches then, as it would have.
-    fn on_evicted(&mut self, stream: &Arc<str>) {
+    fn on_evicted(&mut self, stream: &KeyHash) {
         if let Some(home_stream) = self.streams.get_mut(stream) {
             home_stream.next_seq = 0;
         }
@@ -1537,7 +1519,7 @@ impl Home {
     #[allow(clippy::too_many_arguments)]
     fn on_attached(
         &mut self,
-        stream: &Arc<str>,
+        stream: &KeyHash,
         sub_ref: SubRef,
         filter_id: u32,
         head: u64,
@@ -1551,7 +1533,7 @@ impl Home {
         }
         let key = sub_ref.key;
         self.say_subscribed(key, head, cursor, state_ver, state, true);
-        let home_stream = self.streams.entry(Arc::clone(stream)).or_default();
+        let home_stream = self.streams.entry(*stream).or_default();
         let sub = self.subs[key].as_mut().expect("checked above");
         let was_catching_up = sub.mode == Mode::CatchUp;
         if filter_id == STATE_ONLY_FILTER_ID {
@@ -1576,7 +1558,7 @@ impl Home {
         }
     }
 
-    fn on_fan(&mut self, stream: &Arc<str>, fan: &FanOut) {
+    fn on_fan(&mut self, stream: &KeyHash, fan: &FanOut) {
         let Some(home_stream) = self.streams.get_mut(stream) else {
             return;
         };
@@ -1619,7 +1601,7 @@ impl Home {
             Vec::new()
         };
         if has_groups {
-            self.skipping.insert(Arc::clone(stream));
+            self.skipping.insert(*stream);
         }
         for key in enqueued {
             self.after_enqueue(key);
@@ -1737,7 +1719,7 @@ impl Home {
             return;
         }
         let message = ReadStepMsg {
-            stream: Arc::clone(&sub.stream),
+            stream: sub.stream,
             sub: SubRef {
                 home: self.me,
                 key,

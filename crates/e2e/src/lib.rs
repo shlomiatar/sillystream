@@ -249,6 +249,8 @@ impl Node {
         )
         .expect("writing");
         std::fs::write(dir.path().join("secret"), SECRET).expect("writing");
+        // The all-zero key, which `NodeConfig::new` has too.
+        std::fs::write(dir.path().join("stream-key"), "0".repeat(64)).expect("writing");
         std::fs::write(dir.path().join("wrong_secret"), WRONG_SECRET).expect("writing");
         // Free now. The port stays this node's across restarts, so clients need no new address.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -306,6 +308,7 @@ impl Node {
             .args(["--cert", &self.path_text("cert.pem")])
             .args(["--key", &self.path_text("key.pem")])
             .args(["--token-secret-file", &self.path_text("secret")])
+            .args(["--stream-key-file", &self.path_text("stream-key")])
             .args([
                 "--object-store",
                 &format!("local:{}", self.path_text("objects")),
@@ -393,8 +396,10 @@ impl Node {
     }
 
     /// `(tier, bytes)` of each catch-up read of `stream` in this start.
+    /// The trace names a stream by its key hash, under the all-zero key the tests start with.
     pub fn tiers_read(&self, stream: &str) -> Vec<(String, u64)> {
-        let wanted = format!(" stream={stream:?}");
+        let key = format::IdentityKey::new([0; 32]).hash(stream);
+        let wanted = format!(" stream={key}");
         self.log_text()
             .lines()
             .filter(|line| line.starts_with("trace catch_up ") && line.ends_with(&wanted))

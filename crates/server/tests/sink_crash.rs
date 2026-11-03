@@ -40,6 +40,8 @@ impl Files {
         std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
         std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
         std::fs::write(dir.path().join("secret"), SECRET).unwrap();
+        // The all-zero key, which `NodeConfig::new` has too.
+        std::fs::write(dir.path().join("stream-key"), "0".repeat(64)).unwrap();
         Files { dir, der: cert.der }
     }
 
@@ -73,6 +75,7 @@ fn start(files: &Files, name: &str, crash_at: Option<&str>) -> Running {
         .args(["--cert", &path("cert.pem")])
         .args(["--key", &path("key.pem")])
         .args(["--token-secret-file", &path("secret")])
+        .args(["--stream-key-file", &path("stream-key")])
         .args(["--object-store", &format!("local:{}", path("objects"))])
         .args(["--cores", "2"])
         .args(["--seal-window-ms", "1000"])

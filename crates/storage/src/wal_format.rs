@@ -5,22 +5,21 @@
 //! which is what tells a replay how far to accept its entries (section 8.1, D152):
 //!
 //! ```text
-//! stream_len u16 | stream | producer_id u64 | producer_seq u64 | len u32 | crc32c u32 |
+//! stream key hash [u8; 16] | producer_id u64 | producer_seq u64 | len u32 | crc32c u32 |
 //! records | zero padding up to a multiple of 8
 //! ```
 //!
 //! The CRC is seeded with the file's `seq`, and covers every entry byte except itself.
 
 use std::fmt;
-use std::sync::Arc;
 
-use format::{crc32c, crc32c_append, crc32c_seeded};
+use format::{KeyHash, crc32c, crc32c_append, crc32c_seeded};
 
-/// `SSWAL001` as little-endian bytes on disk.
-pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SSWAL001");
+/// `SSWAL002` as little-endian bytes on disk.
+pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SSWAL002");
 pub const WAL_FILE_HEADER_BYTES: usize = 32;
-/// The entry's fixed fields, without the stream name.
-pub(crate) const ENTRY_FIXED_BYTES: usize = 2 + 8 + 8 + 4 + 4;
+/// The entry's fixed fields.
+pub(crate) const ENTRY_FIXED_BYTES: usize = KeyHash::BYTES + 8 + 8 + 4 + 4;
 pub(crate) const ZERO_PADDING: [u8; 8] = [0; 8];
 
 pub fn encode_file_header(seq: u64, generation: u64) -> [u8; WAL_FILE_HEADER_BYTES] {
@@ -36,10 +35,6 @@ pub fn encode_file_header(seq: u64, generation: u64) -> [u8; WAL_FILE_HEADER_BYT
 /// Why an entry can't be written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalEntryError {
-    /// A stream id is never empty (D42).
-    EmptyStream,
-    /// `stream_len` is a u16.
-    StreamTooLong,
     /// A publish always has at least one record (D6a).
     EmptyRecords,
     /// `len` is a u32.
@@ -49,8 +44,6 @@ pub enum WalEntryError {
 impl fmt::Display for WalEntryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            WalEntryError::EmptyStream => "stream id is empty",
-            WalEntryError::StreamTooLong => "stream id is over 65,535 bytes",
             WalEntryError::EmptyRecords => "entry has no record bytes",
             WalEntryError::RecordsTooLong => "entry records are over u32::MAX bytes",
         })
@@ -64,7 +57,7 @@ impl std::error::Error for WalEntryError {}
 /// generic because the slab reference arrives with the cores.
 #[derive(Debug, Clone)]
 pub struct WalEntry<R> {
-    stream: Arc<str>,
+    stream: KeyHash,
     producer_id: u64,
     producer_seq: u64,
     records: R,
@@ -76,14 +69,14 @@ pub struct WalEntry<R> {
 
 impl<R: AsRef<[u8]>> WalEntry<R> {
     pub fn new(
-        stream: Arc<str>,
+        stream: KeyHash,
         producer_id: u64,
         producer_seq: u64,
         records: R,
         core: usize,
         ticket: u64,
     ) -> Result<WalEntry<R>, WalEntryError> {
-        check_entry(&stream, records.as_ref())?;
+        check_entry(records.as_ref())?;
         Ok(WalEntry {
             stream,
             producer_id,
@@ -94,8 +87,8 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         })
     }
 
-    pub fn stream(&self) -> &str {
-        &self.stream
+    pub fn stream(&self) -> KeyHash {
+        self.stream
     }
 
     /// What the writer will report as durable once this entry is synced.
@@ -115,10 +108,6 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         self.records.as_ref()
     }
 
-    pub(crate) fn stream_arc(&self) -> &Arc<str> {
-        &self.stream
-    }
-
     pub(crate) fn into_records(self) -> R {
         self.records
     }
@@ -128,7 +117,7 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
     pub(crate) fn write_head(&self, seq: u64, out: &mut Vec<u8>) -> usize {
         write_head(
             seq,
-            &self.stream,
+            self.stream,
             self.producer_id,
             self.producer_seq,
             self.records.as_ref(),
@@ -137,13 +126,7 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
     }
 }
 
-fn check_entry(stream: &str, records: &[u8]) -> Result<(), WalEntryError> {
-    if stream.is_empty() {
-        return Err(WalEntryError::EmptyStream);
-    }
-    if stream.len() > usize::from(u16::MAX) {
-        return Err(WalEntryError::StreamTooLong);
-    }
+fn check_entry(records: &[u8]) -> Result<(), WalEntryError> {
     if records.is_empty() {
         return Err(WalEntryError::EmptyRecords);
     }
@@ -155,19 +138,18 @@ fn check_entry(stream: &str, records: &[u8]) -> Result<(), WalEntryError> {
 
 fn write_head(
     seq: u64,
-    stream: &str,
+    stream: KeyHash,
     producer_id: u64,
     producer_seq: u64,
     records: &[u8],
     out: &mut Vec<u8>,
 ) -> usize {
     let start = out.len();
-    out.extend_from_slice(&(stream.len() as u16).to_le_bytes());
-    out.extend_from_slice(stream.as_bytes());
+    out.extend_from_slice(&stream.0);
     out.extend_from_slice(&producer_id.to_le_bytes());
     out.extend_from_slice(&producer_seq.to_le_bytes());
     out.extend_from_slice(&(records.len() as u32).to_le_bytes());
-    let total = ENTRY_FIXED_BYTES + stream.len() + records.len();
+    let total = ENTRY_FIXED_BYTES + records.len();
     let padding = total.next_multiple_of(8) - total;
     let mut crc = crc32c_seeded(seq, &out[start..]);
     crc = crc32c_append(crc, records);
@@ -180,13 +162,13 @@ fn write_head(
 /// because it passes the records to `writev` without copying them.
 pub fn encode_wal_entry(
     seq: u64,
-    stream: &str,
+    stream: KeyHash,
     producer_id: u64,
     producer_seq: u64,
     records: &[u8],
 ) -> Result<Vec<u8>, WalEntryError> {
-    check_entry(stream, records)?;
-    let mut out = Vec::with_capacity(ENTRY_FIXED_BYTES + stream.len() + records.len() + 8);
+    check_entry(records)?;
+    let mut out = Vec::with_capacity(ENTRY_FIXED_BYTES + records.len() + 8);
     let padding = write_head(seq, stream, producer_id, producer_seq, records, &mut out);
     out.extend_from_slice(records);
     out.extend_from_slice(&ZERO_PADDING[..padding]);

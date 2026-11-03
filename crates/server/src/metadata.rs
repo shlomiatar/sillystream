@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use format::KeyHash;
 use object_store::{ObjectStore, PutPayload};
 use storage::{
     CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, MetadataError, MetadataStore,
@@ -15,7 +16,6 @@ use storage::{
     encode_meta, merge_meta, put_checkpoint, put_checkpoint_payload, retry_delay,
 };
 use tokio::sync::mpsc;
-use xxhash_rust::xxh3::xxh3_128;
 
 use crate::message::ControlMsg;
 
@@ -30,24 +30,14 @@ const KEY_OWED: &[u8] = b"p";
 /// The generation this store belongs to, little-endian. Any other generation having claimed the
 /// bucket since means S3 has moved on without it (section 7.6).
 const KEY_GENERATION: &[u8] = b"o";
-/// A stream id can be as long as a whole key (D57), so the longest ones are shortened. The
-/// value holds the whole name, which a read checks (D135).
-const KEY_NAME_BYTES: usize = 65_000;
-
-fn stream_key(tag: u8, name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(32 + name.len().min(KEY_NAME_BYTES));
+fn stream_key(tag: u8, stream: KeyHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + KeyHash::BYTES + 8);
     key.push(tag);
-    key.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    if name.len() <= KEY_NAME_BYTES {
-        key.extend_from_slice(name.as_bytes());
-    } else {
-        key.extend_from_slice(&name.as_bytes()[..KEY_NAME_BYTES]);
-        key.extend_from_slice(&xxh3_128(name.as_bytes()).to_be_bytes());
-    }
+    key.extend_from_slice(&stream.0);
     key
 }
 
-fn extent_key(name: &str, id_first: u64) -> Vec<u8> {
+fn extent_key(name: KeyHash, id_first: u64) -> Vec<u8> {
     let mut key = stream_key(TAG_EXTENT, name);
     key.extend_from_slice(&id_first.to_be_bytes());
     key
@@ -142,17 +132,14 @@ impl LocalMeta {
         self.store.apply([(KEY_GENERATION, Some(&bytes[..]))])
     }
 
-    pub(crate) fn get(&self, name: &str) -> Result<Option<StreamMeta>, LocalError> {
+    pub(crate) fn get(&self, name: KeyHash) -> Result<Option<StreamMeta>, LocalError> {
         let Some(bytes) = self.store.get(&stream_key(TAG_STREAM, name))? else {
             return Ok(None);
         };
         let mut meta =
             decode_meta(&bytes).map_err(|error| LocalError::Corrupt(error.to_string()))?;
-        if meta.name != name {
-            return Err(LocalError::Corrupt(format!(
-                "two stream ids share a key (D135): {} bytes long",
-                name.len()
-            )));
+        if meta.stream != name {
+            return Err(LocalError::Corrupt(format!("{name} holds {}", meta.stream)));
         }
         for (_, value) in self.store.scan_prefix(&stream_key(TAG_EXTENT, name))? {
             let extent =
@@ -188,7 +175,7 @@ impl LocalMeta {
             if meta.deleted {
                 for (key, _) in self
                     .store
-                    .scan_prefix(&stream_key(TAG_EXTENT, &meta.name))?
+                    .scan_prefix(&stream_key(TAG_EXTENT, meta.stream))?
                 {
                     changes.push((key, None));
                 }
@@ -199,13 +186,13 @@ impl LocalMeta {
                     .iter()
                     .any(|extent| extent.id_first == *id_first)
                 {
-                    changes.push((extent_key(&meta.name, *id_first), None));
+                    changes.push((extent_key(meta.stream, *id_first), None));
                 }
             }
             for extent in &meta.extents {
                 let mut value = Vec::with_capacity(64 + extent.path.len());
                 encode_extent(&mut value, extent);
-                changes.push((extent_key(&meta.name, extent.id_first), Some(value)));
+                changes.push((extent_key(meta.stream, extent.id_first), Some(value)));
             }
             let fields = StreamMeta {
                 extents: Vec::new(),
@@ -213,7 +200,7 @@ impl LocalMeta {
                 ..meta.clone()
             };
             changes.push((
-                stream_key(TAG_STREAM, &meta.name),
+                stream_key(TAG_STREAM, meta.stream),
                 Some(encode_meta(&fields)),
             ));
         }
@@ -233,7 +220,7 @@ impl LocalMeta {
 pub(crate) enum MetaMsg {
     Load {
         core: usize,
-        stream: Arc<str>,
+        stream: KeyHash,
         ticket: u64,
     },
     /// A new checkpoint file, for lookups to walk.
@@ -278,7 +265,7 @@ pub(crate) fn run_loader(
                 } => {
                     let mut attempt = 0;
                     let found = loop {
-                        match load_stream(&local, &checkpoints, &store, &stream).await {
+                        match load_stream(&local, &checkpoints, &store, stream).await {
                             Ok(found) => break Some(found),
                             Err(error) if stop.load(Ordering::SeqCst) => {
                                 eprintln!("loading stream metadata: {error}");
@@ -289,10 +276,8 @@ pub(crate) fn run_loader(
                             // access tries again (D243).
                             Err(error) if attempt + 1 >= LOAD_ATTEMPT_MAX_COUNT => {
                                 eprintln!("loading stream metadata of {stream}: {error}");
-                                let _ = control[core].send(ControlMsg::LoadFailed {
-                                    stream: Arc::clone(&stream),
-                                    ticket,
-                                });
+                                let _ =
+                                    control[core].send(ControlMsg::LoadFailed { stream, ticket });
                                 continue 'messages;
                             }
                             Err(error) => {
@@ -329,7 +314,7 @@ pub(crate) async fn load_stream(
     local: &LocalMeta,
     checkpoints: &CheckpointSet,
     store: &Arc<dyn ObjectStore>,
-    name: &str,
+    name: KeyHash,
 ) -> Result<(Option<StreamMeta>, bool), String> {
     if let Some(meta) = local.get(name).map_err(|error| error.to_string())? {
         return Ok((Some(meta), false));
@@ -382,18 +367,18 @@ pub(crate) struct Checkpointer {
     pub loader: mpsc::UnboundedSender<MetaMsg>,
     pub stop: Arc<AtomicBool>,
     /// Every stream with a sink, which each file lists (D198).
-    pub sink_streams: std::collections::BTreeSet<String>,
+    pub sink_streams: std::collections::BTreeSet<KeyHash>,
 }
 
 /// A stream gathered twice in one job, as a tombstone on the core it left and alive on the
 /// next: the one with the most recent ids wins, and a live one above the tombstone beats it.
 fn latest_per_stream(metas: Vec<StreamMeta>) -> Vec<StreamMeta> {
-    let mut latest: BTreeMap<String, StreamMeta> = BTreeMap::new();
+    let mut latest: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
     for meta in metas {
-        match latest.get(&meta.name) {
+        match latest.get(&meta.stream) {
             Some(known) if (known.last_id, !known.deleted) >= (meta.last_id, !meta.deleted) => {}
             _ => {
-                latest.insert(meta.name.clone(), meta);
+                latest.insert(meta.stream, meta);
             }
         }
     }
@@ -431,9 +416,9 @@ impl Checkpointer {
         }
         for meta in &metas {
             if meta.sinks.is_empty() {
-                self.sink_streams.remove(&meta.name);
+                self.sink_streams.remove(&meta.stream);
             } else {
-                self.sink_streams.insert(meta.name.clone());
+                self.sink_streams.insert(meta.stream);
             }
         }
         let changed = !metas.is_empty() || !job.objects.is_empty();
@@ -441,7 +426,7 @@ impl Checkpointer {
             full: false,
             max_id: self.max_id,
             objects: job.objects,
-            sink_streams: self.sink_streams.iter().cloned().collect(),
+            sink_streams: self.sink_streams.iter().copied().collect(),
         };
         let built = if changed {
             match build_checkpoint(&head, &metas) {

@@ -9,7 +9,7 @@
 //! block    := whole records, exactly as on the wire
 //! page     := crc32c u32 | entry_count u32 | entry_count × index_entry
 //! index_entry := hash u64 | offset u64 | len u64 | id_first u64 | id_last u64 |
-//!             block_count u32 | name_len u16 | 0 u16 | name, zero padded to 8
+//!             block_count u32 | 0 u32 | stream key hash [u8; 16]
 //! top_index:= page_count u32 | 0 u32 | page_count × (first_hash u64 | offset u64 | len u32 | 0 u32)
 //! trailer  := magic u64 | top_offset u64 | top_len u32 | crc32c u32
 //! ```
@@ -18,18 +18,16 @@
 //! the top index and the trailer before it, and a block's covers the block.
 
 use std::fmt;
-use std::sync::Arc;
 
-use format::{BlockAuthor, BlockSummary, FormatError, crc32c};
-use xxhash_rust::xxh3::xxh3_64;
+use format::{BlockAuthor, BlockSummary, FormatError, KeyHash, crc32c};
 
-/// `SSSEG001` as little-endian bytes on disk.
-pub const SEGMENT_MAGIC: u64 = u64::from_le_bytes(*b"SSSEG001");
+/// `SSSEG002` as little-endian bytes on disk.
+pub const SEGMENT_MAGIC: u64 = u64::from_le_bytes(*b"SSSEG002");
 pub const TRAILER_BYTES: usize = 24;
 pub const BLOCK_ENTRY_BYTES: usize = 64;
 pub(crate) const TABLE_HEAD_BYTES: usize = 8;
 pub(crate) const PAGE_HEAD_BYTES: usize = 8;
-pub(crate) const INDEX_ENTRY_FIXED_BYTES: usize = 48;
+pub(crate) const INDEX_ENTRY_BYTES: usize = 48 + KeyHash::BYTES;
 const TOP_HEAD_BYTES: usize = 8;
 const TOP_ENTRY_BYTES: usize = 24;
 /// D6d.
@@ -37,8 +35,8 @@ pub const DEFAULT_BLOCK_BYTES: usize = 64 * 1024;
 /// D6d.
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 
-pub fn stream_hash(stream: &str) -> u64 {
-    xxh3_64(stream.as_bytes())
+pub fn stream_hash(stream: KeyHash) -> u64 {
+    stream.top64()
 }
 
 #[derive(Debug)]
@@ -173,7 +171,7 @@ pub fn decode_block_table(bytes: &[u8]) -> Result<BlockTable, SegmentError> {
 /// of these is the "stored extent" that lets a reader skip the footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamExtent {
-    pub stream: Arc<str>,
+    pub stream: KeyHash,
     pub offset: u64,
     pub len_bytes: u64,
     pub id_first: u64,
@@ -187,17 +185,9 @@ impl StreamExtent {
     }
 }
 
-pub(crate) fn index_entry_bytes(stream: &str) -> usize {
-    INDEX_ENTRY_FIXED_BYTES + stream.len().next_multiple_of(8)
-}
-
-/// Encodes one page from entries already sorted by `(hash, name)`.
+/// Encodes one page from entries already sorted by key hash.
 pub(crate) fn encode_page(entries: &[(u64, &StreamExtent)]) -> Vec<u8> {
-    let body: usize = entries
-        .iter()
-        .map(|(_, extent)| index_entry_bytes(&extent.stream))
-        .sum();
-    let mut out = Vec::with_capacity(PAGE_HEAD_BYTES + body);
+    let mut out = Vec::with_capacity(PAGE_HEAD_BYTES + entries.len() * INDEX_ENTRY_BYTES);
     out.extend_from_slice(&[0; 4]);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (hash, extent) in entries {
@@ -211,22 +201,18 @@ pub(crate) fn encode_page(entries: &[(u64, &StreamExtent)]) -> Vec<u8> {
             out.extend_from_slice(&field.to_le_bytes());
         }
         out.extend_from_slice(&extent.block_count.to_le_bytes());
-        out.extend_from_slice(&(extent.stream.len() as u16).to_le_bytes());
-        out.extend_from_slice(&[0; 2]);
-        out.extend_from_slice(extent.stream.as_bytes());
-        let padded = extent.stream.len().next_multiple_of(8);
-        out.resize(out.len() + padded - extent.stream.len(), 0);
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&extent.stream.0);
     }
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
     out
 }
 
-/// Decodes a page, keeping the extents whose hash and name equal `stream`'s when
-/// `only` is given, and every extent otherwise.
+/// Decodes a page, keeping the extent of `only` when it is given, and every extent otherwise.
 pub fn decode_page(
     bytes: &[u8],
-    only: Option<&str>,
+    only: Option<KeyHash>,
 ) -> Result<Vec<(u64, StreamExtent)>, SegmentError> {
     if bytes.len() < PAGE_HEAD_BYTES {
         return Err(SegmentError::Corrupt("page is truncated"));
@@ -234,30 +220,18 @@ pub fn decode_page(
     if crc32c(&bytes[4..]) != u32_at(bytes, 0) {
         return Err(SegmentError::Crc("footer page"));
     }
-    let wanted_hash = only.map(stream_hash);
     let count = u32_at(bytes, 4) as usize;
+    if count.checked_mul(INDEX_ENTRY_BYTES) != Some(bytes.len() - PAGE_HEAD_BYTES) {
+        return Err(SegmentError::Corrupt("page has the wrong length"));
+    }
     let mut entries = Vec::new();
-    let mut offset = PAGE_HEAD_BYTES;
-    for _ in 0..count {
-        let fixed = bytes
-            .get(offset..offset.saturating_add(INDEX_ENTRY_FIXED_BYTES))
-            .ok_or(SegmentError::Corrupt("page entry is truncated"))?;
-        let name_len = usize::from(u16::from_le_bytes([fixed[44], fixed[45]]));
-        let name_start = offset + INDEX_ENTRY_FIXED_BYTES;
-        let name = bytes
-            .get(name_start..name_start + name_len)
-            .ok_or(SegmentError::Corrupt("page entry name is truncated"))?;
-        let hash = u64_at(fixed, 0);
-        // Collisions resolve by name (section 7.3): a hash alone proves nothing.
-        if wanted_hash.is_none_or(|wanted| wanted == hash)
-            && only.is_none_or(|stream| stream.as_bytes() == name)
-        {
-            let name = std::str::from_utf8(name)
-                .map_err(|_| SegmentError::Corrupt("page entry name isn't UTF-8"))?;
+    for fixed in bytes[PAGE_HEAD_BYTES..].as_chunks::<INDEX_ENTRY_BYTES>().0 {
+        let stream = KeyHash::from_slice(&fixed[48..]).unwrap();
+        if only.is_none_or(|wanted| wanted == stream) {
             entries.push((
-                hash,
+                u64_at(fixed, 0),
                 StreamExtent {
-                    stream: Arc::from(name),
+                    stream,
                     offset: u64_at(fixed, 8),
                     len_bytes: u64_at(fixed, 16),
                     id_first: u64_at(fixed, 24),
@@ -266,10 +240,6 @@ pub fn decode_page(
                 },
             ));
         }
-        offset = name_start + name_len.next_multiple_of(8);
-    }
-    if offset != bytes.len() {
-        return Err(SegmentError::Corrupt("page has the wrong length"));
     }
     Ok(entries)
 }

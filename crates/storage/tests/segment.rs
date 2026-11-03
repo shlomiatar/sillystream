@@ -18,6 +18,11 @@ use storage::{
     decode_block_table, decode_page, decode_top_index, stream_hash,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const FIRST_ID: u64 = 1_800_000_000_000 << 16;
 
 fn stores() -> Vec<(Arc<dyn ObjectStore>, Option<tempfile::TempDir>)> {
@@ -67,7 +72,7 @@ proptest! {
                         bytes.extend(record(FIRST_ID + index as u64, *options, *author, data));
                     }
                     let bytes = Bytes::from(bytes);
-                    builder.add_extent(stream, [bytes.clone()]).unwrap();
+                    builder.add_extent(key(stream), [bytes.clone()]).unwrap();
                     expected.insert(stream.clone(), bytes);
                 }
                 let (path, built) = write(store.as_ref(), builder).await;
@@ -80,8 +85,8 @@ proptest! {
                 assert_eq!(all, built.extents);
                 assert_eq!(all.len(), expected.len());
                 for (stream, bytes) in &expected {
-                    assert_eq!(&reader.read_stream(stream).await.unwrap(), bytes);
-                    let extents = reader.lookup(&top, stream).await.unwrap();
+                    assert_eq!(&reader.read_stream(key(stream)).await.unwrap(), bytes);
+                    let extents = reader.lookup(&top, key(stream)).await.unwrap();
                     assert_eq!(extents.len(), 1);
                     let table = reader.read_table(&extents[0]).await.unwrap();
                     for block in &table.blocks {
@@ -90,7 +95,7 @@ proptest! {
                         assert!(records <= block_bytes || block.summary.count == 1);
                     }
                 }
-                let missing = reader.lookup(&top, "missing/never").await.unwrap();
+                let missing = reader.lookup(&top, key("missing/never")).await.unwrap();
                 assert!(missing.is_empty());
             }
         });
@@ -99,7 +104,7 @@ proptest! {
     #[test]
     fn decoders_never_panic_on_random_bytes(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
         let _ = decode_block_table(&bytes);
-        let _ = decode_page(&bytes, Some("s"));
+        let _ = decode_page(&bytes, Some(key("s")));
         let _ = decode_page(&bytes, None);
         let _ = decode_top_index(&bytes);
     }
@@ -139,7 +144,7 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
     let payload = Bytes::from(payload);
     for stream in 0..1_000_000u32 {
         builder
-            .add_extent(&format!("logs.{stream}"), [payload.clone()])
+            .add_extent(key(&format!("logs.{stream}")), [payload.clone()])
             .unwrap();
     }
     let built = builder.finish().unwrap();
@@ -159,7 +164,7 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
             assert_eq!(counting.gets(), 1, "one top index read");
             assert!(top.page_count() > 100, "the footer really has pages");
 
-            let extents = reader.lookup(&top, &name).await.unwrap();
+            let extents = reader.lookup(&top, key(&name)).await.unwrap();
             assert_eq!(counting.gets(), 2, "one page read");
             assert_eq!(extents.len(), 1);
 
@@ -169,7 +174,7 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
 
             // With the top index cached, the top index read goes away.
             counting.reset_gets();
-            let extents = reader.lookup(&top, &name).await.unwrap();
+            let extents = reader.lookup(&top, key(&name)).await.unwrap();
             reader.read_extent(&extents[0]).await.unwrap();
             assert_eq!(counting.gets(), 3, "cached top index: page and two data");
 
@@ -180,7 +185,13 @@ async fn lookup_across_a_million_streams_makes_the_promised_reads() {
         }
         counting.reset_gets();
         let top = reader.read_top_index().await.unwrap();
-        assert!(reader.lookup(&top, "logs.absent").await.unwrap().is_empty());
+        assert!(
+            reader
+                .lookup(&top, key("logs.absent"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(counting.gets(), 2, "a missing stream costs no data read");
     }
 }
@@ -194,31 +205,31 @@ async fn a_stream_in_two_sections_returns_both_entries() {
         let late = Bytes::from(record(FIRST_ID + 1, 1, 7, b"on the new core"));
         for other in 0..50 {
             builder
-                .add_extent(&format!("other.{other}"), [early.clone()])
+                .add_extent(key(&format!("other.{other}")), [early.clone()])
                 .unwrap();
         }
-        builder.add_extent("moved", [early.clone()]).unwrap();
-        builder.add_extent("zz", [early.clone()]).unwrap();
-        builder.add_extent("moved", [late.clone()]).unwrap();
+        builder.add_extent(key("moved"), [early.clone()]).unwrap();
+        builder.add_extent(key("zz"), [early.clone()]).unwrap();
+        builder.add_extent(key("moved"), [late.clone()]).unwrap();
         let (path, _built) = write(store.as_ref(), builder).await;
         let reader = SegmentReader::new(store, path);
         let top = reader.read_top_index().await.unwrap();
-        let extents = reader.lookup(&top, "moved").await.unwrap();
+        let extents = reader.lookup(&top, key("moved")).await.unwrap();
         assert_eq!(extents.len(), 2);
         assert_eq!(reader.read_extent(&extents[0]).await.unwrap(), early);
         assert_eq!(reader.read_extent(&extents[1]).await.unwrap(), late);
         let mut both = early.to_vec();
         both.extend_from_slice(&late);
-        assert_eq!(reader.read_stream("moved").await.unwrap(), both);
+        assert_eq!(reader.read_stream(key("moved")).await.unwrap(), both);
     }
 }
 
-/// A real 64-bit collision can't be found on demand, so this writes the bytes of
-/// section 7.3 by hand, independently of the builder, with `b` claiming `a`'s hash.
+/// Two key hashes sharing their top 64 bits can't be found on demand, so this writes the bytes
+/// of section 7.3 by hand, independently of the builder, with `b` claiming `a`'s index hash.
 #[tokio::test]
-async fn hash_collisions_resolve_by_name() {
+async fn an_index_hash_shared_resolves_by_the_full_key_hash() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let hash = stream_hash("a");
+    let hash = stream_hash(key("a"));
 
     let record_a = record(FIRST_ID, 1, 7, b"aaaa");
     let record_b = record(FIRST_ID, 2, 7, b"bbbb");
@@ -263,10 +274,8 @@ async fn hash_collisions_resolve_by_name() {
             page.extend_from_slice(&field.to_le_bytes());
         }
         page.extend_from_slice(&1u32.to_le_bytes());
-        page.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        page.extend_from_slice(&[0, 0]);
-        page.extend_from_slice(name.as_bytes());
-        page.resize(page.len() + 7, 0);
+        page.extend_from_slice(&[0; 4]);
+        page.extend_from_slice(&key(name).0);
     }
     let crc = crc32c(&page[4..]);
     page[..4].copy_from_slice(&crc.to_le_bytes());
@@ -294,17 +303,15 @@ async fn hash_collisions_resolve_by_name() {
     store.put(&path, object.into()).await.unwrap();
     let reader = SegmentReader::new(store, path);
     let top = reader.read_top_index().await.unwrap();
-    let found = reader.lookup(&top, "a").await.unwrap();
+    let found = reader.lookup(&top, key("a")).await.unwrap();
     assert_eq!(found.len(), 1);
-    assert_eq!(&*found[0].stream, "a");
+    assert_eq!(found[0].stream, key("a"));
     assert_eq!(
         reader.read_extent(&found[0]).await.unwrap()[..],
         record_a[..]
     );
-    // `b` hashes elsewhere in reality, so it finds no page entry with its own hash.
-    assert!(reader.lookup(&top, "b").await.unwrap().is_empty());
-    let page_only_b = decode_page(&page, Some("a")).unwrap();
-    assert_eq!(page_only_b.len(), 1);
+    let only_a = decode_page(&page, Some(key("a"))).unwrap();
+    assert_eq!(only_a.len(), 1);
     assert_eq!(decode_page(&page, None).unwrap().len(), 2);
 }
 
@@ -318,7 +325,7 @@ async fn read_everything(
     let top = reader.read_top_index().await?;
     reader.all_extents(&top).await?;
     for stream in streams {
-        reader.read_stream(stream).await?;
+        reader.read_stream(key(stream)).await?;
     }
     Ok(())
 }
@@ -333,7 +340,7 @@ async fn a_flipped_bit_anywhere_fails() {
     let bytes = Bytes::from(bytes);
     let streams = ["alpha", "beta", "gamma"];
     for stream in streams {
-        builder.add_extent(stream, [bytes.clone()]).unwrap();
+        builder.add_extent(key(stream), [bytes.clone()]).unwrap();
     }
     let object = concat(&builder.finish().unwrap().parts);
     let path = Path::from("flip.seg");
@@ -365,7 +372,7 @@ async fn a_flipped_bit_in_a_block_is_named_as_a_crc_failure() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut builder = SegmentBuilder::new();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"data"));
-    builder.add_extent("s", [bytes.clone()]).unwrap();
+    builder.add_extent(key("s"), [bytes.clone()]).unwrap();
     let built = builder.finish().unwrap();
     let mut object = concat(&built.parts);
     let table_bytes = 8 + BLOCK_ENTRY_BYTES;
@@ -373,7 +380,7 @@ async fn a_flipped_bit_in_a_block_is_named_as_a_crc_failure() {
     let path = Path::from("x.seg");
     store.put(&path, object.into()).await.unwrap();
     let error = SegmentReader::new(store, path)
-        .read_stream("s")
+        .read_stream(key("s"))
         .await
         .unwrap_err();
     assert!(matches!(error, SegmentError::Crc("block")), "{error}");
@@ -412,14 +419,14 @@ async fn record_bytes_in_a_segment_equal_the_wire_bytes() {
             }
         }
         pieces.push(wire.slice(piece_start..offset));
-        builder.add_extent("s", pieces).unwrap();
+        builder.add_extent(key("s"), pieces).unwrap();
         let (path, built) = write(store.as_ref(), builder).await;
         assert!(
             built.extents[0].block_count > 1,
             "the test needs many blocks"
         );
         let reader = SegmentReader::new(Arc::clone(&store), path.clone());
-        assert_eq!(reader.read_stream("s").await.unwrap(), wire);
+        assert_eq!(reader.read_stream(key("s")).await.unwrap(), wire);
         // In the object itself: table, then the wire bytes as one run.
         let whole = store.get(&path).await.unwrap().bytes().await.unwrap();
         let start = 8 + built.extents[0].block_count as usize * BLOCK_ENTRY_BYTES;
@@ -431,7 +438,7 @@ async fn record_bytes_in_a_segment_equal_the_wire_bytes() {
 fn the_builder_does_not_copy_record_bytes() {
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"pointer check"));
     let mut builder = SegmentBuilder::new();
-    builder.add_extent("s", [bytes.clone()]).unwrap();
+    builder.add_extent(key("s"), [bytes.clone()]).unwrap();
     let built = builder.finish().unwrap();
     assert!(
         built
@@ -446,19 +453,19 @@ fn the_builder_does_not_copy_record_bytes() {
 fn the_builder_refuses_what_is_not_stamped_records_in_order() {
     let id_zero = Bytes::from(record(0, 1, 7, b"x"));
     assert!(matches!(
-        SegmentBuilder::new().add_extent("s", [id_zero]),
+        SegmentBuilder::new().add_extent(key("s"), [id_zero]),
         Err(SegmentError::OutOfOrder(_))
     ));
     let late = record(FIRST_ID + 1, 1, 7, b"x");
     let early = record(FIRST_ID, 1, 7, b"x");
     assert!(matches!(
-        SegmentBuilder::new().add_extent("s", [Bytes::from([late, early].concat())]),
+        SegmentBuilder::new().add_extent(key("s"), [Bytes::from([late, early].concat())]),
         Err(SegmentError::OutOfOrder(_))
     ));
     let mut cut = record(FIRST_ID, 1, 7, b"xxxxxxxx");
     cut.truncate(cut.len() - 8);
     assert!(matches!(
-        SegmentBuilder::new().add_extent("s", [Bytes::from(cut)]),
+        SegmentBuilder::new().add_extent(key("s"), [Bytes::from(cut)]),
         Err(SegmentError::Records(_))
     ));
 }
@@ -471,7 +478,7 @@ async fn an_empty_segment_reads_as_empty() {
     let reader = SegmentReader::new(store, path);
     let top = reader.read_top_index().await.unwrap();
     assert_eq!(top.page_count(), 0);
-    assert!(reader.lookup(&top, "s").await.unwrap().is_empty());
+    assert!(reader.lookup(&top, key("s")).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -485,7 +492,7 @@ async fn a_rare_filter_reads_only_the_blocks_that_can_match() {
         let options = u64::from(index == 500) << 63;
         wire.extend(record(FIRST_ID + index, options, 7, &[0x55; 64]));
     }
-    builder.add_extent("s", [Bytes::from(wire)]).unwrap();
+    builder.add_extent(key("s"), [Bytes::from(wire)]).unwrap();
     let built = builder.finish().unwrap();
     let path = Path::from("filter.seg");
     put_parts(counting.as_ref(), &path, &built.parts).await;
@@ -523,7 +530,7 @@ async fn a_big_top_index_takes_a_second_read_and_still_works() {
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     for stream in 0..11_000 {
         builder
-            .add_extent(&format!("s{stream}"), [bytes.clone()])
+            .add_extent(key(&format!("s{stream}")), [bytes.clone()])
             .unwrap();
     }
     let built = builder.finish().unwrap();
@@ -534,12 +541,12 @@ async fn a_big_top_index_takes_a_second_read_and_still_works() {
     let top = reader.read_top_index().await.unwrap();
     assert_eq!(top.page_count(), 11_000);
     assert_eq!(counting.gets(), 2);
-    assert_eq!(reader.read_stream("s10999").await.unwrap(), bytes);
+    assert_eq!(reader.read_stream(key("s10999")).await.unwrap(), bytes);
 }
 
 #[test]
 fn a_small_segment_matches_its_byte_exact_vector() {
-    // Built by an independent implementation of section 7.3 and D10, D52.
+    // Built by an independent implementation of section 7.3 and D10, D52, with a fixed key hash.
     let vector = include_str!("vectors/segment_small.hex").trim();
     let expected: Vec<u8> = (0..vector.len())
         .step_by(2)
@@ -547,7 +554,9 @@ fn a_small_segment_matches_its_byte_exact_vector() {
         .collect();
     let mut builder = SegmentBuilder::new();
     let bytes = Bytes::from(record(0x0001_0000_0000_0005, 0x10, 7, b"hello"));
-    builder.add_extent("s", [bytes]).unwrap();
+    builder
+        .add_extent(format::KeyHash([0x33; 16]), [bytes])
+        .unwrap();
     assert_eq!(concat(&builder.finish().unwrap().parts), expected);
 }
 
@@ -556,14 +565,14 @@ async fn an_empty_block_range_is_empty_and_reads_nothing(inner: Arc<dyn ObjectSt
     let store: Arc<dyn ObjectStore> = counting.clone();
     let mut builder = SegmentBuilder::new();
     builder
-        .add_extent("s", [Bytes::from(record(1 << 16, 1, 7, b"data"))])
+        .add_extent(key("s"), [Bytes::from(record(1 << 16, 1, 7, b"data"))])
         .unwrap();
     let built = builder.finish().unwrap();
     let path = Path::from("sealed/1/node/a.seg");
     put_parts(store.as_ref(), &path, &built.parts).await;
     let reader = SegmentReader::new(store, path);
     let top = reader.read_top_index().await.unwrap();
-    let extents = reader.lookup(&top, "s").await.unwrap();
+    let extents = reader.lookup(&top, key("s")).await.unwrap();
     let table = reader.read_table(&extents[0]).await.unwrap();
     counting.reset_gets();
     let bytes = reader.read_blocks(&extents[0], &table, 0..0).await.unwrap();
@@ -604,14 +613,14 @@ async fn a_stream_in_two_sections_reads_in_id_order_either_way() {
     let mut builder = SegmentBuilder::new();
     let early = Bytes::from(record(FIRST_ID, 1, 7, b"on the old core"));
     let late = Bytes::from(record(FIRST_ID + 1, 1, 7, b"on the new core"));
-    builder.add_extent("moved", [late.clone()]).unwrap();
-    builder.add_extent("zz", [late.clone()]).unwrap();
-    builder.add_extent("moved", [early.clone()]).unwrap();
+    builder.add_extent(key("moved"), [late.clone()]).unwrap();
+    builder.add_extent(key("zz"), [late.clone()]).unwrap();
+    builder.add_extent(key("moved"), [early.clone()]).unwrap();
     let (path, _built) = write(store.as_ref(), builder).await;
     let reader = SegmentReader::new(store, path);
     let mut both = early.to_vec();
     both.extend_from_slice(&late);
-    assert_eq!(reader.read_stream("moved").await.unwrap(), both);
+    assert_eq!(reader.read_stream(key("moved")).await.unwrap(), both);
 }
 
 /// The index's id range covers every item, which is what a reader finds it by.
@@ -628,7 +637,7 @@ async fn an_extents_last_id_is_its_last_items() {
     };
     format::encode_record(&mut bytes, &header, b"data").unwrap();
     let mut builder = SegmentBuilder::new();
-    builder.add_extent("s", [Bytes::from(bytes)]).unwrap();
+    builder.add_extent(key("s"), [Bytes::from(bytes)]).unwrap();
     let built = builder.finish().unwrap();
     assert_eq!(built.extents[0].id_first, FIRST_ID);
     assert_eq!(built.extents[0].id_last, FIRST_ID + 4);

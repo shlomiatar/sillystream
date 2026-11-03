@@ -6,6 +6,11 @@ mod common;
 use common::*;
 use server::shard_of;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// How long an ack that could arrive has, before calling it lost in a forwarding cycle.
 const ACK_WAIT_MS: u64 = 2_000;
 
@@ -14,7 +19,7 @@ fn name_on_core(core: usize, node: &server::Node) -> String {
     (0..)
         .map(|n| format!("s{n}"))
         .find(|name| {
-            shard_of(name, node.virtual_shard_count()) as usize % node.core_count() == core
+            shard_of(key(name), node.virtual_shard_count()) as usize % node.core_count() == core
         })
         .expect("names go on for ever")
 }
@@ -44,10 +49,10 @@ async fn a_stale_override_entry_cant_make_a_second_owner() {
     let harness = Harness::new(manual_config(4));
     let node = harness.node();
     let name = name_on_core(0, node);
-    let hashed = shard_of(&name, node.virtual_shard_count());
+    let hashed = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
 
-    let own = node.set_override(&name, 1).await.unwrap();
+    let own = node.set_override(key(&name), 1).await.unwrap();
     let mut client = node.client(0).await;
     client
         .publish(publish(&name, &records, 5, 1))
@@ -75,11 +80,11 @@ async fn a_new_stream_doesnt_bounce_after_its_override_moved_twice() {
     let harness = Harness::new(manual_config(3));
     let node = harness.node();
     let name = name_on_core(0, node);
-    let hashed = shard_of(&name, node.virtual_shard_count());
+    let hashed = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
 
-    node.set_override(&name, 1).await.unwrap();
-    node.set_override(&name, 2).await.unwrap();
+    node.set_override(key(&name), 1).await.unwrap();
+    node.set_override(key(&name), 2).await.unwrap();
     node.move_shard(hashed, 2).await;
 
     let mut client = node.client(0).await;
@@ -99,15 +104,15 @@ async fn a_written_stream_doesnt_bounce_after_its_override_moved_three_times() {
     let harness = Harness::new(manual_config(4));
     let node = harness.node();
     let name = name_on_core(0, node);
-    let hashed = shard_of(&name, node.virtual_shard_count());
+    let hashed = shard_of(key(&name), node.virtual_shard_count());
     let records = record_with(1, b"payload");
 
     let mut first = node.client(0).await;
     first.publish(publish(&name, &records, 1, 1)).await.unwrap();
     ack_within(&mut first).await;
-    node.set_override(&name, 1).await.unwrap();
-    node.set_override(&name, 2).await.unwrap();
-    node.set_override(&name, 3).await.unwrap();
+    node.set_override(key(&name), 1).await.unwrap();
+    node.set_override(key(&name), 2).await.unwrap();
+    node.set_override(key(&name), 3).await.unwrap();
     node.move_shard(hashed, 2).await;
 
     let mut client = node.client(0).await;
@@ -140,7 +145,7 @@ async fn any_order_of_moves_ends_at_one_owner() {
         let harness = Harness::new(manual_config(core_count));
         let node = harness.node();
         let name = name_on_core(case % core_count, node);
-        let hashed = shard_of(&name, node.virtual_shard_count());
+        let hashed = shard_of(key(&name), node.virtual_shard_count());
         let records = record_with(1, b"payload");
         let mut own = None;
         let mut clients = vec![node.client(0).await];
@@ -149,7 +154,7 @@ async fn any_order_of_moves_ends_at_one_owner() {
         for _ in 0..12 {
             let to = next(core_count as u64) as usize;
             match next(4) {
-                0 => own = node.set_override(&name, to).await,
+                0 => own = node.set_override(key(&name), to).await,
                 1 => {
                     node.move_shard(hashed, to).await;
                 }
@@ -191,13 +196,13 @@ async fn any_order_of_moves_ends_at_one_owner() {
 async fn bad_placement_arguments_are_refused_and_change_nothing() {
     let harness = Harness::new(manual_config(2));
     let node = harness.node();
-    let shard = server::shard_of("s", node.virtual_shard_count());
+    let shard = server::shard_of(key("s"), node.virtual_shard_count());
     let total = node.virtual_shard_count() + 64;
     let before = node.placement().await;
 
     // A core that doesn't exist.
     assert!(!node.move_shard(shard, 2).await);
-    assert_eq!(node.set_override("s", 99).await, None);
+    assert_eq!(node.set_override(key("s"), 99).await, None);
     // A shard that doesn't exist, and an override shard no stream has yet.
     assert!(!node.move_shard(total, 1).await);
     assert!(!node.move_shard(node.virtual_shard_count(), 1).await);
@@ -218,7 +223,7 @@ async fn bad_placement_arguments_are_refused_and_change_nothing() {
         node.move_shard(shard, 1 - before[shard as usize] as usize)
             .await
     );
-    let own = node.set_override("s", 1).await.unwrap();
+    let own = node.set_override(key("s"), 1).await.unwrap();
     assert!(node.move_shard(own, 0).await);
     assert!(harness.finish().wal.is_ok());
 }

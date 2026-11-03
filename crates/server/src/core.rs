@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use format::{
-    ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, ValidatedForward, ValidatedPublish,
+    ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, KeyHash, ValidatedForward, ValidatedPublish,
     encode_system_record, validate_forward, validate_publish,
 };
 use proto::ErrorCode;
@@ -20,13 +20,14 @@ use storage::{MetaCursor, StreamMeta, UploadEvent, UploadKey, WalEntry, WalSendE
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
-use crate::compaction::MANIFEST_STREAM;
+use crate::compaction::RetentionClass;
 use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
     FanOut, PendingVisible, RecordSpan, ReplaceResult, STATE_ONLY_FILTER_ID, SharedBytes,
     StreamDelivery, UnsavedStep, retention_start_id, walk_records,
 };
+use crate::keys::Keys;
 use crate::message::{
     AttachMsg, AttachWalk, CatchReply, CompactSource, CompactView, ControlMsg, CoreStats, CursorOp,
     CursorReport, DeliveryMsg, ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply,
@@ -84,6 +85,7 @@ pub(crate) enum CoreToNode {
 
 pub(crate) struct CoreConfig {
     pub id: usize,
+    pub keys: Keys,
     pub virtual_shard_count: u32,
     pub override_shard_count: u32,
     pub core_count: usize,
@@ -108,7 +110,7 @@ pub(crate) struct CoreInbox {
 /// An entry another core stamped for `stream`, not yet in the WAL channel. What this core
 /// stamps after it took the stream over goes in behind it (D77).
 struct WalWait {
-    stream: Arc<str>,
+    stream: KeyHash,
     core: usize,
     ticket: u64,
     /// This core's last ticket when the stream arrived. Earlier ones don't wait.
@@ -122,7 +124,7 @@ struct Hold {
     shard: u32,
     /// Streams whose route changed here because the handoff told this core of their own
     /// shard, whichever shard they were on.
-    streams: Vec<Arc<str>>,
+    streams: Vec<KeyHash>,
     probes_out_count: usize,
     /// This core's own forwards coming back, with when it first forwarded each. A stale
     /// read can send one round twice, so arrival order isn't enough. Everything else was
@@ -274,7 +276,7 @@ impl StreamLog {
 }
 
 struct Stream {
-    name: Arc<str>,
+    name: KeyHash,
     shard: u32,
     ids: IdAllocator,
     state: StreamState,
@@ -286,7 +288,7 @@ struct Stream {
 
 #[derive(Default)]
 struct Shard {
-    streams: HashSet<Arc<str>>,
+    streams: HashSet<KeyHash>,
     counters: ShardCounters,
 }
 
@@ -318,11 +320,6 @@ fn send_reply(tx: &ReplyTx, reply: Reply) {
     let _ = tx.send(reply);
 }
 
-/// A stream id has to fit a WAL entry (D42).
-fn stream_name_is_valid(name: &str) -> bool {
-    !name.is_empty() && name.len() <= usize::from(u16::MAX)
-}
-
 /// What the WAL entry for this publish would hold, with its system record.
 fn entry_fits(records_bytes: usize, change: Option<&StateChange>) -> bool {
     let system_bytes = change.map_or(0, |change| {
@@ -335,13 +332,9 @@ fn entry_fits(records_bytes: usize, change: Option<&StateChange>) -> bool {
 /// (section 3). It reads no record's data. Gives the records, ready to stamp, and how many ids
 /// they and the state change take.
 pub(crate) fn check_publish<'a>(
-    stream: &str,
     records: &'a mut [u8],
     change: Option<&StateChange>,
 ) -> Result<(ValidatedPublish<'a>, u32), String> {
-    if !stream_name_is_valid(stream) {
-        return Err("stream id is empty or too long".to_owned());
-    }
     let validated = validate_publish(records).map_err(|error| error.to_string())?;
     let item_count = validated.item_count() + u64::from(change.is_some());
     if item_count == 0 {
@@ -383,13 +376,7 @@ impl CheckedRecords<'_> {
 
 /// `check_publish` for a forward sink, which keeps each record's author (section 9.1). It has
 /// no state change, since a sink never forwards a system record (D28).
-fn check_forward<'a>(
-    stream: &str,
-    records: &'a mut [u8],
-) -> Result<(ValidatedForward<'a>, u32), String> {
-    if !stream_name_is_valid(stream) {
-        return Err("stream id is empty or too long".to_owned());
-    }
+fn check_forward<'a>(records: &'a mut [u8]) -> Result<(ValidatedForward<'a>, u32), String> {
     let validated = validate_forward(records).map_err(|error| error.to_string())?;
     let Ok(ack_count) = u32::try_from(validated.item_count()) else {
         return Err("publish has too many items".to_owned());
@@ -416,21 +403,21 @@ pub(crate) struct Core {
     /// owner, because each core that gives a shard away remembers where it went, and an
     /// entry is never overwritten by what another core says (D66).
     location: Vec<u16>,
-    streams: HashMap<Arc<str>, Stream>,
+    streams: HashMap<KeyHash, Stream>,
     shards: HashMap<u32, Shard>,
     /// Stream → its own shard. Kept for good, so that the chain above stays whole.
-    overrides: HashMap<Arc<str>, u32>,
+    overrides: HashMap<KeyHash, u32>,
     hold: Option<Hold>,
     /// Writes read from the forwarded inbox, for streams on this core, that can't be stamped
     /// until the outbound queue empties (D78).
     deferred: VecDeque<WriteMsg>,
 
     /// Deleted streams this core answers for, with their last id (D20).
-    tombstones: HashMap<Arc<str>, u64>,
+    tombstones: HashMap<KeyHash, u64>,
     /// The highest time read so far, which ids' lead is measured from.
     clock_high_ms: u64,
-    logs: HashMap<Arc<str>, StreamLog>,
-    dirty: Vec<Arc<str>>,
+    logs: HashMap<KeyHash, StreamLog>,
+    dirty: Vec<KeyHash>,
     next_ticket: u64,
     /// The highest ticket the WAL channel has taken.
     sent_ticket: u64,
@@ -445,7 +432,7 @@ pub(crate) struct Core {
     wal_sent_owed: u64,
     durable_waiters: VecDeque<(u64, Waiter)>,
 
-    in_flight: HashMap<UploadTag, Vec<Arc<str>>>,
+    in_flight: HashMap<UploadTag, Vec<KeyHash>>,
     unsealed_bytes: u64,
 
     upload_failed_count: u64,
@@ -455,9 +442,9 @@ pub(crate) struct Core {
     home: Home,
     settings: DeliverySettings,
     /// Streams waiting on the WAL for a batch, in ticket order.
-    wal_visible: VecDeque<(u64, Arc<str>)>,
+    wal_visible: VecDeque<(u64, KeyHash)>,
     /// Streams holding batches another core stamped (D84).
-    foreign_visible: Vec<Arc<str>>,
+    foreign_visible: Vec<KeyHash>,
     /// How far other cores' entries are durable, as far as they have said.
     durable_by_core: Vec<u64>,
     /// The ticket other cores are waiting to hear is durable, or 0.
@@ -467,13 +454,13 @@ pub(crate) struct Core {
 
     loader: Option<mpsc::UnboundedSender<MetaMsg>>,
     sink_notes: mpsc::UnboundedSender<SinkNote>,
-    loading: HashMap<Arc<str>, Loading>,
+    loading: HashMap<KeyHash, Loading>,
     load_count: u64,
     /// While a load's parked messages run, that a stream it found no trace of is known new.
-    load_passed: Option<Arc<str>>,
+    load_passed: Option<KeyHash>,
     parked_write_count: usize,
     /// Tombstones no checkpoint has yet, with their last ids.
-    dirty_tombstones: Vec<(Arc<str>, u64)>,
+    dirty_tombstones: Vec<(KeyHash, u64)>,
     /// This core's highest ticket in each seal not yet checkpointed.
     seal_sent: HashMap<u64, u64>,
     use_count: u64,
@@ -696,14 +683,14 @@ impl Core {
 
     fn on_read(&mut self, message: ReadMsg) {
         if let ReadMsg::Step(step) = &message
-            && matches!(self.route(&step.stream), Route::Here(_))
+            && matches!(self.route(step.stream), Route::Here(_))
         {
-            let name = Arc::clone(&step.stream);
+            let name = step.stream;
             if self.needs_load(&name) {
                 self.park(&name, Parked::Read(message));
                 return;
             }
-            self.touch(&name);
+            self.touch(name);
         }
         match message {
             ReadMsg::Step(message) => self.on_read_step(*message),
@@ -737,16 +724,16 @@ impl Core {
         self.accept(message);
     }
 
-    fn is_held(&self, name: &str) -> bool {
+    fn is_held(&self, name: KeyHash) -> bool {
         let Some(hold) = &self.hold else {
             return false;
         };
         let shard = self
             .overrides
-            .get(name)
+            .get(&name)
             .copied()
             .unwrap_or_else(|| shard_of(name, self.config.virtual_shard_count));
-        shard == hold.shard || hold.streams.iter().any(|stream| &**stream == name)
+        shard == hold.shard || hold.streams.contains(&name)
     }
 
     /// Passing a write on needs no room here, so that a stalled core still does it.
@@ -791,7 +778,7 @@ impl Core {
                 u16::MAX => self.config.id,
                 at => at as usize,
             },
-            ProbeTarget::Stream(name) => match self.route(name) {
+            ProbeTarget::Stream(name) => match self.route(*name) {
                 Route::Here(_) => self.config.id,
                 Route::Forward(to) => to,
             },
@@ -822,13 +809,13 @@ impl Core {
         let _ = hold.done.send(());
     }
 
-    fn route(&self, name: &str) -> Route {
-        if let Some(stream) = self.streams.get(name) {
+    fn route(&self, name: KeyHash) -> Route {
+        if let Some(stream) = self.streams.get(&name) {
             return Route::Here(stream.shard);
         }
         let shard = self
             .overrides
-            .get(name)
+            .get(&name)
             .copied()
             .unwrap_or_else(|| shard_of(name, self.config.virtual_shard_count));
         let at = self.location[shard as usize] as usize;
@@ -841,7 +828,7 @@ impl Core {
 
     fn on_write(&mut self, message: WriteMsg) {
         match message {
-            WriteMsg::Publish(publish) => match self.route(&publish.stream) {
+            WriteMsg::Publish(publish) => match self.route(publish.stream) {
                 Route::Here(_) if self.wal_stopped => send_reply(
                     &publish.reply,
                     Reply::Nack {
@@ -852,7 +839,7 @@ impl Core {
                     },
                 ),
                 Route::Here(_) if self.needs_load(&publish.stream) => {
-                    let name = Arc::clone(&publish.stream);
+                    let name = publish.stream;
                     self.park(&name, Parked::Write(WriteMsg::Publish(publish)));
                 }
                 Route::Here(shard) => self.on_publish(*publish, shard),
@@ -860,13 +847,13 @@ impl Core {
                     send_reply(
                         &publish.reply,
                         Reply::Moved {
-                            stream: Arc::clone(&publish.stream),
+                            stream: publish.stream,
                         },
                     );
                     self.forward_write(to, WriteMsg::Publish(publish));
                 }
             },
-            WriteMsg::StateOp(op) => match self.route(&op.stream) {
+            WriteMsg::StateOp(op) => match self.route(op.stream) {
                 Route::Here(_) if self.wal_stopped => send_reply(
                     &op.reply,
                     Reply::Error {
@@ -876,17 +863,12 @@ impl Core {
                     },
                 ),
                 Route::Here(_) if self.needs_load(&op.stream) => {
-                    let name = Arc::clone(&op.stream);
+                    let name = op.stream;
                     self.park(&name, Parked::Write(WriteMsg::StateOp(op)));
                 }
                 Route::Here(shard) => self.on_state_op(*op, shard),
                 Route::Forward(to) => {
-                    send_reply(
-                        &op.reply,
-                        Reply::Moved {
-                            stream: Arc::clone(&op.stream),
-                        },
-                    );
+                    send_reply(&op.reply, Reply::Moved { stream: op.stream });
                     self.forward_write(to, WriteMsg::StateOp(op));
                 }
             },
@@ -894,10 +876,10 @@ impl Core {
                 stream,
                 reply,
                 passed,
-            } => match self.route(&stream) {
+            } => match self.route(stream) {
                 // Behind whatever of this client's is waiting for the load.
                 Route::Here(_) if self.loading.contains_key(&stream) => {
-                    let name = Arc::clone(&stream);
+                    let name = stream;
                     let barrier = WriteMsg::Barrier {
                         stream,
                         reply,
@@ -931,22 +913,18 @@ impl Core {
         let _ = self.links.forwarded[to].send(message);
     }
 
-    fn stream_entry(&mut self, name: &Arc<str>, shard: u32) -> &mut Stream {
-        if !self.streams.contains_key(&**name) {
-            self.shards
-                .entry(shard)
-                .or_default()
-                .streams
-                .insert(Arc::clone(name));
-            let floor_id = self.tombstones.remove(&**name).unwrap_or(0);
+    fn stream_entry(&mut self, name: &KeyHash, shard: u32) -> &mut Stream {
+        if !self.streams.contains_key(name) {
+            self.shards.entry(shard).or_default().streams.insert(*name);
+            let floor_id = self.tombstones.remove(name).unwrap_or(0);
             let mut delivery = StreamDelivery::new(self.config.core_count);
             delivery.floor_id = floor_id;
             delivery.track_meta = self.loader.is_some();
             delivery.meta_dirty = delivery.track_meta;
             self.streams.insert(
-                Arc::clone(name),
+                *name,
                 Stream {
-                    name: Arc::clone(name),
+                    name: *name,
                     shard,
                     ids: IdAllocator::new(floor_id, self.config.last_valid_id),
                     state: StreamState::new(),
@@ -958,7 +936,7 @@ impl Core {
             );
         }
         self.streams
-            .get_mut(&**name)
+            .get_mut(name)
             .expect("the stream was just made if it was missing")
     }
 
@@ -977,7 +955,7 @@ impl Core {
                 },
             );
         };
-        if &*msg.stream == MANIFEST_STREAM {
+        if msg.stream == self.config.keys.manifest {
             nack(ErrorCode::Unauthorized, &"this stream is the server's");
             return;
         }
@@ -989,10 +967,10 @@ impl Core {
             return;
         }
         let checked = if msg.forward {
-            check_forward(&msg.stream, &mut records)
+            check_forward(&mut records)
                 .map(|(validated, count)| (CheckedRecords::Forward(validated), count))
         } else {
-            check_publish(&msg.stream, &mut records, msg.state.as_ref())
+            check_publish(&mut records, msg.state.as_ref())
                 .map(|(validated, count)| (CheckedRecords::Publish(validated), count))
         };
         let (mut validated, ack_count) = match checked {
@@ -1006,7 +984,7 @@ impl Core {
         let item_count = u64::from(ack_count);
         let now_ms = self.clock.now_ms();
         if msg.producer_id != 0
-            && let Some(stream) = self.streams.get_mut(&*msg.stream)
+            && let Some(stream) = self.streams.get_mut(&msg.stream)
         {
             let level = effective_level(msg.ack_level, &stream.config);
             let (ack, wait_last_id) =
@@ -1041,7 +1019,7 @@ impl Core {
             }
         }
         let new_state = match &msg.state {
-            Some(change) => match self.check_state_change(&msg.stream, change) {
+            Some(change) => match self.check_state_change(msg.stream, change) {
                 Ok(doc) => Some(doc),
                 Err((code, text)) => {
                     nack(code, &text);
@@ -1051,13 +1029,13 @@ impl Core {
             None => None,
         };
 
-        if !self.ids_fit_lead(&msg.stream, now_ms, item_count) {
+        if !self.ids_fit_lead(msg.stream, now_ms, item_count) {
             nack(ErrorCode::RateLimited, &IDS_TOO_FAR_AHEAD);
             return;
         }
-        let name = Arc::clone(&msg.stream);
+        let name = msg.stream;
         let stream = self.stream_entry(&name, shard);
-        let name = Arc::clone(&stream.name);
+        let name = stream.name;
         let first_id = match stream.ids.allocate(now_ms, item_count) {
             Ok(first_id) => first_id,
             Err(error) => {
@@ -1085,7 +1063,7 @@ impl Core {
                 let bytes = self.bytes_with_system_record(&records, last_id, msg.author, change);
                 state_after = Some((last_id, doc.clone()));
                 self.streams
-                    .get_mut(&*name)
+                    .get_mut(&name)
                     .expect("the stream was made above")
                     .state
                     .install(doc, last_id);
@@ -1129,17 +1107,10 @@ impl Core {
                 },
             );
         };
-        if &*msg.stream == MANIFEST_STREAM {
+        if msg.stream == self.config.keys.manifest {
             error(
                 ErrorCode::Unauthorized,
                 "this stream is the server's".into(),
-            );
-            return;
-        }
-        if !stream_name_is_valid(&msg.stream) {
-            error(
-                ErrorCode::Malformed,
-                "stream id is empty or too long".into(),
             );
             return;
         }
@@ -1151,10 +1122,10 @@ impl Core {
             error(ErrorCode::Malformed, state_error.to_string());
             return;
         }
-        let doc = match self.check_state_change(&msg.stream, &msg.change) {
+        let doc = match self.check_state_change(msg.stream, &msg.change) {
             Ok(doc) => doc,
             Err((ErrorCode::VersionConflict, _)) => {
-                let ver = self.streams.get(&*msg.stream).map_or(0, |s| s.state.ver());
+                let ver = self.streams.get(&msg.stream).map_or(0, |s| s.state.ver());
                 send_reply(
                     &msg.reply,
                     Reply::StateResult {
@@ -1171,12 +1142,12 @@ impl Core {
             }
         };
         let now_ms = self.clock.now_ms();
-        if !self.ids_fit_lead(&msg.stream, now_ms, 1) {
+        if !self.ids_fit_lead(msg.stream, now_ms, 1) {
             error(ErrorCode::RateLimited, IDS_TOO_FAR_AHEAD.to_owned());
             return;
         }
         let stream = self.stream_entry(&msg.stream, shard);
-        let name = Arc::clone(&stream.name);
+        let name = stream.name;
         let ver = match stream.ids.allocate(now_ms, 1) {
             Ok(ver) => ver,
             Err(id_error) => {
@@ -1214,10 +1185,10 @@ impl Core {
 
     fn check_state_change(
         &self,
-        name: &str,
+        name: KeyHash,
         change: &StateChange,
     ) -> Result<Bytes, (ErrorCode, String)> {
-        let stream = self.streams.get(name);
+        let stream = self.streams.get(&name);
         let ver = stream.map_or(0, |stream| stream.state.ver());
         if change.expect_ver != 0 && change.expect_ver != ver {
             return Err((
@@ -1256,7 +1227,7 @@ impl Core {
 
     fn commit(
         &mut self,
-        name: &Arc<str>,
+        name: &KeyHash,
         ids: CommitIds,
         bytes: SlabBytes,
         level: u8,
@@ -1266,7 +1237,7 @@ impl Core {
         let ticket = self.next_ticket;
         let len_bytes = bytes.len() as u64;
         let entry = WalEntry::new(
-            Arc::clone(name),
+            *name,
             ids.producer_id,
             ids.producer_seq,
             bytes.clone(),
@@ -1275,14 +1246,14 @@ impl Core {
         )
         .expect("the stream id and the length were checked, and there is at least one record");
 
-        let shard_id = self.streams.get(&**name).map(|stream| stream.shard);
+        let shard_id = self.streams.get(name).map(|stream| stream.shard);
         if let Some(shard) = shard_id.and_then(|shard| self.shards.get_mut(&shard)) {
             shard.counters.ingest_bytes += len_bytes;
             shard.counters.ingest_records += ids.record_count;
         }
         let needs_wal = level >= 2;
         let mut track_meta = false;
-        if let Some(stream) = self.streams.get_mut(&**name) {
+        if let Some(stream) = self.streams.get_mut(name) {
             track_meta = stream.delivery.track_meta;
             stream.delivery.pending.push_back(PendingVisible {
                 core: self.config.id,
@@ -1296,7 +1267,7 @@ impl Core {
             self.use_count += 1;
             stream.delivery.last_used = self.use_count;
         }
-        let log = self.logs.entry(Arc::clone(name)).or_default();
+        let log = self.logs.entry(*name).or_default();
         let mut batch = Batch {
             bytes,
             first_id: ids.first_id,
@@ -1314,7 +1285,7 @@ impl Core {
         log.batches.push_back(batch);
         if !log.dirty {
             log.dirty = true;
-            self.dirty.push(Arc::clone(name));
+            self.dirty.push(*name);
         }
         self.unsealed_bytes += len_bytes;
 
@@ -1323,9 +1294,9 @@ impl Core {
 
         // A checkpoint's view waits for the WAL whatever the level (D154).
         if needs_wal || track_meta {
-            self.wal_visible.push_back((ticket, Arc::clone(name)));
+            self.wal_visible.push_back((ticket, *name));
         }
-        self.drain_visible(name);
+        self.drain_visible(*name);
     }
 
     /// In order, so a full channel keeps a stream's entries in id order, and behind what
@@ -1373,11 +1344,14 @@ impl Core {
     /// acked, and goes in a later seal. A manifest waiting for its stream to load was sent
     /// before the seal too, so the seal waits for it.
     fn answer_passed(&mut self) {
-        let manifest_parked = self.loading.get(MANIFEST_STREAM).is_some_and(|loading| {
-            loading.parked.iter().any(|message| {
-                matches!(message, Parked::Control(ControlMsg::PublishManifest { .. }))
-            })
-        });
+        let manifest_parked = self
+            .loading
+            .get(&self.config.keys.manifest)
+            .is_some_and(|loading| {
+                loading.parked.iter().any(|message| {
+                    matches!(message, Parked::Control(ControlMsg::PublishManifest { .. }))
+                })
+            });
         if self.wal_stopped
             || !self.wal.has_file()
             || (self.outbound.is_empty() && !manifest_parked)
@@ -1436,11 +1410,11 @@ impl Core {
 
     /// A stream's waits as it leaves: those it arrived with, and its own entry if one is
     /// still queued here. This core keeps its copies, since entries it stamped wait on them.
-    fn wal_waits_for_handoff(&mut self, name: &str) -> Vec<(usize, u64)> {
+    fn wal_waits_for_handoff(&mut self, name: KeyHash) -> Vec<(usize, u64)> {
         let mut waits: Vec<(usize, u64)> = self
             .wal_waits
             .iter()
-            .filter(|wait| &*wait.stream == name)
+            .filter(|wait| wait.stream == name)
             .map(|wait| (wait.core, wait.ticket))
             .collect();
         let parked = self
@@ -1475,7 +1449,7 @@ impl Core {
             .is_some_and(|(ticket, _)| *ticket <= durable_ticket)
         {
             if let Some((_, name)) = self.wal_visible.pop_front() {
-                self.drain_visible(&name);
+                self.drain_visible(name);
             }
         }
         self.drain_foreign_visible();
@@ -1503,8 +1477,8 @@ impl Core {
             return;
         }
         for name in std::mem::take(&mut self.foreign_visible) {
-            self.drain_visible(&name);
-            let waiting = self.streams.get(&*name).is_some_and(|stream| {
+            self.drain_visible(name);
+            let waiting = self.streams.get(&name).is_some_and(|stream| {
                 !stream.delivery.pending.is_empty() || !stream.delivery.unsaved.is_empty()
             });
             if waiting {
@@ -1515,9 +1489,9 @@ impl Core {
 
     /// Delivery advances in id order: what is ready goes, up to the first that isn't. A
     /// level 0 or 1 batch waits only behind an earlier one that needs the WAL (section 5.2).
-    fn drain_visible(&mut self, name: &str) {
+    fn drain_visible(&mut self, name: KeyHash) {
         let me = self.config.id;
-        let Some(stream) = self.streams.get_mut(name) else {
+        let Some(stream) = self.streams.get_mut(&name) else {
             return;
         };
         let durable_ticket = *self.inbox.durable.borrow();
@@ -1587,7 +1561,7 @@ impl Core {
 
     /// Where a subscriber starts (section 5.1), then live or catching up.
     fn on_attach(&mut self, mut message: AttachMsg) {
-        if let Route::Forward(to) = self.route(&message.stream) {
+        if let Route::Forward(to) = self.route(message.stream) {
             // Whatever a walk found, a move since means another core to ask.
             message.walk = None;
             let _ = self.links.control[to].send(ControlMsg::Attach(Box::new(message)));
@@ -1595,7 +1569,7 @@ impl Core {
         }
         let now_ms = self.clock.now_ms();
         let sub = message.sub;
-        let Some(stream) = self.streams.get_mut(&*message.stream) else {
+        let Some(stream) = self.streams.get_mut(&message.stream) else {
             self.send_catch(
                 sub,
                 CatchReply::Fail {
@@ -1673,7 +1647,7 @@ impl Core {
             }
             let own_id = self
                 .logs
-                .get(&*message.stream)
+                .get(&message.stream)
                 .and_then(|log| next_id_in_log(log, cursor, u64::MAX));
             let lowest_id = [
                 stream.delivery.sealed_id_above(cursor),
@@ -1696,7 +1670,8 @@ impl Core {
             }
         }
         if let Some(name) = &message.name {
-            if !crate::delivery::cursor_has_room(&stream.delivery.cursors, name) {
+            let internal = internal_cursors(&self.config.keys, message.stream, &stream.delivery);
+            if !crate::delivery::cursor_has_room(&stream.delivery.cursors, *name, &internal) {
                 self.send_catch(
                     sub,
                     CatchReply::Fail {
@@ -1706,11 +1681,7 @@ impl Core {
                 );
                 return;
             }
-            stream
-                .delivery
-                .cursors
-                .entry(Arc::clone(name))
-                .or_insert(cursor);
+            stream.delivery.cursors.entry(*name).or_insert(cursor);
             stream.delivery.meta_dirty = stream.delivery.track_meta;
         }
         let (state_ver, visible_doc) = &stream.delivery.visible_state;
@@ -1767,7 +1738,7 @@ impl Core {
             }
             let found = self
                 .logs
-                .get(&*message.stream)
+                .get(&message.stream)
                 .and_then(|log| next_id_in_log(log, walk.cursor, end));
             if found.is_some() {
                 walk.found_id = found;
@@ -1781,7 +1752,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn attach_live(
         &mut self,
-        name: &Arc<str>,
+        name: &KeyHash,
         sub: SubRef,
         filter: format::Filter,
         head: u64,
@@ -1789,7 +1760,7 @@ impl Core {
         state_ver: u64,
         state: Bytes,
     ) {
-        let Some(stream) = self.streams.get_mut(&**name) else {
+        let Some(stream) = self.streams.get_mut(name) else {
             return;
         };
         let filter_id = stream.delivery.table.attach(filter, sub.home);
@@ -1802,7 +1773,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn send_attached(
         &mut self,
-        name: &Arc<str>,
+        name: &KeyHash,
         sub: SubRef,
         filter_id: u32,
         head: u64,
@@ -1810,7 +1781,7 @@ impl Core {
         state_ver: u64,
         state: Bytes,
     ) {
-        let Some(stream) = self.streams.get_mut(&**name) else {
+        let Some(stream) = self.streams.get_mut(name) else {
             return;
         };
         let seq = next_seq(&mut stream.delivery, sub.home);
@@ -1823,18 +1794,18 @@ impl Core {
             state,
         };
         if sub.home == self.config.id {
-            self.home.on_stream(Arc::clone(name), seq, body);
+            self.home.on_stream(*name, seq, body);
         } else {
             let _ = self.links.delivery[sub.home].send(DeliveryMsg::Stream {
-                stream: Arc::clone(name),
+                stream: *name,
                 seq,
                 body,
             });
         }
     }
 
-    fn on_detach(&mut self, name: Arc<str>, filter_id: u32, home: usize) {
-        if let Route::Forward(to) = self.route(&name) {
+    fn on_detach(&mut self, name: KeyHash, filter_id: u32, home: usize) {
+        if let Route::Forward(to) = self.route(name) {
             let _ = self.links.control[to].send(ControlMsg::Detach {
                 stream: name,
                 filter_id,
@@ -1842,7 +1813,7 @@ impl Core {
             });
             return;
         }
-        if let Some(stream) = self.streams.get_mut(&*name) {
+        if let Some(stream) = self.streams.get_mut(&name) {
             stream.delivery.table.detach(filter_id, home);
             if filter_id != STATE_ONLY_FILTER_ID
                 && let Some(shard) = self.shards.get_mut(&stream.shard)
@@ -1855,12 +1826,12 @@ impl Core {
     /// A catching-up subscriber asks what comes next. Reaching what is visible attaches it,
     /// in one step here, so nothing falls between the read and live (section 5.1).
     fn on_read_step(&mut self, message: ReadStepMsg) {
-        if let Route::Forward(to) = self.route(&message.stream) {
+        if let Route::Forward(to) = self.route(message.stream) {
             let _ = self.links.reads[to].send(ReadMsg::Step(Box::new(message)));
             return;
         }
         let me = self.config.id;
-        let Some(stream) = self.streams.get_mut(&*message.stream) else {
+        let Some(stream) = self.streams.get_mut(&message.stream) else {
             self.send_catch(
                 message.sub,
                 CatchReply::Fail {
@@ -1940,7 +1911,7 @@ impl Core {
                 let _ = self.links.reads[core].send(ReadMsg::Chain(chain));
                 return;
             }
-            if let Some(log) = self.logs.get(&*chain.stream) {
+            if let Some(log) = self.logs.get(&chain.stream) {
                 chain.batches =
                     log.read_after(chain.after, end.min(chain.limit), self.settings.read_bytes);
                 if !chain.batches.is_empty() {
@@ -1949,18 +1920,18 @@ impl Core {
                 }
             }
         }
-        if let Route::Forward(to) = self.route(&chain.stream) {
+        if let Route::Forward(to) = self.route(chain.stream) {
             let _ = self.links.reads[to].send(ReadMsg::Chain(chain));
             return;
         }
-        let name = Arc::clone(&chain.stream);
+        let name = chain.stream;
         if self.needs_load(&name) {
             self.park(&name, Parked::Read(ReadMsg::Chain(chain)));
             return;
         }
         let extent = self
             .streams
-            .get(&*chain.stream)
+            .get(&chain.stream)
             .and_then(|stream| stream.delivery.first_extent_after(chain.after))
             .cloned();
         let memory_first = chain.batches.first().map(first_id);
@@ -1985,13 +1956,13 @@ impl Core {
 
     fn on_cursor(
         &mut self,
-        name: Arc<str>,
-        cursor: Arc<str>,
+        name: KeyHash,
+        cursor: KeyHash,
         op: CursorOp,
         report: Option<CursorReport>,
         ticket: Option<CommandTicket>,
     ) {
-        if let Route::Forward(to) = self.route(&name) {
+        if let Route::Forward(to) = self.route(name) {
             let _ = self.links.control[to].send(ControlMsg::Cursor {
                 stream: name,
                 name: cursor,
@@ -2014,7 +1985,7 @@ impl Core {
                 });
             }
         };
-        let Some(stream) = self.streams.get_mut(&*name) else {
+        let Some(stream) = self.streams.get_mut(&name) else {
             match op {
                 CursorOp::Read(reply) => {
                     let _ = reply.send(None);
@@ -2028,7 +1999,8 @@ impl Core {
         };
         let head = stream.ids.last_id();
         stream.delivery.meta_dirty = stream.delivery.track_meta;
-        let room = crate::delivery::cursor_has_room(&stream.delivery.cursors, &cursor);
+        let internal = internal_cursors(&self.config.keys, name, &stream.delivery);
+        let room = crate::delivery::cursor_has_room(&stream.delivery.cursors, cursor, &internal);
         match op {
             CursorOp::Commit(id) if id > head => {
                 fail(ErrorCode::Malformed, "COMMIT above the stream's head");
@@ -2070,27 +2042,27 @@ impl Core {
     fn note_extents(
         &mut self,
         tag: UploadTag,
-        names: &[Arc<str>],
+        names: &[KeyHash],
         path: &object_store::path::Path,
         extents: &[storage::StreamExtent],
     ) {
-        let mut by_stream: HashMap<&str, Vec<storage::StreamExtent>> = HashMap::new();
+        let mut by_stream: HashMap<KeyHash, Vec<storage::StreamExtent>> = HashMap::new();
         for extent in extents {
             by_stream
-                .entry(&*extent.stream)
+                .entry(extent.stream)
                 .or_default()
                 .push(extent.clone());
         }
         for name in names {
-            let own = by_stream.remove(&**name).unwrap_or_default();
-            if let Some(stream) = self.streams.get_mut(&**name) {
+            let own = by_stream.remove(name).unwrap_or_default();
+            if let Some(stream) = self.streams.get_mut(name) {
                 for extent in &own {
                     stream.delivery.add_extent(path, extent);
                 }
-                self.note_batches(name, tag);
-            } else if let Route::Forward(to) = self.route(name) {
+                self.note_batches(*name, tag);
+            } else if let Route::Forward(to) = self.route(*name) {
                 let _ = self.links.control[to].send(ControlMsg::AddExtents {
-                    stream: Arc::clone(name),
+                    stream: *name,
                     path: path.clone(),
                     extents: own,
                     origin: self.config.id,
@@ -2099,23 +2071,23 @@ impl Core {
             } else if self.loader.is_some() {
                 // It may only be out of RAM, and the extent must reach its metadata.
                 self.on_control(ControlMsg::AddExtents {
-                    stream: Arc::clone(name),
+                    stream: *name,
                     path: path.clone(),
                     extents: own,
                     origin: self.config.id,
                     tag,
                 });
             } else {
-                self.note_batches(name, tag);
+                self.note_batches(*name, tag);
             }
         }
     }
 
-    fn note_batches(&mut self, name: &str, tag: UploadTag) {
-        if let Some(log) = self.logs.get_mut(name) {
+    fn note_batches(&mut self, name: KeyHash, tag: UploadTag) {
+        if let Some(log) = self.logs.get_mut(&name) {
             log.note(tag);
-            if log.batches.is_empty() && !self.streams.contains_key(name) {
-                self.logs.remove(name);
+            if log.batches.is_empty() && !self.streams.contains_key(&name) {
+                self.logs.remove(&name);
             }
         }
     }
@@ -2124,7 +2096,7 @@ impl Core {
     /// original may still be on its way, and may have been stamped by an earlier owner.
     fn ack_when_reached(
         &mut self,
-        name: &Arc<str>,
+        name: &KeyHash,
         last_id: u64,
         level: u8,
         ack: Reply,
@@ -2140,14 +2112,14 @@ impl Core {
         }
         let owner = self
             .streams
-            .get(&**name)
+            .get(name)
             .and_then(|stream| stream.owners.iter().find(|(end, _)| *end >= last_id))
             .map_or(self.config.id, |(_, core)| *core);
         if owner == self.config.id {
-            self.ack_local(name, last_id, level, ack, tx);
+            self.ack_local(*name, last_id, level, ack, tx);
         } else {
             let _ = self.links.control[owner].send(ControlMsg::AckWhenReached {
-                stream: Arc::clone(name),
+                stream: *name,
                 last_id,
                 level,
                 ack,
@@ -2158,22 +2130,22 @@ impl Core {
 
     /// The lead is measured from the highest time this core has read, so that a clock stepping
     /// back doesn't stop every stream until it catches up (D221).
-    fn ids_fit_lead(&mut self, name: &str, now_ms: u64, item_count: u64) -> bool {
+    fn ids_fit_lead(&mut self, name: KeyHash, now_ms: u64, item_count: u64) -> bool {
         self.clock_high_ms = self.clock_high_ms.max(now_ms);
-        match self.streams.get(name) {
+        match self.streams.get(&name) {
             Some(stream) => stream.ids.fits_lead(self.clock_high_ms, item_count),
             None => IdAllocator::new(
-                self.tombstones.get(name).copied().unwrap_or(0),
+                self.tombstones.get(&name).copied().unwrap_or(0),
                 self.config.last_valid_id,
             )
             .fits_lead(self.clock_high_ms, item_count),
         }
     }
 
-    fn ack_local(&mut self, name: &str, last_id: u64, level: u8, ack: Reply, tx: ReplyTx) {
+    fn ack_local(&mut self, name: KeyHash, last_id: u64, level: u8, ack: Reply, tx: ReplyTx) {
         let waiter = Waiter { reply: ack, tx };
         let wal_stopped = self.wal_stopped;
-        let batch = self.logs.get_mut(name).and_then(|log| {
+        let batch = self.logs.get_mut(&name).and_then(|log| {
             let at = log.find(last_id)?;
             log.batches.get_mut(at)
         });
@@ -2223,13 +2195,13 @@ impl Core {
         };
         let mut touched = Vec::new();
         for name in names {
-            let Some(log) = self.logs.get_mut(&*name) else {
+            let Some(log) = self.logs.get_mut(&name) else {
                 continue;
             };
             let first = log.first_unsealed;
             self.unsealed_bytes -= log.mark(tag, through);
             if log.first_unsealed > first {
-                touched.push(Arc::clone(&name));
+                touched.push(name);
             }
             log.dirty = log.has_unsealed();
             if log.dirty {
@@ -2273,7 +2245,7 @@ impl Core {
             return;
         };
         for name in &names {
-            if let Some(log) = self.logs.get_mut(&**name) {
+            if let Some(log) = self.logs.get_mut(name) {
                 log.complete(tag);
             }
         }
@@ -2282,30 +2254,30 @@ impl Core {
 
     fn on_control(&mut self, message: ControlMsg) {
         if self.loader.is_some()
-            && let Some(name) = control_stream(&message)
-            && matches!(self.route(&name), Route::Here(_))
+            && let Some(name) = control_stream(&message, &self.config.keys)
+            && matches!(self.route(name), Route::Here(_))
         {
             if self.needs_load(&name) {
                 self.park(&name, Parked::Control(message));
                 return;
             }
-            self.touch(&name);
+            self.touch(name);
         }
         match message {
             ControlMsg::Run(work) => (work.0)(),
-            ControlMsg::StreamInfo { stream, reply } => match self.route(&stream) {
+            ControlMsg::StreamInfo { stream, reply } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::StreamInfo { stream, reply });
                 }
                 Route::Here(_) => {
                     let memory_first_id = self
                         .logs
-                        .get(&*stream)
+                        .get(&stream)
                         .and_then(|log| log.batches.front())
                         .map(|batch| batch.first_id);
                     let result = self
                         .streams
-                        .get(&*stream)
+                        .get(&stream)
                         .map(|stream| StreamInfo {
                             head: stream.delivery.visible_head(stream.ids.last_id()),
                             stamped_id: stream.ids.last_id(),
@@ -2328,7 +2300,7 @@ impl Core {
                                     let cursor = stream
                                         .delivery
                                         .cursors
-                                        .get(sink_cursor_name(*id).as_str())
+                                        .get(&self.config.keys.sink_cursor(*id))
                                         .copied();
                                     (*id, spec.clone(), cursor)
                                 })
@@ -2342,7 +2314,7 @@ impl Core {
                 stream,
                 patch,
                 reply,
-            } => match self.route(&stream) {
+            } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::ConfigurePatch {
                         stream,
@@ -2350,12 +2322,12 @@ impl Core {
                         reply,
                     });
                 }
-                Route::Here(_) if &*stream == MANIFEST_STREAM => {
-                    let config = self.streams.get(&*stream).map(|known| known.config);
+                Route::Here(_) if stream == self.config.keys.manifest => {
+                    let config = self.streams.get(&stream).map(|known| known.config);
                     let _ = reply.send(config.unwrap_or_default());
                 }
                 Route::Here(shard) => {
-                    let before = self.streams.get(&*stream).map(|known| known.config);
+                    let before = self.streams.get(&stream).map(|known| known.config);
                     let config = &mut self.stream_entry(&stream, shard).config;
                     if let Some(level) = patch.default_ack_level {
                         config.default_ack_level = level;
@@ -2367,17 +2339,17 @@ impl Core {
                         config.retention_ms = retention_ms;
                     }
                     let config = *config;
-                    self.mark_dirty(&stream);
+                    self.mark_dirty(stream);
                     self.answer_config_change(before != Some(config), move || {
                         let _ = reply.send(config);
                     });
                 }
             },
-            ControlMsg::DeleteStream { stream, reply } => match self.route(&stream) {
+            ControlMsg::DeleteStream { stream, reply } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::DeleteStream { stream, reply });
                 }
-                Route::Here(_) if &*stream == MANIFEST_STREAM => {
+                Route::Here(_) if stream == self.config.keys.manifest => {
                     let _ = reply.send(false);
                 }
                 Route::Here(shard) => {
@@ -2389,20 +2361,17 @@ impl Core {
                     }
                 }
             },
-            ControlMsg::Sink { stream, op, reply } => match self.route(&stream) {
+            ControlMsg::Sink { stream, op, reply } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::Sink { stream, op, reply });
                 }
                 Route::Here(_) => {
                     let lifecycle_sink = op.lifecycle_sink();
-                    let result = self.on_sink(&stream, op);
-                    self.mark_dirty(&stream);
+                    let result = self.on_sink(stream, op);
+                    self.mark_dirty(stream);
                     let note = lifecycle_sink
                         .filter(|_| result.is_ok())
-                        .map(|sink_id| SinkNote {
-                            stream: Arc::clone(&stream),
-                            sink_id,
-                        });
+                        .map(|sink_id| SinkNote { stream, sink_id });
                     let notes = self.sink_notes.clone();
                     if note.is_some() && self.loader.is_some() {
                         // Once a checkpoint holds it, the pool hears and then the caller, so
@@ -2428,14 +2397,14 @@ impl Core {
             ControlMsg::Ping { reply } => {
                 let _ = reply.send(self.config.id);
             }
-            ControlMsg::Snapshot { stream, reply } => match self.route(&stream) {
+            ControlMsg::Snapshot { stream, reply } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::Snapshot { stream, reply });
                 }
                 Route::Here(_) => {
                     let result = self
                         .streams
-                        .get(&*stream)
+                        .get(&stream)
                         .map(|stream| SnapshotReply {
                             head: stream.delivery.visible_head(stream.ids.last_id()),
                             state_ver: stream.delivery.visible_state.0,
@@ -2448,7 +2417,7 @@ impl Core {
             ControlMsg::ReadMemory { stream, reply } => {
                 let batches = self
                     .logs
-                    .get(&*stream)
+                    .get(&stream)
                     .map(|log| log.batches.iter().map(|b| b.bytes.clone()).collect())
                     .unwrap_or_default();
                 let _ = reply.send(batches);
@@ -2457,7 +2426,7 @@ impl Core {
                 stream,
                 config,
                 reply,
-            } => match self.route(&stream) {
+            } => match self.route(stream) {
                 Route::Forward(to) => {
                     let _ = self.links.control[to].send(ControlMsg::Configure {
                         stream,
@@ -2466,13 +2435,13 @@ impl Core {
                     });
                 }
                 // Nobody but the node sets this one's config (D159).
-                Route::Here(_) if &*stream == MANIFEST_STREAM => {
+                Route::Here(_) if stream == self.config.keys.manifest => {
                     let _ = reply.send(());
                 }
                 Route::Here(shard) => {
-                    let before = self.streams.get(&*stream).map(|known| known.config);
+                    let before = self.streams.get(&stream).map(|known| known.config);
                     self.stream_entry(&stream, shard).config = config;
-                    self.mark_dirty(&stream);
+                    self.mark_dirty(stream);
                     self.answer_config_change(before != Some(config), move || {
                         let _ = reply.send(());
                     });
@@ -2524,7 +2493,7 @@ impl Core {
                 level,
                 ack,
                 reply,
-            } => self.ack_local(&stream, last_id, level, ack, reply),
+            } => self.ack_local(stream, last_id, level, ack, reply),
             ControlMsg::Conn(command) => self.home.on_command(command),
             ControlMsg::Attach(message) => self.on_attach(*message),
             ControlMsg::AttachWalk(message) => self.on_attach_walk(message),
@@ -2547,7 +2516,7 @@ impl Core {
                 origin,
                 tag,
             } => {
-                if let Route::Forward(to) = self.route(&stream) {
+                if let Route::Forward(to) = self.route(stream) {
                     let _ = self.links.control[to].send(ControlMsg::AddExtents {
                         stream,
                         path,
@@ -2557,19 +2526,19 @@ impl Core {
                     });
                     return;
                 }
-                if let Some(known) = self.streams.get_mut(&*stream) {
+                if let Some(known) = self.streams.get_mut(&stream) {
                     for extent in &extents {
                         known.delivery.add_extent(&path, extent);
                     }
                 }
                 if origin == self.config.id {
-                    self.note_batches(&stream, tag);
+                    self.note_batches(stream, tag);
                 } else {
                     let _ =
                         self.links.control[origin].send(ControlMsg::ExtentsNoted { stream, tag });
                 }
             }
-            ControlMsg::ExtentsNoted { stream, tag } => self.note_batches(&stream, tag),
+            ControlMsg::ExtentsNoted { stream, tag } => self.note_batches(stream, tag),
             ControlMsg::PublishManifest { doc, reply } => self.on_publish_manifest(doc, reply),
             ControlMsg::CompactView {
                 stream,
@@ -2577,7 +2546,7 @@ impl Core {
                 footer,
                 reply,
             } => {
-                if let Route::Forward(to) = self.route(&stream) {
+                if let Route::Forward(to) = self.route(stream) {
                     let _ = self.links.control[to].send(ControlMsg::CompactView {
                         stream,
                         path,
@@ -2586,7 +2555,7 @@ impl Core {
                     });
                     return;
                 }
-                let _ = reply.send(self.compact_view(&stream, &path, &footer));
+                let _ = reply.send(self.compact_view(stream, &path, &footer));
             }
             ControlMsg::ReplaceExtents {
                 stream,
@@ -2595,7 +2564,7 @@ impl Core {
                 extent,
                 reply,
             } => {
-                if let Route::Forward(to) = self.route(&stream) {
+                if let Route::Forward(to) = self.route(stream) {
                     let _ = self.links.control[to].send(ControlMsg::ReplaceExtents {
                         stream,
                         path,
@@ -2605,10 +2574,10 @@ impl Core {
                     });
                     return;
                 }
-                let merge_below = self.merge_below(&stream);
+                let merge_below = self.merge_below(stream);
                 let result = self
                     .streams
-                    .get_mut(&*stream)
+                    .get_mut(&stream)
                     .map_or(ReplaceResult::Gone, |known| {
                         known
                             .delivery
@@ -2621,7 +2590,7 @@ impl Core {
                 path,
                 reply,
             } => {
-                if let Route::Forward(to) = self.route(&stream) {
+                if let Route::Forward(to) = self.route(stream) {
                     let _ = self.links.control[to].send(ControlMsg::DropExtents {
                         stream,
                         path,
@@ -2631,7 +2600,7 @@ impl Core {
                 }
                 let dropped = self
                     .streams
-                    .get_mut(&*stream)
+                    .get_mut(&stream)
                     .is_some_and(|known| known.delivery.drop_path(&path) > 0);
                 let _ = reply.send(dropped);
             }
@@ -2683,14 +2652,14 @@ impl Core {
         });
     }
 
-    fn mark_dirty(&mut self, name: &str) {
-        if let Some(stream) = self.streams.get_mut(name) {
+    fn mark_dirty(&mut self, name: KeyHash) {
+        if let Some(stream) = self.streams.get_mut(&name) {
             stream.delivery.meta_dirty = stream.delivery.track_meta;
         }
     }
 
-    fn touch(&mut self, name: &str) {
-        if let Some(stream) = self.streams.get_mut(name) {
+    fn touch(&mut self, name: KeyHash) {
+        if let Some(stream) = self.streams.get_mut(&name) {
             self.use_count += 1;
             stream.delivery.last_used = self.use_count;
         }
@@ -2698,26 +2667,26 @@ impl Core {
 
     /// Whether `name` could be out of RAM, on a core that owns it. Asks for it if nobody has.
     /// Only the first touch of an idle stream pays for this, off the core (section 7.6).
-    fn needs_load(&mut self, name: &Arc<str>) -> bool {
+    fn needs_load(&mut self, name: &KeyHash) -> bool {
         let Some(loader) = &self.loader else {
             return false;
         };
-        if self.streams.contains_key(&**name)
-            || self.tombstones.contains_key(&**name)
-            || self.load_passed.as_deref() == Some(&**name)
+        if self.streams.contains_key(name)
+            || self.tombstones.contains_key(name)
+            || self.load_passed == Some(*name)
         {
             return false;
         }
-        if !self.loading.contains_key(&**name) {
+        if !self.loading.contains_key(name) {
             self.load_count += 1;
             let ticket = self.load_count;
             let _ = loader.send(MetaMsg::Load {
                 core: self.config.id,
-                stream: Arc::clone(name),
+                stream: *name,
                 ticket,
             });
             self.loading.insert(
-                Arc::clone(name),
+                *name,
                 Loading {
                     ticket,
                     parked: Vec::new(),
@@ -2727,8 +2696,8 @@ impl Core {
         true
     }
 
-    fn park(&mut self, name: &Arc<str>, message: Parked) {
-        if let Some(loading) = self.loading.get_mut(&**name) {
+    fn park(&mut self, name: &KeyHash, message: Parked) {
+        if let Some(loading) = self.loading.get_mut(name) {
             if matches!(message, Parked::Write(_)) {
                 self.parked_write_count += 1;
             }
@@ -2738,29 +2707,29 @@ impl Core {
 
     fn on_loaded(
         &mut self,
-        name: Arc<str>,
+        name: KeyHash,
         ticket: u64,
         meta: Option<Box<StreamMeta>>,
         rebuilt: bool,
     ) {
         if self
             .loading
-            .get(&*name)
+            .get(&name)
             .is_none_or(|loading| loading.ticket != ticket)
         {
             // It moved away while this was out. Its new owner asks for itself.
             return;
         }
-        let loading = self.loading.remove(&*name).expect("just looked at it");
-        let shard = match self.route(&name) {
+        let loading = self.loading.remove(&name).expect("just looked at it");
+        let shard = match self.route(name) {
             Route::Here(shard) => Some(shard),
             Route::Forward(_) => None,
         };
-        if let (Some(meta), Some(shard), false) = (meta, shard, self.streams.contains_key(&*name)) {
+        if let (Some(meta), Some(shard), false) = (meta, shard, self.streams.contains_key(&name)) {
             self.loaded_count += 1;
             self.rebuilt_count += u64::from(rebuilt);
             if meta.deleted {
-                self.tombstones.insert(Arc::clone(&name), meta.last_id);
+                self.tombstones.insert(name, meta.last_id);
             } else {
                 self.install_meta(&name, *meta, shard);
             }
@@ -2770,15 +2739,15 @@ impl Core {
 
     /// The metadata can't be read for now. Everything waiting is refused with the retryable
     /// code, as with a stopped WAL, and the next access asks again (D243).
-    fn on_load_failed(&mut self, name: Arc<str>, ticket: u64) {
+    fn on_load_failed(&mut self, name: KeyHash, ticket: u64) {
         if self
             .loading
-            .get(&*name)
+            .get(&name)
             .is_none_or(|loading| loading.ticket != ticket)
         {
             return;
         }
-        let loading = self.loading.remove(&*name).expect("just looked at it");
+        let loading = self.loading.remove(&name).expect("just looked at it");
         for message in loading.parked {
             match message {
                 Parked::Write(write) => {
@@ -2849,8 +2818,8 @@ impl Core {
     }
 
     /// In the order they came. Writes go ahead of what is deferred, which came later.
-    fn run_parked(&mut self, name: &Arc<str>, parked: Vec<Parked>) {
-        self.load_passed = Some(Arc::clone(name));
+    fn run_parked(&mut self, name: &KeyHash, parked: Vec<Parked>) {
+        self.load_passed = Some(*name);
         let mut writes = Vec::new();
         for message in parked {
             match message {
@@ -2871,14 +2840,14 @@ impl Core {
 
     /// A shard just left: what waited for its streams to load follows it, in order.
     fn pass_on_parked(&mut self) {
-        let leaving: Vec<Arc<str>> = self
+        let leaving: Vec<KeyHash> = self
             .loading
             .keys()
-            .filter(|name| matches!(self.route(name), Route::Forward(_)))
-            .cloned()
+            .filter(|name| matches!(self.route(**name), Route::Forward(_)))
+            .copied()
             .collect();
         for name in leaving {
-            if let Some(loading) = self.loading.remove(&*name) {
+            if let Some(loading) = self.loading.remove(&name) {
                 self.run_parked(&name, loading.parked);
             }
         }
@@ -2887,8 +2856,8 @@ impl Core {
     /// A seal manifest is a system record, so nothing a client sends can look like one
     /// (sections 2.2, 7.5).
     fn on_publish_manifest(&mut self, doc: Vec<u8>, reply: ReplyTx) {
-        let name: Arc<str> = Arc::from(MANIFEST_STREAM);
-        let shard = match self.route(&name) {
+        let name = self.config.keys.manifest;
+        let shard = match self.route(name) {
             Route::Forward(to) => {
                 let _ = self.links.control[to].send(ControlMsg::PublishManifest { doc, reply });
                 return;
@@ -2936,27 +2905,27 @@ impl Core {
     }
 
     /// Records at or above this may have no extent yet, here or on an earlier owner.
-    fn merge_below(&self, name: &str) -> u64 {
+    fn merge_below(&self, name: KeyHash) -> u64 {
         let elsewhere = self
             .streams
-            .get(name)
+            .get(&name)
             .is_some_and(|stream| !stream.delivery.held_elsewhere.is_empty());
         if elsewhere {
             return 0;
         }
         self.logs
-            .get(name)
+            .get(&name)
             .and_then(|log| log.batches.front())
             .map_or(u64::MAX, |batch| batch.first_id)
     }
 
     fn compact_view(
         &self,
-        name: &str,
+        name: KeyHash,
         path: &object_store::path::Path,
         footer: &[(u64, u64)],
     ) -> Option<CompactView> {
-        let stream = self.streams.get(name)?;
+        let stream = self.streams.get(&name)?;
         let delivery = &stream.delivery;
         let unnoted = footer.iter().any(|(id_first, id_last)| {
             *id_last > delivery.floor_id
@@ -2985,7 +2954,7 @@ impl Core {
         })
     }
 
-    fn install_meta(&mut self, name: &Arc<str>, meta: StreamMeta, shard: u32) {
+    fn install_meta(&mut self, name: &KeyHash, meta: StreamMeta, shard: u32) {
         let mut delivery = StreamDelivery::new(self.config.core_count);
         delivery.track_meta = true;
         delivery.floor_id = meta.floor_id;
@@ -2995,7 +2964,7 @@ impl Core {
         delivery.cursors = meta
             .cursors
             .iter()
-            .map(|cursor| (Arc::from(cursor.name.as_str()), cursor.id))
+            .map(|cursor| (cursor.name, cursor.id))
             .collect();
         delivery.extents = meta
             .extents
@@ -3013,16 +2982,12 @@ impl Core {
         delivery.last_used = self.use_count;
         let mut state = StreamState::new();
         state.install(meta.state, meta.state_ver);
-        self.shards
-            .entry(shard)
-            .or_default()
-            .streams
-            .insert(Arc::clone(name));
-        self.tombstones.remove(&**name);
+        self.shards.entry(shard).or_default().streams.insert(*name);
+        self.tombstones.remove(name);
         self.streams.insert(
-            Arc::clone(name),
+            *name,
             Stream {
-                name: Arc::clone(name),
+                name: *name,
                 shard,
                 ids: IdAllocator::new(meta.last_id.max(meta.floor_id), self.config.last_valid_id),
                 state,
@@ -3043,13 +3008,13 @@ impl Core {
     /// A stream as the startup put it back. What its WAL entries hold and no extent covers
     /// goes into the next seal, under this generation (D16).
     fn on_restore(&mut self, restored: crate::recovery::RestoredStream) {
-        let name: Arc<str> = Arc::from(restored.meta.name.as_str());
-        let shard = match self.route(&name) {
+        let name = restored.meta.stream;
+        let shard = match self.route(name) {
             Route::Here(shard) => shard,
             Route::Forward(_) => return,
         };
         self.install_meta(&name, restored.meta, shard);
-        let stream = self.streams.get_mut(&*name).expect("just installed");
+        let stream = self.streams.get_mut(&name).expect("just installed");
         stream.dedupe = restored.dedupe;
         stream.delivery.meta_dirty = true;
         stream.delivery.new_extents = restored
@@ -3060,7 +3025,7 @@ impl Core {
         if restored.batches.is_empty() {
             return;
         }
-        let log = self.logs.entry(Arc::clone(&name)).or_default();
+        let log = self.logs.entry(name).or_default();
         for batch in restored.batches {
             let bytes = self.pool.copy_in(&batch.bytes).freeze();
             self.unsealed_bytes += bytes.len() as u64;
@@ -3117,7 +3082,7 @@ impl Core {
             delivery.meta_dirty = false;
             delivery.saved_gather = gather;
             metas.push(StreamMeta {
-                name: stream.name.to_string(),
+                stream: stream.name,
                 deleted: false,
                 last_id: stream.ids.last_id(),
                 floor_id: delivery.floor_id,
@@ -3132,7 +3097,7 @@ impl Core {
                     .cursors
                     .iter()
                     .map(|(name, id)| MetaCursor {
-                        name: name.to_string(),
+                        name: *name,
                         id: *id,
                     })
                     .collect(),
@@ -3151,7 +3116,7 @@ impl Core {
         }
         for (name, last_id) in self.dirty_tombstones.drain(..) {
             metas.push(StreamMeta {
-                name: name.to_string(),
+                stream: name,
                 deleted: true,
                 last_id,
                 floor_id: last_id,
@@ -3172,7 +3137,7 @@ impl Core {
         if over == 0 {
             return;
         }
-        let mut cold: Vec<(u64, Arc<str>)> = self
+        let mut cold: Vec<(u64, KeyHash)> = self
             .streams
             .values()
             .filter(|stream| {
@@ -3189,16 +3154,16 @@ impl Core {
                         .is_none_or(|log| log.batches.is_empty())
                     && !self.wal_waits.iter().any(|wait| wait.stream == stream.name)
             })
-            .map(|stream| (stream.delivery.last_used, Arc::clone(&stream.name)))
+            .map(|stream| (stream.delivery.last_used, stream.name))
             .collect();
         cold.sort_unstable();
         for (_, name) in cold.into_iter().take(over) {
-            let Some(mut stream) = self.streams.remove(&*name) else {
+            let Some(mut stream) = self.streams.remove(&name) else {
                 continue;
             };
-            self.logs.remove(&*name);
+            self.logs.remove(&name);
             if let Some(shard) = self.shards.get_mut(&stream.shard) {
-                shard.streams.remove(&*name);
+                shard.streams.remove(&name);
             }
             for home in 0..self.config.core_count {
                 if stream.delivery.seq_by_home[home] == 0 {
@@ -3206,11 +3171,10 @@ impl Core {
                 }
                 let seq = next_seq(&mut stream.delivery, home);
                 if home == self.config.id {
-                    self.home
-                        .on_stream(Arc::clone(&name), seq, StreamBody::Evicted);
+                    self.home.on_stream(name, seq, StreamBody::Evicted);
                 } else {
                     let _ = self.links.delivery[home].send(DeliveryMsg::Stream {
-                        stream: Arc::clone(&name),
+                        stream: name,
                         seq,
                         body: StreamBody::Evicted,
                     });
@@ -3220,13 +3184,13 @@ impl Core {
         }
     }
 
-    fn package_stream(&mut self, name: &str) -> Option<StreamHandoff> {
-        let mut stream = self.streams.remove(name)?;
+    fn package_stream(&mut self, name: KeyHash) -> Option<StreamHandoff> {
+        let mut stream = self.streams.remove(&name)?;
         let last_id = stream.ids.last_id();
         if last_id > 0 {
             stream.owners.push((last_id, self.config.id));
         }
-        if let Some(batch) = self.logs.get(name).and_then(|log| log.batches.back()) {
+        if let Some(batch) = self.logs.get(&name).and_then(|log| log.batches.back()) {
             stream.delivery.held_elsewhere.push(batch.last_id);
         }
         // The new owner hears when what it takes over from here becomes durable (D84).
@@ -3260,34 +3224,33 @@ impl Core {
 
     /// Its records stop being reachable and age out with their prefixes (D20), and a stream
     /// made under this name later has higher ids and can't read them.
-    fn on_delete_stream(&mut self, name: &Arc<str>, shard: u32) -> bool {
-        let Some(mut stream) = self.streams.remove(&**name) else {
+    fn on_delete_stream(&mut self, name: &KeyHash, shard: u32) -> bool {
+        let Some(mut stream) = self.streams.remove(name) else {
             return false;
         };
         if let Some(shard) = self.shards.get_mut(&shard) {
-            shard.streams.remove(&**name);
+            shard.streams.remove(name);
         }
         for sink_id in stream.delivery.sinks.keys() {
             let _ = self.sink_notes.send(SinkNote {
-                stream: Arc::clone(name),
+                stream: *name,
                 sink_id: *sink_id,
             });
         }
         // Everything at or below the last valid id is older than this delete, though a former
         // generation's late object can hold ids of it this stream never had (section 8.1).
         let floor_id = stream.ids.last_id().max(self.config.last_valid_id);
-        self.tombstones.insert(Arc::clone(name), floor_id);
+        self.tombstones.insert(*name, floor_id);
         if self.loader.is_some() {
-            self.dirty_tombstones.push((Arc::clone(name), floor_id));
+            self.dirty_tombstones.push((*name, floor_id));
         }
         for home in 0..self.config.core_count {
             let seq = next_seq(&mut stream.delivery, home);
             if home == self.config.id {
-                self.home
-                    .on_stream(Arc::clone(name), seq, StreamBody::Deleted);
+                self.home.on_stream(*name, seq, StreamBody::Deleted);
             } else {
                 let _ = self.links.delivery[home].send(DeliveryMsg::Stream {
-                    stream: Arc::clone(name),
+                    stream: *name,
                     seq,
                     body: StreamBody::Deleted,
                 });
@@ -3296,9 +3259,10 @@ impl Core {
         true
     }
 
-    fn on_sink(&mut self, name: &str, op: SinkOp) -> Result<(), ErrorCode> {
+    fn on_sink(&mut self, name: KeyHash, op: SinkOp) -> Result<(), ErrorCode> {
         let now_ms = self.clock.now_ms();
-        let stream = self.streams.get_mut(name).ok_or(ErrorCode::NotFound)?;
+        let keys = &self.config.keys;
+        let stream = self.streams.get_mut(&name).ok_or(ErrorCode::NotFound)?;
         let head = stream.delivery.visible_head(stream.ids.last_id());
         // A cursor up there would hide every later record while the sink looks healthy, so this
         // goes the way of `SUBSCRIBE` and `COMMIT` (D230, D236). An update keeps its cursor.
@@ -3319,8 +3283,7 @@ impl Core {
                 start,
             } => {
                 let mut spec = *spec;
-                if spec.kind == "forward" && (sink_id == 0 || spec.target.as_deref() == Some(name))
-                {
+                if spec.kind == "forward" && (sink_id == 0 || spec.target == Some(name)) {
                     // Producer id 0 means no idempotency (D6), and a stream into itself never
                     // ends.
                     return Err(ErrorCode::Malformed);
@@ -3346,14 +3309,14 @@ impl Core {
                     spec.epoch = now_ms.max(delivery.deleted_sink_epoch.saturating_add(1));
                     delivery
                         .cursors
-                        .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
+                        .insert(keys.sink_cursor(sink_id), cursor_at(start));
                 }
                 delivery.sinks.insert(sink_id, spec);
             }
             SinkOp::Delete { sink_id } => {
                 let spec = delivery.sinks.remove(&sink_id).ok_or(ErrorCode::NotFound)?;
                 delivery.deleted_sink_epoch = delivery.deleted_sink_epoch.max(spec.epoch);
-                delivery.cursors.remove(sink_cursor_name(sink_id).as_str());
+                delivery.cursors.remove(&keys.sink_cursor(sink_id));
             }
             SinkOp::SetPaused { sink_id, paused } => {
                 let spec = delivery
@@ -3377,7 +3340,7 @@ impl Core {
                 spec.expiry_warning_id = None;
                 delivery
                     .cursors
-                    .insert(Arc::from(sink_cursor_name(sink_id)), cursor_at(start));
+                    .insert(keys.sink_cursor(sink_id), cursor_at(start));
             }
             SinkOp::Commit {
                 sink_id,
@@ -3399,11 +3362,11 @@ impl Core {
                 if let Some(id) = id
                     && spec.epoch == epoch
                 {
-                    let name = sink_cursor_name(sink_id);
-                    match delivery.cursors.get_mut(name.as_str()) {
+                    let name = keys.sink_cursor(sink_id);
+                    match delivery.cursors.get_mut(&name) {
                         Some(cursor) => *cursor = (*cursor).max(id),
                         None => {
-                            delivery.cursors.insert(Arc::from(name), id);
+                            delivery.cursors.insert(name, id);
                         }
                     }
                 }
@@ -3457,7 +3420,7 @@ impl Core {
         let streams = state
             .streams
             .iter()
-            .filter_map(|name| self.package_stream(name))
+            .filter_map(|name| self.package_stream(*name))
             .collect();
         // What this shard's new owner has to answer for: entries for streams that hash
         // here, and for streams living in it.
@@ -3465,30 +3428,24 @@ impl Core {
             .overrides
             .iter()
             .filter(|(name, own_shard)| {
-                **own_shard == shard || shard_of(name, self.config.virtual_shard_count) == shard
+                **own_shard == shard || shard_of(**name, self.config.virtual_shard_count) == shard
             })
-            .map(|(name, own_shard)| {
-                (
-                    Arc::clone(name),
-                    *own_shard,
-                    self.location[*own_shard as usize],
-                )
-            })
+            .map(|(name, own_shard)| (*name, *own_shard, self.location[*own_shard as usize]))
             .collect();
-        let tombstones: Vec<(Arc<str>, u64)> = self
+        let tombstones: Vec<(KeyHash, u64)> = self
             .tombstones
             .iter()
             .filter(|(name, _)| {
                 self.overrides
-                    .get(&***name)
+                    .get(*name)
                     .copied()
-                    .unwrap_or_else(|| shard_of(name, self.config.virtual_shard_count))
+                    .unwrap_or_else(|| shard_of(**name, self.config.virtual_shard_count))
                     == shard
             })
-            .map(|(name, last_id)| (Arc::clone(name), *last_id))
+            .map(|(name, last_id)| (*name, *last_id))
             .collect();
         for (name, _) in &tombstones {
-            self.tombstones.remove(&**name);
+            self.tombstones.remove(name);
         }
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard,
@@ -3504,12 +3461,12 @@ impl Core {
 
     fn on_split_stream(
         &mut self,
-        name: Arc<str>,
+        name: KeyHash,
         new_shard: u32,
         to: usize,
         done: oneshot::Sender<()>,
     ) {
-        if let Route::Forward(next) = self.route(&name) {
+        if let Route::Forward(next) = self.route(name) {
             let _ = self.links.control[next].send(ControlMsg::SplitStream {
                 stream: name,
                 new_shard,
@@ -3518,25 +3475,25 @@ impl Core {
             });
             return;
         }
-        let old_shard = self.streams.get(&*name).map(|stream| stream.shard);
+        let old_shard = self.streams.get(&name).map(|stream| stream.shard);
         if let Some(shard) = old_shard.and_then(|shard| self.shards.get_mut(&shard)) {
-            shard.streams.remove(&*name);
+            shard.streams.remove(&name);
         }
-        self.overrides.insert(Arc::clone(&name), new_shard);
+        self.overrides.insert(name, new_shard);
         self.location[new_shard as usize] = to as u16;
         if to == self.config.id {
             let shard = self.shards.entry(new_shard).or_default();
             if old_shard.is_some() {
-                shard.streams.insert(Arc::clone(&name));
+                shard.streams.insert(name);
             }
-            if let Some(stream) = self.streams.get_mut(&*name) {
+            if let Some(stream) = self.streams.get_mut(&name) {
                 stream.shard = new_shard;
             }
             let _ = done.send(());
             return;
         }
-        let streams = self.package_stream(&name).into_iter().collect();
-        let tombstones = self.tombstones.remove_entry(&*name).into_iter().collect();
+        let streams = self.package_stream(name).into_iter().collect();
+        let tombstones = self.tombstones.remove_entry(&name).into_iter().collect();
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard: new_shard,
             streams,
@@ -3561,10 +3518,10 @@ impl Core {
         }
         for (name, _, _) in &handoff.overrides {
             if !self.overrides.contains_key(name)
-                && let Route::Forward(hop) = self.route(name)
+                && let Route::Forward(hop) = self.route(*name)
             {
-                rerouted.push(Arc::clone(name));
-                probes.push((hop, ProbeTarget::Stream(Arc::clone(name))));
+                rerouted.push(*name);
+                probes.push((hop, ProbeTarget::Stream(*name)));
             }
         }
         self.location[shard_id as usize] = me;
@@ -3581,21 +3538,21 @@ impl Core {
         let shard = self.shards.entry(shard_id).or_default();
         shard.counters = handoff.counters;
         for stream in handoff.streams {
-            shard.streams.insert(Arc::clone(&stream.name));
+            shard.streams.insert(stream.name);
             // Anything already sent is dropped by the next `clear_wal_waits`.
             for (core, ticket) in stream.wal_waits {
                 self.wal_waits.push(WalWait {
-                    stream: Arc::clone(&stream.name),
+                    stream: stream.name,
                     core,
                     ticket,
                     stamped_through: self.next_ticket,
                 });
             }
             if !stream.delivery.pending.is_empty() || !stream.delivery.unsaved.is_empty() {
-                self.foreign_visible.push(Arc::clone(&stream.name));
+                self.foreign_visible.push(stream.name);
             }
             self.streams.insert(
-                Arc::clone(&stream.name),
+                stream.name,
                 Stream {
                     name: stream.name,
                     shard: shard_id,
@@ -3635,7 +3592,7 @@ impl Core {
 }
 
 /// The stream a message needs in RAM before it can be handled, if any.
-fn control_stream(message: &ControlMsg) -> Option<Arc<str>> {
+fn control_stream(message: &ControlMsg, keys: &Keys) -> Option<KeyHash> {
     match message {
         ControlMsg::StreamInfo { stream, .. }
         | ControlMsg::ConfigurePatch { stream, .. }
@@ -3647,9 +3604,9 @@ fn control_stream(message: &ControlMsg) -> Option<Arc<str>> {
         | ControlMsg::CompactView { stream, .. }
         | ControlMsg::ReplaceExtents { stream, .. }
         | ControlMsg::DropExtents { stream, .. }
-        | ControlMsg::AddExtents { stream, .. } => Some(Arc::clone(stream)),
-        ControlMsg::PublishManifest { .. } => Some(Arc::from(MANIFEST_STREAM)),
-        ControlMsg::Attach(message) => Some(Arc::clone(&message.stream)),
+        | ControlMsg::AddExtents { stream, .. } => Some(*stream),
+        ControlMsg::PublishManifest { .. } => Some(keys.manifest),
+        ControlMsg::Attach(message) => Some(message.stream),
         _ => None,
     }
 }
@@ -3678,9 +3635,18 @@ fn next_id_in_log(log: &StreamLog, after: u64, through: u64) -> Option<u64> {
         .map(|batch| first_id(batch).max(after + 1))
 }
 
-/// The named cursor of section 9.
-fn sink_cursor_name(sink_id: u64) -> String {
-    format!("sink:{sink_id}")
+/// The cursors of a stream that aren't the clients': its sinks', and on the manifest stream the
+/// compactor's.
+fn internal_cursors(keys: &Keys, stream: KeyHash, delivery: &StreamDelivery) -> Vec<KeyHash> {
+    let mut internal: Vec<KeyHash> = delivery
+        .sinks
+        .keys()
+        .map(|id| keys.sink_cursor(*id))
+        .collect();
+    if stream == keys.manifest {
+        internal.extend(RetentionClass::ALL.map(|class| keys.hash(&class.cursor_name())));
+    }
+    internal
 }
 
 fn first_id(batch: &SlabBytes) -> u64 {
@@ -3730,10 +3696,10 @@ fn fan_out(stream: &mut Stream, entry: PendingVisible, parts: FanOutParts<'_>) {
         let seq = next_seq(&mut stream.delivery, home);
         let body = StreamBody::Fan(Arc::clone(&fan));
         if home == parts.me {
-            parts.home.on_stream(Arc::clone(&stream.name), seq, body);
+            parts.home.on_stream(stream.name, seq, body);
         } else {
             let _ = parts.links.delivery[home].send(DeliveryMsg::Stream {
-                stream: Arc::clone(&stream.name),
+                stream: stream.name,
                 seq,
                 body,
             });

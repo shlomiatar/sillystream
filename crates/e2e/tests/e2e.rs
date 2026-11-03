@@ -2314,14 +2314,7 @@ async fn a_stream_id_cannot_forge_a_log_line() {
         assert!(read.iter().all(|(_, bytes)| *bytes != 999), "{read:?}");
     }
     assert_eq!(node.tiers_read("victim"), Vec::new());
-    assert!(
-        !node
-            .log_text()
-            .lines()
-            .any(|line| line.starts_with("trace catch_up stream=victim")),
-        "{}",
-        node.log_text()
-    );
+    assert!(!node.log_text().contains("victim"), "{}", node.log_text());
 }
 
 // ---------------------------------------------------------------------------------------------

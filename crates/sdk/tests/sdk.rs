@@ -564,16 +564,21 @@ async fn a_slow_reader_pauses_and_comes_back_without_loss() {
             },
         )
         .unwrap();
-    let mut spec = Subscribe::new("slow", FROM_START);
-    spec.max_queue_bytes = 16 * 1024;
-    let mut subscription = client.subscribe(spec).unwrap();
     let mut expected = Vec::new();
-    for index in 0..200u32 {
+    let mut publish = async |index: u32| {
         let mut item = vec![0u8; 1000];
         item[..4].copy_from_slice(&index.to_le_bytes());
         publisher.add(0, item.clone());
-        expected.push(item);
         publisher.flush().await.unwrap();
+        item
+    };
+    // The first publish makes the stream, which may be on another core than the subscribe.
+    expected.push(publish(0).await);
+    let mut spec = Subscribe::new("slow", FROM_START);
+    spec.max_queue_bytes = 16 * 1024;
+    let mut subscription = client.subscribe(spec).unwrap();
+    for index in 1..200u32 {
+        expected.push(publish(index).await);
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     let got = items(&mut subscription, expected.len()).await;
@@ -887,13 +892,25 @@ async fn level_0_publishes_need_no_answer_and_arrive() {
         .unwrap();
     publisher.add(0, b"fast".to_vec());
     publisher.flush().await.unwrap();
-    let mut subscription = client
-        .subscribe(Subscribe::new("zero", FROM_START))
-        .unwrap();
-    assert_eq!(
-        bytes_of(&items(&mut subscription, 1).await),
-        [b"fast".to_vec()]
-    );
+    // Nothing answers a level 0 publish, so the stream may not be there yet.
+    let got = 'subscribe: loop {
+        let mut subscription = client
+            .subscribe(Subscribe::new("zero", FROM_START))
+            .unwrap();
+        loop {
+            match next_event(&mut subscription).await {
+                Ok(Event::Items(items)) => break 'subscribe items,
+                Ok(_) => {}
+                Err(SdkError::Server {
+                    code: ErrorCode::NotFound,
+                    ..
+                }) => break,
+                Err(other) => panic!("{other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(bytes_of(&got), [b"fast".to_vec()]);
     fixture.server.shutdown();
 }
 

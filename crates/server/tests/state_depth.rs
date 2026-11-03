@@ -10,9 +10,14 @@ use common::*;
 use proto::ErrorCode;
 use server::{Reply, StateOp, StateOpRequest};
 
-fn request<'a>(stream: &'a str, req: u32, op: StateOp, doc: &Value) -> StateOpRequest<'a> {
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
+fn request(stream: &str, req: u32, op: StateOp, doc: &Value) -> StateOpRequest {
     StateOpRequest {
-        stream,
+        stream: key(stream),
         req,
         author: AUTHOR,
         expect_ver: 0,
@@ -104,7 +109,7 @@ async fn a_path_too_deep_to_read_back_leaves_state_usable() {
         expect_reply(&mut client).await,
         Reply::StateResult { ok: true, .. }
     ));
-    let snapshot = client.snapshot("s").await.unwrap();
+    let snapshot = client.snapshot(key("s")).await.unwrap();
     assert_eq!(
         from_cbor(&snapshot.state),
         map(&[("a", int(1)), ("b", int(2))])
@@ -159,7 +164,7 @@ async fn a_deep_map_as_a_path_key_is_refused_with_nothing_changed() {
         .await
         .unwrap();
     expect_reply(&mut client).await;
-    let before = client.snapshot("s").await.unwrap();
+    let before = client.snapshot(key("s")).await.unwrap();
     let mut deep_key = int(1);
     for _ in 0..250 {
         deep_key = Value::Map(vec![(int(1), deep_key)]);
@@ -172,6 +177,6 @@ async fn a_deep_map_as_a_path_key_is_refused_with_nothing_changed() {
         .await
         .unwrap();
     expect_malformed(&mut client, 2).await;
-    assert_eq!(client.snapshot("s").await.unwrap(), before);
+    assert_eq!(client.snapshot(key("s")).await.unwrap(), before);
     harness.finish();
 }

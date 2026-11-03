@@ -19,6 +19,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_sillystream-server");
 const STREAM: &str = "crash.stream";
 const PRODUCER: &str = "7";
@@ -43,6 +48,8 @@ impl Files {
         std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
         std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
         std::fs::write(dir.path().join("secret"), SECRET).unwrap();
+        // The all-zero key, which `NodeConfig::new` has too.
+        std::fs::write(dir.path().join("stream-key"), "0".repeat(64)).unwrap();
         Files { dir, der: cert.der }
     }
 
@@ -60,6 +67,7 @@ impl Files {
             .args(["--cert", &path("cert.pem")])
             .args(["--key", &path("key.pem")])
             .args(["--token-secret-file", &path("secret")])
+            .args(["--stream-key-file", &path("stream-key")])
             .args(["--object-store", &format!("local:{}", path("objects"))])
             .args(["--cores", "2"])
             .args(["--seal-window-ms", "1000"])
@@ -415,7 +423,10 @@ async fn entries_a_generation_fenced_off_are_warned_of_and_their_file_is_kept() 
         .filter(|file| wal_files_before.contains(&file.seq))
         .filter(|file| {
             let replayed = storage::replay_file(file).unwrap();
-            replayed.entries.iter().any(|entry| entry.stream == STREAM)
+            replayed
+                .entries
+                .iter()
+                .any(|entry| entry.stream == key(STREAM))
         })
         .map(|file| file.seq)
         .collect();

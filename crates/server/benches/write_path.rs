@@ -77,13 +77,17 @@ fn config(core_count: usize) -> NodeConfig {
     config
 }
 
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 /// One stream name per core, so `core_count` clients each load one core.
-fn stream_per_core(node: &Node, core_count: usize, placement: &[u16]) -> Vec<String> {
+fn stream_per_core(node: &Node, core_count: usize, placement: &[u16]) -> Vec<format::KeyHash> {
     let mut names = vec![None; core_count];
     let mut index = 0;
     while names.iter().any(Option::is_none) {
-        let name = format!("bench.{index}");
-        let core = placement[shard_of(&name, node.virtual_shard_count()) as usize] as usize;
+        let name = key(&format!("bench.{index}"));
+        let core = placement[shard_of(name, node.virtual_shard_count()) as usize] as usize;
         names[core].get_or_insert(name);
         index += 1;
     }
@@ -127,7 +131,7 @@ fn run_load(
                         while sent < publish_count && sent - acked < window {
                             client
                                 .publish(Publish {
-                                    stream: name,
+                                    stream: *name,
                                     handle: 1,
                                     producer_id: 1,
                                     producer_seq: first_seq + sent,
@@ -287,7 +291,7 @@ fn slab_changes_per_record(_c: &mut Criterion) {
         runtime.block_on(async {
             let mut client = node.client(0).await;
             let publish = Publish {
-                stream: "s",
+                stream: key("s"),
                 handle: 1,
                 producer_id: 1,
                 producer_seq: 1,

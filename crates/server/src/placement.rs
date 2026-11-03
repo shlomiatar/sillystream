@@ -1,11 +1,11 @@
 //! Stream → virtual shard → core (SPEC section 6.1), the per-shard counters and the
 //! choice of which shards to move.
 
-use storage::stream_hash;
+use format::KeyHash;
 
 /// The shard a stream hashes to. The override table comes first, and lives on the cores.
-pub fn shard_of(stream: &str, virtual_shard_count: u32) -> u32 {
-    (stream_hash(stream) % u64::from(virtual_shard_count)) as u32
+pub fn shard_of(stream: KeyHash, virtual_shard_count: u32) -> u32 {
+    (stream.top64() % u64::from(virtual_shard_count)) as u32
 }
 
 const AVERAGE_WEIGHT: f64 = 0.5;

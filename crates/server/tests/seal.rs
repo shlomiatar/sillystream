@@ -12,6 +12,11 @@ use object_store::ObjectStore;
 use server::SealOutcome;
 use storage::{SegmentReader, dedicated_path, seal_path};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 #[tokio::test]
 async fn one_put_per_seal_however_many_streams_and_cores() {
     let harness = Harness::new(manual_config(4));
@@ -41,7 +46,7 @@ async fn one_put_per_seal_however_many_streams_and_cores() {
     let store: Arc<dyn ObjectStore> = harness.store.clone();
     let reader = SegmentReader::new(store, path);
     for (name, first_id) in &expected {
-        let stored = reader.read_stream(name).await.unwrap();
+        let stored = reader.read_stream(key(name)).await.unwrap();
         // Identical to the wire bytes, with only id and author stamped.
         let parsed = parse_records(&stored);
         assert_eq!(parsed.len(), 1);
@@ -155,37 +160,16 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object() {
     assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 1);
 
     let store: Arc<dyn ObjectStore> = harness.store.clone();
-    let reader = SegmentReader::new(store, dedicated_path("busy", 1, first_id));
-    let stored = reader.read_stream("busy").await.unwrap();
+    let reader = SegmentReader::new(store, dedicated_path(key("busy"), 1, first_id));
+    let stored = reader.read_stream(key("busy")).await.unwrap();
     assert_eq!(parse_records(&stored).len(), 2);
 
     // The stream's bytes aren't in the next seal, and the quiet one's are.
     match harness.node().seal().await {
         SealOutcome::Uploaded { extents, .. } => {
             assert_eq!(extents.len(), 1);
-            assert_eq!(&*extents[0].stream, "quiet");
+            assert_eq!(extents[0].stream, key("quiet"));
         }
-        other => panic!("{other:?}"),
-    }
-    harness.finish();
-}
-
-#[tokio::test]
-async fn a_stream_id_too_long_for_a_path_stays_in_seals() {
-    let mut config = manual_config(1);
-    config.stream_buffer_bytes = 1024;
-    let harness = Harness::new(config);
-    let mut client = harness.node().client(0).await;
-    let records = record_with(1, &[5; 4096]);
-    let long = "x".repeat(300);
-    client
-        .publish(publish(&long, &records, 1, 2))
-        .await
-        .unwrap();
-    expect_ack(&mut client).await;
-    assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 0);
-    match harness.node().seal().await {
-        SealOutcome::Uploaded { extents, .. } => assert_eq!(&*extents[0].stream, &*long),
         other => panic!("{other:?}"),
     }
     harness.finish();
@@ -217,7 +201,7 @@ async fn a_held_upload_keeps_a_seal_pending_and_the_core_serving() {
     let core_held: usize = {
         let mut held = 0;
         for core in 0..2 {
-            held += harness.node().read_memory(core, "s").await.len();
+            held += harness.node().read_memory(core, key("s")).await.len();
         }
         held
     };

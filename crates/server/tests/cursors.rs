@@ -6,6 +6,11 @@ use common::*;
 use proto::ErrorCode;
 use server::{Connection, Subscription};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "cursor.stream";
 
 async fn publish_records(client: &mut server::Client, count: u64, first_seq: u64) -> Vec<u64> {
@@ -22,8 +27,8 @@ async fn publish_records(client: &mut server::Client, count: u64, first_seq: u64
 }
 
 fn named<'a>(sub: u32, name: &'a str, from: u64) -> Subscription<'a> {
-    let mut subscription = Subscription::new(sub, STREAM, from);
-    subscription.name = Some(name);
+    let mut subscription = Subscription::new(sub, key(STREAM), from);
+    subscription.name = Some(key(name));
     subscription
 }
 
@@ -45,12 +50,21 @@ async fn cursors_move_forward_only_and_only_a_reset_rewinds() {
     wait_for_records(&mut connection, &mut heard, 1, 6).await;
 
     connection.commit(1, ids[3]);
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(ids[3]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(ids[3])
+    );
     // Lower: ignored, and no error.
     connection.commit(1, ids[1]);
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(ids[3]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(ids[3])
+    );
     connection.commit(1, ids[4]);
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(ids[4]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(ids[4])
+    );
 
     // A new subscription resumes after the cursor, whatever `from` says: at-least-once.
     connection.subscribe(named(2, "worker", 0));
@@ -58,41 +72,17 @@ async fn cursors_move_forward_only_and_only_a_reset_rewinds() {
     assert_eq!(heard.records(2)[0].0, ids[5]);
 
     // Reset can go back.
-    connection.reset_cursor(STREAM, "worker", ids[0]);
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(ids[0]));
+    connection.reset_cursor(key(STREAM), key("worker"), ids[0]);
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(ids[0])
+    );
     connection.subscribe(named(3, "worker", u64::MAX));
     wait_for_records(&mut connection, &mut heard, 3, 5).await;
     let got: Vec<u64> = heard.records(3).iter().map(|record| record.0).collect();
     assert_eq!(got, ids[1..]);
 
     assert!(heard.error_code(1).is_none());
-    drop((connection, client));
-    harness.finish();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sink_cursors_are_refused() {
-    let harness = Harness::new(manual_config(1));
-    let node = harness.node();
-    let mut client = node.client(0).await;
-    make_stream(&mut client, STREAM).await;
-    let mut connection = node.connection(0).await.unwrap();
-    let mut heard = Heard::default();
-
-    connection.subscribe(named(1, "sink:7", 0));
-    hear_until(&mut connection, &mut heard, |heard| {
-        heard.error_code(1).is_some()
-    })
-    .await;
-    assert_eq!(heard.error_code(1), Some(ErrorCode::Malformed));
-
-    connection.reset_cursor(STREAM, "sink:7", 5);
-    hear_until(&mut connection, &mut heard, |heard| {
-        heard.error_code(0).is_some()
-    })
-    .await;
-    assert_eq!(heard.error_code(0), Some(ErrorCode::Malformed));
-    assert_eq!(connection.read_cursor(STREAM, "sink:7").await, None);
     drop((connection, client));
     harness.finish();
 }
@@ -107,7 +97,7 @@ async fn commit_needs_a_named_cursor_and_an_id_that_exists() {
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
 
-    connection.subscribe(Subscription::new(1, STREAM, u64::MAX));
+    connection.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
     subscribed(&mut connection, &mut heard, 1).await;
     connection.commit(1, ids[0]);
     hear_until(&mut connection, &mut heard, |heard| {
@@ -125,7 +115,7 @@ async fn commit_needs_a_named_cursor_and_an_id_that_exists() {
     .await;
     assert_eq!(heard.error_code(2), Some(ErrorCode::Malformed));
     assert_ne!(
-        connection.read_cursor(STREAM, "worker").await,
+        connection.read_cursor(key(STREAM), key("worker")).await,
         Some(ids[0] + 1_000_000)
     );
     drop((connection, client));
@@ -140,7 +130,7 @@ async fn a_cursor_moves_with_its_stream_and_can_commit_progress() {
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
     let rare = [format::Clause::Eq {
@@ -158,11 +148,17 @@ async fn a_cursor_moves_with_its_stream_and_can_commit_progress() {
     })
     .await;
     connection.commit(1, ids[2]);
-    assert_eq!(connection.read_cursor(STREAM, "rare").await, Some(ids[2]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("rare")).await,
+        Some(ids[2])
+    );
     for core in 0..2 {
         assert!(node.move_shard(shard, core).await);
     }
-    assert_eq!(connection.read_cursor(STREAM, "rare").await, Some(ids[2]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("rare")).await,
+        Some(ids[2])
+    );
     drop((connection, client));
     harness.finish();
 }
@@ -180,10 +176,13 @@ async fn named_cursors_are_limited_per_stream_and_by_name_length() {
     let mut connection = node.connection(1).await.unwrap();
     let mut heard = Heard::default();
     for at in 0..server::NAMED_CURSOR_CAP_COUNT {
-        connection.reset_cursor(STREAM, &format!("c{at}"), ids[0]);
+        connection.reset_cursor(key(STREAM), key(&format!("c{at}")), ids[0]);
     }
     let last = format!("c{}", server::NAMED_CURSOR_CAP_COUNT - 1);
-    assert_eq!(connection.read_cursor(STREAM, &last).await, Some(ids[0]));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key(&last)).await,
+        Some(ids[0])
+    );
 
     // Full: a new name is refused, by a subscribe or a reset, and nothing is stored.
     connection.subscribe(named(1, "by_subscribe", 0));
@@ -192,9 +191,17 @@ async fn named_cursors_are_limited_per_stream_and_by_name_length() {
     })
     .await;
     assert_eq!(heard.error_code(1), Some(ErrorCode::TooManySubscriptions));
-    assert_eq!(connection.read_cursor(STREAM, "by_subscribe").await, None);
-    connection.reset_cursor(STREAM, "by_reset", ids[0]);
-    assert_eq!(connection.read_cursor(STREAM, "by_reset").await, None);
+    assert_eq!(
+        connection
+            .read_cursor(key(STREAM), key("by_subscribe"))
+            .await,
+        None
+    );
+    connection.reset_cursor(key(STREAM), key("by_reset"), ids[0]);
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("by_reset")).await,
+        None
+    );
 
     // A subscribe under a name it already has is fine.
     connection.subscribe(named(3, "c0", u64::MAX));
@@ -207,17 +214,12 @@ async fn named_cursors_are_limited_per_stream_and_by_name_length() {
     .await;
 
     // One already there still moves.
-    connection.reset_cursor(STREAM, "c0", ids[1]);
-    assert_eq!(connection.read_cursor(STREAM, "c0").await, Some(ids[1]));
+    connection.reset_cursor(key(STREAM), key("c0"), ids[1]);
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("c0")).await,
+        Some(ids[1])
+    );
 
-    // A name over the limit is malformed, at a subscribe.
-    let long = "n".repeat(server::CURSOR_NAME_MAX_BYTES + 1);
-    connection.subscribe(named(2, &long, 0));
-    hear_until(&mut connection, &mut heard, |heard| {
-        heard.error_code(2).is_some()
-    })
-    .await;
-    assert_eq!(heard.error_code(2), Some(ErrorCode::Malformed));
     drop((connection, client));
     harness.finish();
 }
@@ -241,7 +243,7 @@ async fn a_subscribe_cant_make_a_named_cursor_above_the_head() {
     })
     .await;
     assert_eq!(heard.error_code(7), Some(ErrorCode::Malformed));
-    assert_eq!(connection.read_cursor(STREAM, "c").await, None);
+    assert_eq!(connection.read_cursor(key(STREAM), key("c")).await, None);
 
     // The head itself is fine, and so a later record comes.
     connection.subscribe(named(8, "c", ids[0]));
@@ -270,17 +272,23 @@ async fn a_reset_above_the_head_is_refused_and_leaves_the_cursor() {
         .await
         .unwrap();
     let id = expect_ack(&mut client).await.1;
-    connection.reset_cursor(STREAM, "worker", id);
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(id));
+    connection.reset_cursor(key(STREAM), key("worker"), id);
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(id)
+    );
 
     let mut heard = Heard::default();
-    connection.reset_cursor(STREAM, "worker", u64::MAX);
+    connection.reset_cursor(key(STREAM), key("worker"), u64::MAX);
     hear_until(&mut connection, &mut heard, |heard| {
         heard.error_code(0).is_some()
     })
     .await;
     assert_eq!(heard.error_code(0), Some(ErrorCode::Malformed));
-    assert_eq!(connection.read_cursor(STREAM, "worker").await, Some(id));
+    assert_eq!(
+        connection.read_cursor(key(STREAM), key("worker")).await,
+        Some(id)
+    );
     drop((connection, client));
     harness.finish();
 }

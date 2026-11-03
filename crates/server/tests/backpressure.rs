@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 use common::*;
 use server::{ClientError, SealOutcome};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const CAPACITY: usize = 2;
 const INBOX: usize = 4;
 
@@ -53,7 +58,7 @@ async fn a_stalled_writer_leaves_the_core_serving_and_loses_nothing() {
         .await
         .unwrap();
     expect_ack(&mut other).await;
-    let other_head = other.snapshot("other").await.unwrap().head;
+    let other_head = other.snapshot(key("other")).await.unwrap().head;
 
     harness.wal.hold();
     let next_seq = fill(&mut client, &records, 1).await;
@@ -66,11 +71,11 @@ async fn a_stalled_writer_leaves_the_core_serving_and_loses_nothing() {
     for _ in 0..50 {
         let started = std::time::Instant::now();
         assert_eq!(harness.node().ping(0).await, Some(0));
-        assert_eq!(other.snapshot("other").await.unwrap().head, other_head);
+        assert_eq!(other.snapshot(key("other")).await.unwrap().head, other_head);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
-    assert!(!harness.node().read_memory(0, "other").await.is_empty());
-    assert!(!harness.node().read_memory(0, "s").await.is_empty());
+    assert!(!harness.node().read_memory(0, key("other")).await.is_empty());
+    assert!(!harness.node().read_memory(0, key("s")).await.is_empty());
     expect_quiet(&mut client).await;
 
     // A blocking publish waits rather than failing, and doesn't stop the core either.
@@ -132,7 +137,7 @@ async fn a_seal_waits_for_room_and_only_takes_what_the_channel_took() {
         harness.wal.release();
         match seal.await {
             SealOutcome::Uploaded { extents, .. } => {
-                assert!(extents.iter().all(|extent| &*extent.stream == "s"));
+                assert!(extents.iter().all(|extent| extent.stream == key("s")));
             }
             other => panic!("{other:?}"),
         }

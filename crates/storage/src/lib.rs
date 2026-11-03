@@ -34,7 +34,7 @@ pub use object::{
     MAX_PATH_PART_BYTES, ObjectStoreConfig, S3Config, SEALED_PREFIX, build_store,
     check_conditional_create, compacted_path, dedicated_path, list_hour_objects, list_hours,
     list_sealed_objects, object_generation, object_hour, parse_store_config, seal_path,
-    sealed_path, stream_fits_dedicated_path,
+    sealed_path,
 };
 pub use ownership::{
     OWNERSHIP_MAGIC, OWNERSHIP_RECORD_BYTES, Ownership, OwnershipError, claim_generation,

@@ -56,13 +56,15 @@ A local node. I ran exactly these steps with the release binaries, and `publish`
 
 ```
 printf %s "$(head -c 32 /dev/urandom | xxd -p -c 64)" > secret   # no trailing newline, see below
+head -c 32 /dev/urandom | xxd -p -c 64 > stream-key
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout ca.key -out ca.pem -days 1 -subj /CN=demo-ca
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout key.pem -out req.csr -subj /CN=localhost
 printf 'subjectAltName=DNS:localhost\nbasicConstraints=CA:FALSE\n' > ext
 openssl x509 -req -in req.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -extfile ext -out cert.pem
 
 target/release/sillystream-server --listen 127.0.0.1:18443 --wal-dir ./wal --data-dir ./data \
-    --cert cert.pem --key key.pem --token-secret-file secret --object-store local:./store --cores 2
+    --cert cert.pem --key key.pem --token-secret-file secret --stream-key-file stream-key \
+    --object-store local:./store --cores 2
 
 T=$(target/release/silly token issue --secret-file secret --author 7 \
     --grant 'demo*:read,publish,admin' --ttl-ms 600000)

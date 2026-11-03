@@ -7,6 +7,11 @@ use storage::{
     replay_bytes, replay_dir, replay_file, replay_files, wal_file_name,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const SEQ: u64 = 42;
 
 struct Case {
@@ -47,7 +52,7 @@ fn file(seq: u64, cases: &[Case]) -> (Vec<u8>, Vec<usize>) {
         bytes.extend(
             encode_wal_entry(
                 seq,
-                case.stream,
+                key(case.stream),
                 case.producer_id,
                 case.producer_seq,
                 &case.records,
@@ -60,7 +65,7 @@ fn file(seq: u64, cases: &[Case]) -> (Vec<u8>, Vec<usize>) {
 }
 
 fn assert_is_case(entry: &ReplayedEntry, case: &Case) {
-    assert_eq!(entry.stream, case.stream);
+    assert_eq!(entry.stream, key(case.stream));
     assert_eq!(entry.producer_id, case.producer_id);
     assert_eq!(entry.producer_seq, case.producer_seq);
     assert_eq!(entry.records[..], case.records[..]);
@@ -122,7 +127,7 @@ fn stale_entries_of_a_reused_file_are_not_returned() {
     // shorter than what it overwrites, leaving old entries at valid-looking offsets.
     let old_cases = cases();
     let (old, old_ends) = file(41, &old_cases);
-    let new_entry = encode_wal_entry(42, "a", 5, 5, &[0xEE; 32]).unwrap();
+    let new_entry = encode_wal_entry(42, key("a"), 5, 5, &[0xEE; 32]).unwrap();
     assert_eq!(
         WAL_FILE_HEADER_BYTES + new_entry.len(),
         old_ends[0],
@@ -159,26 +164,26 @@ fn a_directory_replays_oldest_first_and_ignores_other_files() {
     std::fs::write(dir.path().join("wal-1.log"), b"not ours").unwrap();
     std::fs::write(dir.path().join("notes.txt"), b"not ours").unwrap();
     let entries = replay_dir(dir.path()).unwrap();
-    let streams: Vec<&str> = entries.iter().map(|entry| entry.stream.as_str()).collect();
-    assert_eq!(streams, ["a", "inbox.reviewer"]);
+    let streams: Vec<_> = entries.iter().map(|entry| entry.stream).collect();
+    assert_eq!(streams, [key("a"), key("inbox.reviewer")]);
 }
 
 #[test]
 fn an_entry_matches_its_byte_exact_vector() {
-    // Built by an independent implementation of section 6.3 and D9, D50.
+    // Built by an independent implementation of section 6.3 and D9, D50, with fixed key hashes.
     let vector = include_str!("vectors/wal_file.hex").trim();
     let expected: Vec<u8> = (0..vector.len())
         .step_by(2)
         .map(|at| u8::from_str_radix(&vector[at..at + 2], 16).unwrap())
         .collect();
     let mut bytes = encode_file_header(3, 5).to_vec();
-    bytes.extend(encode_wal_entry(3, "logs.a", 7, 42, &[0xAB; 32]).unwrap());
-    bytes.extend(encode_wal_entry(3, "b", 0, 0, &[0xCD; 8]).unwrap());
+    bytes.extend(encode_wal_entry(3, format::KeyHash([0x11; 16]), 7, 42, &[0xAB; 32]).unwrap());
+    bytes.extend(encode_wal_entry(3, format::KeyHash([0x22; 16]), 0, 0, &[0xCD; 8]).unwrap());
     assert_eq!(bytes, expected);
     let replayed = replay_bytes(&Bytes::from(expected), 3);
     assert_eq!(replayed.generation, 5);
     assert_eq!(replayed.entries.len(), 2);
-    assert_eq!(replayed.entries[0].stream, "logs.a");
+    assert_eq!(replayed.entries[0].stream, format::KeyHash([0x11; 16]));
     assert_eq!(replayed.entries[0].producer_id, 7);
     assert_eq!(replayed.entries[0].producer_seq, 42);
 }
@@ -195,7 +200,7 @@ proptest! {
     ) {
         let mut bytes = encode_file_header(seq, 0).to_vec();
         for (stream, id, producer_seq, records) in &entries {
-            let entry = encode_wal_entry(seq, stream, *id, *producer_seq, records).unwrap();
+            let entry = encode_wal_entry(seq, key(stream), *id, *producer_seq, records).unwrap();
             prop_assert_eq!(entry.len() % 8, 0);
             bytes.extend(entry);
         }
@@ -206,7 +211,7 @@ proptest! {
         prop_assert_eq!(replayed.valid_end_bytes, end);
         prop_assert_eq!(replayed.entries.len(), entries.len());
         for (entry, (stream, id, producer_seq, records)) in replayed.entries.iter().zip(&entries) {
-            prop_assert_eq!(&entry.stream, stream);
+            prop_assert_eq!(entry.stream, key(stream));
             prop_assert_eq!(entry.producer_id, *id);
             prop_assert_eq!(entry.producer_seq, *producer_seq);
             prop_assert_eq!(&entry.records[..], &records[..]);
@@ -248,7 +253,7 @@ fn sparse_wal_file(dir: &std::path::Path, seq: u64, bytes: &[u8], len_bytes: u64
 fn a_mapped_file_with_a_hole_for_a_tail_replays_and_has_no_damage() {
     let dir = tempfile::tempdir().unwrap();
     let mut bytes = encode_file_header(SEQ, 0).to_vec();
-    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, key("a"), 1, 1, &[0xEE; 32]).unwrap());
     let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 26);
     let replayed = replay_file(&file).unwrap();
     assert_eq!(replayed.entries.len(), 1);
@@ -261,7 +266,7 @@ fn a_mapped_file_with_a_hole_for_a_tail_replays_and_has_no_damage() {
 fn a_mapped_file_finds_damage_past_a_hole() {
     let dir = tempfile::tempdir().unwrap();
     let mut bytes = encode_file_header(SEQ, 0).to_vec();
-    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, key("a"), 1, 1, &[0xEE; 32]).unwrap());
     let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 22);
     let mut handle = std::fs::OpenOptions::new()
         .write(true)
@@ -279,7 +284,7 @@ fn a_mapped_file_finds_damage_past_a_hole() {
 fn replayed_entries_outlive_their_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut bytes = encode_file_header(SEQ, 0).to_vec();
-    bytes.extend_from_slice(&encode_wal_entry(SEQ, "a", 1, 1, &[0xEE; 32]).unwrap());
+    bytes.extend_from_slice(&encode_wal_entry(SEQ, key("a"), 1, 1, &[0xEE; 32]).unwrap());
     let file = sparse_wal_file(dir.path(), SEQ, &bytes, 1 << 16);
     let replayed = replay_files(std::slice::from_ref(&file))
         .pop()

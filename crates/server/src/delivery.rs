@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use format::{Filter, RecordHeader, make_id};
+use format::{Filter, KeyHash, RecordHeader, make_id};
 use object_store::path::Path;
 use storage::StreamExtent;
 
@@ -316,7 +316,7 @@ pub(crate) struct StreamDelivery {
     /// core can put two owners' messages back in order (D85).
     pub seq_by_home: Vec<u64>,
     /// `(stream, name) → id` of section 5.1.
-    pub cursors: HashMap<Arc<str>, u64>,
+    pub cursors: HashMap<KeyHash, u64>,
     /// In id order, and not overlapping (D68).
     pub extents: Vec<ExtentRef>,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
@@ -539,14 +539,19 @@ pub(crate) fn cursor_name_is_allowed(name: &str) -> bool {
         && !name.starts_with("compact:")
 }
 
-/// Whether `name` can be stored: it is there already, it is a sink's or the compactor's, or the
-/// stream has room for one more of the clients'.
-pub(crate) fn cursor_has_room(cursors: &HashMap<Arc<str>, u64>, name: &str) -> bool {
-    cursors.contains_key(name)
-        || !cursor_name_is_allowed(name)
+/// Whether `name` can be stored: it is there already, it is one of `internal`, the cursors of
+/// the stream's sinks and of the compactor, or the stream has room for one more of the clients'.
+/// Names are key hashes by now, so which are whose is what `internal` says.
+pub(crate) fn cursor_has_room(
+    cursors: &HashMap<KeyHash, u64>,
+    name: KeyHash,
+    internal: &[KeyHash],
+) -> bool {
+    cursors.contains_key(&name)
+        || internal.contains(&name)
         || cursors
             .keys()
-            .filter(|name| cursor_name_is_allowed(name))
+            .filter(|name| !internal.contains(name))
             .count()
             < NAMED_CURSOR_CAP_COUNT
 }

@@ -26,6 +26,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "sink.source";
 const SECRET: &str = "the sink's key";
 
@@ -214,7 +219,7 @@ fn deliver_spec(url: &str) -> SinkSpec {
 fn forward_spec(target: &str) -> SinkSpec {
     SinkSpec {
         kind: "forward".to_owned(),
-        target: Some(target.to_owned()),
+        target: Some(key(target)),
         on_expire: "stop".to_owned(),
         concurrency: 1,
         ..SinkSpec::default()
@@ -230,7 +235,7 @@ async fn put_sink(
 ) {
     client
         .sink_op(
-            stream,
+            key(stream),
             SinkOp::Put {
                 sink_id,
                 spec: Box::new(spec),
@@ -252,7 +257,7 @@ async fn send(client: &mut Client, stream: &str, data: &[u8], seq: u64) -> u64 {
 }
 
 async fn sink_of(client: &mut Client, stream: &str, sink_id: u64) -> (SinkSpec, u64) {
-    let info = client.stream_info(stream).await.unwrap();
+    let info = client.stream_info(key(stream)).await.unwrap();
     let (_, spec, cursor) = info
         .sinks
         .into_iter()
@@ -294,7 +299,7 @@ async fn wait_for_pause(client: &mut Client, stream: &str, sink_id: u64) -> Stri
 /// The bytes a reader gets of everything in `stream`.
 async fn stored_bytes(node: &Node, stream: &str, up_to_id: u64, include_system: bool) -> Vec<u8> {
     let mut connection = node.connection(0).await.unwrap();
-    let mut subscription = Subscription::new(1, stream, 0);
+    let mut subscription = Subscription::new(1, key(stream), 0);
     subscription.include_system = include_system;
     connection.subscribe(subscription);
     let mut out = Vec::new();
@@ -317,7 +322,7 @@ async fn stored_bytes(node: &Node, stream: &str, up_to_id: u64, include_system: 
 
 async fn target_records(node: &Node, stream: &str, count: usize) -> Vec<(u64, u64, u64, Vec<u8>)> {
     let mut connection = node.connection(0).await.unwrap();
-    connection.subscribe(Subscription::new(1, stream, 0));
+    connection.subscribe(Subscription::new(1, key(stream), 0));
     let mut heard = Heard::default();
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= count
@@ -584,7 +589,7 @@ async fn retryable_errors_back_off_exponentially_then_too_many_pause() {
     receiver.answer(Answer::Status(200));
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -970,7 +975,8 @@ async fn notify_sends_its_three_fields_and_honours_its_rate_under_a_burst() {
 
     let seen = receiver.seen();
     let body = String::from_utf8(seen[sends - 1].body.clone()).unwrap();
-    assert!(body.contains(&format!("\"stream\":\"{STREAM}\"")), "{body}");
+    assert!(body.contains("\"sink_id\":\"3\""), "{body}");
+    assert!(!body.contains(STREAM), "{body}");
     assert!(body.contains(&format!("\"head\":\"{last}\"")), "{body}");
     assert_eq!(seen[sends - 1].headers["content-type"], "application/json");
     assert_eq!(seen[sends - 1].triple().2, last);
@@ -1016,7 +1022,7 @@ async fn publish_for_forward(client: &mut Client, stream: &str, count: u64) -> F
     }
     let change = client
         .state_op(server::StateOpRequest {
-            stream,
+            stream: key(stream),
             req: 1,
             author: NonZeroAuthor::OTHER,
             expect_ver: 0,
@@ -1056,7 +1062,7 @@ fn check_wal_fields(harness: &Harness, target: &str, sink_id: u64, run: &Forward
     let entries = harness.wal.stream_entries(target);
     let mut seqs: Vec<u64> = entries.iter().map(|entry| entry.producer_seq).collect();
     seqs.dedup();
-    let producer_id = format::forward_producer_id(STREAM, sink_id);
+    let producer_id = format::forward_producer_id(key(STREAM), sink_id);
     assert!(entries.iter().all(|entry| entry.producer_id == producer_id));
     let wanted: Vec<u64> = run.sent.keys().copied().collect();
     assert_eq!(seqs, wanted, "producer_seq is the source first_id");
@@ -1260,7 +1266,7 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
     }
     wait_for_cursor(&mut client, STREAM, 5, last).await;
 
-    let prefix = object_store::path::Path::from_iter(["archive", STREAM, "5"]);
+    let prefix = object_store::path::Path::from_iter(["archive", &key(STREAM).to_string(), "5"]);
     let listed = store.list_with_delimiter(Some(&prefix)).await.unwrap();
     let mut names: Vec<_> = listed
         .objects
@@ -1314,7 +1320,7 @@ async fn an_archive_killed_after_its_put_doesnt_write_a_second_object() {
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
     wait_for_cursor(&mut client, STREAM, 5, last).await;
     assert_eq!(hook.kill_count.load(Ordering::SeqCst), 2);
-    let prefix = object_store::path::Path::from_iter(["archive", STREAM, "5"]);
+    let prefix = object_store::path::Path::from_iter(["archive", &key(STREAM).to_string(), "5"]);
     let listed = store.list_with_delimiter(Some(&prefix)).await.unwrap();
     assert_eq!(listed.objects.len(), 1);
     drop(client);
@@ -1472,7 +1478,7 @@ async fn behind_retention(on_expire: &str) -> (Harness, Receiver, Client, u64, u
     put_sink(&mut client, STREAM, 1, spec, SinkStart::Id(old - 1)).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: true,
@@ -1484,7 +1490,7 @@ async fn behind_retention(on_expire: &str) -> (Harness, Receiver, Client, u64, u
     // first", so set the sink back to before it.
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Id(old - 1),
@@ -1503,7 +1509,7 @@ async fn behind_retention(on_expire: &str) -> (Harness, Receiver, Client, u64, u
     assert_eq!(cursor, old - 1);
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -1553,7 +1559,7 @@ async fn a_paused_sink_warns_too_and_a_skip_acts_on_resume() {
     wait_for_cursor(&mut client, STREAM, 1, delivered).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: true,
@@ -1570,7 +1576,7 @@ async fn a_paused_sink_warns_too_and_a_skip_acts_on_resume() {
     receiver.stays_at(count).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -1622,7 +1628,7 @@ async fn a_report_from_an_older_epoch_is_ignored() {
     put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
     let old_epoch = sink_of(&mut client, STREAM, 1).await.0.epoch;
     client
-        .sink_op(STREAM, SinkOp::Delete { sink_id: 1 })
+        .sink_op(key(STREAM), SinkOp::Delete { sink_id: 1 })
         .await
         .unwrap();
     spec.paused = false;
@@ -1631,7 +1637,7 @@ async fn a_report_from_an_older_epoch_is_ignored() {
     assert!(now.epoch > old_epoch);
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Report {
                 sink_id: 1,
                 epoch: old_epoch,
@@ -1771,7 +1777,7 @@ async fn pause_resume_reset_and_delete() {
 
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: true,
@@ -1783,7 +1789,7 @@ async fn pause_resume_reset_and_delete() {
     receiver.stays_at(1).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -1796,7 +1802,7 @@ async fn pause_resume_reset_and_delete() {
 
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Earliest,
@@ -1811,7 +1817,7 @@ async fn pause_resume_reset_and_delete() {
 
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Id(first),
@@ -1823,12 +1829,19 @@ async fn pause_resume_reset_and_delete() {
     wait_for_cursor(&mut client, STREAM, 1, second).await;
 
     client
-        .sink_op(STREAM, SinkOp::Delete { sink_id: 1 })
+        .sink_op(key(STREAM), SinkOp::Delete { sink_id: 1 })
         .await
         .unwrap();
     send(&mut client, STREAM, b"3", 3).await;
     receiver.stays_at(5).await;
-    assert!(client.stream_info(STREAM).await.unwrap().sinks.is_empty());
+    assert!(
+        client
+            .stream_info(key(STREAM))
+            .await
+            .unwrap()
+            .sinks
+            .is_empty()
+    );
     drop(client);
     harness.finish();
 }
@@ -1853,7 +1866,7 @@ async fn a_reset_during_a_delivery_is_not_undone_when_that_delivery_ends() {
     receiver.wait_for_count(1).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Earliest,
@@ -1891,7 +1904,7 @@ async fn a_deleted_stream_stops_its_sinks() {
     .await;
     send(&mut client, STREAM, b"1", 1).await;
     receiver.wait_for_count(1).await;
-    assert!(client.delete_stream(STREAM).await);
+    assert!(client.delete_stream(key(STREAM)).await);
     // Made again under its old name, it has no sink.
     send(&mut client, STREAM, b"2", 2).await;
     receiver.stays_at(1).await;
@@ -1916,7 +1929,7 @@ async fn a_sink_moves_with_its_shard() {
         SinkStart::Earliest,
     )
     .await;
-    let shard = server::shard_of(STREAM, node.virtual_shard_count());
+    let shard = server::shard_of(key(STREAM), node.virtual_shard_count());
     let mut ids = Vec::new();
     for round in 0..8u64 {
         for seq in 0..10u64 {
@@ -1938,7 +1951,7 @@ async fn a_sink_moves_with_its_shard() {
     // Lifecycle ops find it on its new core, and so does a move while it is paused.
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: true,
@@ -1952,7 +1965,7 @@ async fn a_sink_moves_with_its_shard() {
     assert!(node.move_shard(shard, 0).await);
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -2028,7 +2041,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     .await;
     client
         .sink_op(
-            "keep.a",
+            key("keep.a"),
             SinkOp::SetPaused {
                 sink_id: 2,
                 paused: true,
@@ -2052,7 +2065,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     // And a reset, which is held by the checkpoint as the lifecycle's other ops are.
     client
         .sink_op(
-            "keep.b",
+            key("keep.b"),
             SinkOp::Reset {
                 sink_id: 3,
                 start: SinkStart::Id(reset_at),
@@ -2064,7 +2077,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     let epoch = sink_of(&mut client, "keep.b", 3).await.0.epoch;
     client
         .sink_op(
-            "keep.b",
+            key("keep.b"),
             SinkOp::Report {
                 sink_id: 3,
                 epoch,
@@ -2085,7 +2098,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     )
     .await;
     client
-        .sink_op("keep.gone", SinkOp::Delete { sink_id: 4 })
+        .sink_op(key("keep.gone"), SinkOp::Delete { sink_id: 4 })
         .await
         .unwrap();
     running.wait_for_count(1).await;
@@ -2116,7 +2129,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     assert_eq!(spec.gaps[0].first_id, 5);
     assert!(
         client
-            .stream_info("keep.gone")
+            .stream_info(key("keep.gone"))
             .await
             .unwrap()
             .sinks
@@ -2132,7 +2145,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     stopped.answer(Answer::Status(200));
     client
         .sink_op(
-            "keep.b",
+            key("keep.b"),
             SinkOp::SetPaused {
                 sink_id: 3,
                 paused: false,
@@ -2211,7 +2224,7 @@ async fn stream_config_is_read_for_the_expiry_check() {
     let (harness, _receiver, mut client, first) = stuck_sink("stop").await;
     client
         .configure(
-            STREAM,
+            key(STREAM),
             StreamConfig {
                 retention_ms: RetentionClass::Days7.length_ms(),
                 ..StreamConfig::default()
@@ -2254,7 +2267,11 @@ async fn archive_objects(
     stream: &str,
     sink_id: u64,
 ) -> Vec<(String, Vec<Vec<u8>>)> {
-    let prefix = object_store::path::Path::from_iter(["archive", stream, &sink_id.to_string()]);
+    let prefix = object_store::path::Path::from_iter([
+        "archive",
+        &key(stream).to_string(),
+        &sink_id.to_string(),
+    ]);
     let listed = store.list_with_delimiter(Some(&prefix)).await.unwrap();
     let mut objects = Vec::new();
     for object in listed.objects {
@@ -2398,7 +2415,7 @@ async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently(
     .await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 5,
                 start: SinkStart::Earliest,
@@ -2434,7 +2451,7 @@ async fn a_paused_forward_does_not_hold_up_another_source_with_its_sink_id() {
     wait_for_cursor(&mut client, "c.a", 9, a1).await;
     client
         .sink_op(
-            "c.a",
+            key("c.a"),
             SinkOp::SetPaused {
                 sink_id: 9,
                 paused: true,
@@ -2478,7 +2495,7 @@ async fn a_sink_id_reused_by_another_source_after_a_delete_loses_nothing() {
     .await;
     wait_for_cursor(&mut client, "re.a", 9, a_id).await;
     client
-        .sink_op("re.a", SinkOp::Delete { sink_id: 9 })
+        .sink_op(key("re.a"), SinkOp::Delete { sink_id: 9 })
         .await
         .unwrap();
     put_sink(
@@ -2529,7 +2546,7 @@ async fn a_publisher_cannot_use_the_forward_key_space() {
     let mut client = harness.node().client(0).await;
     let record = record_with(1, b"forged");
     let mut message = publish("q.dst", &record, 1, 2);
-    message.producer_id = format::forward_producer_id("q.src", 9);
+    message.producer_id = format::forward_producer_id(key("q.src"), 9);
     client.publish(message).await.unwrap();
     match client.recv().await {
         Some(Reply::Nack { code, .. }) => assert_eq!(code, ErrorCode::Malformed),
@@ -2553,7 +2570,7 @@ async fn cursor_zero_sink_past_expiry(
     put_sink(&mut client, STREAM, 1, spec, start).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: true,
@@ -2573,7 +2590,7 @@ async fn cursor_zero_sink_past_expiry(
     send(&mut client, STREAM, b"new", 2).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::SetPaused {
                 sink_id: 1,
                 paused: false,
@@ -2662,7 +2679,7 @@ async fn a_start_or_reset_at_u64_max_means_live_only() {
     wait_for_cursor(&mut client, STREAM, 1, live).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Id(u64::MAX),
@@ -2812,7 +2829,7 @@ async fn a_paused_sink_warns_about_its_new_position_after_a_reset() {
     send(&mut client, STREAM, b"third", 3).await;
     client
         .sink_op(
-            STREAM,
+            key(STREAM),
             SinkOp::Reset {
                 sink_id: 1,
                 start: SinkStart::Id(second),
@@ -2828,7 +2845,7 @@ async fn a_paused_sink_warns_about_its_new_position_after_a_reset() {
 
 async fn set_paused(client: &mut Client, stream: &str, sink_id: u64, paused: bool) {
     client
-        .sink_op(stream, SinkOp::SetPaused { sink_id, paused })
+        .sink_op(key(stream), SinkOp::SetPaused { sink_id, paused })
         .await
         .unwrap();
 }
@@ -2869,7 +2886,7 @@ async fn a_sink_recreated_in_the_same_millisecond_ignores_the_old_ones_commit() 
     send(&mut client, STREAM, b"a", 1).await;
     old.wait_for_count(1).await;
     client
-        .sink_op(STREAM, SinkOp::Delete { sink_id: 1 })
+        .sink_op(key(STREAM), SinkOp::Delete { sink_id: 1 })
         .await
         .unwrap();
     put_sink(
@@ -3159,7 +3176,7 @@ async fn a_commit_from_before_an_update_stops_at_what_was_visible_then() {
     put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
     let later = send(&mut client, STREAM, b"after", 2).await;
     client
-        .sink_op(STREAM, commit(later, generation))
+        .sink_op(key(STREAM), commit(later, generation))
         .await
         .unwrap();
     assert_eq!(sink_of(&mut client, STREAM, 1).await.1, visible);
@@ -3167,7 +3184,7 @@ async fn a_commit_from_before_an_update_stops_at_what_was_visible_then() {
     // The current spell's goes as far as it says.
     let current = generation + 1;
     client
-        .sink_op(STREAM, commit(later, current))
+        .sink_op(key(STREAM), commit(later, current))
         .await
         .unwrap();
     assert_eq!(sink_of(&mut client, STREAM, 1).await.1, later);
@@ -3176,7 +3193,7 @@ async fn a_commit_from_before_an_update_stops_at_what_was_visible_then() {
     let last = send(&mut client, STREAM, b"last", 3).await;
     put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
     client
-        .sink_op(STREAM, commit(last, generation))
+        .sink_op(key(STREAM), commit(last, generation))
         .await
         .unwrap();
     assert_eq!(sink_of(&mut client, STREAM, 1).await.1, later);

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use format::{Clause, Filter, HEADER_BYTES, RecordHeader};
+use format::{Clause, Filter, HEADER_BYTES, KeyHash, RecordHeader};
 use proto::{DATA_PREFIX_BYTES, ErrorCode, is_valid_stream_id};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -24,6 +24,7 @@ use super::ws::accept_key;
 use super::{Shared, with_core_io};
 use crate::connection::{Connection, Event, Subscription};
 use crate::delivery::{CURSOR_NAME_REFUSED, cursor_name_is_allowed};
+use crate::keys::Keys;
 use crate::message::{
     Reply, SinkOp, SinkSpec, SinkStart, StateChange, StreamConfig, StreamConfigPatch, StreamInfo,
 };
@@ -666,6 +667,7 @@ impl<'a> HttpConn<'a> {
             response.status = 403;
             return self.refuse(&mut request, response).await;
         }
+        let key = self.shared.keys.hash(&stream);
         let limit_bytes = if route == Route::Publish {
             self.max_records_bytes()
         } else {
@@ -684,28 +686,25 @@ impl<'a> HttpConn<'a> {
         let shape = match route {
             Route::Info => {
                 let is_admin = token.check(&stream, auth::PERM_ADMIN, now_ms).is_ok();
-                self.info(&stream, is_admin).await
+                self.info(&stream, key, is_admin).await
             }
             Route::Publish => {
-                return self.publish(&stream, &mut request, token.author).await;
+                return self.publish(key, &mut request, token.author).await;
             }
-            Route::Read => self.read(&stream, &request).await,
-            Route::StateGet => self.state_get(&stream).await,
-            Route::StatePatch => {
-                self.state_patch(&stream, &request, body, token.author)
-                    .await
-            }
-            Route::Cursor(name) => self.cursor(&stream, &name, &request, &body).await,
-            Route::Put => self.stream_put(&stream, &body).await,
-            Route::Core => self.stream_core(&stream, &body).await,
+            Route::Read => self.read(key, &request).await,
+            Route::StateGet => self.state_get(key).await,
+            Route::StatePatch => self.state_patch(key, &request, body, token.author).await,
+            Route::Cursor(name) => self.cursor(key, &name, &request, &body).await,
+            Route::Put => self.stream_put(key, &body).await,
+            Route::Core => self.stream_core(key, &body).await,
             Route::Delete => {
-                if self.client().delete_stream(&stream).await {
+                if self.client().delete_stream(key).await {
                     Response::json(200, "{\"deleted\":true}".to_owned())
                 } else {
                     error(ErrorCode::NotFound, "no such stream")
                 }
             }
-            Route::SinkPut(sink_id) => match forward_target(&body) {
+            Route::SinkPut(sink_id) => match forward_target(&body, &self.shared.keys) {
                 // The sink will write there, as a publish would (section 12).
                 Some(target)
                     if let Err(failure) = token.check(&target, auth::PERM_PUBLISH, now_ms) =>
@@ -714,12 +713,12 @@ impl<'a> HttpConn<'a> {
                     response.status = 403;
                     response
                 }
-                _ => self.sink_put(&stream, sink_id, &body).await,
+                _ => self.sink_put(key, sink_id, &body).await,
             },
-            Route::SinkDelete(sink_id) => self.sink(&stream, SinkOp::Delete { sink_id }).await,
+            Route::SinkDelete(sink_id) => self.sink(key, SinkOp::Delete { sink_id }).await,
             Route::SinkPause(sink_id) => {
                 self.sink(
-                    &stream,
+                    key,
                     SinkOp::SetPaused {
                         sink_id,
                         paused: true,
@@ -729,7 +728,7 @@ impl<'a> HttpConn<'a> {
             }
             Route::SinkResume(sink_id) => {
                 self.sink(
-                    &stream,
+                    key,
                     SinkOp::SetPaused {
                         sink_id,
                         paused: false,
@@ -738,7 +737,7 @@ impl<'a> HttpConn<'a> {
                 .await
             }
             Route::SinkReset(sink_id) => match parse_sink_reset(&body) {
-                Ok(start) => self.sink(&stream, SinkOp::Reset { sink_id, start }).await,
+                Ok(start) => self.sink(key, SinkOp::Reset { sink_id, start }).await,
                 Err(response) => response,
             },
         };
@@ -847,7 +846,7 @@ impl<'a> HttpConn<'a> {
 
     async fn publish(
         &mut self,
-        stream: &str,
+        stream: KeyHash,
         request: &mut Request,
         author: NonZeroU64,
     ) -> io::Result<Response> {
@@ -901,13 +900,13 @@ impl<'a> HttpConn<'a> {
         // Nothing will come back to answer with, so what the owner would refuse is refused here,
         // or the caller is told a publish was accepted that commits nothing (D133).
         if ack_level == 0
-            && let Err(msg) = crate::core::check_publish(stream, &mut records, None)
+            && let Err(msg) = crate::core::check_publish(&mut records, None)
         {
             return Ok(error(ErrorCode::Malformed, &msg));
         }
         let handle = self.number();
         let mut publish = RegionPublish {
-            stream: Arc::from(stream),
+            stream,
             handle,
             producer_id: shape.producer_id,
             producer_seq: shape.producer_seq,
@@ -968,14 +967,14 @@ impl<'a> HttpConn<'a> {
         }
     }
 
-    async fn info(&mut self, stream: &str, is_admin: bool) -> Response {
+    async fn info(&mut self, name: &str, stream: KeyHash, is_admin: bool) -> Response {
         match self.client().stream_info(stream).await {
             Err(code) => error(code, "no such stream"),
-            Ok(info) => Response::json(200, info_json(stream, &info, is_admin)),
+            Ok(info) => Response::json(200, info_json(name, &info, is_admin)),
         }
     }
 
-    async fn state_get(&mut self, stream: &str) -> Response {
+    async fn state_get(&mut self, stream: KeyHash) -> Response {
         match self.client().snapshot(stream).await {
             Err(code) => error(code, "no such stream"),
             Ok(snapshot) => Response::binary("application/cbor", snapshot.state.to_vec())
@@ -987,7 +986,7 @@ impl<'a> HttpConn<'a> {
 
     async fn state_patch(
         &mut self,
-        stream: &str,
+        stream: KeyHash,
         request: &Request,
         body: Vec<u8>,
         author: NonZeroU64,
@@ -1007,7 +1006,7 @@ impl<'a> HttpConn<'a> {
         };
         let req = self.number();
         let mut state_op = OwnedStateOp {
-            stream: Arc::from(stream),
+            stream,
             req,
             author,
             change: StateChange {
@@ -1064,7 +1063,7 @@ impl<'a> HttpConn<'a> {
 
     async fn cursor(
         &mut self,
-        stream: &str,
+        stream: KeyHash,
         name: &str,
         request: &Request,
         body: &[u8],
@@ -1084,6 +1083,7 @@ impl<'a> HttpConn<'a> {
             return malformed("the body is an id, in decimal or as {\"id\": ...}");
         };
         let reset = matches!(request.query("reset"), Some("true") | Some("1"));
+        let name = self.shared.keys.hash(name);
         match self.client().put_cursor(stream, name, id, reset).await {
             Ok(at) => Response::json(200, format!("{{\"id\":\"{at}\"}}")),
             Err(ErrorCode::NotFound) => error(ErrorCode::NotFound, "no such stream"),
@@ -1096,7 +1096,7 @@ impl<'a> HttpConn<'a> {
     }
 
     /// Gives a stream its own shard on a core, or moves the one it has (section 6.1, D249).
-    async fn stream_core(&mut self, stream: &str, body: &[u8]) -> Response {
+    async fn stream_core(&mut self, stream: KeyHash, body: &[u8]) -> Response {
         let fields = match object_fields(body) {
             Ok(fields) => fields,
             Err(response) => return response,
@@ -1123,7 +1123,7 @@ impl<'a> HttpConn<'a> {
         }
     }
 
-    async fn stream_put(&mut self, stream: &str, body: &[u8]) -> Response {
+    async fn stream_put(&mut self, stream: KeyHash, body: &[u8]) -> Response {
         let patch = match parse_config(body) {
             Ok(patch) => patch,
             Err(response) => return response,
@@ -1134,9 +1134,9 @@ impl<'a> HttpConn<'a> {
         }
     }
 
-    async fn sink_put(&mut self, stream: &str, sink_id: u64, body: &[u8]) -> Response {
-        match parse_sink(body) {
-            Ok((spec, start)) => {
+    async fn sink_put(&mut self, stream: KeyHash, sink_id: u64, body: &[u8]) -> Response {
+        match parse_sink(body, &self.shared.keys) {
+            Ok((spec, start, _)) => {
                 self.sink(
                     stream,
                     SinkOp::Put {
@@ -1151,7 +1151,7 @@ impl<'a> HttpConn<'a> {
         }
     }
 
-    async fn sink(&mut self, stream: &str, op: SinkOp) -> Response {
+    async fn sink(&mut self, stream: KeyHash, op: SinkOp) -> Response {
         match self.client().sink_op(stream, op).await {
             Ok(()) => Response::json(200, "{\"ok\":true}".to_owned()),
             Err(code) if code == ErrorCode::Malformed => error(
@@ -1168,7 +1168,7 @@ impl<'a> HttpConn<'a> {
 
     /// A read is a subscription that ends: catch-up already goes through memory, the local
     /// disk and the object store, and through the filter (section 5.1).
-    async fn read(&mut self, stream: &str, request: &Request) -> Response {
+    async fn read(&mut self, stream: KeyHash, request: &Request) -> Response {
         let from = match request.query("from").map(parse_u64) {
             None => 0,
             Some(Some(from)) => from,
@@ -1464,13 +1464,9 @@ fn parse_config(body: &[u8]) -> Result<StreamConfigPatch, Response> {
 
 /// A forward's target, if the body is a sink that has one. Anything malformed is left for
 /// `parse_sink` to answer.
-fn forward_target(body: &[u8]) -> Option<String> {
-    let (spec, _) = parse_sink(body).ok()?;
-    if spec.kind == "forward" {
-        spec.target
-    } else {
-        None
-    }
+fn forward_target(body: &[u8], keys: &Keys) -> Option<String> {
+    let (spec, _, target) = parse_sink(body, keys).ok()?;
+    if spec.kind == "forward" { target } else { None }
 }
 
 fn parse_start(value: &Json) -> Result<SinkStart, Response> {
@@ -1495,13 +1491,15 @@ fn parse_sink_reset(body: &[u8]) -> Result<SinkStart, Response> {
     Ok(start)
 }
 
-fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
+/// The spec and start, and a forward's target as named, which the token is checked against.
+fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<String>), Response> {
     let mut spec = SinkSpec {
         on_expire: "stop".to_owned(),
         concurrency: 1,
         ..SinkSpec::default()
     };
     let mut start = SinkStart::Now;
+    let mut target = None;
     let text = |value: &Json, name: &str| -> Result<String, Response> {
         let text = value
             .as_str()
@@ -1517,7 +1515,14 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
         match key.as_str() {
             "kind" => spec.kind = text(&value, "kind")?,
             "url" => spec.url = Some(text(&value, "url")?),
-            "target" => spec.target = Some(text(&value, "target")?),
+            "target" => {
+                let name = text(&value, "target")?;
+                if !is_valid_stream_id(&name) {
+                    return Err(malformed("target is a stream id"));
+                }
+                spec.target = Some(keys.hash(&name));
+                target = Some(name);
+            }
             "filter" => {
                 let filter = text(&value, "filter")?;
                 if parse_filter(&filter).is_none() {
@@ -1574,7 +1579,7 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
             }
         }
         "forward" => {
-            if !spec.target.as_deref().is_some_and(is_valid_stream_id) {
+            if spec.target.is_none() {
                 return Err(malformed("forward needs a target stream"));
             }
             if spec.concurrency > 1 {
@@ -1588,7 +1593,7 @@ fn parse_sink(body: &[u8]) -> Result<(SinkSpec, SinkStart), Response> {
             ));
         }
     }
-    Ok((spec, start))
+    Ok((spec, start, target))
 }
 
 #[cfg(test)]
@@ -1600,9 +1605,13 @@ mod tests {
     #[test]
     fn an_empty_sink_secret_is_refused() {
         let deliver = br#"{"kind":"webhook.deliver","url":"http://x/","secret":""}"#;
-        assert_eq!(parse_sink(deliver).err().map(|r| r.status), Some(400));
+        let keys = crate::NodeConfig::new(1).keys;
+        assert_eq!(
+            parse_sink(deliver, &keys).err().map(|r| r.status),
+            Some(400)
+        );
         let notify = br#"{"kind":"webhook.notify","url":"http://x/","secret":""}"#;
-        assert_eq!(parse_sink(notify).err().map(|r| r.status), Some(400));
+        assert_eq!(parse_sink(notify, &keys).err().map(|r| r.status), Some(400));
     }
 
     #[test]

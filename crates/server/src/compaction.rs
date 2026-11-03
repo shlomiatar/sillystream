@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use format::{ENTRY_SEAL_MANIFEST, Records, SystemRecord, decode_manifest_doc, id_ms};
+use format::{ENTRY_SEAL_MANIFEST, KeyHash, Records, SystemRecord, decode_manifest_doc, id_ms};
 use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
@@ -29,13 +29,11 @@ use crate::clock::Clock;
 use crate::connection::{Connection, Event, Subscription};
 use crate::core::Links;
 use crate::delivery::ReplaceResult;
+use crate::keys::Keys;
 use crate::message::{CompactSource, CompactView, ControlMsg, CursorOp};
 use crate::node::{NodeMsg, sleep_until_some};
 use crate::placement::shard_of;
 use crate::recovery::accepted_prefix;
-
-/// The system stream manifests go to (Q3). Clients can read it, and nothing else.
-pub const MANIFEST_STREAM: &str = "_sys.manifests";
 
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
@@ -206,7 +204,7 @@ struct Source {
 #[derive(Default)]
 struct Batch {
     /// Sorted by stream, so the output is (section 7.5). `(sources, merge_below)`.
-    streams: BTreeMap<Arc<str>, (Vec<Source>, u64)>,
+    streams: BTreeMap<KeyHash, (Vec<Source>, u64)>,
     bytes: u64,
     /// The last manifest it covers.
     through: Option<u64>,
@@ -227,7 +225,7 @@ enum Planned {
 }
 
 struct Run {
-    stream: Arc<str>,
+    stream: KeyHash,
     sources: Vec<(Path, u64, u64)>,
     first_id: u64,
 }
@@ -241,6 +239,7 @@ pub(crate) struct Compactor {
     pub store: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     pub links: Links,
+    pub keys: Keys,
     pub virtual_shard_count: u32,
     pub core_count: usize,
     pub window_bytes: u64,
@@ -333,7 +332,7 @@ impl Compactor {
     }
 
     /// Where a message about `stream` goes first. A core that gave it away passes it on (D66).
-    fn first_hop(&self, stream: &str) -> &mpsc::UnboundedSender<ControlMsg> {
+    fn first_hop(&self, stream: KeyHash) -> &mpsc::UnboundedSender<ControlMsg> {
         let shard = shard_of(stream, self.virtual_shard_count);
         &self.links.control[shard as usize % self.core_count]
     }
@@ -349,7 +348,7 @@ impl Compactor {
         };
         let mut from = log.through;
         let subscribe = |connection: &mut Connection, from: u64| {
-            let mut subscription = Subscription::new(1, MANIFEST_STREAM, from);
+            let mut subscription = Subscription::new(1, self.keys.manifest, from);
             subscription.include_system = true;
             connection.subscribe(subscription);
         };
@@ -396,10 +395,10 @@ impl Compactor {
 
     async fn read_cursor(&self, class: RetentionClass) -> Result<u64, String> {
         let (reply, answer) = oneshot::channel();
-        self.first_hop(MANIFEST_STREAM)
+        self.first_hop(self.keys.manifest)
             .send(ControlMsg::Cursor {
-                stream: Arc::from(MANIFEST_STREAM),
-                name: Arc::from(class.cursor_name().as_str()),
+                stream: self.keys.manifest,
+                name: self.keys.hash(&class.cursor_name()),
                 op: CursorOp::Read(reply),
                 report: None,
                 ticket: None,
@@ -413,10 +412,10 @@ impl Compactor {
 
     async fn commit_cursor(&self, class: RetentionClass, id: u64) -> Result<(), String> {
         let (reply, answer) = oneshot::channel();
-        self.first_hop(MANIFEST_STREAM)
+        self.first_hop(self.keys.manifest)
             .send(ControlMsg::Cursor {
-                stream: Arc::from(MANIFEST_STREAM),
-                name: Arc::from(class.cursor_name().as_str()),
+                stream: self.keys.manifest,
+                name: self.keys.hash(&class.cursor_name()),
                 op: CursorOp::Put {
                     id,
                     reset: false,
@@ -561,14 +560,14 @@ impl Compactor {
 
     async fn view(
         &self,
-        stream: &Arc<str>,
+        stream: &KeyHash,
         path: &Path,
         footer: Vec<(u64, u64)>,
     ) -> Result<Option<CompactView>, String> {
         let (reply, answer) = oneshot::channel();
-        self.first_hop(stream)
+        self.first_hop(*stream)
             .send(ControlMsg::CompactView {
-                stream: Arc::clone(stream),
+                stream: *stream,
                 path: path.clone(),
                 footer,
                 reply,
@@ -598,17 +597,17 @@ impl Compactor {
         &self,
         extents: &[StreamExtent],
         limit: Option<u64>,
-    ) -> BTreeMap<Arc<str>, Vec<(u64, u64)>> {
-        let mut footer: BTreeMap<Arc<str>, Vec<(u64, u64)>> = BTreeMap::new();
+    ) -> BTreeMap<KeyHash, Vec<(u64, u64)>> {
+        let mut footer: BTreeMap<KeyHash, Vec<(u64, u64)>> = BTreeMap::new();
         for extent in extents {
-            if &*extent.stream == MANIFEST_STREAM
+            if extent.stream == self.keys.manifest
                 || limit.is_some_and(|limit| extent.id_first > limit)
             {
                 continue;
             }
             let id_last = limit.map_or(extent.id_last, |limit| extent.id_last.min(limit));
             footer
-                .entry(Arc::clone(&extent.stream))
+                .entry(extent.stream)
                 .or_default()
                 .push((extent.id_first, id_last));
         }
@@ -723,7 +722,7 @@ impl Compactor {
     /// comes back as `Ok(Err)`: only that source is left behind (D177).
     async fn read_source(
         &self,
-        stream: &Arc<str>,
+        stream: &KeyHash,
         source: &Source,
     ) -> Result<Result<Bytes, String>, String> {
         let reader = SegmentReader::new(Arc::clone(&self.store), source.path.clone());
@@ -796,10 +795,10 @@ impl Compactor {
                         .map_err(|error| format!("a source of {stream}: {error}"))?
                         .id;
                     builder
-                        .add_extent(&stream, pieces)
+                        .add_extent(stream, pieces)
                         .map_err(|error| format!("building for {stream}: {error}"))?;
                     runs.push(Run {
-                        stream: Arc::clone(&stream),
+                        stream,
                         sources: sources[start..end]
                             .iter()
                             .map(|source| {
@@ -836,16 +835,16 @@ impl Compactor {
             )
             .await?;
             storage::crash_point("compact.after_output");
-            let by_first: HashMap<(&str, u64), &StreamExtent> = built
+            let by_first: HashMap<(KeyHash, u64), &StreamExtent> = built
                 .extents
                 .iter()
-                .map(|extent| ((&*extent.stream, extent.id_first), extent))
+                .map(|extent| ((extent.stream, extent.id_first), extent))
                 .collect();
             let mut applied_count = 0;
             let mut retry = false;
             for run in &runs {
                 let extent = by_first
-                    .get(&(&*run.stream, run.first_id))
+                    .get(&(run.stream, run.first_id))
                     .expect("every run went into the builder");
                 match self
                     .replace_extents(&run.stream, &path, run.sources.clone(), extent)
@@ -875,15 +874,15 @@ impl Compactor {
 
     async fn replace_extents(
         &self,
-        stream: &Arc<str>,
+        stream: &KeyHash,
         path: &Path,
         sources: Vec<(Path, u64, u64)>,
         extent: &StreamExtent,
     ) -> Result<ReplaceResult, String> {
         let (reply, answer) = oneshot::channel();
-        self.first_hop(stream)
+        self.first_hop(*stream)
             .send(ControlMsg::ReplaceExtents {
-                stream: Arc::clone(stream),
+                stream: *stream,
                 path: path.clone(),
                 sources,
                 extent: extent.clone(),
@@ -893,15 +892,15 @@ impl Compactor {
         answer.await.map_err(|_| "the node has stopped".to_owned())
     }
 
-    async fn drop_extents(&self, stream: &Arc<str>, path: &Path) -> Result<bool, String> {
+    async fn drop_extents(&self, stream: &KeyHash, path: &Path) -> Result<bool, String> {
         self.noted
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(path.to_string());
         let (reply, answer) = oneshot::channel();
-        self.first_hop(stream)
+        self.first_hop(*stream)
             .send(ControlMsg::DropExtents {
-                stream: Arc::clone(stream),
+                stream: *stream,
                 path: path.clone(),
                 reply,
             })
@@ -922,7 +921,7 @@ impl Compactor {
     ) -> Result<bool, String> {
         let holds_unread_manifests = extents
             .iter()
-            .any(|extent| &*extent.stream == MANIFEST_STREAM && extent.id_last > slowest_cursor);
+            .any(|extent| extent.stream == self.keys.manifest && extent.id_last > slowest_cursor);
         if holds_unread_manifests {
             return Ok(false);
         }
@@ -964,7 +963,7 @@ impl Compactor {
     async fn copy_passed_over(
         &self,
         class: RetentionClass,
-        stream: Arc<str>,
+        stream: KeyHash,
         path: &Path,
         view: CompactView,
         limit: Option<u64>,

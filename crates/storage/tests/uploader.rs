@@ -15,9 +15,13 @@ use object_store::path::Path;
 use storage::{
     Handoff, SealExtent, SegmentCache, SegmentReader, UnfinishedUpload, UploadEvent, UploadKey,
     UploadSendError, Uploader, UploaderConfig, UploaderSender, dedicated_path, seal_path,
-    stream_fits_dedicated_path,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn stream_key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
 
 const FIRST_ID: u64 = 1_800_000_000_000 << 16;
 
@@ -60,7 +64,7 @@ fn extents(stream_count: u64, base_id: u64) -> (Vec<SealExtent>, Vec<(String, By
     for (name, index) in names {
         let bytes = Bytes::from(record(base_id + index, index, 7, name.as_bytes()));
         out.push(SealExtent {
-            stream: Arc::from(name.as_str()),
+            stream: stream_key(name.as_str()),
             records: vec![bytes.clone()],
         });
         expected.push((name, bytes));
@@ -80,7 +84,7 @@ fn one_stream_seal(number: u64, stream: &str, bytes: &Bytes) -> Handoff {
     seal(
         number,
         vec![SealExtent {
-            stream: Arc::from(stream),
+            stream: stream_key(stream),
             records: vec![bytes.clone()],
         }],
     )
@@ -88,7 +92,7 @@ fn one_stream_seal(number: u64, stream: &str, bytes: &Bytes) -> Handoff {
 
 fn dedicated(stream: &str, number: u64, records: Vec<Bytes>) -> Handoff {
     Handoff::Dedicated {
-        stream: Arc::from(stream),
+        stream: stream_key(stream),
         number,
         records,
         tickets: Vec::new(),
@@ -146,7 +150,7 @@ async fn one_put_per_seal(inner: Arc<dyn ObjectStore>) {
         let reader = SegmentReader::new(Arc::clone(&store), path);
         let top = reader.read_top_index().await.unwrap();
         for (name, bytes) in expected.iter().step_by(97) {
-            let extents = reader.lookup(&top, name).await.unwrap();
+            let extents = reader.lookup(&top, stream_key(name)).await.unwrap();
             assert_eq!(extents.len(), 1);
             assert_eq!(&reader.read_extent(&extents[0]).await.unwrap(), bytes);
         }
@@ -180,7 +184,7 @@ async fn one_stream_in_two_extents_of_a_seal_gets_two_entries_in_one_object() {
     let other = Bytes::from(record(FIRST_ID + 1, 1, 7, b"other"));
     let late = Bytes::from(record(FIRST_ID + 2, 1, 7, b"late"));
     let extent = |stream: &str, bytes: &Bytes| SealExtent {
-        stream: Arc::from(stream),
+        stream: stream_key(stream),
         records: vec![bytes.clone()],
     };
     sender
@@ -196,10 +200,20 @@ async fn one_stream_in_two_extents_of_a_seal_gets_two_entries_in_one_object() {
     let (_, path, _) = next_uploaded(&mut events).await;
     let reader = SegmentReader::new(Arc::clone(&store), path);
     let top = reader.read_top_index().await.unwrap();
-    assert_eq!(reader.lookup(&top, "moved").await.unwrap().len(), 2);
+    assert_eq!(
+        reader
+            .lookup(&top, stream_key("moved"))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     let both = [early, late].concat();
-    assert_eq!(reader.read_stream("moved").await.unwrap(), both);
-    assert_eq!(reader.read_stream("a.other").await.unwrap(), other);
+    assert_eq!(reader.read_stream(stream_key("moved")).await.unwrap(), both);
+    assert_eq!(
+        reader.read_stream(stream_key("a.other")).await.unwrap(),
+        other
+    );
     drop(sender);
     uploader.finish();
 }
@@ -223,20 +237,27 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() 
     assert_eq!(
         key,
         UploadKey::Dedicated {
-            stream: Arc::from("logs.busy"),
+            stream: stream_key("logs.busy"),
             number: 77
         }
     );
-    assert_eq!(path, dedicated_path("logs.busy", 3, FIRST_ID));
+    assert_eq!(path, dedicated_path(stream_key("logs.busy"), 3, FIRST_ID));
     let hour = id_ms(FIRST_ID) / 3_600_000;
     assert_eq!(
         path.to_string(),
-        format!("sealed/{hour}/logs.busy/{:020}-{FIRST_ID:020}.seg", 3)
+        format!(
+            "sealed/{hour}/{}/{:020}-{FIRST_ID:020}.seg",
+            stream_key("logs.busy"),
+            3
+        )
     );
     assert_eq!(counting.puts(), 1);
     let reader = SegmentReader::new(store, path);
     let both = [first, second].concat();
-    assert_eq!(reader.read_stream("logs.busy").await.unwrap(), both);
+    assert_eq!(
+        reader.read_stream(stream_key("logs.busy")).await.unwrap(),
+        both
+    );
     drop(sender);
     uploader.finish();
 }
@@ -266,7 +287,7 @@ async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
         .try_send(Handoff::Seal {
             seal: 4,
             extents: vec![SealExtent {
-                stream: Arc::from("s"),
+                stream: stream_key("s"),
                 records: vec![bytes.clone()],
             }],
             tickets: vec![3, 0, 9],
@@ -274,7 +295,7 @@ async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
         .unwrap();
     sender
         .try_send(Handoff::Dedicated {
-            stream: Arc::from("d"),
+            stream: stream_key("d"),
             number: 8,
             records: vec![bytes],
             tickets: vec![5, 1, 0],
@@ -282,7 +303,7 @@ async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
         .unwrap();
     let seal_key = UploadKey::Seal(4);
     let dedicated_key = UploadKey::Dedicated {
-        stream: Arc::from("d"),
+        stream: stream_key("d"),
         number: 8,
     };
     let mut seen = Vec::new();
@@ -345,7 +366,7 @@ async fn store_failures_retry_with_references_held_until_success() {
     assert_eq!(counting.puts(), 1);
     assert_eq!(counting.put_attempt_count.load(Ordering::SeqCst), 6);
     let reader = SegmentReader::new(store, path);
-    assert_eq!(reader.read_stream("s").await.unwrap(), wire);
+    assert_eq!(reader.read_stream(stream_key("s")).await.unwrap(), wire);
     drop(sender);
     assert!(uploader.finish().unfinished.is_empty());
     assert_eq!(Arc::strong_count(&reference), 1, "released after success");
@@ -360,7 +381,7 @@ async fn shutdown_during_an_outage_hands_every_reference_back() {
     let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     let extent = |stream: &str| SealExtent {
-        stream: Arc::from(stream),
+        stream: stream_key(stream),
         records: vec![bytes.clone()],
     };
     sender
@@ -386,7 +407,7 @@ async fn shutdown_during_an_outage_hands_every_reference_back() {
             UnfinishedUpload::Dedicated {
                 stream, records, ..
             } => {
-                assert_eq!(&*stream, "c");
+                assert_eq!(stream, stream_key("c"));
                 assert_eq!(records.len(), 1);
                 dedicated_count += 1;
             }
@@ -439,7 +460,7 @@ async fn unsorted_extents_are_uploaded_sorted_and_readable() {
     for (index, stream) in streams.iter().enumerate() {
         let bytes = Bytes::from(record(FIRST_ID + index as u64, 1, 7, stream.as_bytes()));
         extents.push(SealExtent {
-            stream: Arc::from(*stream),
+            stream: stream_key(stream),
             records: vec![bytes.clone()],
         });
         expected.push((*stream, bytes));
@@ -449,7 +470,7 @@ async fn unsorted_extents_are_uploaded_sorted_and_readable() {
     let reader = SegmentReader::new(store, path);
     let top = reader.read_top_index().await.unwrap();
     for (stream, bytes) in expected {
-        let found = reader.lookup(&top, stream).await.unwrap();
+        let found = reader.lookup(&top, stream_key(stream)).await.unwrap();
         assert_eq!(found.len(), 1, "{stream}");
         assert_eq!(reader.read_extent(&found[0]).await.unwrap(), bytes);
     }
@@ -477,9 +498,9 @@ async fn a_retry_after_a_lost_response_counts_as_done_and_a_collision_takes_the_
     drop(sender);
     assert_eq!(uploader.finish().unfinished.len(), 0);
     let reader = SegmentReader::new(Arc::clone(&store), path);
-    assert_eq!(reader.read_stream("s").await.unwrap(), bytes);
+    assert_eq!(reader.read_stream(stream_key("s")).await.unwrap(), bytes);
     let reader = SegmentReader::new(store, other_path);
-    assert_eq!(reader.read_stream("s").await.unwrap(), other);
+    assert_eq!(reader.read_stream(stream_key("s")).await.unwrap(), other);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -528,7 +549,10 @@ async fn uploaded_objects_reach_the_local_cache() {
     let (_, path, _) = next_uploaded(&mut events).await;
     // Same bytes from both tiers, through the same reader.
     let from_cache = SegmentReader::new(local.clone(), path.clone());
-    assert_eq!(from_cache.read_stream("s").await.unwrap(), bytes);
+    assert_eq!(
+        from_cache.read_stream(stream_key("s")).await.unwrap(),
+        bytes
+    );
     let cached = local.get(&path).await.unwrap().bytes().await.unwrap();
     let stored = inner.get(&path).await.unwrap().bytes().await.unwrap();
     assert_eq!(concat(&[cached]), concat(&[stored]));
@@ -561,71 +585,6 @@ async fn events_until_uploaded(
         seen.first()
     );
     seen
-}
-
-async fn a_stream_id_too_long_for_a_path_fails_alone(store: Arc<dyn ObjectStore>) {
-    let (config, mut events) = config(store);
-    let (sender, uploader) = Uploader::start(config).unwrap();
-    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    // Over the limit as encoded in a path, including ids short enough as raw bytes.
-    let long_ids = [
-        "x".repeat(300),
-        "x".repeat(256),
-        "#".repeat(100),
-        "é".repeat(60),
-    ];
-    for (number, id) in long_ids.iter().enumerate() {
-        assert!(!stream_fits_dedicated_path(id));
-        sender
-            .try_send(dedicated(id, number as u64, vec![bytes.clone()]))
-            .unwrap();
-    }
-    // The longest id that fits, and a long id in a seal, which puts it in no path.
-    assert!(stream_fits_dedicated_path(&"x".repeat(255)));
-    sender
-        .try_send(dedicated(&"x".repeat(255), 100, vec![bytes.clone()]))
-        .unwrap();
-    sender
-        .try_send(one_stream_seal(1, &"y".repeat(300), &bytes))
-        .unwrap();
-    let seen = events_until_uploaded(&mut events, &UploadKey::Seal(1)).await;
-    let mut failed = Vec::new();
-    for event in seen {
-        match event {
-            UploadEvent::Failed {
-                key: UploadKey::Dedicated { number, .. },
-                ..
-            } => failed.push(number),
-            UploadEvent::Uploaded {
-                key: UploadKey::Dedicated { number, .. },
-                ..
-            } => assert_eq!(number, 100),
-            UploadEvent::Uploaded { .. } => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-    assert_eq!(failed, [0, 1, 2, 3]);
-    let exit = uploader.shutdown();
-    assert_eq!(exit.unfinished.len(), 4, "their references come back");
-    for unfinished in exit.unfinished {
-        assert!(matches!(
-            unfinished,
-            UnfinishedUpload::Dedicated { records, .. } if records.len() == 1
-        ));
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stream_id_too_long_for_a_path_fails_alone_on_the_local_file_system() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-    a_stream_id_too_long_for_a_path_fails_alone(store).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stream_id_too_long_for_a_path_fails_alone_in_memory() {
-    // The same result on every store, whatever that store would have accepted.
-    a_stream_id_too_long_for_a_path_fails_alone(Arc::new(InMemory::new())).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -775,7 +734,9 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     let probe = {
         let mut builder = storage::SegmentBuilder::new();
-        builder.add_extent("s", [bytes.clone()]).unwrap();
+        builder
+            .add_extent(stream_key("s"), [bytes.clone()])
+            .unwrap();
         builder.finish().unwrap().len_bytes
     };
     let cache = SegmentCache::open(dir.path(), probe).unwrap();
@@ -1096,7 +1057,8 @@ async fn an_idle_uploader_keeps_running_the_tasks_a_put_left() {
 #[derive(Debug)]
 struct HoldsPuts {
     inner: InMemory,
-    held: String,
+    /// Paths with any of these in them wait for `release`.
+    held: Vec<String>,
     release: Arc<AtomicBool>,
     waiting: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -1115,7 +1077,11 @@ impl ObjectStore for HoldsPuts {
         payload: object_store::PutPayload,
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        if location.as_ref().contains(&self.held) {
+        if self
+            .held
+            .iter()
+            .any(|held| location.as_ref().contains(held.as_str()))
+        {
             self.waiting.fetch_add(1, Ordering::SeqCst);
             while !self.release.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -1195,7 +1161,7 @@ async fn puts_overlap_and_their_events_stay_in_order() {
     let waiting = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let store: Arc<dyn ObjectStore> = Arc::new(HoldsPuts {
         inner,
-        held: "slow.stream".to_owned(),
+        held: vec![stream_key("slow.stream").to_string()],
         release: Arc::clone(&release),
         waiting: Arc::clone(&waiting),
     });
@@ -1233,10 +1199,12 @@ async fn sealed_path_of(store: &Arc<dyn ObjectStore>, stream: &str) -> Option<Pa
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             let listed = storage::list_sealed_objects(store.as_ref()).await.unwrap();
-            if let Some(object) = listed
-                .into_iter()
-                .find(|object| object.location.as_ref().contains(stream))
-            {
+            if let Some(object) = listed.into_iter().find(|object| {
+                object
+                    .location
+                    .as_ref()
+                    .contains(&stream_key(stream).to_string())
+            }) {
                 return object.location;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -1263,7 +1231,9 @@ async fn a_stop_returns_every_put_under_way() {
     let waiting = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let store: Arc<dyn ObjectStore> = Arc::new(HoldsPuts {
         inner: InMemory::new(),
-        held: "held.".to_owned(),
+        held: (0..3)
+            .map(|number| stream_key(&format!("held.{number}")).to_string())
+            .collect(),
         release,
         waiting: Arc::clone(&waiting),
     });

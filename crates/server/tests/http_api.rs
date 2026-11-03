@@ -629,11 +629,13 @@ async fn cursors_move_forward_and_reset_goes_back() {
     // Above the head, not a number, a sink's own name, and a stream that isn't there.
     assert_code(&put(path, (ids[2] + 100).to_string()).await, 400, 8);
     assert_code(&put(path, "soon".to_owned()).await, 400, 8);
-    assert_code(
-        &put("/v1/stream/c/cursor/sink:1", "1".to_owned()).await,
-        400,
-        8,
-    );
+    for reserved in ["sink:1", "compact:7d"] {
+        assert_code(
+            &put(&format!("/v1/stream/c/cursor/{reserved}"), "1".to_owned()).await,
+            400,
+            8,
+        );
+    }
     assert_code(
         &put("/v1/stream/none/cursor/x", "1".to_owned()).await,
         404,

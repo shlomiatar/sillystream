@@ -8,13 +8,18 @@ use common::*;
 use format::Clause;
 use server::{Event, NodeConfig, Reply, StateOp, StateOpRequest, Subscription};
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const STREAM: &str = "bounds.stream";
 const STATE_STREAM: &str = "bounds.state";
 
 async fn set_state(client: &mut server::Client, stream: &str, req: u32, doc: bytes::Bytes) -> u64 {
     client
         .state_op(StateOpRequest {
-            stream,
+            stream: key(stream),
             req,
             author: AUTHOR,
             expect_ver: 0,
@@ -68,8 +73,8 @@ async fn state_frames_a_client_has_read_return_their_window() {
     make_stream(&mut client, STATE_STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, STREAM, u64::MAX));
-    let mut state_only = Subscription::new(2, STATE_STREAM, u64::MAX);
+    connection.subscribe(Subscription::new(1, key(STREAM), u64::MAX));
+    let mut state_only = Subscription::new(2, key(STATE_STREAM), u64::MAX);
     state_only.state_only = true;
     connection.subscribe(state_only);
     subscribed(&mut connection, &mut heard, 1).await;
@@ -109,7 +114,7 @@ async fn a_state_only_connection_recovers_from_a_doc_over_its_window() {
     make_stream(&mut client, STATE_STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut state_only = Subscription::new(1, STATE_STREAM, u64::MAX);
+    let mut state_only = Subscription::new(1, key(STATE_STREAM), u64::MAX);
     state_only.state_only = true;
     connection.subscribe(state_only);
     subscribed(&mut connection, &mut heard, 1).await;
@@ -175,7 +180,7 @@ async fn a_stalled_subscriber_with_a_rare_filter_falls_behind_and_lets_go_of_sla
         mask: 0xFF,
         value: 1,
     }];
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &clauses;
     stalled.subscribe(subscription);
     subscribed(&mut stalled, &mut heard, 1).await;
@@ -218,7 +223,7 @@ async fn unread_small_frames_do_not_hold_slabs_past_the_window() {
         mask: 0xFF,
         value: 1,
     }];
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &clauses;
     stalled.subscribe(subscription);
     subscribed(&mut stalled, &mut heard, 1).await;
@@ -244,7 +249,7 @@ async fn a_tight_memory_cap_lowers_the_bound_so_the_publisher_still_runs() {
     let mut stalled = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
     let clauses = [Clause::Eq { mask: 1, value: 1 }];
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &clauses;
     stalled.subscribe(subscription);
     subscribed(&mut stalled, &mut heard, 1).await;
@@ -273,7 +278,7 @@ async fn a_reading_subscriber_with_a_rare_filter_never_gets_behind() {
         mask: 0xFF,
         value: 1,
     }];
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.clauses = &clauses;
     connection.subscribe(subscription);
     subscribed(&mut connection, &mut heard, 1).await;
@@ -323,7 +328,7 @@ async fn lingering_frames(
     make_stream(&mut client, STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.linger_ms = 200;
     connection.subscribe(subscription);
     subscribed(&mut connection, &mut heard, 1).await;
@@ -381,7 +386,7 @@ async fn subscribed_and_snapshot_show_no_state_the_wal_has_not_taken() {
     harness.wal.hold();
     client
         .state_op(StateOpRequest {
-            stream: STREAM,
+            stream: key(STREAM),
             req: 2,
             author: AUTHOR,
             expect_ver: 0,
@@ -394,11 +399,11 @@ async fn subscribed_and_snapshot_show_no_state_the_wal_has_not_taken() {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut with_state = Subscription::new(1, STREAM, u64::MAX);
+    let mut with_state = Subscription::new(1, key(STREAM), u64::MAX);
     with_state.with_state = true;
     with_state.include_system = true;
     connection.subscribe(with_state);
-    let mut state_only = Subscription::new(2, STREAM, u64::MAX);
+    let mut state_only = Subscription::new(2, key(STREAM), u64::MAX);
     state_only.state_only = true;
     connection.subscribe(state_only);
     let head = subscribed(&mut connection, &mut heard, 1).await;
@@ -414,7 +419,7 @@ async fn subscribed_and_snapshot_show_no_state_the_wal_has_not_taken() {
     }
     assert_eq!(head, first_ver, "the head goes with the state beside it");
 
-    let snapshot = client.snapshot(STREAM).await.unwrap();
+    let snapshot = client.snapshot(key(STREAM)).await.unwrap();
     assert_eq!(snapshot.state_ver, first_ver);
     assert_eq!(snapshot.state, first_doc);
     assert_eq!(snapshot.head, first_ver);
@@ -430,7 +435,7 @@ async fn subscribed_and_snapshot_show_no_state_the_wal_has_not_taken() {
     })
     .await;
     assert_eq!(heard.records(1)[0].0, ver);
-    let snapshot = client.snapshot(STREAM).await.unwrap();
+    let snapshot = client.snapshot(key(STREAM)).await.unwrap();
     assert_eq!(snapshot.state_ver, ver);
     drop((connection, client));
     harness.finish();
@@ -446,7 +451,7 @@ async fn a_lingering_subscriber_that_is_reading_never_gets_behind() {
     make_stream(&mut client, STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.linger_ms = 10_000;
     connection.subscribe(subscription);
     subscribed(&mut connection, &mut heard, 1).await;
@@ -484,7 +489,7 @@ async fn a_batch_past_the_bound_with_the_window_open_is_not_behind() {
     make_stream(&mut client, STREAM).await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut subscription = Subscription::new(1, STREAM, u64::MAX);
+    let mut subscription = Subscription::new(1, key(STREAM), u64::MAX);
     subscription.linger_ms = 10_000;
     connection.subscribe(subscription);
     subscribed(&mut connection, &mut heard, 1).await;

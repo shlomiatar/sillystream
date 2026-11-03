@@ -23,6 +23,11 @@ use storage::{
     SegmentBuilder, SegmentReader, compacted_path, list_hour_objects, list_hours, seal_path,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const HOUR_MS: u64 = 3_600_000;
 const DAY_MS: u64 = 24 * HOUR_MS;
 
@@ -89,7 +94,7 @@ impl Disk {
         for path in self.objects(root).await {
             let reader = SegmentReader::new(self.store(), path);
             let top = reader.read_top_index().await.unwrap();
-            for extent in reader.lookup(&top, stream).await.unwrap() {
+            for extent in reader.lookup(&top, key(stream)).await.unwrap() {
                 pieces.push((extent.id_first, reader.read_extent(&extent).await.unwrap()));
             }
         }
@@ -97,14 +102,14 @@ impl Disk {
         pieces.into_iter().flat_map(|(_, bytes)| bytes).collect()
     }
 
-    /// `(stream, id_first, id_last)` of what the objects under `root` hold.
-    async fn extents(&self, root: &str) -> Vec<(String, u64, u64)> {
+    /// `(stream key, id_first, id_last)` of what the objects under `root` hold.
+    async fn extents(&self, root: &str) -> Vec<(format::KeyHash, u64, u64)> {
         let mut out = Vec::new();
         for path in self.objects(root).await {
             let reader = SegmentReader::new(self.store(), path);
             let top = reader.read_top_index().await.unwrap();
             for extent in reader.all_extents(&top).await.unwrap() {
-                out.push((extent.stream.to_string(), extent.id_first, extent.id_last));
+                out.push((extent.stream, extent.id_first, extent.id_last));
             }
         }
         out.sort();
@@ -142,7 +147,7 @@ async fn publish_one(client: &mut server::Client, stream: &str, seq: u64, data: 
 async fn hear_all(node: &Node, stream: &str, from: u64, count: usize) -> Heard {
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, stream, from));
+    connection.subscribe(Subscription::new(1, key(stream), from));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= count || heard.error_code(1).is_some()
     })
@@ -166,7 +171,7 @@ async fn read_all(node: &Node, stream: &str, count: usize) -> Vec<(u64, Vec<u8>)
 /// The object paths in the manifest stream, in order.
 async fn manifests(node: &Node) -> Vec<String> {
     let mut connection = node.connection(0).await.unwrap();
-    let mut subscription = Subscription::new(1, MANIFEST_STREAM, 0);
+    let mut subscription = Subscription::new(1, key(MANIFEST_STREAM), 0);
     subscription.include_system = true;
     connection.subscribe(subscription);
     let mut heard = Heard::default();
@@ -227,7 +232,7 @@ async fn each_seal_publishes_one_manifest_and_the_manifest_stream_none_for_itsel
     assert!(
         extents
             .iter()
-            .all(|extent| &*extent.stream == MANIFEST_STREAM),
+            .all(|extent| extent.stream == key(MANIFEST_STREAM)),
         "{extents:?}"
     );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -268,7 +273,7 @@ async fn clients_cannot_write_the_manifest_stream_or_touch_its_cursors() {
     }
     client
         .state_op(StateOpRequest {
-            stream: MANIFEST_STREAM,
+            stream: key(MANIFEST_STREAM),
             req: 1,
             author: AUTHOR,
             expect_ver: 0,
@@ -281,26 +286,9 @@ async fn clients_cannot_write_the_manifest_stream_or_touch_its_cursors() {
         Reply::Error { code, .. } => assert_eq!(code, ErrorCode::Unauthorized),
         other => panic!("{other:?}"),
     }
-    assert!(!client.delete_stream(MANIFEST_STREAM).await);
+    assert!(!client.delete_stream(key(MANIFEST_STREAM)).await);
 
-    // The delete job trusts these, so nobody else may move them.
-    let mut connection = node.connection(0).await.unwrap();
-    let mut heard = Heard::default();
-    let mut named = Subscription::new(1, MANIFEST_STREAM, 0);
-    named.name = Some("compact:7d");
-    connection.subscribe(named);
-    hear_until(&mut connection, &mut heard, |heard| {
-        heard.error_code(1).is_some()
-    })
-    .await;
-    assert_eq!(heard.error_code(1), Some(ErrorCode::Malformed));
-    connection.reset_cursor(MANIFEST_STREAM, "compact:7d", u64::MAX - 1);
-    hear_until(&mut connection, &mut heard, |heard| {
-        heard.error_code(0).is_some()
-    })
-    .await;
-    assert_eq!(heard.error_code(0), Some(ErrorCode::Malformed));
-    drop((connection, client));
+    drop(client);
     node.shutdown();
 }
 
@@ -311,7 +299,9 @@ async fn compaction_keeps_every_record_byte_for_byte_and_deletes_nothing() {
     let mut client = node.client(0).await;
     let streams = ["keep.a", "keep.b", "keep.c"];
     for stream in streams {
-        client.configure(stream, class_config(7 * DAY_MS)).await;
+        client
+            .configure(key(stream), class_config(7 * DAY_MS))
+            .await;
     }
     let mut expected: Vec<Vec<(u64, Vec<u8>)>> = vec![Vec::new(); 3];
     let mut seq = 0;
@@ -335,7 +325,7 @@ async fn compaction_keeps_every_record_byte_for_byte_and_deletes_nothing() {
         seal_path_of(&node).await;
     }
     // A move partway makes a stream's extents come from two cores.
-    let shard = server::shard_of("keep.a", node.virtual_shard_count());
+    let shard = server::shard_of(key("keep.a"), node.virtual_shard_count());
     assert!(node.move_shard(shard, 1).await);
     let last = publish_one(&mut client, "keep.a", 1000, b"after the move").await;
     expected[0].push((last, b"after the move".to_vec()));
@@ -369,7 +359,7 @@ async fn compaction_keeps_every_record_byte_for_byte_and_deletes_nothing() {
     // Neighbours merged: a stream that sealed six times is one extent now.
     let compacted = disk.extents("7d").await;
     assert_eq!(
-        compacted.iter().filter(|e| e.0 == "keep.b").count(),
+        compacted.iter().filter(|e| e.0 == key("keep.b")).count(),
         1,
         "{compacted:?}"
     );
@@ -381,7 +371,7 @@ async fn compaction_keeps_every_record_byte_for_byte_and_deletes_nothing() {
             .iter()
             .all(|path| sources_after.contains(path))
     );
-    assert!(compacted.iter().all(|e| e.0 != MANIFEST_STREAM));
+    assert!(compacted.iter().all(|e| e.0 != key(MANIFEST_STREAM)));
 
     // Nothing left to do, and no second copy for doing it again.
     let again = node.compact_now(&RetentionClass::ALL).await.unwrap();
@@ -409,7 +399,9 @@ async fn a_read_during_compaction_sees_no_gap_or_duplicate() {
     settings.catch_up_read_bytes = 8 * 1024;
     let node = disk.start(settings);
     let mut client = node.client(0).await;
-    client.configure("during", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("during"), class_config(7 * DAY_MS))
+        .await;
     let mut ids = Vec::new();
     let data = vec![7u8; 4096];
     for round in 0..8u64 {
@@ -420,7 +412,7 @@ async fn a_read_during_compaction_sees_no_gap_or_duplicate() {
     }
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "during", 0));
+    connection.subscribe(Subscription::new(1, key("during"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         heard.records(1).len() >= 5
     })
@@ -454,7 +446,9 @@ async fn a_reader_holding_a_deleted_extent_recovers_through_the_compacted_one() 
     settings.catch_up_read_bytes = 4 * 1024;
     let node = disk.start(settings);
     let mut client = node.client(0).await;
-    client.configure("stale", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("stale"), class_config(7 * DAY_MS))
+        .await;
     let mut ids = Vec::new();
     let data = vec![9u8; 8 * 1024];
     // Past a block's size, so a read stops partway through an extent.
@@ -465,7 +459,7 @@ async fn a_reader_holding_a_deleted_extent_recovers_through_the_compacted_one() 
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "stale", 0));
+    connection.subscribe(Subscription::new(1, key("stale"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         !heard.records(1).is_empty()
     })
@@ -526,7 +520,9 @@ async fn the_1d_class_is_never_compacted_and_each_longer_class_has_its_own_prefi
     ];
     let mut expected = Vec::new();
     for (seq, (stream, retention_ms, _)) in classes.iter().enumerate() {
-        client.configure(stream, class_config(*retention_ms)).await;
+        client
+            .configure(key(stream), class_config(*retention_ms))
+            .await;
         let id = publish_one(&mut client, stream, seq as u64 + 1, b"x").await;
         expected.push((*stream, id));
     }
@@ -547,11 +543,11 @@ async fn the_1d_class_is_never_compacted_and_each_longer_class_has_its_own_prefi
             Some(prefix) => {
                 let held = disk.extents(prefix).await;
                 assert_eq!(held.len(), 1, "{prefix}: {held:?}");
-                assert_eq!(held[0].0, stream);
+                assert_eq!(held[0].0, key(stream));
             }
             None => {
                 for root in ["7d", "30d", "365d"] {
-                    assert!(disk.extents(root).await.iter().all(|e| e.0 != stream));
+                    assert!(disk.extents(root).await.iter().all(|e| e.0 != key(stream)));
                 }
             }
         }
@@ -570,11 +566,15 @@ async fn a_changed_class_applies_to_what_is_compacted_from_then_on() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("moving", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("moving"), class_config(7 * DAY_MS))
+        .await;
     let first = publish_one(&mut client, "moving", 1, b"a").await;
     seal_path_of(&node).await;
     node.compact_now(&RetentionClass::ALL).await.unwrap();
-    client.configure("moving", class_config(30 * DAY_MS)).await;
+    client
+        .configure(key("moving"), class_config(30 * DAY_MS))
+        .await;
     let second = publish_one(&mut client, "moving", 2, b"b").await;
     seal_path_of(&node).await;
     node.compact_now(&RetentionClass::ALL).await.unwrap();
@@ -592,7 +592,9 @@ async fn a_restart_that_lost_the_cursor_redoes_nothing_and_loses_nothing() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("again", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("again"), class_config(7 * DAY_MS))
+        .await;
     let mut ids = Vec::new();
     for at in 0..3u64 {
         ids.push(publish_one(&mut client, "again", at + 1, b"x").await);
@@ -608,7 +610,9 @@ async fn a_restart_that_lost_the_cursor_redoes_nothing_and_loses_nothing() {
     let node = disk.start(config(1));
     let connection = node.connection(0).await.unwrap();
     assert_eq!(
-        connection.read_cursor(MANIFEST_STREAM, "compact:7d").await,
+        connection
+            .read_cursor(key(MANIFEST_STREAM), key("compact:7d"))
+            .await,
         None,
         "this test is about a cursor that wasn't saved"
     );
@@ -633,7 +637,9 @@ async fn partial_output_from_a_crash_is_never_readable() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("partial", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("partial"), class_config(7 * DAY_MS))
+        .await;
     let mut ids = Vec::new();
     for at in 0..3u64 {
         ids.push(publish_one(&mut client, "partial", at + 1, b"x").await);
@@ -647,7 +653,7 @@ async fn partial_output_from_a_crash_is_never_readable() {
     let source = disk.stream_bytes("sealed", "partial").await;
     let mut builder = SegmentBuilder::new();
     builder
-        .add_extent("partial", vec![Bytes::from(source.clone())])
+        .add_extent(key("partial"), vec![Bytes::from(source.clone())])
         .unwrap();
     let built = builder.finish().unwrap();
     let whole: Vec<u8> = built.parts.iter().flatten().copied().collect();
@@ -724,7 +730,7 @@ async fn a_former_generations_records_above_its_limit_are_dropped_by_compaction(
     let at = stamped(limit, b"at");
     builder
         .add_extent(
-            "late",
+            key("late"),
             vec![below.clone(), at.clone(), stamped(limit + 1, b"above")],
         )
         .unwrap();
@@ -744,7 +750,9 @@ async fn a_former_generations_records_above_its_limit_are_dropped_by_compaction(
 
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("late", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("late"), class_config(7 * DAY_MS))
+        .await;
     let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
     assert_eq!(report.errors, Vec::<String>::new());
     assert!(
@@ -790,7 +798,9 @@ async fn only_whole_expired_hour_prefixes_are_ever_deleted() {
     let disk = Disk::new();
     let node = disk.start(config(2));
     let mut client = node.client(0).await;
-    client.configure("week", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("week"), class_config(7 * DAY_MS))
+        .await;
     publish_over_hours(&disk, &node, &mut client, "week", 2).await;
     publish_over_hours(&disk, &node, &mut client, "day", 3).await;
     let report = node.compact_now(&RetentionClass::ALL).await.unwrap();
@@ -880,8 +890,12 @@ async fn a_stalled_compactor_blocks_sealed_expiry_until_it_catches_up() {
     let disk = Disk::new();
     let node = disk.start(config(2));
     let mut client = node.client(0).await;
-    client.configure("week", class_config(7 * DAY_MS)).await;
-    client.configure("month", class_config(30 * DAY_MS)).await;
+    client
+        .configure(key("week"), class_config(7 * DAY_MS))
+        .await;
+    client
+        .configure(key("month"), class_config(30 * DAY_MS))
+        .await;
     let week = publish_one(&mut client, "week", 1, b"w").await;
     let month = publish_one(&mut client, "month", 1, b"m").await;
     let day = publish_one(&mut client, "day", 1, b"d").await;
@@ -978,7 +992,7 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
         default_ack_level: 2,
         min_ack_level: 1,
     };
-    client.configure("life", stream_config).await;
+    client.configure(key("life"), stream_config).await;
     let mut old_ids = Vec::new();
     for at in 0..3u64 {
         old_ids.push(publish_one(&mut client, "life", at + 1, b"old").await);
@@ -986,7 +1000,7 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
     }
     client
         .state_op(StateOpRequest {
-            stream: "life",
+            stream: key("life"),
             req: 1,
             author: AUTHOR,
             expect_ver: 0,
@@ -1001,8 +1015,8 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
     };
     let mut cursor_connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut named = Subscription::new(1, "life", 0);
-    named.name = Some("worker");
+    let mut named = Subscription::new(1, key("life"), 0);
+    named.name = Some(key("worker"));
     cursor_connection.subscribe(named);
     hear_until(&mut cursor_connection, &mut heard, |heard| {
         heard.records(1).len() >= 3
@@ -1010,7 +1024,9 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
     .await;
     cursor_connection.commit(1, old_ids[2]);
     assert_eq!(
-        cursor_connection.read_cursor("life", "worker").await,
+        cursor_connection
+            .read_cursor(key("life"), key("worker"))
+            .await,
         Some(old_ids[2])
     );
     drop(cursor_connection);
@@ -1034,15 +1050,15 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
 
     let got = read_all(&node, "life", 1).await;
     assert_eq!(got, vec![(new_id, b"new".to_vec())], "from = 0");
-    let snapshot = client.snapshot("life").await.unwrap();
+    let snapshot = client.snapshot(key("life")).await.unwrap();
     assert_eq!(snapshot.state_ver, state_ver);
     assert_eq!(from_cbor(&snapshot.state), map(&[("kept", int(5))]));
-    let info = client.stream_info("life").await.unwrap();
+    let info = client.stream_info(key("life")).await.unwrap();
     assert_eq!(info.config, stream_config);
     assert!(info.head >= new_id);
     let connection = node.connection(0).await.unwrap();
     assert_eq!(
-        connection.read_cursor("life", "worker").await,
+        connection.read_cursor(key("life"), key("worker")).await,
         Some(old_ids[2])
     );
     drop(connection);
@@ -1063,13 +1079,13 @@ async fn after_records_expire_state_cursors_ids_and_config_remain() {
         let got = read_all(&node, "life", 2).await;
         assert_eq!(got[0], (new_id, b"new".to_vec()), "rebuild {rebuild}");
         assert_eq!(got[1], (next, b"next".to_vec()));
-        let snapshot = client.snapshot("life").await.unwrap();
+        let snapshot = client.snapshot(key("life")).await.unwrap();
         assert_eq!(snapshot.state_ver, state_ver);
-        let info = client.stream_info("life").await.unwrap();
+        let info = client.stream_info(key("life")).await.unwrap();
         assert_eq!(info.config, stream_config);
         let connection = node.connection(0).await.unwrap();
         assert_eq!(
-            connection.read_cursor("life", "worker").await,
+            connection.read_cursor(key("life"), key("worker")).await,
             Some(old_ids[2])
         );
         assert!(publish_one(&mut client, "life", 200 + u64::from(rebuild), b"z").await > next);
@@ -1158,8 +1174,10 @@ async fn a_compacted_mixed_seal_keeps_its_class_from_the_newest_record() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("old", class_config(7 * DAY_MS)).await;
-    client.configure("fresh", class_config(7 * DAY_MS)).await;
+    client.configure(key("old"), class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("fresh"), class_config(7 * DAY_MS))
+        .await;
     assert!(node.seal_and_checkpoint().await);
     publish_one(&mut client, "old", 1, b"old").await;
     drop(client);
@@ -1192,7 +1210,9 @@ async fn a_class_raised_between_workers_still_gets_its_records_copied() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("grow", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("grow"), class_config(7 * DAY_MS))
+        .await;
     let id = publish_one(&mut client, "grow", 1, b"keep me").await;
     let source = seal_path_of(&node).await;
     assert!(node.seal_and_checkpoint().await);
@@ -1200,7 +1220,9 @@ async fn a_class_raised_between_workers_still_gets_its_records_copied() {
     node.compact_now(&[RetentionClass::Days365, RetentionClass::Days30])
         .await
         .unwrap();
-    client.configure("grow", class_config(365 * DAY_MS)).await;
+    client
+        .configure(key("grow"), class_config(365 * DAY_MS))
+        .await;
     node.compact_now(&[RetentionClass::Days7]).await.unwrap();
     assert!(disk.objects("7d").await.is_empty());
     assert!(disk.objects("365d").await.is_empty());
@@ -1248,7 +1270,7 @@ async fn expire_under_a_paused_reader(publish_later_first: bool) {
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    connection.subscribe(Subscription::new(1, "gap", 0));
+    connection.subscribe(Subscription::new(1, key("gap"), 0));
     hear_until(&mut connection, &mut heard, |heard| {
         !heard.records(1).is_empty()
     })
@@ -1339,22 +1361,25 @@ async fn a_stored_cursor_with_expired_records_after_it_gets_error_7() {
     let first = publish_one(&mut client, "gone", 1, b"first").await;
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut named = Subscription::new(1, "gone", 0);
-    named.name = Some("worker");
+    let mut named = Subscription::new(1, key("gone"), 0);
+    named.name = Some(key("worker"));
     connection.subscribe(named);
     hear_until(&mut connection, &mut heard, |heard| {
         !heard.records(1).is_empty()
     })
     .await;
     connection.commit(1, first);
-    assert_eq!(connection.read_cursor("gone", "worker").await, Some(first));
+    assert_eq!(
+        connection.read_cursor(key("gone"), key("worker")).await,
+        Some(first)
+    );
     drop(connection);
     expired_then_one_more(&disk, &node).await;
 
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
-    let mut named = Subscription::new(2, "gone", 0);
-    named.name = Some("worker");
+    let mut named = Subscription::new(2, key("gone"), 0);
+    named.name = Some(key("worker"));
     connection.subscribe(named);
     hear_until(&mut connection, &mut heard, |heard| {
         heard.error_code(2).is_some() || !heard.records(2).is_empty()
@@ -1390,8 +1415,12 @@ async fn a_corrupt_footer_holds_only_its_own_hour() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("mine", class_config(7 * DAY_MS)).await;
-    client.configure("other", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("mine"), class_config(7 * DAY_MS))
+        .await;
+    client
+        .configure(key("other"), class_config(7 * DAY_MS))
+        .await;
     assert!(node.seal_and_checkpoint().await);
     let bad_id = publish_one(&mut client, "mine", 1, b"bad").await;
     let bad = seal_path_of(&node).await;
@@ -1438,8 +1467,12 @@ async fn corrupt_records_hold_only_their_own_hour() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("mine", class_config(7 * DAY_MS)).await;
-    client.configure("other", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("mine"), class_config(7 * DAY_MS))
+        .await;
+    client
+        .configure(key("other"), class_config(7 * DAY_MS))
+        .await;
     assert!(node.seal_and_checkpoint().await);
     publish_one(&mut client, "mine", 1, b"bad").await;
     let bad = seal_path_of(&node).await;
@@ -1500,7 +1533,9 @@ async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("lowered", class_config(30 * DAY_MS)).await;
+    client
+        .configure(key("lowered"), class_config(30 * DAY_MS))
+        .await;
     let raised = publish_one(&mut client, "raised", 1, b"up").await;
     publish_one(&mut client, "lowered", 1, b"down").await;
     seal_path_of(&node).await;
@@ -1508,8 +1543,10 @@ async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     node.compact_now(&[RetentionClass::Days7, RetentionClass::Days365])
         .await
         .unwrap();
-    client.configure("lowered", class_config(DAY_MS)).await;
-    client.configure("raised", class_config(7 * DAY_MS)).await;
+    client.configure(key("lowered"), class_config(DAY_MS)).await;
+    client
+        .configure(key("raised"), class_config(7 * DAY_MS))
+        .await;
     node.compact_now(&[RetentionClass::Days30]).await.unwrap();
     assert!(node.seal_and_checkpoint().await);
 
@@ -1517,7 +1554,7 @@ async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     node.expire_now().await.unwrap();
     let copied = disk.extents("7d").await;
     assert_eq!(copied.len(), 1, "{copied:?}");
-    assert_eq!((copied[0].0.as_str(), copied[0].1), ("raised", raised));
+    assert_eq!((copied[0].0, copied[0].1), (key("raised"), raised));
     assert!(disk.extents("30d").await.is_empty());
 
     let report = node.expire_now().await.unwrap();
@@ -1535,7 +1572,9 @@ async fn a_manifest_read_left_below_expired_records_starts_again() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("seven", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("seven"), class_config(7 * DAY_MS))
+        .await;
     publish_one(&mut client, "seven", 1, b"one").await;
     seal_path_of(&node).await;
     seal_path_of(&node).await;
@@ -1582,7 +1621,9 @@ async fn a_manifest_only_in_the_wal_leaves_its_object_unrecorded() {
     let disk = Disk::new();
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    client.configure("seven", class_config(7 * DAY_MS)).await;
+    client
+        .configure(key("seven"), class_config(7 * DAY_MS))
+        .await;
     assert!(node.seal_and_checkpoint().await);
 
     disk.store.hold();
@@ -1670,10 +1711,10 @@ async fn a_former_generations_record_crossing_its_limit_does_not_stop_the_worker
     .unwrap();
     let mut builder = SegmentBuilder::new();
     builder
-        .add_extent("crossing", vec![Bytes::from(crossing)])
+        .add_extent(key("crossing"), vec![Bytes::from(crossing)])
         .unwrap();
     builder
-        .add_extent("below", vec![stamped(limit - 1, b"below")])
+        .add_extent(key("below"), vec![stamped(limit - 1, b"below")])
         .unwrap();
     let body: Vec<u8> = builder
         .finish()
@@ -1691,7 +1732,9 @@ async fn a_former_generations_record_crossing_its_limit_does_not_stop_the_worker
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
     for stream in ["crossing", "below", "fresh"] {
-        client.configure(stream, class_config(7 * DAY_MS)).await;
+        client
+            .configure(key(stream), class_config(7 * DAY_MS))
+            .await;
     }
     let fresh = publish_one(&mut client, "fresh", 1, b"fresh").await;
     seal_path_of(&node).await;
@@ -1699,17 +1742,17 @@ async fn a_former_generations_record_crossing_its_limit_does_not_stop_the_worker
     assert_eq!(report.errors, Vec::<String>::new());
     let copied = disk.extents("7d").await;
     assert!(
-        copied.iter().any(|extent| extent.0 == "below"),
+        copied.iter().any(|extent| extent.0 == key("below")),
         "{copied:?}"
     );
     assert!(
         copied
             .iter()
-            .any(|extent| extent.0 == "fresh" && extent.1 == fresh),
+            .any(|extent| extent.0 == key("fresh") && extent.1 == fresh),
         "{copied:?}"
     );
     assert!(
-        copied.iter().all(|extent| extent.0 != "crossing"),
+        copied.iter().all(|extent| extent.0 != key("crossing")),
         "{copied:?}"
     );
     drop(client);
@@ -1772,7 +1815,7 @@ async fn a_state_only_subscribe_from_before_what_expired_gets_the_state() {
     seal_path_of(&node).await;
     client
         .state_op(StateOpRequest {
-            stream: "so",
+            stream: key("so"),
             req: 1,
             author: AUTHOR,
             expect_ver: 0,
@@ -1789,7 +1832,7 @@ async fn a_state_only_subscribe_from_before_what_expired_gets_the_state() {
     assert!(!report.deleted_prefixes.is_empty(), "{report:?}");
 
     let mut connection = node.connection(0).await.unwrap();
-    let mut subscription = Subscription::new(1, "so", old);
+    let mut subscription = Subscription::new(1, key("so"), old);
     subscription.state_only = true;
     connection.subscribe(subscription);
     let mut heard = Heard::default();
@@ -1819,8 +1862,10 @@ async fn configure_cannot_change_the_manifest_stream() {
     let mut client = node.client(0).await;
     publish_one(&mut client, "a", 1, b"x").await;
     seal_path_of(&node).await;
-    client.configure(MANIFEST_STREAM, class_config(1)).await;
-    let info = client.stream_info(MANIFEST_STREAM).await.unwrap();
+    client
+        .configure(key(MANIFEST_STREAM), class_config(1))
+        .await;
+    let info = client.stream_info(key(MANIFEST_STREAM)).await.unwrap();
     assert_eq!(info.config.retention_ms, u64::MAX);
     drop(client);
     node.shutdown();

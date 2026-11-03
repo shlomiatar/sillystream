@@ -11,6 +11,11 @@ use storage::{
     check_conditional_create, dedicated_path, parse_store_config, seal_path,
 };
 
+/// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 fn fake_s3(endpoint: String) -> ObjectStoreConfig {
     ObjectStoreConfig::S3(S3Config {
         bucket: "not-a-real-bucket".to_owned(),
@@ -70,18 +75,9 @@ fn paths_follow_section_7_3() {
         format!("sealed/2/node-1/{:020}-{first_id:020}.seg", 2)
     );
     assert_eq!(
-        dedicated_path("logs.a", 2, first_id).to_string(),
-        format!("sealed/2/logs.a/{:020}-{first_id:020}.seg", 2)
+        dedicated_path(key("logs.a"), 2, first_id).to_string(),
+        format!("sealed/2/{}/{:020}-{first_id:020}.seg", key("logs.a"), 2)
     );
-}
-
-#[test]
-fn a_hostile_stream_id_stays_one_path_part() {
-    for stream in ["..", ".", "a b", "%2F", "x\ny"] {
-        let path = dedicated_path(stream, 1, 1 << 16);
-        assert_eq!(path.parts().count(), 4, "{stream}");
-        assert!(!path.parts().any(|part| part.as_ref() == ".."), "{stream}");
-    }
 }
 
 /// Answers exactly one HTTP request and returns its head and body length. This is not
@@ -148,7 +144,7 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     format::encode_record(&mut wire, &header, b"data").unwrap();
     sender
         .try_send(Handoff::Dedicated {
-            stream: Arc::from("s"),
+            stream: key("s"),
             number: 0,
             records: vec![bytes::Bytes::from(wire)],
             tickets: Vec::new(),

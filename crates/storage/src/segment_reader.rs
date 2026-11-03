@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use format::{Decision, Filter, crc32c};
+use format::{Decision, Filter, KeyHash, crc32c};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -81,7 +81,7 @@ impl SegmentReader {
     pub async fn lookup(
         &self,
         top: &TopIndex,
-        stream: &str,
+        stream: KeyHash,
     ) -> Result<Vec<StreamExtent>, SegmentError> {
         let Some(page) = top.page_for(stream_hash(stream)) else {
             return Ok(Vec::new());
@@ -199,7 +199,7 @@ impl SegmentReader {
 
     /// All of a stream's records, for the common case of a reader without a cached top
     /// index: extents in id order, concatenated.
-    pub async fn read_stream(&self, stream: &str) -> Result<Bytes, SegmentError> {
+    pub async fn read_stream(&self, stream: KeyHash) -> Result<Bytes, SegmentError> {
         let top = self.read_top_index().await?;
         let mut extents = self.lookup(&top, stream).await?;
         extents.sort_by_key(|extent| extent.id_first);

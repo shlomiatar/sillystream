@@ -13,6 +13,7 @@ fn write_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {
     std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
     std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
     std::fs::write(dir.join("secret"), secret).unwrap();
+    std::fs::write(dir.join("stream-key"), "0".repeat(64)).unwrap();
     let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
     [
         "--listen".to_owned(),
@@ -27,6 +28,8 @@ fn write_files(dir: &std::path::Path, secret: &[u8]) -> Vec<String> {
         path("key.pem"),
         "--token-secret-file".to_owned(),
         path("secret"),
+        "--stream-key-file".to_owned(),
+        path("stream-key"),
         "--object-store".to_owned(),
         format!("local:{}", path("objects")),
         "--cores".to_owned(),
@@ -69,6 +72,32 @@ fn it_starts_says_where_and_stops_on_sigterm() {
             panic!("still running 20 s after SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Every stream is stored under a hash made with it, so there is no starting without it
+/// (section 13).
+#[test]
+fn it_refuses_to_start_without_a_stream_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = write_files(dir.path(), &[7u8; 32]);
+    let at = args
+        .iter()
+        .position(|arg| arg == "--stream-key-file")
+        .unwrap();
+    let mut without = args.clone();
+    without.drain(at..at + 2);
+    let output = Command::new(BIN).args(without).output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--stream-key-file is required"), "{stderr}");
+
+    for bad in ["00", &"g".repeat(64), &"é".repeat(32)] {
+        std::fs::write(dir.path().join("stream-key"), bad).unwrap();
+        let output = Command::new(BIN).args(&args).output().unwrap();
+        assert!(!output.status.success(), "{bad}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("64 hex digits"), "{stderr}");
     }
 }
 

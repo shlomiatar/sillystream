@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
+use format::KeyHash;
 use tokio::sync::{oneshot, watch};
 
 use crate::crash::{crash_point, wal_write_gate};
-use crate::object::stream_fits_dedicated_path;
 use crate::uploader::{Handoff, SealExtent};
 use crate::wal_format::{WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header};
 use crate::wal_replay::wal_file_name;
@@ -415,7 +415,7 @@ struct Writer<V: WalVolume, N, S> {
 struct OpenFile {
     /// In the order each stream first appeared. A stream's records are in id order.
     extents: Vec<SealExtent>,
-    streams: HashMap<Arc<str>, OpenStream>,
+    streams: HashMap<KeyHash, OpenStream>,
     entry_count: u64,
     record_bytes: u64,
     full_told: bool,
@@ -507,43 +507,40 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
     /// object once they fill its buffer.
     fn keep<R: AsRef<[u8]> + Send + 'static>(&mut self, entry: WalEntry<R>) {
         let (core, ticket) = (entry.core(), entry.ticket());
-        let stream = Arc::clone(entry.stream_arc());
+        let stream = entry.stream();
         let records = Bytes::from_owner(entry.into_records());
         raise(&mut self.last_tickets, core, ticket);
         let open = &mut self.open;
         open.entry_count += 1;
         open.record_bytes += records.len() as u64;
         let at = open.extents.len();
-        let kept = open
-            .streams
-            .entry(Arc::clone(&stream))
-            .or_insert_with(|| OpenStream {
-                at,
-                record_bytes: 0,
-                tickets: Vec::new(),
-            });
+        let kept = open.streams.entry(stream).or_insert_with(|| OpenStream {
+            at,
+            record_bytes: 0,
+            tickets: Vec::new(),
+        });
         if kept.at == at {
             open.extents.push(SealExtent {
-                stream: Arc::clone(&stream),
+                stream,
                 records: Vec::new(),
             });
         }
         kept.record_bytes += records.len() as u64;
         raise(&mut kept.tickets, core, ticket);
         open.extents[kept.at].records.push(records);
-        if kept.record_bytes >= self.stream_buffer_bytes && stream_fits_dedicated_path(&stream) {
+        if kept.record_bytes >= self.stream_buffer_bytes {
             self.hand_off_dedicated(stream);
         }
     }
 
     /// One that can't be taken now stays in the seal (D59, D268).
-    fn hand_off_dedicated(&mut self, stream: Arc<str>) {
+    fn hand_off_dedicated(&mut self, stream: KeyHash) {
         let Some(kept) = self.open.streams.remove(&stream) else {
             return;
         };
         let records = std::mem::take(&mut self.open.extents[kept.at].records);
         let handoff = Handoff::Dedicated {
-            stream: Arc::clone(&stream),
+            stream,
             number: self.dedicated_count,
             records,
             tickets: kept.tickets.clone(),

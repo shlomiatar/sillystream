@@ -22,6 +22,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+/// A stream id's key hash under the all-zero key the server is started with here.
+fn key(name: &str) -> format::KeyHash {
+    format::IdentityKey::new([0; 32]).hash(name)
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_sillystream-server");
 const STREAM: &str = "keep.week";
 const THREE_DAYS_MS: u64 = 72 * 3_600_000;
@@ -39,6 +44,8 @@ impl Files {
         std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
         std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
         std::fs::write(dir.path().join("secret"), SECRET).unwrap();
+        // The all-zero key, which `NodeConfig::new` has too.
+        std::fs::write(dir.path().join("stream-key"), "0".repeat(64)).unwrap();
         let config = tls_client_config(&cert.der, &[&rustls::version::TLS13]);
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -112,6 +119,7 @@ fn start(files: &Files, name: &str, crash_at: Option<&str>, offset_ms: u64) -> R
         .args(["--cert", &path("cert.pem")])
         .args(["--key", &path("key.pem")])
         .args(["--token-secret-file", &path("secret")])
+        .args(["--stream-key-file", &path("stream-key")])
         .args(["--object-store", &format!("local:{}", path("objects"))])
         .args(["--cores", "2"])
         .args(["--seal-window-ms", "1000"])
@@ -215,7 +223,7 @@ impl Files {
             ranges.extend(
                 extents
                     .iter()
-                    .filter(|extent| &*extent.stream == stream)
+                    .filter(|extent| extent.stream == key(stream))
                     .map(|extent| (extent.id_first, extent.id_last)),
             );
         }
