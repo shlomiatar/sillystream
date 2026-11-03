@@ -10,6 +10,8 @@ A stream has an id, an ordered log of records, cursors, sinks, and a state of up
 
 Stream ids are UTF-8 names without `/`, such as `inbox.reviewer` or `logs.payments.3`.
 
+**Stream identity:** the server identifies a stream by its key hash, BLAKE3 in keyed mode over the stream id, cut to 128 bits. It stores only the key hash, never the id: in WAL entries, segments, metadata, checkpoints, manifests and sinks. So nothing on disk or in the bucket names a stream, and without the key a name can't be found by guessing. The key is one per deployment, kept outside the bucket (section 13), and can never change, because everything stored refers to streams by it. At 128 bits two streams sharing a key hash can't happen in practice, which matters because nothing could detect it.
+
 One owner assigns ids for each stream, so a stream has a total order without consensus on the write path.
 
 ## 2. Record
@@ -64,7 +66,9 @@ A publish is one or more records, and it commits as one unit with consecutive id
 - **Order:** the SDK sorts stably by options, keeping producer order within each options value. Ids follow that order. Order across publishes is preserved.
 - **Stamping:** the owner walks the record headers, writes `id` and `author`, and never re-encodes anything.
 - **Idempotency:** `(producer_id, producer_seq)`, carried on the publish frame and in the WAL entry, not in records. Duplicates are dropped and never re-stamped. `producer_seq` must increase per stream, and gaps are allowed.
-- **Dedupe entries:** one per `(stream, producer_id)`, about 28 bytes, holding the highest `producer_seq` with its `first_id` and `count`. Entries expire after 24 hours idle, with a cap of 1,000 per stream that evicts the oldest first. A producer retrying after its entry has expired can create a duplicate.
+- **Dedupe entries:** one per `(stream, producer_id)`, about 28 bytes, holding the highest `producer_seq` with its `first_id` and `count`. Entries expire after 24 hours idle, with a cap of 1,000 per stream that evicts the oldest first.
+- **Memory only:** dedupe entries live in the owning core and are never saved to the local store or a checkpoint. After a restart, WAL replay refills them from the entries' `(producer_id, producer_seq)`.
+- **At-least-once:** publishing is at-least-once. A retry creates a duplicate when its entry is gone: it expired, its stream was evicted while idle, or a restart's WAL no longer held it.
 - **Retries:** a retry of the latest publish gets the original `ACK`. A retry of an older one is dropped and acked with `first_id = 0`, meaning it is already committed and its id wasn't kept.
 - **Validation:** the owner rejects the whole publish with error 8 if the record lengths don't add up exactly to the frame, `count = 0`, `id` or `author` isn't 0, padding isn't 0, or a state doc is over 64 KB or isn't valid CBOR. This never reads a record's data. Forward sinks may set `author`, because they keep the original.
 - **Rejection:** a rejected publish gets a `NACK`, commits nothing and doesn't use up its seq. The SDK waits for the ack on a publish with `expect_ver` before sending later ones from that producer, because a later seq succeeding would make the retry look like a duplicate. Other publishes can be sent in parallel.
@@ -108,7 +112,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 - Positions: `from = 0` is the start of retention, `u64::MAX` is live only, and anything else means "after this id".
 - Reads come from memory, then the local disk, then S3. A reader catching up becomes live when it reaches recent data in memory.
 - A client-held cursor needs nothing on the server.
-- A named cursor is stored on the server as `(stream, name) → id`. It moves forward only, through `COMMIT`, which gives at-least-once delivery. Rewinding is an explicit reset.
+- A named cursor is stored on the server as `(stream, name) → id`, with the stream and the name each kept as a key hash (section 1). It moves forward only, through `COMMIT`, which gives at-least-once delivery. Rewinding is an explicit reset.
 
 ### 5.2 Delivery to connected clients
 
@@ -140,8 +144,9 @@ Each core exclusively owns a set of streams, including their ids, buffers and su
 1. The owning core reads the publish into a slab (section 6.5), dedupes on `(producer_id, producer_seq)` and stamps the records in place.
 2. It passes a reference to the bytes to the WAL writer, without copying.
 3. The WAL writer appends and fsyncs, then tells the cores what is durable. The cores send the acks and deliver to subscribers.
-4. At seal, each core hands the uploader its references, sorted by stream. The uploader writes one segment to the local segment directory and fsyncs it, every time.
-5. It uploads the segment from that file. Once it is uploaded, the file stays as a read cache until the directory's cap evicts it (section 7.3).
+4. The WAL writer keeps a reference to every entry in its active file. At seal it rotates and hands that file's references to the uploader. The cores take no part in a seal.
+5. The uploader sorts the references by stream, writes one segment to the local segment directory and fsyncs it, every time.
+6. Once that file is fsynced, the object table (section 7.6) marks the object local, and the cores release their references. It uploads the segment from that file, and the file stays as a read cache until the directory's cap evicts it (section 7.3).
 
 The source of truth is the WAL until a segment is uploaded, and S3 after that. A segment waiting to upload is a copy of what the WAL still holds.
 
@@ -160,15 +165,17 @@ loop {
 ```
 
 - **Group commit needs no timer:** whatever queued during the last fsync goes in the next one, which gives one group commit across the whole node.
-- **Entries:** `stream | producer_id | producer_seq | len | crc32c`, then the record bytes. The CRC detects torn writes during recovery.
+- **Entries:** `stream key hash | producer_id | producer_seq | len | crc32c`, then the record bytes. The CRC detects torn writes during recovery.
 - **Backpressure:** the channel is bounded and cores use `try_send`. A full queue becomes backpressure on publishers and never blocks a core.
 - **Waking cores:** cores can't block on a crossbeam `recv`, so the writer wakes them through a mechanism they can await.
+- **Seals:** the writer seals when its active file reaches the size cap (section 7.3), or when the node asks at the end of a seal window. A file with no entries isn't rotated, so an idle node makes no files and no objects. A seal is the file: its segment holds exactly the entries the file holds.
+- **Dedicated objects:** the writer counts each stream's bytes in the active file. A stream that reaches its buffer has those entries handed to the uploader as a dedicated object, and they are left out of the file's segment. The file is removed once every object holding its entries is uploaded and checkpointed.
 
 ### 6.4 Uploader
 
 One thread per node, following the same pattern as the WAL writer. It produces **one object per node per seal**, so a node's PUT count doesn't depend on its stream count.
 
-A stream lives on one core, so the cores' sections don't overlap. The uploader writes the sections to a local file one after another from the references it received, already sorted by stream, and combines their footer indexes. A stream that moved cores during the window appears in two sections, so the footer allows two entries for it.
+It receives a sealed file's references in the order they were written, which is id order within each stream, including a stream that moved cores during the window. It groups them by stream, keeping that order, and writes them to a local file with one footer entry per stream.
 
 The file write and fsync never run on the WAL writer's thread or a core, so they can't delay an ack. There is one upload path: every PUT sends a finished local file, however fast the network is.
 
@@ -196,6 +203,8 @@ What to mount at `wal_dir`:
 
 An acked record survives machine loss only if `wal_dir` is on EBS. The default path doesn't guarantee this, so deployment docs must say to mount EBS there.
 
+The local segment directory (section 7.3) must be on a volume as durable as `wal_dir`, because a segment waiting to upload is then the only copy of its records outside the WAL.
+
 A shorter window loses less and makes level 3 acks faster, but costs more PUTs: about 2.6M a month per node at 1 s, 260K at 10 s, and 22K at 120 s.
 
 Sealed data is safe in S3. Surviving the loss of a region is out of scope.
@@ -213,17 +222,21 @@ Each publish asks for an ack level, and the ack is sent only after that level is
 
 ### 7.3 Segments
 
-- Written every seal window, or earlier when the size cap is reached (32–128 MB).
-- Sorted by stream within each core's section, with per-block summaries and CRCs. Readers never scan.
-- **Two-level footer:** the stream index `stream → (offset, len, id range)` would be about 32 MB at 1M streams, so it is split into fixed-size pages sorted by stream hash, with a small top index over the pages. A reader fetches the top index once and caches it, then makes one small range read for the right page and one for the data. A reader with a stored extent skips the footer entirely.
+- Written every seal window, or earlier when the size cap is reached (32–128 MB). The cap is one total per node, counted by the WAL writer, however the load is spread across cores.
+- Grouped by stream, with per-block summaries and CRCs. Readers never scan.
+- **Stream regions:** each stream's records form one region, in order of the stream's key hash (section 1). A region starts with the full key hash, then its block table, then its blocks.
+- **Footer index:** one entry per stream, in the same order: the top 64 bits of the key hash, delta-encoded from the previous entry, and the region's length as a varint. A region's offset is the sum of the lengths before it, and every 64th entry also stores its absolute offset. That is about 8 bytes per stream, so about 8 MB at 1M streams. A reader checks the full key hash at the start of the region.
+- **Pages:** the index is split into fixed-size pages, with a small top index giving each page's first entry and position. A reader fetches the top index once per object and caches it, then makes one small range read for the right page and one for the region. Readers cache pages too, and prefetch the pages of the next objects in a stream's list (section 7.6).
+- **Last ids:** after the index, each stream's full key hash and last id, in the same order. Readers never fetch it. Rebuilding metadata (section 7.6) and the startup scan of unrecorded objects read it.
 - There are no per-stream S3 objects on the write path, except that a stream filling its own buffer within the window gets a dedicated object.
-- Path: `sealed/<ingest_hour>/<node-or-stream>/<generation>-<first_id>.seg`.
+- **Object id:** a u64 of the seal's time in ms (40 bits), the generation (16 bits) and an index within the seal (8 bits). Index 0 is the seal's segment, and dedicated objects take the next ones. A stream that would need a dedicated object past index 255 stays in the seal. Compaction gives its outputs ids of its own.
+- **Path:** computed from the id, so it is never stored: `sealed/<ingest_hour>/<id in hex>.seg`, or `compacted/<class>/<ingest_hour>/<id in hex>.seg`.
 - Plain files. Segment bytes are the same as wire bytes.
 - **Local segment directory:** `pending/` holds segments waiting to upload, and `cached/` holds uploaded ones. A finished upload renames the file across, so the listing alone says what each file is. A write goes to a temporary name, is fsynced and is then renamed into `pending/`, so anything in `pending/` is complete.
 - **Cap:** one size cap covers both directories. Only `cached/` can be evicted, oldest written first. When `pending/` alone reaches the cap, seals wait, and the backpressure reaches publishers through the usual bounds.
-- **Crash:** startup uploads what is in `pending/` before it does anything else with the store, under the generation in each file's path. Section 8.1's limits then apply to those objects as they do to a late upload by a former owner.
+- **Crash:** startup uploads what is in `pending/` in the background, under the generation in each file's path, and readers read those files locally until then. Section 8.1's limits then apply to those objects as they do to a late upload by a former owner.
 - **Reads of history:** a segment in the local directory is read through a memory map, on a thread that isn't a core, so a page fault can't stall publishes. A read error on a mapped page ends the process, and it isn't retried from S3.
-- **Deleted data:** expired or deleted records can stay in `cached/` until eviction reaches them. The read index stops them being served.
+- **Deleted data:** expired or deleted records can stay in `cached/` until eviction reaches them. Stream metadata stops them being served (section 7.6).
 
 ### 7.4 Retention and deletion
 
@@ -234,12 +247,13 @@ Deletion is purely retention: whole hour prefixes expire, and nothing else delet
 - New segments go to the `sealed/` prefix, which expires after about 2 days. The `1d` class is served from here and is never compacted.
 - Longer classes are copied by compaction into their own prefix, which expires by that class.
 - The delete job checks how far compaction has progressed before expiring anything, so a stalled compactor can't destroy data. An S3 lifecycle rule alone can't do that.
+- **No per-stream work:** an object id holds its time, so whether an object is expired for a stream follows from the stream's class. The expired front of a stream's object list is dropped whenever the stream is loaded or appended to, and its highest expired id is the larger of the stored one and the first id at the cutoff.
 
 ### 7.5 Compaction
 
-Seal manifests are published to a system stream. A compactor follows it with a named cursor, with one worker per retention class, and merges small segments into larger ones sorted by stream. It copies records without decoding them, then updates the index readers use to find them. It deletes nothing.
+Seal manifests are published to a system stream. A compactor follows it with a named cursor, with one worker per retention class, and merges small segments into larger ones sorted by stream. It copies stream regions without decoding records, then adds object table rows (section 7.6) saying which compacted objects replace each source object for that class. It deletes nothing and changes no stream's metadata.
 
-Unlike a normal sink, it must update the read index. The manifest stream also can't produce manifests for its own segments, so it needs a special rule.
+Unlike a normal sink, it must update the object table. The manifest stream also can't produce manifests for its own segments, so it needs a special rule.
 
 ### 7.6 Stream metadata
 
@@ -249,9 +263,15 @@ A stream is in one of two states, and S3 backs both:
 - **Idle:** evicted from RAM, least recently used first, to a local key-value store on NVMe, and loaded on the next access.
 - **Backup:** if the local copy is gone, the stream is rebuilt on demand from its S3 checkpoint.
 
-The metadata is last id, the highest expired id, state, config, cursors, dedupe entries and extents (`id range → memory, local or S3 location`). A position below the highest expired id gets error 7, including after a restart.
+The metadata is last id, the highest expired id, state, config, cursors and the object list. Dedupe entries aren't part of it (section 3). A position below the highest expired id gets error 7, including after a restart.
 
-At each seal, changed metadata is written to the local store and to S3 checkpoints. Checkpoints go into shared files, so PUTs don't grow with stream count, and they are separate from segments because they must outlive record retention. The key-value store stays out of the write path.
+**Object list:** the sorted ids of the objects that hold the stream's records, delta-encoded, about 2–3 bytes per id. Records not sealed yet need no entry, because the owning core knows where its unsealed records start. A reader takes the objects whose time covers what it wants and finds the stream in each one's footer (section 7.3).
+
+**Object table:** one row per object, kept per node, holding its kind (seal, dedicated or compacted), its state (local not uploaded, uploaded and cached, or uploaded only), and the compacted objects that replace it, per class and range of stream hashes. An upload or eviction changes one row, never a stream. A reader goes through the row: a local file is read through a memory map, anything else from S3, and a replaced object leads to its compacted object. A stream's list is rewritten to the compacted ids when the stream is next loaded or appended to.
+
+**Local store:** one key per stream for the metadata, the object list in chunks of about 256 ids keyed by the first id so that a seal appends to the last chunk and expiry deletes whole chunks, and one key per object table row.
+
+**Checkpoints:** at each seal, changed metadata is written to the local store and to an S3 checkpoint. A checkpoint holds the object table rows that changed, for uploaded objects only since another machine can't read a local file, and the metadata of streams whose state, config, cursors or sinks changed. Object lists and last ids are left out, because they are rebuilt from the last-id sections of objects newer than the last full checkpoint. Every few seals a full checkpoint holds everything. Checkpoints go into shared files, so PUTs don't grow with stream count, and they are separate from segments because they must outlive record retention. The key-value store stays out of the write path.
 
 ## 8. Ownership and recovery
 
@@ -260,12 +280,13 @@ The first version runs on a single node. Shards stay, because cores need them fo
 ### 8.1 Single node
 
 - **Startup:** the server replays whatever is in `wal_dir`, then carries on from S3. The code is the same in every case below.
+- **Clean stop:** the node seals, waits for the segment's upload and checkpoint, and exits with an empty WAL, so a planned stop or handover leaves nothing to replay. A stop that runs past its timeout exits as it is, and startup treats it as a crash.
 - **Process crash:** the process restarts and replays the WAL.
 - **Machine loss:** something external, such as an auto-scaling group, starts a replacement. With EBS, that automation reattaches the volume, and force-detaching it stops the old machine's WAL writes. With local NVMe, the WAL is gone.
 - **Empty WAL check:** if `wal_dir` is empty but the ownership record already has a generation, the server logs a warning that the WAL was lost and that unsealed records may be gone. It can't tell how many. A new node has no generation yet, so it doesn't warn.
 - **Clients:** resume from cursors, and producers retry with the same `(producer_id, producer_seq)`.
 
-A replacement could start while the old machine is still running, and the old machine could still upload a segment. So one ownership record in the bucket holds a `generation` and the last valid id of the previous generation. A new process takes ownership with a conditional write that increments the generation. The generation is in every object path, and readers accept an older generation's data only up to that last valid id.
+A replacement could start while the old machine is still running, and the old machine could still upload a segment. So one ownership record in the bucket holds a `generation` and the last valid id of the previous generation. A new process takes ownership with a conditional write that increments the generation. The generation is in every object id, and readers accept an older generation's data only up to that last valid id.
 
 ### 8.2 Multiple nodes (designed, deferred)
 
@@ -274,6 +295,7 @@ Not part of the first version. The record format and storage layout don't need t
 - **Ownership:** each node renews a lease record in the bucket and owns its shards while it is alive.
 - **Routing:** clients find owners through a routing table and follow `REDIRECT`.
 - **Epochs:** each shard has an epoch, a counter that goes up each time its ownership changes. It replaces the single generation of section 8.1. The segment footer records the epoch for each shard it contains, because one object holds many shards.
+- **Object ids:** each node writes its own objects, object table and checkpoints. Object ids then need node bits, taken from the 16 generation bits.
 - **Takeover:**
   1. A node's lease expires.
   2. A node in the same AZ claims its shards with a conditional write of `epoch + 1`, recording the last valid id of the previous epoch.
@@ -286,7 +308,7 @@ Not part of the first version. The record format and storage layout don't need t
 A sink is a source stream, a filter, a destination, and a named cursor `sink:<id>`. When a matching record arrives, the sink sends it on. Unlike a connected client, it runs on the server and retries.
 
 - **Destinations:**
-  - `webhook.notify`: sends `{stream, head, unread}`, rate-limited, for wake-ups.
+  - `webhook.notify`: sends `{sink_id, head, unread}`, rate-limited, for wake-ups. It names the sink, not the stream, since the server keeps no stream ids (section 1).
   - `webhook.deliver`: sends records, HMAC-signed, with private addresses blocked.
   - `forward`: writes into another stream.
   - `archive`: writes records to S3 or R2.
@@ -299,7 +321,9 @@ A sink is a source stream, a filter, a destination, and a named cursor `sink:<id
 
 ### 9.1 Forwarding between streams
 
-A `forward` sink publishes with a `producer_id` the server derives from the source stream and `sink_id`, with the top bit set, and `producer_seq = source first_id`. A publisher that sets the top bit is rejected with error 8, so forwards have a dedupe key space of their own. Retries therefore dedupe through normal idempotency and never duplicate records in the target. It keeps each record's original author.
+A `forward` sink publishes with a `producer_id` the server derives from the source stream and `sink_id`, with the top bit set, and `producer_seq = source first_id`. A publisher that sets the top bit is rejected with error 8, so forwards have a dedupe key space of their own. Retries therefore dedupe through normal idempotency, and duplicate records in the target only when a dedupe entry is gone (section 3). It keeps each record's original author.
+
+The sink stores its target stream as a key hash (section 1), which is all it needs to publish there.
 
 There are no server-side wildcards. A feed across many streams is a fan-in: forward sinks into one aggregate stream.
 
@@ -404,11 +428,12 @@ A signed token grants access to streams. It lists stream id patterns such as `lo
 ## 13. Configuration
 
 - **Per node:** `wal_dir` and seal window (section 7.1).
+- **Per deployment:** the stream identity key (section 1), from the environment or a secret store, never from the bucket. A node without it doesn't start.
 - **Per stream, set when it is created or changed later:** retention class, default and minimum ack level, and sinks. Streams are created on first publish or first state write, or explicitly.
 
 ## 14. Open questions
 
-- **Letting go earlier.** A sealed segment is on local disk before its upload finishes, so RAM (section 6.5) and the WAL could both be released at that point, and a slow network would then cost only local disk. Today both wait for the upload. Releasing RAM needs readers and checkpoints to tell a local extent from an uploaded one. Releasing the WAL also needs dedupe entries (section 3) to survive without it, and needs `pending/` on a volume as durable as `wal_dir` (section 7.1).
+- **Releasing the WAL earlier.** RAM is released once a segment is fsynced locally (section 6.2). The WAL could go at the same point, so a slow network would cost only local disk, but it still waits for the upload and checkpoint. Releasing it earlier needs the metadata changes it holds saved in the local store first. Dedupe entries refilled from a released WAL would then be gone, which section 3 already allows.
 
 ## 15. Not brought over
 
