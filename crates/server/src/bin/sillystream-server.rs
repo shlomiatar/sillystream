@@ -204,7 +204,7 @@ fn run() -> Result<(), String> {
         key_pem,
         token_secret,
     };
-    let (server, report) = Server::start_recovering(
+    let (mut server, report) = Server::start_recovering(
         config,
         RecoverConfig {
             wal_dir,

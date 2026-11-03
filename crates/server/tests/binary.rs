@@ -188,6 +188,73 @@ async fn running_out_of_descriptors_at_a_seal_does_not_stop_writes_for_good() {
     );
 }
 
+/// A clean stop seals, uploads and checkpoints before it exits, so the next start has nothing in
+/// the WAL to replay (section 8.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_stop_leaves_nothing_to_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = api::test_cert();
+    let start = |stderr: &str| {
+        let args = write_files(dir.path(), &[7u8; 32]);
+        std::fs::write(dir.path().join("cert.pem"), &cert.cert_pem).unwrap();
+        std::fs::write(dir.path().join("key.pem"), &cert.key_pem).unwrap();
+        let mut child = Command::new(BIN)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(dir.path().join(stderr)).unwrap())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(line.starts_with("listening on 127.0.0.1:"), "{line}");
+        let address = line.trim().rsplit(' ').next().unwrap().to_owned();
+        (child, address)
+    };
+    let (mut child, address) = start("first.stderr");
+
+    let token = auth::Token {
+        expiry_ms: u64::MAX,
+        author: std::num::NonZeroU64::new(1).unwrap(),
+        grants: vec![auth::Grant {
+            pattern: "*".to_owned(),
+            perms: api::ALL,
+        }],
+    }
+    .sign(&[7u8; 32])
+    .unwrap();
+    let client = api::tls_client_config(&cert.der, &[&rustls::version::TLS13]);
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+    let socket = tokio::net::TcpStream::connect(&address).await.unwrap();
+    let mut tls = connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    let request = api::Http::new("POST", "/v1/stream/a/publish?ack=2", &token).body(b"x".to_vec());
+    tokio::io::AsyncWriteExt::write_all(&mut tls, &request.bytes())
+        .await
+        .unwrap();
+    let reply = api::read_http_reply(&mut tls).await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+    drop(tls);
+
+    let killed = Command::new("kill")
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    let stderr = std::fs::read_to_string(dir.path().join("first.stderr")).unwrap();
+    assert!(status.success(), "{status}\n{stderr}");
+    assert!(!stderr.contains("didn't finish"), "{stderr}");
+
+    let (child, _) = start("second.stderr");
+    let _running = RunningServer(child);
+    let stderr = std::fs::read_to_string(dir.path().join("second.stderr")).unwrap();
+    assert!(stderr.contains(", 0 WAL entries replayed,"), "{stderr}");
+}
+
 /// Section 7.1's range is refused outside it, not quietly moved into it.
 #[test]
 fn a_seal_window_out_of_range_is_refused() {

@@ -245,9 +245,13 @@ impl Server {
             .sum()
     }
 
-    /// Seals what's open and saves its metadata, waiting up to `wait_ms`, so a clean stop leaves
-    /// little to replay. False if that didn't finish, which a restart makes up for.
-    pub fn seal_before_stop(&self, wait_ms: u64) -> bool {
+    /// Stops taking connections, then seals what's open and saves its metadata, waiting up to
+    /// `wait_ms` in all, so a clean stop leaves nothing to replay (section 8.1). It seals twice:
+    /// the first seal's manifest goes into the WAL after it, and the second seal holds it without
+    /// making a manifest of its own (section 7.5). False if that didn't finish, which a restart
+    /// makes up for.
+    pub fn seal_before_stop(&mut self, wait_ms: u64) -> bool {
+        self.stop_listener();
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -256,9 +260,12 @@ impl Server {
         };
         runtime.block_on(async {
             let wait = std::time::Duration::from_millis(wait_ms);
-            tokio::time::timeout(wait, self.node().seal_and_checkpoint())
-                .await
-                .unwrap_or(false)
+            let node = self.node();
+            tokio::time::timeout(wait, async {
+                node.seal_and_checkpoint().await && node.seal_and_checkpoint().await
+            })
+            .await
+            .unwrap_or(false)
         })
     }
 
