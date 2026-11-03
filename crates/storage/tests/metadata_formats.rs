@@ -8,24 +8,13 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use proptest::prelude::*;
 use storage::{
-    CheckpointFile, CheckpointHead, CheckpointSet, MetaCursor, MetaDedupe, MetaExtent, MetaSink,
-    Ownership, StreamMeta, build_checkpoint, checkpoint_path, decode_extent, decode_meta,
-    decode_ownership, encode_extent, encode_meta, encode_ownership, put_checkpoint,
+    CheckpointFile, CheckpointHead, CheckpointSet, MetaCursor, MetaExtent, MetaSink, Ownership,
+    StreamMeta, build_checkpoint, checkpoint_path, decode_extent, decode_meta, decode_ownership,
+    encode_extent, encode_meta, encode_ownership, put_checkpoint,
 };
 
 fn cursor() -> impl Strategy<Value = MetaCursor> {
     (".{0,8}", any::<u64>()).prop_map(|(name, id)| MetaCursor { name, id })
-}
-
-fn dedupe() -> impl Strategy<Value = MetaDedupe> {
-    any::<(u64, u64, u64, u32)>().prop_map(|(producer_id, producer_seq, first_id, count)| {
-        MetaDedupe {
-            producer_id,
-            producer_seq,
-            first_id,
-            count,
-        }
-    })
 }
 
 fn sink() -> impl Strategy<Value = MetaSink> {
@@ -85,7 +74,6 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
         proptest::collection::vec(any::<u8>(), 0..32),
         any::<(u8, u8, u64)>(),
         proptest::collection::vec(cursor(), 0..4),
-        proptest::collection::vec(dedupe(), 0..4),
         proptest::collection::vec(sink(), 0..3),
         (
             proptest::collection::vec(extent(), 0..4),
@@ -98,7 +86,6 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 state,
                 (default_ack_level, min_ack_level, retention_ms),
                 cursors,
-                dedupe,
                 sinks,
                 (extents, dropped_extents),
             )| StreamMeta {
@@ -114,7 +101,6 @@ fn meta() -> impl Strategy<Value = StreamMeta> {
                 min_ack_level,
                 retention_ms,
                 cursors,
-                dedupe,
                 sinks,
                 extents,
                 dropped_extents,
@@ -200,12 +186,6 @@ fn meta_bytes_are_exact() {
             name: "c".to_owned(),
             id: 7,
         }],
-        dedupe: vec![MetaDedupe {
-            producer_id: 8,
-            producer_seq: 9,
-            first_id: 10,
-            count: 11,
-        }],
         sinks: vec![MetaSink {
             sink_id: 12,
             kind: "k".to_owned(),
@@ -253,11 +233,6 @@ fn meta_bytes_are_exact() {
     u32le(&mut body, 1);
     text(&mut body, b"c");
     u64le(&mut body, 7);
-    u32le(&mut body, 1);
-    for value in [8, 9, 10] {
-        u64le(&mut body, value);
-    }
-    u32le(&mut body, 11);
     u32le(&mut body, 1);
     u64le(&mut body, 12);
     text(&mut body, b"k");

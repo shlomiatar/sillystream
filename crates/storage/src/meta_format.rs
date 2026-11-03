@@ -5,10 +5,9 @@
 //! meta   := crc32c u32 | flags u32 | name str32 | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
-//!           n u32 | n × cursor | n u32 | n × dedupe | n u32 | n × sink | n u32 | n × extent |
+//!           n u32 | n × cursor | n u32 | n × sink | n u32 | n × extent |
 //!           n u32 | n × dropped_id_first u64
 //! cursor := name str32 | id u64
-//! dedupe := producer_id u64 | producer_seq u64 | first_id u64 | count u32
 //! sink   := sink_id u64 | kind str32 | url opt | target opt | filter opt | on_expire str32 |
 //!           concurrency u32 | paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
 //!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
@@ -30,14 +29,6 @@ const FLAG_DELETED: u32 = 1;
 pub struct MetaCursor {
     pub name: String,
     pub id: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MetaDedupe {
-    pub producer_id: u64,
-    pub producer_seq: u64,
-    pub first_id: u64,
-    pub count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +81,7 @@ pub struct StreamMeta {
     pub floor_id: u64,
     /// The highest id in an extent retention took away. A position below it has lost records.
     pub expired_through: u64,
-    /// State and dedupe include every change up to this id, and no later one. A change above
+    /// State includes every change up to this id, and no later one. A change above
     /// it comes from the WAL.
     pub applied_id: u64,
     pub state_ver: u64,
@@ -99,7 +90,6 @@ pub struct StreamMeta {
     pub min_ack_level: u8,
     pub retention_ms: u64,
     pub cursors: Vec<MetaCursor>,
-    pub dedupe: Vec<MetaDedupe>,
     pub sinks: Vec<MetaSink>,
     pub extents: Vec<MetaExtent>,
     /// `id_first` of extents this entry takes away, which compaction replaced or retention
@@ -170,13 +160,6 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     for cursor in &meta.cursors {
         put_bytes(&mut out, cursor.name.as_bytes());
         put_u64(&mut out, cursor.id);
-    }
-    put_u32(&mut out, meta.dedupe.len() as u32);
-    for entry in &meta.dedupe {
-        put_u64(&mut out, entry.producer_id);
-        put_u64(&mut out, entry.producer_seq);
-        put_u64(&mut out, entry.first_id);
-        put_u32(&mut out, entry.count);
     }
     put_u32(&mut out, meta.sinks.len() as u32);
     for sink in &meta.sinks {
@@ -338,14 +321,6 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
         meta.cursors.push(MetaCursor {
             name: reader.text()?,
             id: reader.u64()?,
-        });
-    }
-    for _ in 0..reader.count(28)? {
-        meta.dedupe.push(MetaDedupe {
-            producer_id: reader.u64()?,
-            producer_seq: reader.u64()?,
-            first_id: reader.u64()?,
-            count: reader.u32()?,
         });
     }
     for _ in 0..reader.count(55)? {

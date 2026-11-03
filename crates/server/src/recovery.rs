@@ -12,10 +12,9 @@ use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    BlockEntry, CheckpointSet, MetaDedupe, MetaExtent, MetaSink, MetaSinkGap, Ownership,
-    SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects,
-    list_wal_files, object_generation, read_ownership, replay_files, sync_wal_files,
-    upload_pending,
+    BlockEntry, CheckpointSet, MetaExtent, MetaSink, MetaSinkGap, Ownership, SegmentError,
+    SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects, list_wal_files,
+    object_generation, read_ownership, replay_files, sync_wal_files, upload_pending,
 };
 
 use crate::compaction::MANIFEST_STREAM;
@@ -116,6 +115,8 @@ pub(crate) struct RestoredStream {
     pub new_extents: Vec<MetaExtent>,
     /// What only the WAL holds, to go into the next seal.
     pub batches: Vec<RestoredBatch>,
+    /// Dedupe entries from the WAL's entries, the only place they survive a restart (section 3).
+    pub dedupe: DedupeTable,
 }
 
 impl std::fmt::Debug for RestoredStream {
@@ -461,14 +462,7 @@ fn replay_stream(
     let saved_applied_id = meta.applied_id.max(floor_id);
     let mut applied_id = saved_applied_id;
     let mut state = StreamState::new();
-    let mut dedupe = DedupeTable::from_entries(meta.dedupe.iter().map(|entry| {
-        (
-            entry.producer_id,
-            entry.producer_seq,
-            entry.first_id,
-            entry.count,
-        )
-    }));
+    let mut dedupe = DedupeTable::new();
     let mut alive = !was_deleted;
     let mut batches = Vec::new();
     if alive {
@@ -520,7 +514,7 @@ fn replay_stream(
         applied_id = applied_id.max(last_id);
         meta.last_id = meta.last_id.max(last_id);
         if let Some((producer_id, producer_seq)) = producer {
-            if producer_id != 0 && last_id > saved_applied_id {
+            if producer_id != 0 {
                 dedupe.record(
                     producer_id,
                     producer_seq,
@@ -548,20 +542,11 @@ fn replay_stream(
     meta.applied_id = applied_id;
     meta.state_ver = state.ver();
     meta.state = state.doc().clone();
-    meta.dedupe = dedupe
-        .entries()
-        .iter()
-        .map(|entry| MetaDedupe {
-            producer_id: entry.producer_id(),
-            producer_seq: entry.producer_seq(),
-            first_id: entry.first_id(),
-            count: entry.count(),
-        })
-        .collect();
     Ok(Some(RestoredStream {
         meta,
         new_extents,
         batches,
+        dedupe,
     }))
 }
 

@@ -189,6 +189,28 @@ async fn a_restart_restores_state_dedupe_and_cursors() {
     node.shutdown();
 }
 
+/// Dedupe entries are never saved (section 3): once a checkpoint lets the WAL file holding a
+/// publish go, a restart can't dedupe a retry of it, and publishing is at-least-once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_its_wal_file_is_gone_is_a_new_record() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    wait_for_wal_files(&disk, 1, "after the checkpoint").await;
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (again, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(again > first);
+    assert_eq!(read_all(&node, "a", 2).await.len(), 2);
+    drop(client);
+    node.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_empty_wal_warning_is_only_for_a_node_that_had_a_generation() {
     let disk = Disk::new();
@@ -593,9 +615,10 @@ async fn an_evicted_stream_comes_back_identical_on_first_access() {
     assert_eq!(stats.loaded_count, 1);
     assert_eq!(stats.rebuilt_count, 0);
 
-    // A retry after the reload still dedupes, and a write first in line works.
-    let last_seq_ack = publish_one(&mut client, "cold", 2, b"two").await;
-    assert_eq!(last_seq_ack.0, before.records[1].0);
+    // Dedupe entries live in memory only (section 3), so eviction dropped them: a retry after
+    // the reload is a new record, after the ones it had.
+    let retry_ack = publish_one(&mut client, "cold", 2, b"two").await;
+    assert!(retry_ack.0 > before.records[1].0);
     drop(client);
     node.shutdown();
 }
@@ -783,8 +806,15 @@ async fn an_evicted_stream_loads_on_the_core_its_shard_moved_to() {
 
     let mut fresh = node.client(1).await;
     assert_eq!(fresh.snapshot("wanderer").await.unwrap().head, id);
-    assert_eq!(publish_one(&mut fresh, "wanderer", 1, b"x").await.0, id);
-    assert_eq!(read_all(&node, "wanderer", 1).await[0].0, id);
+    // Eviction dropped its dedupe entries (section 3), so the same seq is a new record.
+    let again = publish_one(&mut fresh, "wanderer", 1, b"x").await.0;
+    assert!(again > id);
+    let ids: Vec<u64> = read_all(&node, "wanderer", 2)
+        .await
+        .iter()
+        .map(|record| record.0)
+        .collect();
+    assert_eq!(ids, vec![id, again]);
     drop((client, fresh));
     node.shutdown();
 }

@@ -26,8 +26,8 @@ pub use crash::crash_point;
 #[cfg(feature = "test-hooks")]
 pub use crash::hold_wal_writes;
 pub use meta_format::{
-    MetaCursor, MetaDedupe, MetaError, MetaExtent, MetaSink, MetaSinkGap, StreamMeta,
-    decode_extent, decode_meta, encode_extent, encode_meta,
+    MetaCursor, MetaError, MetaExtent, MetaSink, MetaSinkGap, StreamMeta, decode_extent,
+    decode_meta, encode_extent, encode_meta,
 };
 pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{

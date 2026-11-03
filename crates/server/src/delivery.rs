@@ -13,7 +13,6 @@ use format::{Filter, RecordHeader, make_id};
 use object_store::path::Path;
 use storage::StreamExtent;
 
-use crate::dedupe::DedupeTable;
 use crate::slab::SlabBytes;
 
 /// The record bytes a delivery shares: slab memory while they are recent, and what a read
@@ -269,8 +268,6 @@ pub(crate) struct PendingVisible {
     pub last_id: u64,
     pub bytes: SlabBytes,
     pub state: Option<(u64, Bytes)>,
-    /// `(producer_id, producer_seq, first_id, count)`, if it has a producer.
-    pub dedupe: Option<(u64, u64, u64, u32)>,
 }
 
 /// A stream's sealed records in one object.
@@ -303,7 +300,6 @@ pub(crate) struct UnsavedStep {
     pub ticket: u64,
     pub last_id: u64,
     pub state: Option<(u64, Bytes)>,
-    pub dedupe: Option<(u64, u64, u64, u32)>,
 }
 
 /// A stream's delivery state. Moves with the stream.
@@ -335,7 +331,6 @@ pub(crate) struct StreamDelivery {
     /// publish a crash can erase would ack it on the retry, unwritten (D136, D154).
     pub saved_through: u64,
     pub saved_state: (u64, Bytes),
-    pub saved_dedupe: DedupeTable,
     /// Visible, and not yet in the WAL, in id order. Only with `track_meta`.
     pub unsaved: VecDeque<UnsavedStep>,
     /// The last id each core held when this stream left it. Its extent still has to reach
@@ -370,7 +365,6 @@ impl StreamDelivery {
             deleted_sink_epoch: 0,
             saved_through: 0,
             saved_state: (0, Bytes::new()),
-            saved_dedupe: DedupeTable::new(),
             unsaved: VecDeque::new(),
             held_elsewhere: Vec::new(),
             track_meta: false,

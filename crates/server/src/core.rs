@@ -16,9 +16,7 @@ use format::{
     encode_system_record, validate_forward, validate_publish,
 };
 use proto::ErrorCode;
-use storage::{
-    MetaCursor, MetaDedupe, StreamMeta, UploadEvent, UploadKey, WalEntry, WalSendError, WalSender,
-};
+use storage::{MetaCursor, StreamMeta, UploadEvent, UploadKey, WalEntry, WalSendError, WalSender};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::clock::Clock;
@@ -1293,12 +1291,6 @@ impl Core {
                 last_id: ids.last_id,
                 bytes: bytes.clone(),
                 state: ids.state_after,
-                dedupe: (ids.producer_id != 0).then_some((
-                    ids.producer_id,
-                    ids.producer_seq,
-                    ids.first_id,
-                    (ids.last_id - ids.first_id + 1) as u32,
-                )),
             });
             stream.delivery.meta_dirty = stream.delivery.track_meta;
             self.use_count += 1;
@@ -1553,7 +1545,6 @@ impl Core {
                     ticket: entry.ticket,
                     last_id: entry.last_id,
                     state: entry.state.clone(),
-                    dedupe: entry.dedupe,
                 });
             }
             let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
@@ -1582,15 +1573,6 @@ impl Core {
             delivery.saved_through = step.last_id;
             if let Some(state) = step.state {
                 delivery.saved_state = state;
-            }
-            if let Some((producer_id, producer_seq, first_id, count)) = step.dedupe {
-                delivery.saved_dedupe.record(
-                    producer_id,
-                    producer_seq,
-                    first_id,
-                    count,
-                    self.clock.now_ms(),
-                );
             }
         }
     }
@@ -3025,17 +3007,8 @@ impl Core {
             .iter()
             .map(|sink| (sink.sink_id, crate::recovery::sink_spec(sink)))
             .collect();
-        let dedupe = DedupeTable::from_entries(meta.dedupe.iter().map(|entry| {
-            (
-                entry.producer_id,
-                entry.producer_seq,
-                entry.first_id,
-                entry.count,
-            )
-        }));
         delivery.saved_through = meta.last_id;
         delivery.saved_state = (meta.state_ver, meta.state.clone());
-        delivery.saved_dedupe = dedupe.clone();
         self.use_count += 1;
         delivery.last_used = self.use_count;
         let mut state = StreamState::new();
@@ -3053,7 +3026,9 @@ impl Core {
                 shard,
                 ids: IdAllocator::new(meta.last_id.max(meta.floor_id), self.config.last_valid_id),
                 state,
-                dedupe,
+                // Dedupe entries live in memory only (section 3): a stream loaded from the
+                // store starts with none, and a restored one gets the WAL's.
+                dedupe: DedupeTable::new(),
                 config: StreamConfig {
                     default_ack_level: meta.default_ack_level,
                     min_ack_level: meta.min_ack_level,
@@ -3075,6 +3050,7 @@ impl Core {
         };
         self.install_meta(&name, restored.meta, shard);
         let stream = self.streams.get_mut(&*name).expect("just installed");
+        stream.dedupe = restored.dedupe;
         stream.delivery.meta_dirty = true;
         stream.delivery.new_extents = restored
             .new_extents
@@ -3158,17 +3134,6 @@ impl Core {
                     .map(|(name, id)| MetaCursor {
                         name: name.to_string(),
                         id: *id,
-                    })
-                    .collect(),
-                dedupe: delivery
-                    .saved_dedupe
-                    .entries()
-                    .iter()
-                    .map(|entry| MetaDedupe {
-                        producer_id: entry.producer_id(),
-                        producer_seq: entry.producer_seq(),
-                        first_id: entry.first_id(),
-                        count: entry.count(),
                     })
                     .collect(),
                 sinks: delivery
