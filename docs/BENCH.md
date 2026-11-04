@@ -758,3 +758,21 @@ Object lists, the object table, memory going at the local write and the backgrou
 Both builds sometimes collapse to tens of thousands, which is this laptop's `F_FULLFSYNC` against other writers to the same disk. `ec123cf` does it more often (5 of 11 against 1 of 8). That fits the extra local metadata writes each seal now makes (list chunks and object rows), but the difference isn't established here. A Linux run with the WAL on its own device would settle it.
 
 The catch-up table's three byte-count columns read 0 in both builds, so that bench's counters don't reach its output; they were added after `39aa32f` and this predates phases 5 to 7.
+
+### The same comparison on Linux
+
+`4bcf093` against `ec123cf`, one `n2-standard-16` in `us-east4-a`, 2026-11-04, Ubuntu 24.04, rustc 1.98.1, client on the same machine. `silly bench throughput --seconds 5 --cores 8`, 6 rounds, alternating builds. Two layouts, each its own ext4 local NVMe: **shared** has the WAL, data and objects on one; **split** moves the WAL to the other. Median publishes/s, with the range across the 6 rounds.
+
+| ack | connections | bytes | shared, `4bcf093` | shared, `ec123cf` | split, `4bcf093` | split, `ec123cf` |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1024 | 181K (178–190K) | 184K (177–186K) | 187K (184–193K) | 190K (188–200K) |
+| 1 | 4 | 1024 | 192K (191–195K) | 194K (192–195K) | 364K (360–366K) | 363K (358–366K) |
+| 1 | 4 | 65536 | 3,889 | 3,976 | 6,215 | 6,101 |
+| 2 | 1 | 1024 | 170K (164–170K) | 166K (162–172K) | 181K (180–185K) | 182K (179–186K) |
+| 2 | 1 | 65536 | 3,154 | 3,158 | 5,992 | 6,012 |
+| 2 | 4 | 1024 | 192K (191–193K) | 192K (191–193K) | 363K (361–365K) | 364K (362–366K) |
+| 2 | 4 | 65536 | 3,147 | 3,155 | 5,874 | 5,923 |
+
+- **No regression:** every row of `ec123cf` is within 2.5% of `4bcf093`, in both layouts.
+- **No collapses:** none of the 96 runs fell below 160K at 1 KiB, so the laptop's drops were `F_FULLFSYNC` and other writers on that disk, not phases 5 to 7.
+- **The layout matters:** with 4 connections at 1 KiB, a WAL on its own disk gives about 1.9× the rate of a shared one, and at 64 KiB about 1.6–1.9×, in both builds.
