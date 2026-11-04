@@ -741,3 +741,20 @@ Up to 8 PUTs at once. In-region rows are the same VM setup as above; the restart
 
 - **What this settles:** the earlier 0 of 200 was the server not being up yet. No marker was lost in 6 rounds, though only the markers were read back, not the bench's records.
 - **What it doesn't settle:** both versions were tested with their own upload rate, so this can't separate D262 from parallel uploads. The peak memory figure counts mapped WAL pages, which the kernel can take back. Heap alone wasn't measured.
+
+## Phases 5 to 7 at `ec123cf`, against `4bcf093`
+
+Object lists, the object table, memory going at the local write and the background `pending/` upload, on the shared laptop with the client on the same machine, load average 5 to 13. The same commands as the `39aa32f` run, one run each, then throughput and catch-up alternating between this build and `4bcf093` (phase 4, before any of this). Real S3, EBS and Linux were not exercised.
+
+**Unchanged within noise:** latency (level 1 p50 35 µs, p99 91 µs; level 2 p50 4.4 ms), the ack matrix (level 3 with 4 streams flat out was 94,046/s against 56,947/s at `39aa32f`), fan-out (every row delivered all it should, `BEHIND` 0), recovery (256 MiB of WAL to the port in 0.040 s, read back in 0.23 s), catch-up (memory, local disk and `LocalFileSystem` 1,000 to 1,900 MB/s in both builds) and idle connections (21,820 bytes each).
+
+**Level 2, 4 connections, 1 KiB, publishes/s:** the one row that may have moved.
+
+| build | samples |
+|---|---|
+| `4bcf093` | 352K, 349K, 355K, 351K, 348K, 36K, 334K, 333K |
+| `ec123cf` | 63K, 313K, 281K, 336K, 376K, 67K, 331K, 339K, 170K, 47K, 120K |
+
+Both builds sometimes collapse to tens of thousands, which is this laptop's `F_FULLFSYNC` against other writers to the same disk. `ec123cf` does it more often (5 of 11 against 1 of 8). That fits the extra local metadata writes each seal now makes (list chunks and object rows), but the difference isn't established here. A Linux run with the WAL on its own device would settle it.
+
+The catch-up table's three byte-count columns read 0 in both builds, so that bench's counters don't reach its output; they were added after `39aa32f` and this predates phases 5 to 7.
