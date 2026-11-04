@@ -799,6 +799,25 @@ The catch-up table's three byte-count columns read 0 in both builds, so that ben
 | 4,096 | 485 | 577 | 576 | 38–70% |
 
 - **Disk bandwidth is the limit, not record size or connections:** on single SSDs both volumes wrote 365–430 MB/s through every row, the WAL's own SSD at its `fio` rate. 64 KiB and 200 KB records reach the same MB/s as 1 KiB.
-- **RAID0 pairs give about 1.5×,** not 2×. The WAL pair wrote 490–650 MB/s against 728 MB/s raw, and the cause of the gap wasn't isolated: fsync per batch, and the clients, which weren't profiled, are candidates.
+- **RAID0 pairs give about 1.5×,** not 2×. The WAL pair wrote 490–650 MB/s against 728 MB/s raw. The section below profiles the gap.
 - **Connections cost CPU, not throughput:** 4,096 publishing connections at 1 KiB took server idle from about 77% to 38–45%, and 1 KiB lost about 10% on RAID0 at 4,096. Nothing failed and the server logged no errors.
 - **This bench writes the data volume twice:** the segment, then its copy into `LocalFileSystem`. With a real bucket the data volume takes one write per record.
+
+## The RAID0 gap
+
+Same machines, `41dc36a`, 512 connections in all, level 2. Data on its own RAID0 pair throughout.
+
+**Moving the WAL to tmpfs** raised ingest from about 580 MB/s to 1,450–1,530 MB/s at 64 KiB, so the data volume and the network aren't the limit: the WAL pair is.
+
+**What the WAL thread does with its time,** at 64 KiB: groups of about 190 MB per `fdatasync`, each taking about 175 ms. Between syncs the thread computes CRC32C over every entry (37% of its CPU samples) and copies the data into the page cache (about 41%, much of it `kernel_init_pages`). The disk sits idle while that runs, so the pair is written at about 75–80% of its `fio` rate.
+
+**Starting writeback early doesn't close it.** A patch that calls `sync_file_range(SYNC_FILE_RANGE_WRITE)` after every 8 MiB of a batch, so the disk starts before the `fdatasync`, gave, in MB/s of record data:
+
+| round | bytes | before | with the patch |
+|---|---|---|---|
+| 1 | 64 KiB | 584 | 611 |
+| 1 | 200 KB | 572 | 575 |
+| 1 | 1 KiB | 592 | 569 |
+| 2 | 64 KiB | 581 | 604 |
+
+About 4% at 64 KiB and noise elsewhere, so it wasn't kept. Closing the gap would take moving the CRC off the WAL thread, `O_DIRECT`, or overlapping one batch's write with the previous batch's sync, each a new mechanism. The remaining 20% is a GCP local SSD limit worth less than the cost of any of them for now.
