@@ -203,6 +203,15 @@ impl SegmentCache {
         Ok(cache)
     }
 
+    /// What a former process left in `pending/`, for the uploader to upload (section 7.3).
+    pub fn pending_segments(&self) -> Result<Vec<(Path, u64)>, String> {
+        list_pending(&self.root)
+    }
+
+    pub fn pending_file(&self, path: &Path) -> PathBuf {
+        file_for(&self.root.join(PENDING_DIR), path)
+    }
+
     /// A store over `cached/`, for `SegmentReader`. A missing object means it was evicted or
     /// never got here, and the reader goes to S3.
     pub fn store(&self) -> Arc<MappedSegments> {
@@ -287,6 +296,31 @@ async fn upload_one(
         .map_err(|error| describe(&error))
 }
 
+/// What a former process left in `pending/`: each segment's path in the store and its size.
+/// Each one is complete, since it only gets its name once it is fsynced. A file not named by an
+/// object id is an error.
+pub fn list_pending(root: &FsPath) -> Result<Vec<(Path, u64)>, String> {
+    let dir = root.join(PENDING_DIR);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    walk(&dir, &mut found).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let mut out = Vec::with_capacity(found.len());
+    for (file, metadata) in found {
+        let written = file
+            .strip_prefix(&dir)
+            .ok()
+            .and_then(FsPath::to_str)
+            .and_then(|relative| Path::parse(relative).ok())
+            .filter(|written| crate::ObjectId::of_path(written).is_some())
+            .ok_or_else(|| format!("{}: not a segment's name", file.display()))?;
+        out.push((written, metadata.len()));
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Uploads what a former process left in `pending/` and moves it to `cached/`. A former
 /// generation's limit applies to these as to any object it uploaded late (section 8.1). What's
 /// here is complete, since it only gets its name once it is fsynced. Returns how many there were.
@@ -328,6 +362,16 @@ pub struct MappedSegments {
     dir: PathBuf,
     /// Read too: a segment is readable here from its fsync, before it is uploaded (section 6.2).
     pending: PathBuf,
+}
+
+impl MappedSegments {
+    /// Reads a local segment directory's files, for a startup before its cache is open.
+    pub fn new(root: &FsPath) -> MappedSegments {
+        MappedSegments {
+            dir: root.join(CACHED_DIR),
+            pending: root.join(PENDING_DIR),
+        }
+    }
 }
 
 impl fmt::Display for MappedSegments {

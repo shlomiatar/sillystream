@@ -12,10 +12,10 @@ use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    BlockEntry, BlockTable, CheckpointSet, MetaSink, MetaSinkGap, NewerObjects, ObjectId,
-    ObjectKey, Ownership, SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation,
-    list_sealed_objects, list_wal_files, object_generation, read_ownership, replay_files,
-    sync_wal_files, upload_pending,
+    BlockEntry, BlockTable, CheckpointSet, MappedSegments, MetaSink, MetaSinkGap, NewerObjects,
+    ObjectId, ObjectKey, Ownership, SegmentError, SegmentReader, StreamExtent, StreamMeta,
+    claim_generation, list_pending, list_sealed_objects, list_wal_files, object_generation,
+    read_ownership, replay_files, sync_wal_files,
 };
 
 use crate::dedupe::DedupeTable;
@@ -51,7 +51,8 @@ pub struct RecoveryReport {
     pub damaged_wal_seqs: Vec<u64>,
     pub restored_stream_count: u64,
     /// Segments a former process left waiting to upload, uploaded before anything else.
-    pub uploaded_pending_count: u64,
+    /// Segments a former process left in `pending/`, which upload in the background.
+    pub pending_segment_count: u64,
     /// Objects no checkpoint knew of, whose extents were looked at.
     pub scanned_object_count: u64,
     /// Extents taken from them, and those a former generation's limit ruled out entirely.
@@ -147,6 +148,9 @@ pub(crate) struct ScannedObject {
     /// It holds accepted records that aren't the manifest stream's, so it needs a manifest: a
     /// crash can have lost the one it had (section 7.5).
     pub needs_manifest: bool,
+    /// Only in `pending/` so far: the uploader puts it up, and until then it is read locally
+    /// and nothing records it (section 7.3).
+    pub local: bool,
 }
 
 pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
@@ -337,6 +341,7 @@ async fn scan_object(
             len_bytes,
             last_ids,
             needs_manifest,
+            local: false,
         },
         ignored_extent_count,
     })
@@ -347,6 +352,7 @@ async fn scan_object(
 /// later one's out.
 async fn scan_objects(
     store: &Arc<dyn ObjectStore>,
+    local: Option<PendingSegments>,
     checkpoints: &CheckpointSet,
     ownership: &Ownership,
     objects_seen: &mut Vec<ScannedObject>,
@@ -354,7 +360,7 @@ async fn scan_objects(
     manifest: KeyHash,
 ) -> Result<Vec<ScannedExtent>, String> {
     let known: HashSet<ObjectKey> = checkpoints.rows().into_keys().collect();
-    let mut objects: Vec<(u64, Path, u64)> = list_sealed_objects(store.as_ref())
+    let mut objects: Vec<(u64, Path, u64, bool)> = list_sealed_objects(store.as_ref())
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -367,16 +373,42 @@ async fn scan_objects(
                 object_generation(&object.location)?,
                 object.location,
                 object.size as u64,
+                false,
             ))
         })
         .collect();
+    // A segment a crash left before its upload: in `pending/` and not in the store, or there
+    // already when the crash came before its rename (section 7.3).
+    let mut local_store = None;
+    if let Some((reader, pending)) = local {
+        for (path, len_bytes) in pending {
+            let Some(generation) = object_generation(&path) else {
+                continue;
+            };
+            let unknown =
+                ObjectId::of_path(&path).is_some_and(|id| !known.contains(&ObjectKey::sealed(id)));
+            if unknown && !objects.iter().any(|(_, listed, _, _)| *listed == path) {
+                objects.push((generation, path, len_bytes, true));
+            }
+        }
+        local_store = Some(reader);
+    }
     objects.sort();
-    let mut scans =
-        futures_util::stream::iter(objects.into_iter().map(|(generation, path, len_bytes)| {
+    let mut scans = futures_util::stream::iter(objects.into_iter().map(
+        |(generation, path, len_bytes, local)| {
             let limit = ownership.limit_for(generation);
-            scan_object(Arc::clone(store), path, len_bytes, limit, manifest)
-        }))
-        .buffered(CONCURRENT_OBJECT_SCANS);
+            let from = match (&local_store, local) {
+                (Some(reader), true) => Arc::clone(reader),
+                _ => Arc::clone(store),
+            };
+            async move {
+                let mut scan = scan_object(from, path, len_bytes, limit, manifest).await?;
+                scan.object.local = local;
+                Ok::<_, String>(scan)
+            }
+        },
+    ))
+    .buffered(CONCURRENT_OBJECT_SCANS);
     let mut out = Vec::new();
     while let Some(scan) = scans.next().await {
         let scan = scan?;
@@ -394,6 +426,9 @@ struct Pending {
     scanned: Vec<ScannedExtent>,
     wal: Vec<storage::ReplayedEntry>,
 }
+
+/// A reader of the local segment directory, and what `pending/` holds.
+type PendingSegments = (Arc<dyn ObjectStore>, Vec<(Path, u64)>);
 
 /// A stream put together, and the id ranges of the scanned objects holding it.
 type Replayed = (RestoredStream, Vec<(u64, u64)>);
@@ -568,10 +603,17 @@ pub(crate) async fn prepare(
     manifest: KeyHash,
 ) -> Result<(Prepared, Arc<LocalMeta>), String> {
     let mut report = RecoveryReport::default();
-    // Before the scan, which then finds them as it finds any object no checkpoint records.
-    if let Some(dir) = segment_dir {
-        report.uploaded_pending_count = upload_pending(dir, store.as_ref()).await?;
-    }
+    // The uploader puts these up in the background. The scan reads them locally and finds them
+    // as it finds any object no checkpoint records (section 7.3).
+    let pending_segments = match segment_dir {
+        Some(dir) => {
+            let pending = list_pending(dir)?;
+            report.pending_segment_count = pending.len() as u64;
+            let reader: Arc<dyn ObjectStore> = Arc::new(MappedSegments::new(dir));
+            Some((reader, pending))
+        }
+        None => None,
+    };
     let mut ownership = read_ownership(store.as_ref())
         .await
         .map_err(|error| error.to_string())?;
@@ -596,6 +638,7 @@ pub(crate) async fn prepare(
     let mut scanned_objects = Vec::new();
     let scanned = scan_objects(
         store,
+        pending_segments,
         &checkpoints,
         &ownership,
         &mut scanned_objects,
@@ -844,6 +887,7 @@ async fn put_restored_parts(
                 len_bytes: built.len_bytes,
                 last_ids: vec![(name, last_id)],
                 needs_manifest: name != manifest,
+                local: false,
             });
         }
     }

@@ -265,6 +265,7 @@ fn key_of(event: &UploadEvent) -> &UploadKey {
         | UploadEvent::Empty { key }
         | UploadEvent::Retrying { key, .. }
         | UploadEvent::Failed { key, .. } => key,
+        UploadEvent::Restored { path } => panic!("no startup upload here: {path}"),
     }
 }
 

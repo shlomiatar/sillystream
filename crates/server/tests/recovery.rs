@@ -1825,3 +1825,122 @@ async fn a_checkpoint_that_stays_bad_refuses_what_waits_for_it() {
     drop(client);
     node.shutdown();
 }
+
+fn pending_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for item in items.flatten() {
+        let path = item.path();
+        if path.is_dir() {
+            pending_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// A segment a crash left in `pending/` is read locally from the start, while it uploads in the
+/// background, and its WAL files stay until it has (sections 6.3, 7.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_segment_is_read_at_once_and_uploads_in_the_background() {
+    let disk = Disk::new();
+    let segments = disk.dir.path().join("segments");
+    let mut config = manual_config(1);
+    config.local_cache = Some(server::LocalCacheConfig {
+        dir: segments.clone(),
+        cap_bytes: 1 << 30,
+    });
+    let (node, _) = disk.start(config.clone());
+    let mut client = node.client(0).await;
+    let (id, _) = publish_one(&mut client, "s", 1, b"kept").await;
+    disk.store.hold();
+    {
+        let seal = node.seal();
+        tokio::pin!(seal);
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut found = Vec::new();
+            pending_files(&segments.join("pending"), &mut found);
+            if !found.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < give_up,
+                "nothing reached pending/"
+            );
+            tokio::select! {
+                outcome = &mut seal => panic!("the PUT is held: {outcome:?}"),
+                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    }
+    drop(client);
+    node.shutdown();
+    let mut found = Vec::new();
+    pending_files(&segments.join("pending"), &mut found);
+    assert_eq!(found.len(), 1);
+    let name = found[0].file_name().unwrap().to_str().unwrap().to_owned();
+    disk.store
+        .slow_put
+        .lock()
+        .unwrap()
+        .push((name.clone(), Duration::from_secs(3)));
+    disk.store.release();
+
+    let started = std::time::Instant::now();
+    let (node, report) = disk.start(config);
+    assert_eq!(report.pending_segment_count, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "startup waited for the upload"
+    );
+    assert_eq!(read_all(&node, "s", 1).await, vec![(id, b"kept".to_vec())]);
+    let in_store = |disk: &Disk| {
+        let store = disk.store.clone();
+        let name = name.clone();
+        async move {
+            let listed: Vec<_> = store.list(None).collect().await;
+            listed
+                .into_iter()
+                .flatten()
+                .any(|meta| meta.location.as_ref().ends_with(name.as_str()))
+        }
+    };
+    assert!(!in_store(&disk).await, "uploaded before the reads");
+    let wal_before = wal_file_count(&disk);
+    assert!(node.seal_and_checkpoint().await);
+    assert!(
+        wal_file_count(&disk) >= wal_before,
+        "a WAL file went before the upload"
+    );
+
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    while !in_store(&disk).await {
+        assert!(std::time::Instant::now() < give_up, "never uploaded");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut left = Vec::new();
+    pending_files(&segments.join("pending"), &mut left);
+    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    while !left.is_empty() {
+        assert!(
+            std::time::Instant::now() < give_up,
+            "{left:?} stayed in pending/"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        left.clear();
+        pending_files(&segments.join("pending"), &mut left);
+    }
+    assert!(node.seal_and_checkpoint().await);
+    assert_eq!(read_all(&node, "s", 1).await, vec![(id, b"kept".to_vec())]);
+    node.shutdown();
+
+    // From the store alone, it was recorded.
+    std::fs::remove_dir_all(disk.metadata_dir()).unwrap();
+    std::fs::remove_dir_all(disk.wal_dir()).unwrap();
+    std::fs::remove_dir_all(&segments).unwrap();
+    let (node, _) = disk.start(manual_config(1));
+    assert_eq!(read_all(&node, "s", 1).await, vec![(id, b"kept".to_vec())]);
+    node.shutdown();
+}

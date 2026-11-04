@@ -2353,7 +2353,7 @@ impl Core {
                 }
                 return;
             }
-            UploadEvent::Retrying { .. } => return,
+            UploadEvent::Retrying { .. } | UploadEvent::Restored { .. } => return,
         };
         let tag = UploadTag::of(&key);
         let Some((path, extents)) = uploaded else {

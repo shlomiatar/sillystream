@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use format::KeyHash;
 use futures::StreamExt;
-use futures::stream::FuturesOrdered;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::error::TrySendError;
@@ -91,6 +91,8 @@ pub enum UploadEvent {
         len_bytes: u64,
         extents: Arc<Vec<StreamExtent>>,
     },
+    /// A segment a former process left in `pending/` is in the store now (section 7.3).
+    Restored { path: Path },
     /// A seal with no records. Nothing was written.
     Empty { key: UploadKey },
     /// A PUT failed and will be retried. The references are still held.
@@ -399,6 +401,9 @@ struct Finished {
 
 type Put = Pin<Box<dyn Future<Output = Finished>>>;
 
+/// A former process's segment: its path, its size, and how its upload ended (`None`: stopped).
+type Restore = Pin<Box<dyn Future<Output = (Path, u64, Option<Result<(), String>>)>>>;
+
 struct Worker {
     config: UploaderConfig,
     putter: Arc<Putter>,
@@ -432,6 +437,24 @@ impl fmt::Display for PutError {
 impl Worker {
     async fn run(mut self, mut rx: Receiver<UploadCommand>) -> UploaderExit {
         let mut in_flight: FuturesOrdered<Put> = FuturesOrdered::new();
+        // What a former process left in `pending/`, uploaded beside the new seals and read
+        // locally until then (section 7.3).
+        let mut restoring: FuturesUnordered<Restore> = FuturesUnordered::new();
+        if let Some(cache) = &self.config.cache {
+            match cache.pending_segments() {
+                Ok(found) => {
+                    for (path, len_bytes) in found {
+                        let file = cache.pending_file(&path);
+                        let putter = Arc::clone(&self.putter);
+                        restoring.push(Box::pin(async move {
+                            let result = putter.upload_file(&path, &file).await;
+                            (path, len_bytes, result)
+                        }));
+                    }
+                }
+                Err(error) => eprintln!("listing pending/: {error}"),
+            }
+        }
         loop {
             let has_puts = !in_flight.is_empty();
             // With `pending/` full, seals wait here, and the channel fills behind them. What is
@@ -446,6 +469,12 @@ impl Worker {
             // This has to wait on the runtime, not block the thread: connections opened here
             // run on this runtime, and the store's other users share them (D260).
             let command = tokio::select! {
+                restored = restoring.next(), if !restoring.is_empty() => {
+                    if let Some((path, len_bytes, result)) = restored {
+                        self.restored(path, len_bytes, result);
+                    }
+                    continue;
+                },
                 finished = in_flight.next(), if has_puts => {
                     if let Some(finished) = finished {
                         self.finish(finished);
@@ -486,6 +515,20 @@ impl Worker {
     fn keep_unfinished(&mut self, command: UploadCommand) {
         if let UploadCommand::Handoff(handoff) = command {
             self.unfinished.push(UnfinishedUpload::of(handoff));
+        }
+    }
+
+    fn restored(&mut self, path: Path, len_bytes: u64, result: Option<Result<(), String>>) {
+        match result {
+            Some(Ok(())) => {
+                if let Some(cache) = &mut self.config.cache {
+                    let _ = cache.uploaded(&path, len_bytes);
+                }
+                self.emit(UploadEvent::Restored { path });
+            }
+            // It stays in `pending/`, and so do the WAL files with its records.
+            Some(Err(error)) => eprintln!("uploading {path} from pending/: {error}"),
+            None => {}
         }
     }
 
@@ -740,6 +783,31 @@ impl Putter {
                 }))
             })),
             _ = self.wait_for_stop() => None,
+        }
+    }
+
+    /// Uploads a file from `pending/`, retrying until it's in the store or stopped.
+    async fn upload_file(&self, path: &Path, file: &std::path::Path) -> Option<Result<(), String>> {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(error) => return Some(Err(format!("{}: {error}", file.display()))),
+        };
+        let mut backoff_ms = self.retry_initial_ms;
+        loop {
+            match self
+                .put_unless_stopped(path, std::slice::from_ref(&bytes))
+                .await?
+            {
+                Ok(()) => return Some(Ok(())),
+                Err(error @ (PutError::Collision | PutError::Permanent(_))) => {
+                    return Some(Err(error.to_string()));
+                }
+                Err(PutError::Retryable(_)) => {}
+            }
+            if !self.wait_unless_stopped(backoff_ms).await {
+                return None;
+            }
+            backoff_ms = backoff_ms.saturating_mul(2).min(self.retry_max_ms);
         }
     }
 

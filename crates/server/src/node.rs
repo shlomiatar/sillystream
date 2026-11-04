@@ -298,6 +298,10 @@ struct ControlMeta {
     /// Uploaded objects whose manifest isn't in an uploaded object yet, each with where that
     /// manifest's level 3 ack arrives (D180).
     unsaved_manifests: Vec<(Upload, mpsc::UnboundedReceiver<Reply>)>,
+    /// Objects a startup found only in `pending/`, each with its size and whether it needs a
+    /// manifest. Nothing records one until it is uploaded, and no WAL file goes until none is
+    /// left (section 6.3).
+    held_scans: HashMap<ObjectId, (Upload, u64, bool)>,
     gather_count: u64,
     next_waiters: Vec<CheckpointWaiter>,
     waiters_by_seal: BTreeMap<u64, Vec<CheckpointWaiter>>,
@@ -548,7 +552,11 @@ impl Control {
             gather,
             metas,
             uploads,
-            remove_seq: if clean { closed_seq } else { None },
+            remove_seq: if clean && meta.held_scans.is_empty() {
+                closed_seq
+            } else {
+                None
+            },
         });
     }
 
@@ -573,6 +581,21 @@ impl Control {
     }
 
     async fn on_upload_event(&mut self, event: UploadEvent) {
+        if let UploadEvent::Restored { path } = &event {
+            let held = ObjectId::of_path(path).and_then(|id| {
+                self.meta
+                    .as_mut()
+                    .and_then(|meta| meta.held_scans.remove(&id))
+            });
+            if let Some((upload, len_bytes, needs_manifest)) = held {
+                if needs_manifest {
+                    self.publish_manifest(upload, len_bytes);
+                } else if let Some(meta) = &mut self.meta {
+                    meta.objects.push(upload);
+                }
+            }
+            return;
+        }
         if let UploadEvent::Uploaded {
             path,
             len_bytes,
@@ -1184,6 +1207,7 @@ impl Node {
             }
             manifests = config.compaction.is_some();
             let mut known_objects = Vec::new();
+            let mut held_scans = HashMap::new();
             let state = if config.local_cache.is_some() {
                 ObjectState::Cached
             } else {
@@ -1195,7 +1219,12 @@ impl Node {
                     state,
                     last_ids: object.last_ids,
                 };
-                if manifests && object.needs_manifest {
+                if object.local {
+                    held_scans.insert(
+                        object.id,
+                        (upload, object.len_bytes, manifests && object.needs_manifest),
+                    );
+                } else if manifests && object.needs_manifest {
                     startup_manifests.push((upload, object.len_bytes));
                 } else {
                     known_objects.push(upload);
@@ -1262,6 +1291,7 @@ impl Node {
                 closed_seq_by_seal: HashMap::new(),
                 objects: known_objects,
                 unsaved_manifests: Vec::new(),
+                held_scans,
                 gather_count: 0,
                 next_waiters: Vec::new(),
                 waiters_by_seal: BTreeMap::new(),
