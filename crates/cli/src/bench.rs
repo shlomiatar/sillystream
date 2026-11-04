@@ -630,17 +630,16 @@ async fn throughput(args: &Args, bin: &Path) -> Result<(), String> {
                 let server = start_server(bin, cores)?;
                 run += 1;
                 let stream = format!("throughput.{run}");
-                let (acked, elapsed) =
-                    throughput_run(
-                        &server,
-                        ack,
-                        connection_count,
-                        data_bytes,
-                        seconds,
-                        &stream,
-                        stream_count,
-                    )
-                    .await?;
+                let (acked, elapsed) = throughput_run(
+                    &server,
+                    ack,
+                    connection_count,
+                    data_bytes,
+                    seconds,
+                    &stream,
+                    stream_count,
+                )
+                .await?;
                 let per_second = acked as f64 / elapsed;
                 println!(
                     "| {name} | {connection_count} | {data_bytes} | {per_second:.0} | {:.1} |",
