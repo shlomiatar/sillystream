@@ -776,3 +776,29 @@ The catch-up table's three byte-count columns read 0 in both builds, so that ben
 - **No regression:** every row of `ec123cf` is within 2.5% of `4bcf093`, in both layouts.
 - **No collapses:** none of the 96 runs fell below 160K at 1 KiB, so the laptop's drops were `F_FULLFSYNC` and other writers on that disk, not phases 5 to 7.
 - **The layout matters:** with 4 connections at 1 KiB, a WAL on its own disk gives about 1.9× the rate of a shared one, and at 64 KiB about 1.6–1.9×, in both builds.
+
+## Two producer machines, up to 4,096 connections, records to 200 KB
+
+`a8c83d1`, `us-east4-a`, 2026-11-04. Server `n2-standard-16` with 4 local NVMe SSDs, two `n2-standard-8` producers on internal addresses with TLS. `silly bench throughput --remote-url … --seconds 10 --streams 32 --levels 2` on both producers at once, each with its own stream prefix, a fresh server for each row, a 1 s seal window and `LocalFileSystem` objects on the data volume. One run per row. Disk rates are the mean of the 8 busiest seconds from `iostat`.
+
+**Raw sequential write, `fio`, 1 MiB direct:** one local SSD 379 MB/s, a RAID0 pair 728 MB/s.
+
+**Level 2 ack, MB/s of record data, both producers added up:**
+
+| connections in all | 1 KiB | 64 KiB | 200 KB | server CPU idle |
+|---|---|---|---|---|
+| WAL on one SSD, data on another | | | | |
+| 8 | 382 | 377 | 382 | 77–86% |
+| 128 | 375 | 387 | 378 | 72–79% |
+| 1,024 | 375 | 392 | 374 | 63–78% |
+| 4,096 | 378 | 387 | 374 | 45–77% |
+| WAL on a RAID0 pair, data on another | | | | |
+| 8 | 551 | 567 | 582 | 66–76% |
+| 128 | 524 | 548 | 584 | 63–78% |
+| 1,024 | 511 | 586 | 584 | 55–75% |
+| 4,096 | 485 | 577 | 576 | 38–70% |
+
+- **Disk bandwidth is the limit, not record size or connections:** on single SSDs both volumes wrote 365–430 MB/s through every row, the WAL's own SSD at its `fio` rate. 64 KiB and 200 KB records reach the same MB/s as 1 KiB.
+- **RAID0 pairs give about 1.5×,** not 2×. The WAL pair wrote 490–650 MB/s against 728 MB/s raw, and the cause of the gap wasn't isolated: fsync per batch, and the clients, which weren't profiled, are candidates.
+- **Connections cost CPU, not throughput:** 4,096 publishing connections at 1 KiB took server idle from about 77% to 38–45%, and 1 KiB lost about 10% on RAID0 at 4,096. Nothing failed and the server logged no errors.
+- **This bench writes the data volume twice:** the segment, then its copy into `LocalFileSystem`. With a real bucket the data volume takes one write per record.
