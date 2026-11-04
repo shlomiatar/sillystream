@@ -184,6 +184,7 @@ impl SegmentCache {
         let mut cache = SegmentCache {
             store: Arc::new(MappedSegments {
                 dir: root.join(CACHED_DIR),
+                pending: root.join(PENDING_DIR),
             }),
             writer: PendingWriter {
                 root: root.clone(),
@@ -325,6 +326,8 @@ pub async fn upload_pending(root: &FsPath, store: &dyn ObjectStore) -> Result<u6
 #[derive(Debug)]
 pub struct MappedSegments {
     dir: PathBuf,
+    /// Read too: a segment is readable here from its fsync, before it is uploaded (section 6.2).
+    pending: PathBuf,
 }
 
 impl fmt::Display for MappedSegments {
@@ -410,11 +413,24 @@ impl ObjectStore for MappedSegments {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let file = file_for(&self.dir, location);
+        let cached = file_for(&self.dir, location);
+        let pending = file_for(&self.pending, location);
         let location = location.clone();
-        tokio::task::spawn_blocking(move || read_mapped(&file, &location, &options))
-            .await
-            .map_err(|error| object_store::Error::JoinError { source: error })?
+        tokio::task::spawn_blocking(move || {
+            match read_mapped(&cached, &location, &options) {
+                Err(object_store::Error::NotFound { .. }) => {}
+                read => return read,
+            }
+            match read_mapped(&pending, &location, &options) {
+                // Renamed across since the first look.
+                Err(object_store::Error::NotFound { .. }) => {
+                    read_mapped(&cached, &location, &options)
+                }
+                read => read,
+            }
+        })
+        .await
+        .map_err(|error| object_store::Error::JoinError { source: error })?
     }
 
     async fn put_opts(

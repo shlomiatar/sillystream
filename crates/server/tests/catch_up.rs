@@ -601,3 +601,50 @@ async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
     drop((connection, client));
     harness.finish();
 }
+
+/// A seal's records leave memory once its file is fsynced locally, and are read from that file
+/// while the PUT is held. Level 3 still waits for the store (section 6.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn records_leave_memory_at_the_local_write_and_level_3_waits_for_the_store() {
+    let cache = tempfile::tempdir().unwrap();
+    let harness = Harness::new(cached_config(1, cache.path()));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    harness.store.hold();
+    let records = record_with(1, b"local");
+    client
+        .publish(publish(STREAM, &records, 1, 3))
+        .await
+        .unwrap();
+    {
+        let seal = node.seal();
+        tokio::pin!(seal);
+        tokio::select! {
+            outcome = &mut seal => panic!("the PUT is held: {outcome:?}"),
+            () = wait_for_memory_to_empty(node, STREAM) => {}
+        }
+        tokio::select! {
+            ack = expect_ack(&mut client) => panic!("level 3 before the upload: {ack:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(QUIET_MS)) => {}
+        }
+
+        let mut connection = node.connection(0).await.unwrap();
+        let mut heard = Heard::default();
+        connection.subscribe(Subscription::new(1, key(STREAM), 0));
+        hear_until(&mut connection, &mut heard, |heard| {
+            heard.records(1).len() == 1
+        })
+        .await;
+        let stats = node.stats(0).await.unwrap();
+        assert!(stats.catch_up_local_bytes > 0, "{stats:?}");
+        assert_eq!(stats.catch_up_object_bytes, 0, "{stats:?}");
+
+        harness.store.release();
+        assert!(matches!(seal.await, SealOutcome::Uploaded { .. }));
+        expect_ack(&mut client).await;
+        drop(connection);
+    }
+    drop(client);
+    harness.finish();
+}

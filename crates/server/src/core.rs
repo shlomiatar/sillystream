@@ -166,12 +166,24 @@ pub(crate) enum UploadTag {
     Dedicated(u64),
 }
 
+impl UploadTag {
+    fn of(key: &UploadKey) -> UploadTag {
+        match key {
+            UploadKey::Seal(seal) => UploadTag::Seal(*seal),
+            UploadKey::Dedicated { number, .. } => UploadTag::Dedicated(*number),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchUpload {
     Unsealed,
     Pending(UploadTag),
     /// In the store, so level 3 can ack. Stays readable here until the owner knows.
     Done(UploadTag),
+    /// Fsynced locally and listed, not yet in the store: readable from the local file, and its
+    /// level 3 acks wait in the core for the upload (section 6.2).
+    Written(UploadTag),
     /// The owner has the extent, so nothing needs this copy (D83).
     Noted,
 }
@@ -198,6 +210,9 @@ struct StreamLog {
     batches: VecDeque<Batch>,
     first_unsealed: usize,
     dirty: bool,
+    /// Objects whose batches went at their local write and that aren't uploaded yet, with the
+    /// last id each covers here, so a level 3 ack still waits for them.
+    unuploaded: VecDeque<(UploadTag, u64)>,
 }
 
 impl StreamLog {
@@ -252,25 +267,45 @@ impl StreamLog {
                 for waiter in batch.waiters.drain(..) {
                     waiter.fire();
                 }
-            }
-        }
-    }
-
-    /// The owner has the extents, so a read can't miss these. The core's references go.
-    fn note(&mut self, tag: UploadTag) {
-        for batch in self.batches.iter_mut().take(self.first_unsealed) {
-            if batch.upload == BatchUpload::Done(tag) {
+            } else if batch.upload == BatchUpload::Written(tag) {
                 batch.upload = BatchUpload::Noted;
             }
         }
-        while self
-            .batches
-            .front()
-            .is_some_and(|batch| batch.upload == BatchUpload::Noted)
-        {
+        self.unuploaded.retain(|(known, _)| *known != tag);
+    }
+
+    /// The owner has the object listed, so a read can't miss these. The core's references go,
+    /// and the level 3 acks of any not uploaded yet come back to wait in the core.
+    fn note(&mut self, tag: UploadTag) -> Vec<Waiter> {
+        let mut waiting = Vec::new();
+        let mut last_written = None;
+        for batch in self.batches.iter_mut().take(self.first_unsealed) {
+            if batch.upload == BatchUpload::Done(tag) {
+                batch.upload = BatchUpload::Noted;
+            } else if batch.upload == BatchUpload::Pending(tag) {
+                batch.upload = BatchUpload::Written(tag);
+                waiting.append(&mut batch.waiters);
+                last_written = Some(batch.last_id);
+            }
+        }
+        if let Some(last_id) = last_written {
+            self.unuploaded.push_back((tag, last_id));
+        }
+        while self.batches.front().is_some_and(|batch| {
+            matches!(batch.upload, BatchUpload::Noted | BatchUpload::Written(_))
+        }) {
             self.batches.pop_front();
             self.first_unsealed -= 1;
         }
+        waiting
+    }
+
+    /// The object not uploaded yet that holds `id`, if its batches have gone.
+    fn unuploaded_holding(&self, id: u64) -> Option<UploadTag> {
+        self.unuploaded
+            .iter()
+            .find(|(_, last_id)| *last_id >= id)
+            .map(|(tag, _)| *tag)
     }
 }
 
@@ -432,6 +467,10 @@ pub(crate) struct Core {
     durable_waiters: VecDeque<(u64, Waiter)>,
 
     in_flight: HashMap<UploadTag, Vec<KeyHash>>,
+    /// Uploads whose objects were listed at their local write.
+    written: HashSet<UploadTag>,
+    /// Level 3 acks for records already let go here, until their object is uploaded.
+    upload_waiters: HashMap<UploadTag, Vec<Waiter>>,
     unsealed_bytes: u64,
 
     upload_failed_count: u64,
@@ -537,6 +576,8 @@ impl Core {
             wal_sent_owed: 0,
             durable_waiters: VecDeque::new(),
             in_flight: HashMap::new(),
+            written: HashSet::new(),
+            upload_waiters: HashMap::new(),
             unsealed_bytes: 0,
             upload_failed_count: 0,
             duplicate_count: 0,
@@ -2150,12 +2191,14 @@ impl Core {
     }
 
     fn note_batches(&mut self, name: KeyHash, tag: UploadTag) {
-        if let Some(log) = self.logs.get_mut(&name) {
-            log.note(tag);
-            if log.batches.is_empty() && !self.streams.contains_key(&name) {
-                self.logs.remove(&name);
-            }
+        let Some(log) = self.logs.get_mut(&name) else {
+            return;
+        };
+        let waiting = log.note(tag);
+        if !waiting.is_empty() {
+            self.upload_waiters.entry(tag).or_default().extend(waiting);
         }
+        self.drop_idle_log(name);
     }
 
     /// A duplicate is acked once what it duplicates has reached the level asked for. The
@@ -2215,9 +2258,16 @@ impl Core {
             let at = log.find(last_id)?;
             log.batches.get_mut(at)
         });
-        // No longer held means uploaded.
+        // No longer held means uploaded, or written locally and on its way.
         let Some(batch) = batch else {
-            waiter.fire();
+            let tag = self
+                .logs
+                .get(&name)
+                .and_then(|log| log.unuploaded_holding(last_id));
+            match tag {
+                Some(tag) if level >= 3 => self.upload_waiters.entry(tag).or_default().push(waiter),
+                _ => waiter.fire(),
+            }
             return;
         };
         if level == 2 {
@@ -2233,6 +2283,8 @@ impl Core {
             }
         } else if matches!(batch.upload, BatchUpload::Done(_) | BatchUpload::Noted) {
             waiter.fire();
+        } else if let BatchUpload::Written(tag) = batch.upload {
+            self.upload_waiters.entry(tag).or_default().push(waiter);
         } else if wal_stopped && batch.upload == BatchUpload::Unsealed {
             waiter.fail_wal_stopped();
         } else {
@@ -2283,6 +2335,14 @@ impl Core {
                 self.on_sealed(key, &tickets);
                 return;
             }
+            UploadEvent::Written { key, path, extents } => {
+                let tag = UploadTag::of(&key);
+                if let Some(names) = self.in_flight.get(&tag).cloned() {
+                    self.written.insert(tag);
+                    self.note_extents(tag, &names, &path, &extents);
+                }
+                return;
+            }
             UploadEvent::Uploaded {
                 key, path, extents, ..
             } => (key, Some((path, extents))),
@@ -2295,10 +2355,7 @@ impl Core {
             }
             UploadEvent::Retrying { .. } => return,
         };
-        let tag = match key {
-            UploadKey::Seal(seal) => UploadTag::Seal(seal),
-            UploadKey::Dedicated { number, .. } => UploadTag::Dedicated(number),
-        };
+        let tag = UploadTag::of(&key);
         let Some((path, extents)) = uploaded else {
             // The uploader keeps the references and level 3 stays unacked, since the
             // records aren't in the store (D55).
@@ -2315,7 +2372,28 @@ impl Core {
                 log.complete(tag);
             }
         }
-        self.note_extents(tag, &names, &path, &extents);
+        for waiter in self.upload_waiters.remove(&tag).unwrap_or_default() {
+            waiter.fire();
+        }
+        if self.written.remove(&tag) {
+            // Listed at the local write already. A log only an upload kept can go now.
+            for name in &names {
+                self.drop_idle_log(*name);
+            }
+        } else {
+            self.note_extents(tag, &names, &path, &extents);
+        }
+    }
+
+    fn drop_idle_log(&mut self, name: KeyHash) {
+        if self
+            .logs
+            .get(&name)
+            .is_some_and(|log| log.batches.is_empty() && log.unuploaded.is_empty())
+            && !self.streams.contains_key(&name)
+        {
+            self.logs.remove(&name);
+        }
     }
 
     fn on_control(&mut self, message: ControlMsg) {

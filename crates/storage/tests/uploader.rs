@@ -100,11 +100,11 @@ fn dedicated(stream: &str, number: u64, records: Vec<Bytes>) -> Handoff {
     }
 }
 
-/// The next event that isn't `Sealed`.
+/// The next event that isn't `Sealed` or `Written`.
 async fn next_event(events: &mut UnboundedReceiver<UploadEvent>) -> Option<UploadEvent> {
     loop {
         match events.recv().await {
-            Some(UploadEvent::Sealed { .. }) => {}
+            Some(UploadEvent::Sealed { .. } | UploadEvent::Written { .. }) => {}
             other => return other,
         }
     }
@@ -119,7 +119,9 @@ async fn next_uploaded(events: &mut UnboundedReceiver<UploadEvent>) -> (UploadKe
                 len_bytes,
                 ..
             } => return (key, path, len_bytes),
-            UploadEvent::Retrying { .. } | UploadEvent::Sealed { .. } => {}
+            UploadEvent::Retrying { .. }
+            | UploadEvent::Sealed { .. }
+            | UploadEvent::Written { .. } => {}
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -258,6 +260,7 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() 
 fn key_of(event: &UploadEvent) -> &UploadKey {
     match event {
         UploadEvent::Sealed { key, .. }
+        | UploadEvent::Written { key, .. }
         | UploadEvent::Uploaded { key, .. }
         | UploadEvent::Empty { key }
         | UploadEvent::Retrying { key, .. }

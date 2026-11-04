@@ -76,6 +76,14 @@ pub enum UploadEvent {
         key: UploadKey,
         tickets: Arc<Vec<u64>>,
     },
+    /// The object is fsynced in the local segment directory and readable there, so the cores
+    /// can let their references go (section 6.2). Only with a local directory, and before
+    /// `Uploaded`.
+    Written {
+        key: UploadKey,
+        path: Path,
+        extents: Arc<Vec<StreamExtent>>,
+    },
     /// The object is in the store. The extents are what level 3 acks and reads need.
     Uploaded {
         key: UploadKey,
@@ -609,7 +617,17 @@ impl Putter {
         // The references have done their job once it is a file, and the PUT reads that.
         let parts = match &self.local {
             Some(local) => match self.write_pending(key, local, &path, parts).await {
-                Some(file) => vec![file],
+                Some(file) => {
+                    let written = UploadEvent::Written {
+                        key: key.clone(),
+                        path: path.clone(),
+                        extents: Arc::new(extents.clone()),
+                    };
+                    for events in &self.events {
+                        let _ = events.send(written.clone());
+                    }
+                    vec![file]
+                }
                 None => return PutEnd::Stopped,
             },
             None => parts,
