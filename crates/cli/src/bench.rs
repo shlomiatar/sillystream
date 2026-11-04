@@ -550,15 +550,14 @@ async fn throughput_run(
 ) -> Result<(u64, f64), String> {
     let body = Arc::new(record(data_bytes)?);
     let acked = Arc::new(AtomicU64::new(0));
-    let deadline = Instant::now() + Duration::from_secs(seconds);
-    let started = Instant::now();
-    let mut tasks = Vec::new();
     // Up to 8 MiB in flight on each of a few connections, and 256 MiB in all past 32.
     let inflight_bytes = (256 * 1024 * 1024 / connection_count as usize)
         .clamp(data_bytes * 4, (8 * 1024 * 1024).max(data_bytes * 16));
+    // Connected first, so that with thousands of connections the setup isn't timed.
+    let mut publishers = Vec::new();
     for at in 0..connection_count {
         let client = server.client().await?;
-        let mut publisher = client
+        let publisher = client
             .publisher(
                 &stream_name(&format!("{stream}.{}", at % stream_count)),
                 PublisherConfig {
@@ -568,6 +567,12 @@ async fn throughput_run(
                 },
             )
             .map_err(|error| error.to_string())?;
+        publishers.push((client, publisher));
+    }
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let started = Instant::now();
+    let mut tasks = Vec::new();
+    for (client, mut publisher) in publishers {
         let body = Arc::clone(&body);
         let acked = Arc::clone(&acked);
         tasks.push(tokio::spawn(async move {
