@@ -17,9 +17,10 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    CheckpointSet, DirVolume, DurableWatch, MetadataStore, SealExtent, SegmentCache, StreamExtent,
-    UploadEvent, UploadKey, UploadSealer, Uploader, UploaderConfig, WalConfig, WalError, WalHandle,
-    WalSendError, WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
+    CheckpointSet, DirVolume, DurableWatch, MetadataStore, NewerObjects, ObjectId, ObjectState,
+    ObjectTable, Ownership, SealExtent, SegmentCache, StreamExtent, UploadEvent, UploadKey,
+    UploadSealer, Uploader, UploaderConfig, WalConfig, WalError, WalHandle, WalSendError,
+    WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -36,8 +37,9 @@ use crate::message::{
     StateChange, StateOpMsg, StreamConfig, StreamConfigPatch, StreamInfo, WriteMsg,
 };
 use crate::metadata::{
-    CheckpointDone, CheckpointJob, Checkpointer, LocalMeta, run_checkpointer, run_loader,
+    CheckpointDone, CheckpointJob, Checkpointer, LocalMeta, Upload, run_checkpointer, run_loader,
 };
+use crate::pages::{PAGE_CACHE_BYTES, PageCache};
 use crate::placement::{ShardMove, plan_moves, shard_of};
 use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, ScannedObject, prepare};
 use crate::sink::{SinkConfig, SinkNote, SinkPool};
@@ -280,7 +282,7 @@ struct Control {
     /// Whether objects get a manifest.
     manifests: bool,
     /// Objects a startup found that need one.
-    startup_manifests: Vec<(String, u64)>,
+    startup_manifests: Vec<(Upload, u64)>,
 }
 
 /// Who waits for a checkpoint, and what each is told if none can come.
@@ -291,11 +293,11 @@ struct ControlMeta {
     jobs: mpsc::UnboundedSender<CheckpointJob>,
     /// The WAL file each seal closed.
     closed_seq_by_seal: HashMap<u64, u64>,
-    /// Objects no checkpoint has listed yet, which wait for their extents to reach a gather.
-    objects: Vec<String>,
+    /// Uploads no checkpoint has recorded yet, which wait for their records to reach a gather.
+    objects: Vec<Upload>,
     /// Uploaded objects whose manifest isn't in an uploaded object yet, each with where that
     /// manifest's level 3 ack arrives (D180).
-    unsaved_manifests: Vec<(String, mpsc::UnboundedReceiver<Reply>)>,
+    unsaved_manifests: Vec<(Upload, mpsc::UnboundedReceiver<Reply>)>,
     gather_count: u64,
     next_waiters: Vec<CheckpointWaiter>,
     waiters_by_seal: BTreeMap<u64, Vec<CheckpointWaiter>>,
@@ -313,8 +315,8 @@ impl Control {
         };
         let mut next_seal = after(self.config.seal_window_ms);
         let mut next_rebalance = after(self.config.rebalance_period_ms);
-        for (path, len_bytes) in std::mem::take(&mut self.startup_manifests) {
-            self.publish_manifest(path, len_bytes);
+        for (upload, len_bytes) in std::mem::take(&mut self.startup_manifests) {
+            self.publish_manifest(upload, len_bytes);
         }
         loop {
             tokio::select! {
@@ -527,16 +529,16 @@ impl Control {
             unsaved_manifests,
             ..
         } = &mut *meta;
-        unsaved_manifests.retain_mut(|(path, answer)| match answer.try_recv() {
+        unsaved_manifests.retain_mut(|(upload, answer)| match answer.try_recv() {
             Ok(Reply::Ack { .. }) => {
-                objects.push(std::mem::take(path));
+                objects.push(upload.clone());
                 false
             }
             Err(mpsc::error::TryRecvError::Empty) => true,
             // The next startup looks at this object again.
             Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => false,
         });
-        let objects = if clean {
+        let uploads = if clean {
             std::mem::take(&mut meta.objects)
         } else {
             Vec::new()
@@ -545,7 +547,7 @@ impl Control {
             seal,
             gather,
             metas,
-            objects,
+            uploads,
             remove_seq: if clean { closed_seq } else { None },
         });
     }
@@ -583,10 +585,27 @@ impl Control {
             let others = extents
                 .iter()
                 .any(|extent| extent.stream != self.config.keys.manifest);
-            if self.manifests && others {
-                self.publish_manifest(path.to_string(), *len_bytes);
-            } else if let Some(meta) = &mut self.meta {
-                meta.objects.push(path.to_string());
+            if let Some(id) = ObjectId::of_path(path) {
+                let mut last_ids: Vec<(KeyHash, u64)> = extents
+                    .iter()
+                    .map(|extent| (extent.stream, extent.id_last))
+                    .collect();
+                last_ids.sort_unstable();
+                let state = if self.config.local_cache.is_some() {
+                    ObjectState::Cached
+                } else {
+                    ObjectState::Remote
+                };
+                let upload = Upload {
+                    id,
+                    state,
+                    last_ids,
+                };
+                if self.manifests && others {
+                    self.publish_manifest(upload, *len_bytes);
+                } else if let Some(meta) = &mut self.meta {
+                    meta.objects.push(upload);
+                }
             }
         }
         let (seal, outcome) = match event {
@@ -633,15 +652,16 @@ impl Control {
     /// checkpoint record the object: a startup looks at any object no checkpoint records and
     /// publishes again, so a crash or a lost WAL can't leave an object the compactor will never
     /// hear of (section 7.5, D180).
-    fn publish_manifest(&mut self, path: String, len_bytes: u64) {
+    fn publish_manifest(&mut self, upload: Upload, len_bytes: u64) {
         storage::crash_point("manifest.before_publish");
         let (reply, answer) = mpsc::unbounded_channel();
         let shard = shard_of(self.config.keys.manifest, self.config.virtual_shard_count);
         let core = self.location[shard as usize] as usize;
-        let doc = format::encode_manifest_doc(len_bytes, &path);
+        let path = storage::sealed_path(upload.id);
+        let doc = format::encode_manifest_doc(len_bytes, path.as_ref());
         let _ = self.links.control[core].send(ControlMsg::PublishManifest { doc, reply });
         if let Some(meta) = &mut self.meta {
-            meta.unsaved_manifests.push((path, answer));
+            meta.unsaved_manifests.push((upload, answer));
         }
     }
 
@@ -847,6 +867,7 @@ struct RecoveredParts {
     closed_seqs: Vec<u64>,
     restored: Vec<RestoredStream>,
     scanned_objects: Vec<ScannedObject>,
+    newer: NewerObjects,
     last_object_ms: u64,
 }
 
@@ -947,6 +968,7 @@ impl Node {
                 closed_seqs: prepared.closed_seqs,
                 restored: prepared.restored,
                 scanned_objects: prepared.scanned_objects,
+                newer: prepared.newer,
                 last_object_ms: prepared.last_object_ms,
             }),
         )?;
@@ -972,12 +994,23 @@ impl Node {
             }
             None => None,
         };
+        // The table a startup read: what the checkpoints record (section 7.6).
+        let mut table = ObjectTable::new();
+        if let Some(parts) = &recovered {
+            table.load(parts.checkpoints.rows().into_values());
+        }
+        let objects = Arc::new(std::sync::RwLock::new(table));
         let stores = Stores {
             local: cache.as_ref().map(|cache| {
                 let store: Arc<dyn ObjectStore> = cache.store();
                 store
             }),
             object: Arc::clone(&store),
+            pages: Arc::new(PageCache::new(PAGE_CACHE_BYTES)),
+            ownership: Arc::new(recovered.as_ref().map_or_else(Ownership::default, |parts| {
+                parts.checkpoints.ownership.clone()
+            })),
+            objects: Arc::clone(&objects),
         };
         let (notify, durable): (DurableWatch, _) = durable_watches(core_count);
         let mut upload_txs = Vec::with_capacity(core_count + 1);
@@ -1151,11 +1184,21 @@ impl Node {
             }
             manifests = config.compaction.is_some();
             let mut known_objects = Vec::new();
+            let state = if config.local_cache.is_some() {
+                ObjectState::Cached
+            } else {
+                ObjectState::Remote
+            };
             for object in parts.scanned_objects {
+                let upload = Upload {
+                    id: object.id,
+                    state,
+                    last_ids: object.last_ids,
+                };
                 if manifests && object.needs_manifest {
-                    startup_manifests.push((object.path, object.len_bytes));
+                    startup_manifests.push((upload, object.len_bytes));
                 } else {
-                    known_objects.push(object.path);
+                    known_objects.push(upload);
                 }
             }
             if let Some(compaction) = &config.compaction {
@@ -1172,13 +1215,7 @@ impl Node {
                     window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
                     has_seal_window: config.seal_window_ms.is_some(),
                     to_control: to_control.clone(),
-                    noted: std::sync::Mutex::new(
-                        parts
-                            .checkpoints
-                            .recorded_objects()
-                            .map(str::to_owned)
-                            .collect(),
-                    ),
+                    objects: Arc::clone(&objects),
                 });
             }
             let (jobs, job_rx) = mpsc::unbounded_channel();
@@ -1192,6 +1229,9 @@ impl Node {
                 loader: loader_tx,
                 stop: Arc::clone(&meta_stop),
                 sink_streams: known_sink_streams,
+                objects: Arc::clone(&objects),
+                newer: parts.newer.clone(),
+                clock: Arc::clone(&clock),
             };
             let saved = to_control.clone();
             meta_threads.push(
@@ -1209,12 +1249,12 @@ impl Node {
                 links.control.clone(),
                 Arc::clone(&meta_stop),
             );
-            let checkpoints = parts.checkpoints;
+            let (checkpoints, newer) = (parts.checkpoints, parts.newer);
             meta_threads.push(
                 std::thread::Builder::new()
                     .name("meta-loader".to_owned())
                     .spawn(move || {
-                        run_loader(loader_rx, local, store, checkpoints, control, stop);
+                        run_loader(loader_rx, local, store, checkpoints, newer, control, stop);
                     })?,
             );
             meta = Some(ControlMeta {

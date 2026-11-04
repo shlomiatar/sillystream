@@ -374,8 +374,13 @@ impl TopIndex {
     /// The page that holds `hash`, if any. All entries with one hash are in one page,
     /// which is what keeps a lookup at one page read (D52).
     pub(crate) fn page_for(&self, hash: u64) -> Option<TopEntry> {
+        self.page_number_for(hash).map(|index| self.pages[index])
+    }
+
+    /// Which page would hold `hash`, counting from 0.
+    pub fn page_number_for(&self, hash: u64) -> Option<usize> {
         let after = self.pages.partition_point(|page| page.first_hash <= hash);
-        after.checked_sub(1).map(|index| self.pages[index])
+        after.checked_sub(1)
     }
 
     pub(crate) fn pages(&self) -> &[TopEntry] {

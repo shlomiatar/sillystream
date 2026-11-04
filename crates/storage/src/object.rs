@@ -174,7 +174,83 @@ pub fn parse_store_config(
     }))
 }
 
-const HOUR_MS: u64 = 3_600_000;
+pub const HOUR_MS: u64 = 3_600_000;
+const DAY_MS: u64 = 24 * HOUR_MS;
+
+/// The classes that are compacted. `1d` isn't one: it is served from `sealed/` (section 7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RetentionClass {
+    Days7,
+    Days30,
+    Days365,
+}
+
+impl RetentionClass {
+    pub const ALL: [RetentionClass; 3] = [
+        RetentionClass::Days7,
+        RetentionClass::Days30,
+        RetentionClass::Days365,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RetentionClass::Days7 => "7d",
+            RetentionClass::Days30 => "30d",
+            RetentionClass::Days365 => "365d",
+        }
+    }
+
+    /// Where its compacted objects go (section 7.3).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            RetentionClass::Days7 => "compacted/7d",
+            RetentionClass::Days30 => "compacted/30d",
+            RetentionClass::Days365 => "compacted/365d",
+        }
+    }
+
+    pub fn length_ms(self) -> u64 {
+        match self {
+            RetentionClass::Days7 => 7 * DAY_MS,
+            RetentionClass::Days30 => 30 * DAY_MS,
+            RetentionClass::Days365 => 365 * DAY_MS,
+        }
+    }
+
+    /// The named cursor of this class's worker. Clients can't use these names.
+    pub fn cursor_name(self) -> String {
+        format!("compact:{}", self.name())
+    }
+
+    /// Its code in an object table row: 1 to 3, with 0 for sealed objects.
+    pub fn code(self) -> u8 {
+        self as u8 + 1
+    }
+
+    pub fn of_code(code: u8) -> Option<RetentionClass> {
+        RetentionClass::ALL
+            .get(usize::from(code).checked_sub(1)?)
+            .copied()
+    }
+
+    /// Its bit in a row's mask of the classes an object holds.
+    pub fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+
+    /// `None` for what stays in `sealed/`.
+    pub fn of_retention(retention_ms: u64) -> Option<RetentionClass> {
+        if retention_ms <= DAY_MS {
+            None
+        } else if retention_ms <= 7 * DAY_MS {
+            Some(RetentionClass::Days7)
+        } else if retention_ms <= 30 * DAY_MS {
+            Some(RetentionClass::Days30)
+        } else {
+            Some(RetentionClass::Days365)
+        }
+    }
+}
 
 /// 2026-01-01T00:00:00Z, where an object id's time starts (section 7.3).
 pub const OBJECT_EPOCH_MS: u64 = 1_767_225_600_000;
@@ -233,6 +309,11 @@ impl ObjectId {
         ObjectId::new((hour + 1) * HOUR_MS - 1, generation, index)
     }
 
+    /// Whether it is a compacted object's: only those take an hour's last ms.
+    pub fn is_compacted(self) -> bool {
+        self.time_ms() % HOUR_MS == HOUR_MS - 1
+    }
+
     /// The id in a path this module made.
     pub fn of_path(path: &Path) -> Option<ObjectId> {
         let name = path.filename()?.strip_suffix(".seg")?;
@@ -240,6 +321,16 @@ impl ObjectId {
             return None;
         }
         u64::from_str_radix(name, 16).ok().map(ObjectId)
+    }
+}
+
+/// The time a sealed object takes for `time_ms`: the next ms when it is an hour's last, which
+/// only compacted objects take (section 7.3).
+pub fn sealed_time_ms(time_ms: u64) -> u64 {
+    if time_ms % HOUR_MS == HOUR_MS - 1 {
+        time_ms + 1
+    } else {
+        time_ms
     }
 }
 

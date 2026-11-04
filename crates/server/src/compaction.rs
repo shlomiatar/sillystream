@@ -3,13 +3,13 @@
 //!
 //! Workers read segments and write segments, and copy records without opening them: only the
 //! manifests themselves, which are system records, are ever read. A worker changes what readers
-//! see only through a stream's owner core, one message per extent, so a reader finds either the
-//! old extents or the new one and goes by id either way. The old objects stay until their hour
-//! expires. A cursor moves only once a checkpoint holds the new extents, so a crash at any point
-//! redoes work, and what it left behind is an object nothing refers to.
+//! see only through object table rows, saying which compacted object replaces each source for
+//! its class and a range of stream hashes. It changes no stream's metadata (section 7.5). The old
+//! objects stay until their hour expires. A cursor moves only once a checkpoint holds the rows,
+//! so a crash at any point redoes work, and what it left behind is an object nothing refers to.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -18,8 +18,9 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    Ownership, SEALED_PREFIX, SegmentBuilder, SegmentError, SegmentReader, StreamExtent,
-    list_hour_objects, list_hours, object_generation, object_hour, put_compacted, read_ownership,
+    ObjectId, ObjectKey, ObjectState, ObjectTable, Ownership, Replacement, SEALED_PREFIX,
+    SegmentBuilder, SegmentError, SegmentReader, StreamExtent, list_hour_objects, list_hours,
+    object_generation, object_hour, put_compacted, read_ownership, stream_hash,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -27,9 +28,8 @@ use tokio::time::Instant;
 use crate::clock::Clock;
 use crate::connection::{Connection, Event, Subscription};
 use crate::core::Links;
-use crate::delivery::ReplaceResult;
 use crate::keys::Keys;
-use crate::message::{CompactSource, CompactView, ControlMsg, CursorOp};
+use crate::message::{ControlMsg, CursorOp};
 use crate::node::{NodeMsg, sleep_until_some};
 use crate::placement::shard_of;
 use crate::recovery::accepted_prefix;
@@ -41,70 +41,10 @@ pub const SEALED_EXPIRY_MS: u64 = 2 * DAY_MS;
 /// What a class's prefix keeps past its length. A prefix is named for its highest id's hour
 /// (D175), so nothing needs this today; it is a margin for a clock that steps back.
 pub const CLASS_GRACE_MS: u64 = HOUR_MS;
-/// How long a worker waits for an owner to hear of an object it was told of.
-const NOT_READY_RETRY_MS: u64 = 20;
-const NOT_READY_RETRY_COUNT: u32 = 100;
 /// How long a read of the manifest stream waits with nothing arriving.
 const LOG_QUIET_MS: u64 = 5_000;
 
-/// The classes that are compacted. `1d` isn't one: it is served from `sealed/` (section 7.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RetentionClass {
-    Days7,
-    Days30,
-    Days365,
-}
-
-impl RetentionClass {
-    pub const ALL: [RetentionClass; 3] = [
-        RetentionClass::Days7,
-        RetentionClass::Days30,
-        RetentionClass::Days365,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            RetentionClass::Days7 => "7d",
-            RetentionClass::Days30 => "30d",
-            RetentionClass::Days365 => "365d",
-        }
-    }
-
-    /// Where its compacted objects go (section 7.3).
-    pub fn prefix(self) -> &'static str {
-        match self {
-            RetentionClass::Days7 => "compacted/7d",
-            RetentionClass::Days30 => "compacted/30d",
-            RetentionClass::Days365 => "compacted/365d",
-        }
-    }
-
-    pub fn length_ms(self) -> u64 {
-        match self {
-            RetentionClass::Days7 => 7 * DAY_MS,
-            RetentionClass::Days30 => 30 * DAY_MS,
-            RetentionClass::Days365 => 365 * DAY_MS,
-        }
-    }
-
-    /// The named cursor of this class's worker. Clients can't use these names.
-    pub fn cursor_name(self) -> String {
-        format!("compact:{}", self.name())
-    }
-
-    /// `None` for what stays in `sealed/`.
-    pub fn of_retention(retention_ms: u64) -> Option<RetentionClass> {
-        if retention_ms <= DAY_MS {
-            None
-        } else if retention_ms <= 7 * DAY_MS {
-            Some(RetentionClass::Days7)
-        } else if retention_ms <= 30 * DAY_MS {
-            Some(RetentionClass::Days30)
-        } else {
-            Some(RetentionClass::Days365)
-        }
-    }
-}
+pub use storage::RetentionClass;
 
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -134,9 +74,9 @@ impl Default for CompactionConfig {
 /// What a run of the workers did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactReport {
-    /// Objects written, each referred to by at least one extent unless a crash intervened.
+    /// Objects written, each referred to by at least one row unless a crash intervened.
     pub outputs: Vec<Path>,
-    /// Extents readers now find in those objects.
+    /// Source rows that now lead to those objects.
     pub replaced_count: u64,
     /// Where each worker that ran has got to.
     pub cursors: Vec<(RetentionClass, u64)>,
@@ -200,19 +140,21 @@ impl ManifestLog {
     }
 }
 
+/// One stream's region in one source object.
 struct Source {
-    path: Path,
+    object: ObjectId,
     extent: StreamExtent,
-    next_id_first: Option<u64>,
     /// How far a former generation's object is accepted (D17).
     limit: Option<u64>,
 }
 
-/// One output's worth of work.
+/// One output's worth of work: the objects of one hour, after the cursor.
 #[derive(Default)]
 struct Batch {
-    /// Sorted by stream, so the output is (section 7.5). `(sources, merge_below)`.
-    streams: BTreeMap<KeyHash, (Vec<Source>, u64)>,
+    /// Sorted by stream, so the output is (section 7.5), each stream's sources in list order.
+    streams: BTreeMap<KeyHash, Vec<Source>>,
+    /// Each source object, with the longer classes it holds streams of (section 7.4).
+    objects: BTreeMap<ObjectId, u8>,
     bytes: u64,
     /// The last manifest it covers.
     through: Option<u64>,
@@ -227,15 +169,7 @@ enum Planned {
     Nothing,
     /// There is something, and it isn't time yet.
     Wait,
-    /// An owner hasn't heard of an object yet.
-    NotReady,
     Ready(Batch),
-}
-
-struct Run {
-    stream: KeyHash,
-    sources: Vec<(Path, u64, u64)>,
-    first_id: u64,
 }
 
 /// Runs on its own thread, and reaches everything through messages and the store.
@@ -252,10 +186,8 @@ pub(crate) struct Compactor {
     pub window_bytes: u64,
     pub has_seal_window: bool,
     pub to_control: mpsc::UnboundedSender<NodeMsg>,
-    /// Objects every owner has heard of: those a checkpoint recorded before this start, and
-    /// those this job has dropped. A footer range no stream lists means they dropped it, where
-    /// for another object it can mean the owner's report is still on its way.
-    pub noted: Mutex<HashSet<String>>,
+    /// The node's object table, which this adds rows to and removes them from.
+    pub objects: Arc<RwLock<ObjectTable>>,
 }
 
 fn is_not_found(error: &SegmentError) -> bool {
@@ -277,6 +209,37 @@ enum FooterRead {
     /// The object isn't there.
     Missing,
     Corrupt(String),
+}
+
+fn write_table(table: &RwLock<ObjectTable>) -> std::sync::RwLockWriteGuard<'_, ObjectTable> {
+    table
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The hash ranges a source object's rows say an output replaces: its streams of the class in
+/// hash order, broken at any it holds that the output doesn't.
+fn hash_ranges(copied: &[u64], left_out: &[u64]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut open: Option<(u64, u64)> = None;
+    let mut left = left_out.iter().peekable();
+    for hash in copied {
+        let broken = open.is_some_and(|(_, last)| {
+            while left.peek().is_some_and(|out| **out <= last) {
+                left.next();
+            }
+            left.peek().is_some_and(|out| **out < *hash)
+        });
+        match &mut open {
+            Some(range) if !broken => range.1 = *hash,
+            _ => {
+                ranges.extend(open.take());
+                open = Some((*hash, *hash));
+            }
+        }
+    }
+    ranges.extend(open);
+    ranges
 }
 
 impl Compactor {
@@ -509,7 +472,6 @@ impl Compactor {
                 return (report, 0);
             }
         };
-        let mut not_ready_count = 0;
         loop {
             let planned = match self.plan_batch(class, log, cursor, forced).await {
                 Ok(planned) => planned,
@@ -520,27 +482,11 @@ impl Compactor {
             };
             match planned {
                 Planned::Nothing | Planned::Wait => return (report, cursor),
-                Planned::NotReady => {
-                    not_ready_count += 1;
-                    if not_ready_count >= NOT_READY_RETRY_COUNT {
-                        report
-                            .errors
-                            .push("an owner hasn't heard of an uploaded object yet".to_owned());
-                        return (report, cursor);
-                    }
-                    tokio::time::sleep(Duration::from_millis(NOT_READY_RETRY_MS)).await;
-                }
                 Planned::Ready(mut batch) => {
                     let through = batch.through.expect("a ready batch covers a manifest");
                     report.errors.append(&mut batch.skipped);
                     match self.run_batch(class, batch, forced, &mut report).await {
-                        Ok(true) => cursor = through,
-                        Ok(false) => {
-                            report
-                                .errors
-                                .push("an owner couldn't take a compacted extent yet".to_owned());
-                            return (report, cursor);
-                        }
+                        Ok(()) => cursor = through,
                         Err(error) => {
                             report.errors.push(error);
                             return (report, cursor);
@@ -565,60 +511,13 @@ impl Compactor {
         }
     }
 
-    async fn view(
-        &self,
-        stream: &KeyHash,
-        path: &Path,
-        footer: Vec<(u64, u64)>,
-    ) -> Result<Option<CompactView>, String> {
+    /// A stream's retention as its owner has it, or `None` if there is no such stream.
+    async fn retention_of(&self, stream: KeyHash) -> Result<Option<u64>, String> {
         let (reply, answer) = oneshot::channel();
-        self.first_hop(*stream)
-            .send(ControlMsg::CompactView {
-                stream: *stream,
-                path: path.clone(),
-                footer,
-                reply,
-            })
+        self.first_hop(stream)
+            .send(ControlMsg::RetentionOf { stream, reply })
             .map_err(|_| "the node has stopped".to_owned())?;
-        let mut view = answer
-            .await
-            .map_err(|_| "the node has stopped".to_owned())?;
-        if let Some(view) = &mut view
-            && self.is_noted(path)
-        {
-            view.unnoted = false;
-        }
-        Ok(view)
-    }
-
-    fn is_noted(&self, path: &Path) -> bool {
-        self.noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(path.as_ref())
-    }
-
-    /// The footer's id ranges by stream, leaving out what the manifest stream has (it is never
-    /// compacted, Q4) and what readers ignore of a former generation.
-    fn footer_by_stream(
-        &self,
-        extents: &[StreamExtent],
-        limit: Option<u64>,
-    ) -> BTreeMap<KeyHash, Vec<(u64, u64)>> {
-        let mut footer: BTreeMap<KeyHash, Vec<(u64, u64)>> = BTreeMap::new();
-        for extent in extents {
-            if extent.stream == self.keys.manifest
-                || limit.is_some_and(|limit| extent.id_first > limit)
-            {
-                continue;
-            }
-            let id_last = limit.map_or(extent.id_last, |limit| extent.id_last.min(limit));
-            footer
-                .entry(extent.stream)
-                .or_default()
-                .push((extent.id_first, id_last));
-        }
-        footer
+        answer.await.map_err(|_| "the node has stopped".to_owned())
     }
 
     async fn plan_batch(
@@ -630,15 +529,20 @@ impl Compactor {
     ) -> Result<Planned, String> {
         let mut batch = Batch::default();
         let mut closed = false;
-        let mut not_ready = false;
-        'manifests: for (id, path) in log.by_id.range(cursor.saturating_add(1)..) {
-            let Some(hour) = object_hour(path) else {
+        for (id, path) in log.by_id.range(cursor.saturating_add(1)..) {
+            let (Some(hour), Some(object)) = (object_hour(path), ObjectId::of_path(path)) else {
                 batch.through = Some(*id);
                 continue;
             };
-            if !batch.streams.is_empty() && hour != batch.hour {
+            if !batch.objects.is_empty() && hour != batch.hour {
                 closed = true;
                 break;
+            }
+            // A startup publishes again the manifest of an object no checkpoint recorded, so
+            // the log can name one twice.
+            if batch.objects.contains_key(&object) || self.copied_for(object, class) {
+                batch.through = Some(*id);
+                continue;
             }
             let footer = match self.read_footer(path).await? {
                 FooterRead::Found(footer) => footer,
@@ -647,8 +551,8 @@ impl Compactor {
                     batch.through = Some(*id);
                     continue;
                 }
-                // Nothing else waits for it. The delete job can't read it either, so the object
-                // and its hour stay, and owners go on listing what's in it (D177).
+                // Nothing else waits for it. The delete job can't pass it either, since its row
+                // never says what it holds, so the object and its hour stay (D177).
                 FooterRead::Corrupt(error) => {
                     batch.skipped.push(error);
                     batch.through = Some(*id);
@@ -656,47 +560,43 @@ impl Compactor {
                 }
             };
             let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
+            let mut held = 0;
             let mut found = Vec::new();
-            for (stream, ranges) in self.footer_by_stream(&footer, limit) {
-                let Some(view) = self.view(&stream, path, ranges).await? else {
+            for extent in footer {
+                // The manifest stream is never compacted (Q4), and what readers ignore of a
+                // former generation isn't copied.
+                if extent.stream == self.keys.manifest
+                    || limit.is_some_and(|limit| extent.id_first > limit)
+                {
+                    continue;
+                }
+                let Some(retention_ms) = self.retention_of(extent.stream).await? else {
                     continue;
                 };
-                if RetentionClass::of_retention(view.retention_ms) != Some(class) {
+                let Some(of) = RetentionClass::of_retention(retention_ms) else {
                     continue;
-                }
-                // Only this generation's uploads can still be on their way to an owner. A former
-                // one's were all read at startup, and what is unlisted was left out (D181).
-                if view.unnoted && object_generation(path) == Some(self.generation) {
-                    not_ready = true;
-                    break 'manifests;
-                }
-                if !view.sources.is_empty() {
-                    found.push((stream, view));
+                };
+                held |= of.bit();
+                if of == class {
+                    found.push(extent);
                 }
             }
-            if batch.streams.is_empty() {
+            if batch.objects.is_empty() {
                 batch.first_manifest_id = *id;
                 batch.hour = hour;
             }
-            for (stream, view) in found {
-                let entry = batch
+            batch.objects.insert(object, held);
+            for extent in found {
+                batch.bytes += extent.len_bytes;
+                batch
                     .streams
-                    .entry(stream)
-                    .or_insert_with(|| (Vec::new(), u64::MAX));
-                entry.1 = entry.1.min(view.merge_below);
-                for CompactSource {
-                    extent,
-                    next_id_first,
-                } in view.sources
-                {
-                    batch.bytes += extent.len_bytes;
-                    entry.0.push(Source {
-                        path: path.clone(),
+                    .entry(extent.stream)
+                    .or_default()
+                    .push(Source {
+                        object,
                         extent,
-                        next_id_first,
                         limit,
                     });
-                }
             }
             batch.through = Some(*id);
             if batch.bytes >= self.config.target_output_bytes {
@@ -705,13 +605,9 @@ impl Compactor {
             }
         }
         if batch.through.is_none() {
-            return Ok(if not_ready {
-                Planned::NotReady
-            } else {
-                Planned::Nothing
-            });
+            return Ok(Planned::Nothing);
         }
-        if !closed && !not_ready && !forced && !batch.streams.is_empty() {
+        if !closed && !forced && !batch.streams.is_empty() {
             let now_ms = self.clock.now_ms();
             // An id ahead of the clock says nothing of its age: ids after a restart are (D221).
             let manifest_ms = id_ms(batch.first_manifest_id);
@@ -724,31 +620,35 @@ impl Compactor {
         Ok(Planned::Ready(batch))
     }
 
-    /// One source's records, as stored. If the object has gone from under its extent, the owner
-    /// is told, this batch stops, and the next run goes without it. `Err` of a corrupt source
-    /// comes back as `Ok(Err)`: only that source is left behind (D177).
-    async fn read_source(
-        &self,
-        stream: &KeyHash,
-        source: &Source,
-    ) -> Result<Result<Bytes, String>, String> {
-        let reader = SegmentReader::new(Arc::clone(&self.store), source.path.clone());
+    /// Whether a row already leads this class from the object to a copy, which a cursor a crash
+    /// lost leaves behind: the batch isn't done again (section 7.5).
+    fn copied_for(&self, object: ObjectId, class: RetentionClass) -> bool {
+        let table = self
+            .objects
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table
+            .get(ObjectKey::sealed(object))
+            .is_some_and(|row| row.replacements.iter().any(|known| known.class == class))
+    }
+
+    /// One source's records, as stored. `Ok(Err)` is a source that can't be read and is left
+    /// behind (D177); `Err` stops the batch, for the next run to try again.
+    async fn read_source(&self, source: &Source) -> Result<Result<Bytes, String>, String> {
+        let path = ObjectKey::sealed(source.object).path();
+        let reader = SegmentReader::new(Arc::clone(&self.store), path.clone());
         let bytes = match reader.read_extent(&source.extent).await {
             Ok(bytes) => bytes,
-            Err(error) if is_corrupt(&error) => {
-                return Ok(Err(format!("{}: {error}", source.path)));
+            // Gone or bad: either way no row will say it was copied.
+            Err(error) if is_corrupt(&error) || is_not_found(&error) => {
+                return Ok(Err(format!("{path}: {error}")));
             }
-            Err(error) => {
-                if is_not_found(&error) {
-                    self.drop_extents(stream, &source.path).await?;
-                }
-                return Err(format!("{}: {error}", source.path));
-            }
+            Err(error) => return Err(format!("{path}: {error}")),
         };
         let Some(limit) = source.limit else {
             return Ok(Ok(bytes));
         };
-        // An extent of a former generation stops at its last accepted record (D17, D138).
+        // A region of a former generation stops at its last accepted record (D17, D138).
         Ok(Ok(accepted_prefix(
             &bytes,
             limit.min(source.extent.id_last),
@@ -756,251 +656,175 @@ impl Compactor {
         .map_or_else(Bytes::new, |(_, accepted)| accepted)))
     }
 
-    /// True if the cursor may now pass this batch, which it has if the batch covers a manifest.
+    /// One output for the batch, with one region per stream, then the rows that lead readers
+    /// to it, then the cursor, once a checkpoint holds the rows.
     async fn run_batch(
         &self,
         class: RetentionClass,
         batch: Batch,
         forced: bool,
         report: &mut CompactReport,
-    ) -> Result<bool, String> {
-        let through = batch.through;
-        // A stream has one region per object, so its k-th run goes into the k-th output.
-        let mut outputs: Vec<(SegmentBuilder, Vec<Run>)> = Vec::new();
-        for (stream, (mut sources, merge_below)) in batch.streams {
-            sources.sort_by_key(|source| source.extent.id_first);
-            sources.dedup_by_key(|source| source.extent.id_first);
-            let mut output = 0;
-            let mut start = 0;
-            while start < sources.len() {
-                // Neighbours become one extent, unless something unsealed could be between them.
-                let mut end = start + 1;
-                while end < sources.len()
-                    && sources[end - 1].next_id_first == Some(sources[end].extent.id_first)
-                    && sources[end].extent.id_last < merge_below
-                {
-                    end += 1;
-                }
-                let mut pieces = Vec::with_capacity(end - start);
-                let mut corrupt = false;
-                for source in &sources[start..end] {
-                    match self.read_source(&stream, source).await? {
-                        Ok(piece) => pieces.push(piece),
-                        Err(error) => {
-                            report.errors.push(error);
-                            corrupt = true;
-                        }
+    ) -> Result<(), String> {
+        let mut builder = SegmentBuilder::new();
+        let mut any = false;
+        // Per source object, the hashes it holds of this class that were copied and those that
+        // weren't.
+        let mut copied: BTreeMap<ObjectId, (Vec<u64>, Vec<u64>)> = BTreeMap::new();
+        for (stream, mut sources) in batch.streams {
+            sources.sort_by_key(|source| source.object);
+            let hash = stream_hash(stream);
+            let mut pieces = Vec::with_capacity(sources.len());
+            let mut corrupt = false;
+            for source in &sources {
+                match self.read_source(source).await? {
+                    Ok(piece) => pieces.push(piece),
+                    Err(error) => {
+                        report.errors.push(error);
+                        corrupt = true;
                     }
                 }
-                // Left where they are. The delete job tries again before their hour can go.
-                if corrupt {
-                    start = end;
-                    continue;
+            }
+            // Left where it is, and its sources' rows say so by leaving it out. The delete job
+            // keeps their hour.
+            if corrupt {
+                for source in &sources {
+                    copied.entry(source.object).or_default().1.push(hash);
                 }
-                pieces.retain(|piece| !piece.is_empty());
-                if let Some(first) = pieces.first() {
-                    let first_id = format::RecordHeader::read(first)
-                        .map_err(|error| format!("a source of {stream}: {error}"))?
-                        .id;
-                    if output == outputs.len() {
-                        outputs.push((SegmentBuilder::new(), Vec::new()));
-                    }
-                    let (builder, runs) = &mut outputs[output];
-                    output += 1;
-                    builder
-                        .add_extent(stream, pieces)
-                        .map_err(|error| format!("building for {stream}: {error}"))?;
-                    runs.push(Run {
-                        stream,
-                        sources: sources[start..end]
-                            .iter()
-                            .map(|source| {
-                                (
-                                    source.path.clone(),
-                                    source.extent.id_first,
-                                    source.extent.id_last,
-                                )
-                            })
-                            .collect(),
-                        first_id,
-                    });
-                }
-                start = end;
+                continue;
+            }
+            for source in &sources {
+                copied.entry(source.object).or_default().0.push(hash);
+            }
+            pieces.retain(|piece| !piece.is_empty());
+            if !pieces.is_empty() {
+                builder
+                    .add_extent(stream, pieces)
+                    .map_err(|error| format!("building for {stream}: {error}"))?;
+                any = true;
             }
         }
-        let mut retry = false;
-        for (builder, runs) in outputs {
+        let output = if any {
             let built = builder.finish().map_err(|error| error.to_string())?;
-            let hour = batch.hour;
             let path = put_compacted(
                 self.store.as_ref(),
                 class.prefix(),
-                hour,
+                batch.hour,
                 self.generation,
                 &built.parts,
             )
             .await?;
             storage::crash_point("compact.after_output");
-            let by_first: HashMap<(KeyHash, u64), &StreamExtent> = built
-                .extents
-                .iter()
-                .map(|extent| ((extent.stream, extent.id_first), extent))
-                .collect();
-            let mut applied_count = 0;
-            for run in &runs {
-                let extent = by_first
-                    .get(&(run.stream, run.first_id))
-                    .expect("every run went into the builder");
-                match self
-                    .replace_extents(&run.stream, &path, run.sources.clone(), extent)
-                    .await?
-                {
-                    ReplaceResult::Applied => applied_count += 1,
-                    ReplaceResult::Gone => {}
-                    ReplaceResult::Retry => retry = true,
+            let id =
+                ObjectId::of_path(&path).ok_or_else(|| format!("{path}: no id in the path"))?;
+            report.outputs.push(path);
+            Some(id)
+        } else {
+            None
+        };
+        {
+            let mut table = write_table(&self.objects);
+            if let Some(by) = output {
+                table.update(
+                    ObjectKey::compacted(class, by),
+                    ObjectState::Remote,
+                    |row| {
+                        row.held = Some(0);
+                    },
+                );
+            }
+            for (object, held) in &batch.objects {
+                let (hashes, left_out) = copied.remove(object).unwrap_or_default();
+                // A stream with nothing accepted still counts as copied: the output has all of
+                // it there is.
+                let ranges = match output {
+                    Some(_) => hash_ranges(&hashes, &left_out),
+                    None => Vec::new(),
+                };
+                let mut replaced = 0;
+                table.update(ObjectKey::sealed(*object), ObjectState::Remote, |row| {
+                    // A class raised since an earlier look is held too, so the object stays
+                    // until it has a copy.
+                    row.held = Some(row.held.unwrap_or(0) | *held);
+                    if let Some(by) = output {
+                        row.replacements.retain(|known| known.class != class);
+                        for (hash_first, hash_last) in &ranges {
+                            row.replacements.push(Replacement {
+                                class,
+                                hash_first: *hash_first,
+                                hash_last: *hash_last,
+                                by,
+                            });
+                            replaced += 1;
+                        }
+                    }
+                    // Nothing of this class to copy, or nothing it held was accepted: the class
+                    // is passed with no copy needed.
+                    if (output.is_none() || hashes.is_empty())
+                        && left_out.is_empty()
+                        && let Some(held) = &mut row.held
+                    {
+                        *held &= !class.bit();
+                    }
+                });
+                if replaced > 0 {
+                    report.replaced_count += 1;
                 }
             }
-            storage::crash_point("compact.after_extents");
-            report.outputs.push(path);
-            report.replaced_count += applied_count;
-            if applied_count > 0 {
-                self.wait_for_checkpoint(forced).await?;
-            }
         }
-        if retry {
-            return Ok(false);
-        }
+        storage::crash_point("compact.after_rows");
+        self.wait_for_checkpoint(forced).await?;
         storage::crash_point("compact.before_cursor");
-        if let Some(through) = through {
+        if let Some(through) = batch.through {
             self.commit_cursor(class, through).await?;
         }
-        Ok(true)
+        Ok(())
     }
 
-    async fn replace_extents(
-        &self,
-        stream: &KeyHash,
-        path: &Path,
-        sources: Vec<(Path, u64, u64)>,
-        extent: &StreamExtent,
-    ) -> Result<ReplaceResult, String> {
-        let (reply, answer) = oneshot::channel();
-        self.first_hop(*stream)
-            .send(ControlMsg::ReplaceExtents {
-                stream: *stream,
-                path: path.clone(),
-                sources,
-                extent: extent.clone(),
-                reply,
-            })
-            .map_err(|_| "the node has stopped".to_owned())?;
-        answer.await.map_err(|_| "the node has stopped".to_owned())
-    }
-
-    async fn drop_extents(&self, stream: &KeyHash, path: &Path) -> Result<bool, String> {
-        self.noted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path.to_string());
-        let (reply, answer) = oneshot::channel();
-        self.first_hop(*stream)
-            .send(ControlMsg::DropExtents {
-                stream: *stream,
-                path: path.clone(),
-                reply,
-            })
-            .map_err(|_| "the node has stopped".to_owned())?;
-        answer.await.map_err(|_| "the node has stopped".to_owned())
-    }
-
-    /// Whether an expired `sealed/` object may go: every worker has passed its manifest and the
-    /// manifest records it holds. An object with no manifest passes only if no stream points at
-    /// it, or its manifest has expired. Everything here errs towards keeping it.
-    async fn sealed_object_passed(
+    /// Whether an expired `sealed/` object may go (section 7.4): every worker has passed its
+    /// manifest, and its row says each longer class it holds has a compacted copy. An object of
+    /// the manifest stream alone holds no class, and goes once the manifests in it are read.
+    /// Everything here errs towards keeping it.
+    fn sealed_object_passed(
         &self,
         path: &Path,
         extents: &[StreamExtent],
         manifest_ids: &HashMap<&Path, u64>,
         log_complete: bool,
         slowest_cursor: u64,
-    ) -> Result<bool, String> {
+    ) -> bool {
         let holds_unread_manifests = extents
             .iter()
             .any(|extent| extent.stream == self.keys.manifest && extent.id_last > slowest_cursor);
         if holds_unread_manifests {
-            return Ok(false);
+            return false;
         }
+        if extents
+            .iter()
+            .all(|extent| extent.stream == self.keys.manifest)
+        {
+            return true;
+        }
+        let Some(id) = ObjectId::of_path(path) else {
+            return false;
+        };
+        let table = self
+            .objects
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let row = table.get(ObjectKey::sealed(id));
         let manifest_passed = match manifest_ids.get(path) {
-            Some(id) => *id <= slowest_cursor,
+            Some(manifest) => *manifest <= slowest_cursor,
             // A recorded object's manifest was saved in an object (D180). With all of the stream
             // read and no sign of it, that object has gone, which takes every worker passing it
-            // (D182). A longer class left behind is still copied below.
-            None => log_complete && self.is_noted(path),
+            // (D182).
+            None => log_complete && row.is_some(),
         };
-        let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
-        let mut passed = true;
-        for (stream, ranges) in self.footer_by_stream(extents, limit) {
-            let Some(view) = self.view(&stream, path, ranges).await? else {
-                continue;
-            };
-            if !manifest_passed {
-                if view.unnoted || !view.sources.is_empty() {
-                    return Ok(false);
-                }
-                continue;
-            }
-            // Every worker has gone past, each deciding when it got there. A stream of a longer
-            // class still here slipped between them: this is its last chance to be copied.
-            let Some(class) = RetentionClass::of_retention(view.retention_ms) else {
-                continue;
-            };
-            if !view.sources.is_empty() {
-                self.copy_passed_over(class, stream, path, view, limit)
-                    .await?;
-                passed = false;
-            }
-        }
-        Ok(passed)
-    }
-
-    /// What every worker went past copied into its class's prefix, for the next run of the
-    /// delete job to find gone from `sealed/` (D176).
-    async fn copy_passed_over(
-        &self,
-        class: RetentionClass,
-        stream: KeyHash,
-        path: &Path,
-        view: CompactView,
-        limit: Option<u64>,
-    ) -> Result<(), String> {
-        let mut batch = Batch {
-            hour: object_hour(path).ok_or_else(|| format!("{path}: no hour in the path"))?,
-            ..Batch::default()
-        };
-        let sources = view
-            .sources
-            .into_iter()
-            .map(|source| Source {
-                path: path.clone(),
-                extent: source.extent,
-                next_id_first: source.next_id_first,
-                limit,
-            })
-            .collect();
-        batch.streams.insert(stream, (sources, view.merge_below));
-        let mut report = CompactReport::default();
-        if !self.run_batch(class, batch, false, &mut report).await? {
-            return Err("an owner couldn't take a compacted extent yet".to_owned());
-        }
-        match report.errors.pop() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        manifest_passed && row.is_some_and(storage::ObjectRow::is_passed)
     }
 
     /// The delete job (section 7.4). Only whole hours under a prefix, once expired, and for
-    /// `sealed/` only once compaction has passed all of the hour. Readers are moved off first:
-    /// the deletes come after a checkpoint no longer points at these objects.
+    /// `sealed/` only once compaction has passed all of the hour. It messages no stream: rows
+    /// lead readers to the compacted copies, which a checkpoint held before the cursors moved.
     async fn expire(&self, log: &mut ManifestLog) -> ExpireReport {
         let mut report = ExpireReport::default();
         // A running node can't otherwise tell it has been replaced, and its view of which
@@ -1028,11 +852,14 @@ impl Compactor {
             }
         }
         let now_ms = self.clock.now_ms();
-        let mut going: Vec<(String, Vec<Path>)> = Vec::new();
-        let mut any_dropped = false;
-        let mut prefixes = vec![(SEALED_PREFIX, self.config.sealed_expiry_ms)];
+        let mut going: Vec<(Option<RetentionClass>, String, Vec<Path>)> = Vec::new();
+        let mut prefixes = vec![(None, SEALED_PREFIX, self.config.sealed_expiry_ms)];
         for class in RetentionClass::ALL {
-            prefixes.push((class.prefix(), class.length_ms() + CLASS_GRACE_MS));
+            prefixes.push((
+                Some(class),
+                class.prefix(),
+                class.length_ms() + CLASS_GRACE_MS,
+            ));
         }
         let manifest_ids: HashMap<&Path, u64> = log
             .by_id
@@ -1040,7 +867,7 @@ impl Compactor {
             .rev()
             .map(|(id, path)| (path, *id))
             .collect();
-        for (root, expiry_ms) in prefixes {
+        for (class, root, expiry_ms) in prefixes {
             let hours = match list_hours(self.store.as_ref(), root).await {
                 Ok(hours) => hours,
                 Err(error) => {
@@ -1060,17 +887,10 @@ impl Compactor {
                 }
                 let prefix = format!("{root}/{hour}");
                 match self
-                    .check_hour(
-                        root,
-                        hour,
-                        &manifest_ids,
-                        log_complete,
-                        slowest_cursor,
-                        &mut any_dropped,
-                    )
+                    .check_hour(root, hour, &manifest_ids, log_complete, slowest_cursor)
                     .await
                 {
-                    Ok(Some(paths)) => going.push((prefix, paths)),
+                    Ok(Some(paths)) => going.push((class, prefix, paths)),
                     Ok(None) => report.blocked_prefixes.push(prefix),
                     Err(error) => {
                         report.errors.push(format!("{prefix}: {error}"));
@@ -1080,20 +900,16 @@ impl Compactor {
             }
         }
         drop(manifest_ids);
-        if going.is_empty() {
-            return report;
-        }
-        if any_dropped && let Err(error) = self.wait_for_checkpoint(false).await {
-            report.errors.push(error);
-            return report;
-        }
         storage::crash_point("expire.before_delete");
-        for (prefix, paths) in going {
+        for (class, prefix, paths) in going {
             let mut all_gone = true;
             for path in &paths {
                 match self.store.delete(path).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                         report.deleted_object_count += 1;
+                        if let Some(id) = ObjectId::of_path(path) {
+                            self.forget(class, id);
+                        }
                     }
                     Err(error) => {
                         all_gone = false;
@@ -1109,8 +925,52 @@ impl Compactor {
         report
     }
 
-    /// Everything in one expired hour, if it can all go, with owners told to stop pointing at
-    /// it. Nothing is told unless the whole hour passes.
+    /// The rows a deleted object leaves. A sealed object's row stays while it leads to a copy,
+    /// since a list may still name it, and a compacted object takes the replacements naming it
+    /// with it.
+    fn forget(&self, class: Option<RetentionClass>, id: ObjectId) {
+        let mut table = write_table(&self.objects);
+        match class {
+            None => {
+                let keep = table
+                    .get(ObjectKey::sealed(id))
+                    .is_some_and(|row| !row.replacements.is_empty());
+                if !keep {
+                    table.remove(ObjectKey::sealed(id));
+                }
+            }
+            Some(class) => {
+                table.remove(ObjectKey::compacted(class, id));
+                let naming: Vec<ObjectKey> = table
+                    .rows()
+                    .filter(|row| {
+                        row.key.class.is_none()
+                            && row
+                                .replacements
+                                .iter()
+                                .any(|known| known.class == class && known.by == id)
+                    })
+                    .map(|row| row.key)
+                    .collect();
+                let sealed_gone_ms = self.config.sealed_expiry_ms + HOUR_MS;
+                let now_ms = self.clock.now_ms();
+                for key in naming {
+                    let mut empty = false;
+                    table.update(key, ObjectState::Remote, |row| {
+                        row.replacements
+                            .retain(|known| !(known.class == class && known.by == id));
+                        empty = row.replacements.is_empty();
+                    });
+                    // Its own hour is long past, so the sealed object went before this did.
+                    if empty && key.id.time_ms().saturating_add(sealed_gone_ms) <= now_ms {
+                        table.remove(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything in one expired hour, if it can all go.
     async fn check_hour(
         &self,
         root: &str,
@@ -1118,44 +978,49 @@ impl Compactor {
         manifest_ids: &HashMap<&Path, u64>,
         log_complete: bool,
         slowest_cursor: u64,
-        any_dropped: &mut bool,
     ) -> Result<Option<Vec<Path>>, String> {
         let objects = list_hour_objects(self.store.as_ref(), root, hour)
             .await
             .map_err(|error| error.to_string())?;
         let mut paths = Vec::with_capacity(objects.len());
-        let mut footers = Vec::with_capacity(objects.len());
         for object in objects {
             let path = object.location;
-            let extents = match self.read_footer(&path).await? {
-                FooterRead::Found(extents) => extents,
-                FooterRead::Missing => Vec::new(),
-                // A compacted object nobody could read: its time is up all the same. A sealed
-                // one may hold what was never copied.
-                FooterRead::Corrupt(_) if root != SEALED_PREFIX => Vec::new(),
-                FooterRead::Corrupt(error) => return Err(error),
-            };
-            if root == SEALED_PREFIX
-                && !self
-                    .sealed_object_passed(
-                        &path,
-                        &extents,
-                        manifest_ids,
-                        log_complete,
-                        slowest_cursor,
-                    )
-                    .await?
-            {
-                return Ok(None);
+            if root == SEALED_PREFIX {
+                let extents = match self.read_footer(&path).await? {
+                    FooterRead::Found(extents) => extents,
+                    FooterRead::Missing => Vec::new(),
+                    // A sealed object nobody could read may hold what was never copied.
+                    FooterRead::Corrupt(error) => return Err(error),
+                };
+                if !self.sealed_object_passed(
+                    &path,
+                    &extents,
+                    manifest_ids,
+                    log_complete,
+                    slowest_cursor,
+                ) {
+                    return Ok(None);
+                }
             }
             paths.push(path);
-            footers.push(extents);
-        }
-        for (path, extents) in paths.iter().zip(&footers) {
-            for extent in extents {
-                *any_dropped |= self.drop_extents(&extent.stream, path).await?;
-            }
         }
         Ok(Some(paths))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_ranges;
+
+    #[test]
+    fn ranges_break_only_at_streams_left_out() {
+        assert_eq!(hash_ranges(&[1, 3, 9], &[]), vec![(1, 9)]);
+        assert_eq!(hash_ranges(&[1, 3, 9], &[5]), vec![(1, 3), (9, 9)]);
+        assert_eq!(hash_ranges(&[1, 3, 9], &[0, 10]), vec![(1, 9)]);
+        assert_eq!(hash_ranges(&[], &[4]), Vec::<(u64, u64)>::new());
+        assert_eq!(
+            hash_ranges(&[2, 4, 6, 8], &[3, 7]),
+            vec![(2, 2), (4, 6), (8, 8)]
+        );
     }
 }

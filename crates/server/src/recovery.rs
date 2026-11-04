@@ -2,7 +2,7 @@
 //! Read who owned last, what the WAL holds, what the checkpoints hold and any object they
 //! don't know of, take ownership, and put back every stream that has something to replay.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
@@ -12,14 +12,13 @@ use futures_util::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    BlockEntry, BlockTable, CheckpointSet, MetaExtent, MetaSink, MetaSinkGap, Ownership,
-    SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation, list_sealed_objects,
-    list_wal_files, object_generation, read_ownership, replay_files, sync_wal_files,
-    upload_pending,
+    BlockEntry, BlockTable, CheckpointSet, MetaSink, MetaSinkGap, NewerObjects, ObjectId,
+    ObjectKey, Ownership, SegmentError, SegmentReader, StreamExtent, StreamMeta, claim_generation,
+    list_sealed_objects, list_wal_files, object_generation, read_ownership, replay_files,
+    sync_wal_files, upload_pending,
 };
 
 use crate::dedupe::DedupeTable;
-use crate::delivery::ExtentRef;
 use crate::message::{SinkGap, SinkSpec, StreamConfig};
 use crate::metadata::{LocalMeta, load_stream, put_owed_checkpoint};
 use crate::state::StreamState;
@@ -111,8 +110,6 @@ pub(crate) struct RestoredBatch {
 /// One stream, ready for its core.
 pub(crate) struct RestoredStream {
     pub meta: StreamMeta,
-    /// Those of `meta.extents` no checkpoint has yet.
-    pub new_extents: Vec<MetaExtent>,
     /// What only the WAL holds, to go into the next seal.
     pub batches: Vec<RestoredBatch>,
     /// Dedupe entries from the WAL's entries, the only place they survive a restart (section 3).
@@ -132,45 +129,24 @@ pub(crate) struct Prepared {
     pub checkpoints: CheckpointSet,
     pub max_id: u64,
     pub restored: Vec<RestoredStream>,
-    /// Objects this startup looked at or put, for the next checkpoint to record. Their extents
-    /// are in `restored`, or are ones nobody should read.
+    /// Objects this startup looked at or put, for the next checkpoint to record. They are in
+    /// the lists in `restored`, or hold nothing anybody should read.
     pub scanned_objects: Vec<ScannedObject>,
+    /// The last ids of the objects checkpoints record since their full file (section 7.6).
+    pub newer: NewerObjects,
     /// The time in the id of the last object this startup put, for the uploader's to follow.
     pub last_object_ms: u64,
 }
 
 /// One object no checkpoint recorded.
 pub(crate) struct ScannedObject {
-    pub path: String,
+    pub id: ObjectId,
     pub len_bytes: u64,
+    /// Each stream's last accepted id in it, in key hash order.
+    pub last_ids: Vec<(KeyHash, u64)>,
     /// It holds accepted records that aren't the manifest stream's, so it needs a manifest: a
     /// crash can have lost the one it had (section 7.5).
     pub needs_manifest: bool,
-}
-
-pub(crate) fn extent_ref(stream: &KeyHash, extent: &MetaExtent) -> ExtentRef {
-    ExtentRef {
-        path: Path::parse(&extent.path).unwrap_or_else(|_| Path::from(extent.path.as_str())),
-        extent: StreamExtent {
-            stream: *stream,
-            offset: extent.offset,
-            len_bytes: extent.len_bytes,
-            id_first: extent.id_first,
-            id_last: extent.id_last,
-            block_count: extent.block_count,
-        },
-    }
-}
-
-pub(crate) fn meta_extent(known: &ExtentRef) -> MetaExtent {
-    MetaExtent {
-        path: known.path.to_string(),
-        offset: known.extent.offset,
-        len_bytes: known.extent.len_bytes,
-        id_first: known.extent.id_first,
-        id_last: known.extent.id_last,
-        block_count: known.extent.block_count,
-    }
 }
 
 pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
@@ -262,7 +238,10 @@ fn entry_is_above(entry: &storage::ReplayedEntry, limit: u64) -> bool {
 
 struct ScannedExtent {
     stream: KeyHash,
-    extent: MetaExtent,
+    object: ObjectId,
+    id_first: u64,
+    /// The last accepted id.
+    id_last: u64,
     /// The blocks that may hold system records, in order. Replay needs nothing else (D264).
     system_blocks: Vec<Bytes>,
 }
@@ -308,10 +287,12 @@ async fn scan_object(
     manifest: KeyHash,
 ) -> Result<ScannedOne, String> {
     let describe = |error: SegmentError| format!("{path}: {error}");
+    let id = ObjectId::of_path(&path).ok_or_else(|| format!("{path}: no id in the path"))?;
     let reader = SegmentReader::new(store, path.clone());
     let top = reader.read_top_index().await.map_err(describe)?;
     let heads = reader.read_heads(&top).await.map_err(describe)?;
     let mut out = Vec::new();
+    let mut last_ids = Vec::new();
     let mut needs_manifest = false;
     let mut ignored_extent_count = 0;
     for (extent, table) in heads {
@@ -339,24 +320,22 @@ async fn scan_object(
             ),
         };
         needs_manifest |= extent.stream != manifest;
+        last_ids.push((extent.stream, id_last));
         out.push(ScannedExtent {
             stream: extent.stream,
-            extent: MetaExtent {
-                path: path.to_string(),
-                offset: extent.offset,
-                len_bytes: extent.len_bytes,
-                id_first: extent.id_first,
-                id_last,
-                block_count: extent.block_count,
-            },
+            object: id,
+            id_first: extent.id_first,
+            id_last,
             system_blocks,
         });
     }
+    last_ids.sort_unstable();
     Ok(ScannedOne {
         extents: out,
         object: ScannedObject {
-            path: path.to_string(),
+            id,
             len_bytes,
+            last_ids,
             needs_manifest,
         },
         ignored_extent_count,
@@ -374,12 +353,15 @@ async fn scan_objects(
     report: &mut RecoveryReport,
     manifest: KeyHash,
 ) -> Result<Vec<ScannedExtent>, String> {
-    let known: HashSet<&str> = checkpoints.recorded_objects().collect();
+    let known: HashSet<ObjectKey> = checkpoints.rows().into_keys().collect();
     let mut objects: Vec<(u64, Path, u64)> = list_sealed_objects(store.as_ref())
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
-        .filter(|object| !known.contains(object.location.as_ref()))
+        .filter(|object| {
+            ObjectId::of_path(&object.location)
+                .is_some_and(|id| !known.contains(&ObjectKey::sealed(id)))
+        })
         .filter_map(|object| {
             Some((
                 object_generation(&object.location)?,
@@ -413,13 +395,20 @@ struct Pending {
     wal: Vec<storage::ReplayedEntry>,
 }
 
+/// A stream put together, and the id ranges of the scanned objects holding it.
+type Replayed = (RestoredStream, Vec<(u64, u64)>);
+
 /// Puts one stream together: its saved metadata, then every record above it, in id order.
+/// `recorded` is each object recorded since the full file holding it, with its last id there.
+/// Says the id ranges of the scanned objects holding it, which the WAL's entries may be in.
 fn replay_stream(
     mut meta: StreamMeta,
     pending: Pending,
+    recorded: &[(ObjectId, u64)],
+    sealed_through: u64,
     now_ms: u64,
     report: &mut RecoveryReport,
-) -> Result<Option<RestoredStream>, String> {
+) -> Result<Option<Replayed>, String> {
     let name = meta.stream;
     let was_deleted = meta.deleted;
     let floor_id = if was_deleted {
@@ -427,34 +416,43 @@ fn replay_stream(
     } else {
         meta.floor_id
     };
-    let mut new_extents = Vec::new();
+    // What the scanned objects hold of it, which covers a WAL entry that is in one.
+    let mut covering: Vec<(u64, u64)> = Vec::new();
 
     enum Item {
         Scanned { blocks: Vec<Bytes>, last_id: u64 },
         Wal(storage::ReplayedEntry),
     }
     let mut items: Vec<(u64, Item)> = Vec::new();
+    let listed: HashSet<ObjectId> = meta.objects.iter().copied().collect();
     for scanned in pending.scanned {
-        let extent = scanned.extent;
-        let overlaps = meta
-            .extents
+        let overlaps = covering
             .iter()
-            .any(|known| known.id_first <= extent.id_last && extent.id_first <= known.id_last);
-        if extent.id_last <= floor_id || overlaps {
+            .any(|(first, last)| *first <= scanned.id_last && scanned.id_first <= *last);
+        // A former generation's upload, late, of what a later one already sealed (section 8.1).
+        let superseded = recorded.iter().any(|(id, last_id)| {
+            id.generation() > scanned.object.generation() && scanned.id_first <= *last_id
+        });
+        if scanned.id_last <= floor_id || overlaps || superseded {
+            continue;
+        }
+        covering.push((scanned.id_first, scanned.id_last));
+        // Listed already: the local store had it, and replay applied what it holds.
+        if listed.contains(&scanned.object) {
             continue;
         }
         report.adopted_extent_count += 1;
         items.push((
-            extent.id_first,
+            scanned.id_first,
             Item::Scanned {
                 blocks: scanned.system_blocks,
-                last_id: extent.id_last,
+                last_id: scanned.id_last,
             },
         ));
-        new_extents.push(extent.clone());
-        meta.extents.push(extent);
+        meta.objects.push(scanned.object);
     }
-    meta.extents.sort_by_key(|extent| extent.id_first);
+    meta.objects.sort_unstable();
+    meta.objects.dedup();
     for entry in pending.wal {
         let first_id = format::RecordHeader::read(&entry.records)
             .map_err(|error| format!("a WAL entry for {name}: {error}"))?
@@ -527,10 +525,12 @@ fn replay_stream(
                     now_ms,
                 );
             }
-            let covered = meta
-                .extents
-                .iter()
-                .any(|extent| extent.id_first <= first_id && last_id <= extent.id_last);
+            // A recorded object holding the stream up to an id holds every entry below it,
+            // since a stream's records are sealed in id order.
+            let covered = last_id <= sealed_through
+                || covering
+                    .iter()
+                    .any(|(first, last)| *first <= first_id && last_id <= *last);
             if !covered && let Item::Wal(entry) = item {
                 batches.push(RestoredBatch {
                     bytes: entry.records,
@@ -546,12 +546,14 @@ fn replay_stream(
     meta.applied_id = applied_id;
     meta.state_ver = state.ver();
     meta.state = state.doc().clone();
-    Ok(Some(RestoredStream {
-        meta,
-        new_extents,
-        batches,
-        dedupe,
-    }))
+    Ok(Some((
+        RestoredStream {
+            meta,
+            batches,
+            dedupe,
+        },
+        covering,
+    )))
 }
 
 /// Everything up to and including taking ownership. A process that loses that race has written
@@ -642,11 +644,46 @@ pub(crate) async fn prepare(
         }
     }
 
+    let newer = NewerObjects::read(store, &checkpoints.newer_objects())
+        .await
+        .map_err(|error| error.to_string())?;
+    // A recorded object can hold what the WAL still has, when a crash came after its checkpoint
+    // was owed or written and before the WAL file went. Such an object is no older than the
+    // oldest entry, since an object's time is at least its newest record's.
+    let oldest_entry_ms = pending
+        .values()
+        .flat_map(|one| one.wal.iter())
+        .filter_map(|entry| format::RecordHeader::read(&entry.records).ok())
+        .map(|header| format::id_ms(header.id))
+        .min();
+    let recent: Vec<ObjectId> = match oldest_entry_ms {
+        Some(from_ms) => checkpoints
+            .rows()
+            .into_keys()
+            .filter(|key| key.class.is_none() && key.id.time_ms() >= from_ms)
+            .map(|key| key.id)
+            .collect(),
+        None => Vec::new(),
+    };
+    let recent = NewerObjects::read(store, &recent)
+        .await
+        .map_err(|error| error.to_string())?;
     let mut restored = Vec::with_capacity(pending.len());
+    let mut covering_by_stream = HashMap::new();
     for (name, one) in pending {
-        let (meta, _) = load_stream(&local, &checkpoints, store, name).await?;
+        let (meta, _) = load_stream(&local, &checkpoints, &newer, store, name).await?;
         let meta = meta.unwrap_or_else(|| new_meta(name));
-        if let Some(stream) = replay_stream(meta, one, now_ms, &mut report)? {
+        let recorded = newer.of(name, &checkpoints);
+        let sealed_through = recent
+            .of(name, &checkpoints)
+            .into_iter()
+            .map(|(_, last_id)| last_id)
+            .max()
+            .unwrap_or(0);
+        if let Some((stream, covering)) =
+            replay_stream(meta, one, &recorded, sealed_through, now_ms, &mut report)?
+        {
+            covering_by_stream.insert(name, covering);
             restored.push(stream);
         }
     }
@@ -674,14 +711,28 @@ pub(crate) async fn prepare(
             closed_seqs.retain(|seq| *seq != file.seq);
         }
     }
+    // Seals within one ms move each object's time on, so a known object can be timed past the
+    // clock. This generation's objects come after them all, or a list would be out of record
+    // order.
+    let known_ms = checkpoints
+        .rows()
+        .into_keys()
+        .filter(|key| key.class.is_none())
+        .map(|key| key.id)
+        .chain(scanned_objects.iter().map(|object| object.id))
+        .map(|id| id.time_ms())
+        .max()
+        .unwrap_or(0);
     let last_object_ms = put_restored_parts(
         store.as_ref(),
         generation,
         manifest,
         &mut restored,
+        &covering_by_stream,
         &mut scanned_objects,
     )
-    .await?;
+    .await?
+    .max(known_ms);
     ownership.record(generation, last_valid_id);
     checkpoints.ownership = ownership;
     report.generation = generation;
@@ -695,43 +746,54 @@ pub(crate) async fn prepare(
             max_id: last_valid_id,
             restored,
             scanned_objects,
+            newer,
             last_object_ms,
         },
         local,
     ))
 }
 
-/// A stream's restored records split wherever an object's extent lies between them, and an
-/// object holds one region per stream (D157, D275). The first part goes into the first seal, and
-/// each later one goes up here as its own object, under this generation, and joins the stream's
-/// extents. Says the time in the last id put.
+/// A stream's restored records split wherever a scanned object's records lie between them, and
+/// an object holds one region per stream (D157, D275). A list is in record order, so a part
+/// with a scanned object above it goes up here as its own object, under this generation, at
+/// its newest record's ms or a listed object's below it if later, and joins the stream's list;
+/// only a last part with nothing above it goes into the first seal. Says the latest time put.
 async fn put_restored_parts(
     store: &dyn ObjectStore,
     generation: u64,
     manifest: KeyHash,
     restored: &mut [RestoredStream],
+    covering_by_stream: &HashMap<KeyHash, Vec<(u64, u64)>>,
     scanned_objects: &mut Vec<ScannedObject>,
 ) -> Result<u64, String> {
     let mut last_object_ms = 0;
+    // The index each time has given out: objects of this generation at one ms differ by it.
+    let mut used: HashMap<u64, u8> = HashMap::new();
     for stream in restored {
         let name = stream.meta.stream;
+        let covering = covering_by_stream.get(&name).map_or(&[][..], Vec::as_slice);
         let mut parts: Vec<Vec<RestoredBatch>> = Vec::new();
         for batch in std::mem::take(&mut stream.batches) {
             let split = parts
                 .last()
                 .and_then(|part| part.last())
                 .is_none_or(|previous| {
-                    stream.meta.extents.iter().any(|known| {
-                        previous.last_id < known.id_first && known.id_first < batch.first_id
-                    })
+                    covering
+                        .iter()
+                        .any(|(first, _)| previous.last_id < *first && *first < batch.first_id)
                 });
             if split {
                 parts.push(Vec::new());
             }
             parts.last_mut().expect("pushed above").push(batch);
         }
-        let mut parts = parts.into_iter();
-        stream.batches = parts.next().unwrap_or_default();
+        let above = |part: &[RestoredBatch]| {
+            let last_id = part.last().map_or(0, |batch| batch.last_id);
+            covering.iter().any(|(first, _)| *first > last_id)
+        };
+        if parts.last().is_some_and(|part| !above(part)) {
+            stream.batches = parts.pop().unwrap_or_default();
+        }
         for part in parts {
             let mut builder = storage::SegmentBuilder::new();
             builder
@@ -739,27 +801,48 @@ async fn put_restored_parts(
                 .map_err(|error| format!("restoring {name}: {error}"))?;
             let built = builder.finish().map_err(|error| error.to_string())?;
             let last_id = built.last_id.expect("a part has records");
-            let time_ms = format::id_ms(last_id)
-                .max(last_object_ms + 1)
-                .max(storage::OBJECT_EPOCH_MS);
-            last_object_ms = time_ms;
-            let path = storage::sealed_path(storage::ObjectId::new(time_ms, generation, 0));
-            storage::put_object(store, &path, &built.parts).await?;
-            let extent = &built.extents[0];
-            let extent = MetaExtent {
-                path: path.to_string(),
-                offset: extent.offset,
-                len_bytes: extent.len_bytes,
-                id_first: extent.id_first,
-                id_last: extent.id_last,
-                block_count: extent.block_count,
+            // At or after every listed object below it, which a seal within one ms can have
+            // timed past its records. Only a scanned object can be above.
+            let below_ms = stream
+                .meta
+                .objects
+                .iter()
+                .filter(|id| {
+                    !scanned_objects.iter().any(|object| {
+                        object.id == **id
+                            && object
+                                .last_ids
+                                .iter()
+                                .any(|(key, last)| *key == name && *last > last_id)
+                    })
+                })
+                .map(|id| id.time_ms())
+                .max()
+                .unwrap_or(0);
+            let mut time_ms = storage::sealed_time_ms(
+                format::id_ms(last_id)
+                    .max(below_ms)
+                    .max(storage::OBJECT_EPOCH_MS),
+            );
+            let index = loop {
+                let next = used.entry(time_ms).or_insert(0);
+                if let Some(after) = next.checked_add(1) {
+                    let index = *next;
+                    *next = after;
+                    break index;
+                }
+                time_ms = storage::sealed_time_ms(time_ms + 1);
             };
-            stream.meta.extents.push(extent.clone());
-            stream.meta.extents.sort_by_key(|extent| extent.id_first);
-            stream.new_extents.push(extent);
+            last_object_ms = last_object_ms.max(time_ms);
+            let id = ObjectId::new(time_ms, generation, index);
+            let path = storage::sealed_path(id);
+            storage::put_object(store, &path, &built.parts).await?;
+            stream.meta.objects.push(id);
+            stream.meta.objects.sort_unstable();
             scanned_objects.push(ScannedObject {
-                path: path.to_string(),
+                id,
                 len_bytes: built.len_bytes,
+                last_ids: vec![(name, last_id)],
                 needs_manifest: name != manifest,
             });
         }

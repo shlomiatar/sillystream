@@ -163,6 +163,39 @@ impl SegmentReader {
         Ok(entries)
     }
 
+    /// Page `number` of the index, decoded. Readers cache it (section 7.3).
+    pub async fn read_page(
+        &self,
+        top: &TopIndex,
+        number: usize,
+    ) -> Result<Vec<IndexEntry>, SegmentError> {
+        let page = *top
+            .pages()
+            .get(number)
+            .ok_or(SegmentError::Corrupt("page number"))?;
+        let bytes = self
+            .read_range(page.offset..page.offset + u64::from(page.len_bytes))
+            .await?;
+        decode_page(&bytes, &page)
+    }
+
+    /// `stream`'s region and its table, among a page's entries: one read, or two for a long
+    /// table.
+    pub async fn find_region(
+        &self,
+        entries: &[IndexEntry],
+        stream: KeyHash,
+    ) -> Result<Option<(StreamExtent, BlockTable)>, SegmentError> {
+        let hash = stream_hash(stream);
+        for entry in entries.iter().filter(|entry| entry.hash == hash) {
+            let (extent, table) = self.read_head(entry).await?;
+            if extent.stream == stream {
+                return Ok(Some((extent, table)));
+            }
+        }
+        Ok(None)
+    }
+
     /// `stream`'s region, if it has one: a page read, then one for the region's key and table.
     /// A stream has at most one.
     pub async fn lookup(
@@ -202,6 +235,19 @@ impl SegmentReader {
         }
         let rest = self.read_range(head_end..entry.offset + needed).await?;
         extent_of(&[head, rest].concat(), entry)
+    }
+
+    /// Each region's full key hash and last id, in key hash order: one read (section 7.3). For
+    /// rebuilding metadata and the startup scan.
+    pub async fn read_last_ids(&self, top: &TopIndex) -> Result<Vec<(KeyHash, u64)>, SegmentError> {
+        let bytes = self
+            .read_range(top.last_ids_offset..top.last_ids_offset + top.last_ids_len)
+            .await?;
+        let last_ids = decode_last_ids(&bytes)?;
+        if last_ids.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(SegmentError::Corrupt("last ids aren't in key hash order"));
+        }
+        Ok(last_ids)
     }
 
     /// Every region's key and table, without its blocks: one read of the index and last ids,

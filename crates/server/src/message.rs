@@ -8,10 +8,10 @@ use format::{IdAllocator, KeyHash};
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::{CommandTicket, Event, ExtentRead, Outbox};
+use crate::connection::{CommandTicket, Event, ObjectRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
-use crate::delivery::{ExtentRef, FanOut, ReplaceResult, StreamDelivery};
+use crate::delivery::{FanOut, ObjectRef, StreamDelivery};
 use crate::placement::ShardCounters;
 use crate::slab::{SlabBytes, SlabRegion};
 use crate::state::{StateOp, StreamState};
@@ -137,7 +137,7 @@ pub struct StreamInfo {
     pub head: u64,
     /// The last id given out, visible yet or not.
     pub stamped_id: u64,
-    /// The lowest id this stream's extents and memory hold, or 0 with none. A sink at cursor 0
+    /// The lowest id this stream's objects and memory hold, or 0 with none. A sink at cursor 0
     /// warns from it (D239).
     pub earliest_id: u64,
     pub state_ver: u64,
@@ -530,7 +530,7 @@ pub(crate) enum ControlMsg {
     /// What changed since the last gather.
     CheckpointGather {
         gather: u64,
-        reply: oneshot::Sender<Vec<storage::StreamMeta>>,
+        reply: oneshot::Sender<Vec<crate::delivery::Gathered>>,
     },
     /// That gather is in the local store and the object store, so what it took may leave RAM.
     CheckpointDone {
@@ -541,28 +541,11 @@ pub(crate) enum ControlMsg {
         doc: Vec<u8>,
         reply: ReplyTx,
     },
-    /// What the compactor needs of a stream, for one source object.
-    CompactView {
+    /// A stream's retention, which says which compacted class it goes to (section 7.5). `None`
+    /// if there is no such stream.
+    RetentionOf {
         stream: KeyHash,
-        path: object_store::path::Path,
-        /// Id ranges the object's footer holds for this stream.
-        footer: Vec<(u64, u64)>,
-        reply: oneshot::Sender<Option<CompactView>>,
-    },
-    /// Readers follow a compacted extent from here on (section 7.5).
-    ReplaceExtents {
-        stream: KeyHash,
-        path: object_store::path::Path,
-        /// `(path, id_first, id_last)`, neighbours in id order.
-        sources: Vec<(object_store::path::Path, u64, u64)>,
-        extent: storage::StreamExtent,
-        reply: oneshot::Sender<ReplaceResult>,
-    },
-    /// An object is about to expire, so nothing may point at it.
-    DropExtents {
-        stream: KeyHash,
-        path: object_store::path::Path,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Option<u64>>,
     },
     /// The metadata a load found, or `None` if there is no such stream (section 7.6).
     Loaded {
@@ -572,25 +555,6 @@ pub(crate) enum ControlMsg {
         rebuilt: bool,
     },
     Stop,
-}
-
-/// One source extent, and the extent after it in the owner's list.
-#[derive(Debug, Clone)]
-pub(crate) struct CompactSource {
-    pub extent: storage::StreamExtent,
-    pub next_id_first: Option<u64>,
-}
-
-/// An owner's answer to the compactor.
-#[derive(Debug)]
-pub(crate) struct CompactView {
-    pub retention_ms: u64,
-    /// The footer holds ids this owner hasn't heard of yet: its extents are still on their way.
-    pub unnoted: bool,
-    /// What it holds at this path. A footer range missing here was compacted, or expired.
-    pub sources: Vec<CompactSource>,
-    /// A merged extent must end below this: at or above it, records may still be unsealed.
-    pub merge_below: u64,
 }
 
 /// A connection on its home core, and the reference an error about a cursor should use.
@@ -728,8 +692,10 @@ pub(crate) struct ReadStepMsg {
     pub after: u64,
     /// Bytes read since the last step, for the shard's counters.
     pub read_bytes: u64,
-    /// An object the subscriber found missing, which may have been compacted away.
-    pub gone: Option<object_store::path::Path>,
+    /// The object the subscriber read last, so the next is after it.
+    pub past: Option<ObjectRef>,
+    /// The object the subscriber found missing.
+    pub gone: Option<ObjectRef>,
 }
 
 /// A read step's walk over the cores that stamped the ids in question, oldest first, which
@@ -740,6 +706,8 @@ pub(crate) struct ReadChain {
     pub sub: SubRef,
     pub after: u64,
     pub limit: u64,
+    /// The object the subscriber read last.
+    pub past: Option<ObjectRef>,
     /// `(last_id, core)`.
     pub hops: std::collections::VecDeque<(u64, usize)>,
     pub batches: Vec<SlabBytes>,
@@ -758,8 +726,8 @@ pub(crate) enum CatchReply {
         batches: Vec<SlabBytes>,
         limit: u64,
     },
-    Extent {
-        extent: ExtentRef,
+    Object {
+        object: ObjectRef,
         limit: u64,
     },
     Fail {
@@ -770,7 +738,7 @@ pub(crate) enum CatchReply {
 
 #[derive(Debug)]
 pub(crate) enum ReadDone {
-    Read(ExtentRead),
+    Read(ObjectRead),
     /// The store failed. The next try is the subscriber's to start.
     Retry,
     /// The object isn't there. The owner knows if the records are somewhere else.

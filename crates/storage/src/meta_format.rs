@@ -5,13 +5,12 @@
 //! meta   := crc32c u32 | flags u32 | stream key | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
-//!           n u32 | n × cursor | n u32 | n × sink | n u32 | n × extent |
-//!           n u32 | n × dropped_id_first u64
+//!           n u32 | n × cursor | n u32 | n × sink | ids
 //! cursor := name key | id u64
 //! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
 //!           concurrency u32 | paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
 //!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
-//! extent := path str32 | offset u64 | len_bytes u64 | id_first u64 | id_last u64 | block_count u32
+//! ids    := n u32 | n × delta varint      object ids, ascending, each less the one before
 //! str32  := len u32 | bytes        bytes32 likewise
 //! opt    := present u8 | str32 if present
 //! key    := a key hash, 16 bytes (SPEC section 1)
@@ -24,6 +23,8 @@ use std::fmt;
 
 use bytes::Bytes;
 use format::{KeyHash, crc32c};
+
+use crate::object::ObjectId;
 
 const FLAG_DELETED: u32 = 1;
 
@@ -64,17 +65,6 @@ pub struct MetaSinkGap {
     pub last_id: u64,
 }
 
-/// `id range → location` of section 7.6.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetaExtent {
-    pub path: String,
-    pub offset: u64,
-    pub len_bytes: u64,
-    pub id_first: u64,
-    pub id_last: u64,
-    pub block_count: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamMeta {
     pub stream: KeyHash,
@@ -83,7 +73,7 @@ pub struct StreamMeta {
     pub last_id: u64,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
-    /// The highest id in an extent retention took away. A position below it has lost records.
+    /// The highest expired id (section 7.4). A position below it has lost records.
     pub expired_through: u64,
     /// State includes every change up to this id, and no later one. A change above
     /// it comes from the WAL.
@@ -95,10 +85,8 @@ pub struct StreamMeta {
     pub retention_ms: u64,
     pub cursors: Vec<MetaCursor>,
     pub sinks: Vec<MetaSink>,
-    pub extents: Vec<MetaExtent>,
-    /// `id_first` of extents this entry takes away, which compaction replaced or retention
-    /// expired. It applies to what older entries hold, not to `extents` beside it.
-    pub dropped_extents: Vec<u64>,
+    /// The object list (section 7.6): the ids of the objects holding its records, ascending.
+    pub objects: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,14 +123,28 @@ fn put_opt(out: &mut Vec<u8>, text: Option<&str>) {
     }
 }
 
-/// One extent's bytes, which the local store keeps under a key of its own.
-pub fn encode_extent(out: &mut Vec<u8>, extent: &MetaExtent) {
-    put_bytes(out, extent.path.as_bytes());
-    put_u64(out, extent.offset);
-    put_u64(out, extent.len_bytes);
-    put_u64(out, extent.id_first);
-    put_u64(out, extent.id_last);
-    put_u32(out, extent.block_count);
+/// Ascending object ids, each as a varint less the one before (section 7.6).
+pub fn encode_ids(out: &mut Vec<u8>, ids: &[ObjectId]) {
+    put_u32(out, ids.len() as u32);
+    let mut previous = 0;
+    for id in ids {
+        let mut delta = id.0 - previous;
+        while delta >= 0x80 {
+            out.push(delta as u8 | 0x80);
+            delta >>= 7;
+        }
+        out.push(delta as u8);
+        previous = id.0;
+    }
+}
+
+pub fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>, MetaError> {
+    let mut reader = Reader { bytes, at: 0 };
+    let ids = reader.ids()?;
+    if reader.at != bytes.len() {
+        return Err(MetaError("bytes after the ids"));
+    }
+    Ok(ids)
 }
 
 pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
@@ -192,14 +194,7 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
         }
         put_u64(&mut out, sink.gap_count);
     }
-    put_u32(&mut out, meta.extents.len() as u32);
-    for extent in &meta.extents {
-        encode_extent(&mut out, extent);
-    }
-    put_u32(&mut out, meta.dropped_extents.len() as u32);
-    for id_first in &meta.dropped_extents {
-        out.extend_from_slice(&id_first.to_le_bytes());
-    }
+    encode_ids(&mut out, &meta.objects);
     let crc = crc32c(&out[4..]);
     out[..4].copy_from_slice(&crc.to_le_bytes());
     out
@@ -270,15 +265,33 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn extent(&mut self) -> Result<MetaExtent, MetaError> {
-        Ok(MetaExtent {
-            path: self.text()?,
-            offset: self.u64()?,
-            len_bytes: self.u64()?,
-            id_first: self.u64()?,
-            id_last: self.u64()?,
-            block_count: self.u32()?,
-        })
+    fn ids(&mut self) -> Result<Vec<ObjectId>, MetaError> {
+        let count = self.count(1)?;
+        let mut ids = Vec::with_capacity(count);
+        let mut previous = 0u64;
+        for index in 0..count {
+            let mut delta = 0u64;
+            let mut shift = 0;
+            loop {
+                let byte = self.u8()?;
+                if shift > 63 {
+                    return Err(MetaError("a varint is too long"));
+                }
+                delta |= u64::from(byte & 0x7F) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            if index > 0 && delta == 0 {
+                return Err(MetaError("object ids aren't ascending"));
+            }
+            previous = previous
+                .checked_add(delta)
+                .ok_or(MetaError("an object id is too big"))?;
+            ids.push(ObjectId(previous));
+        }
+        Ok(ids)
     }
 
     /// A count can't promise more than the bytes left could hold, so a corrupt one can't
@@ -290,15 +303,6 @@ impl<'a> Reader<'a> {
         }
         Ok(count)
     }
-}
-
-pub fn decode_extent(bytes: &[u8]) -> Result<MetaExtent, MetaError> {
-    let mut reader = Reader { bytes, at: 0 };
-    let extent = reader.extent()?;
-    if reader.at != bytes.len() {
-        return Err(MetaError("bytes after the extent"));
-    }
-    Ok(extent)
 }
 
 pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
@@ -384,12 +388,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             gap_count,
         });
     }
-    for _ in 0..reader.count(40)? {
-        meta.extents.push(reader.extent()?);
-    }
-    for _ in 0..reader.count(8)? {
-        meta.dropped_extents.push(reader.u64()?);
-    }
+    meta.objects = reader.ids()?;
     if reader.at != bytes.len() {
         return Err(MetaError("bytes after the metadata"));
     }

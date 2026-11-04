@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use format::{Filter, KeyHash, RecordHeader, make_id};
-use object_store::path::Path;
-use storage::StreamExtent;
+use storage::{ObjectId, ObjectKey, ObjectTable, RetentionClass};
 
 use crate::slab::SlabBytes;
 
@@ -270,27 +269,41 @@ pub(crate) struct PendingVisible {
     pub state: Option<(u64, Bytes)>,
 }
 
-/// A stream's sealed records in one object.
-#[derive(Debug, Clone)]
-pub(crate) struct ExtentRef {
-    pub path: Path,
-    pub extent: StreamExtent,
-}
-
-impl ExtentRef {
-    fn extent_path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// What came of asking an owner to replace extents with a compacted one.
+/// An object in a stream's list, and where a reader reads it: itself, or the compacted object
+/// replacing it for the stream's class (section 7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReplaceResult {
-    Applied,
-    /// None of them are there any more, as after a crash that lost only the cursor.
-    Gone,
-    /// They are there but this can't be done yet. The cursor waits.
-    Retry,
+pub(crate) struct ObjectRef {
+    pub stream: KeyHash,
+    pub listed: ObjectId,
+    pub key: ObjectKey,
+}
+
+/// A stream's changes for a checkpoint: its metadata, whether any of it beyond the last id and
+/// the list changed (which the object store's checkpoint takes), and its list's changes (which
+/// only the local store takes).
+#[derive(Debug, Clone)]
+pub(crate) struct Gathered {
+    pub meta: storage::StreamMeta,
+    pub meta_changed: bool,
+    /// A rewrite has the whole list in `appended`.
+    pub list: ListChange,
+}
+
+/// How a stream's object list changed since a checkpoint gather took it, for the local store
+/// (section 7.6): ids added at the end, the front cut by expiry, or a rewrite.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ListChange {
+    pub appended: Vec<ObjectId>,
+    /// Every id below this one is gone.
+    pub expired_below: Option<ObjectId>,
+    /// The list changed some other way, so the whole of it is written.
+    pub rewritten: bool,
+}
+
+impl ListChange {
+    pub fn is_empty(&self) -> bool {
+        self.appended.is_empty() && self.expired_below.is_none() && !self.rewritten
+    }
 }
 
 /// What a visible batch changes in the saved view, once its ticket is durable.
@@ -317,12 +330,12 @@ pub(crate) struct StreamDelivery {
     pub seq_by_home: Vec<u64>,
     /// `(stream, name) → id` of section 5.1.
     pub cursors: HashMap<KeyHash, u64>,
-    /// In id order, and not overlapping (D68).
-    pub extents: Vec<ExtentRef>,
+    /// The object list (section 7.6): ascending, which is the order of the records.
+    pub objects: Vec<ObjectId>,
     /// The last id of a deleted stream of this name. Nothing at or below it is readable.
     pub floor_id: u64,
-    /// The highest id in an extent taken away with nothing in its place. A position below this
-    /// has lost records (D178, Q32).
+    /// The stored highest expired id: what an object found gone took away. Retention's cutoff
+    /// adds to it when used (section 7.4). A position below this has lost records.
     pub expired_through: u64,
     pub sinks: std::collections::BTreeMap<u64, crate::message::SinkSpec>,
     /// The highest epoch of a sink deleted here. Not saved: no delivery outlives a restart.
@@ -333,18 +346,19 @@ pub(crate) struct StreamDelivery {
     pub saved_state: (u64, Bytes),
     /// Visible, and not yet in the WAL, in id order. Only with `track_meta`.
     pub unsaved: VecDeque<UnsavedStep>,
-    /// The last id each core held when this stream left it. Its extent still has to reach
+    /// The last id each core held when this stream left it. Its object still has to reach
     /// here, and until it does this stream's owner list is the only way to that core (D153).
     pub held_elsewhere: Vec<u64>,
     /// Whether this stream's metadata is saved at seals. Off on a node without a store.
     pub track_meta: bool,
+    /// State, config, cursors, sinks or the tombstone changed, which a checkpoint saves.
     pub meta_dirty: bool,
     /// The last checkpoint gather that took this stream's changes.
     pub saved_gather: u64,
-    /// Extents no checkpoint has yet.
-    pub new_extents: Vec<ExtentRef>,
-    /// `id_first` of extents gone since the last checkpoint, for it to take away.
-    pub dropped_extents: Vec<u64>,
+    /// What the list did since the last gather, which only the local store saves.
+    pub list_change: ListChange,
+    /// The last id as the last gather took it.
+    pub saved_last_id: u64,
     /// When it was last used, on its core's own count, for eviction.
     pub last_used: u64,
 }
@@ -358,7 +372,7 @@ impl StreamDelivery {
             table: FilterTable::new(core_count),
             seq_by_home: vec![0; core_count],
             cursors: HashMap::new(),
-            extents: Vec::new(),
+            objects: Vec::new(),
             floor_id: 0,
             expired_through: 0,
             sinks: std::collections::BTreeMap::new(),
@@ -370,8 +384,8 @@ impl StreamDelivery {
             track_meta: false,
             meta_dirty: false,
             saved_gather: 0,
-            new_extents: Vec::new(),
-            dropped_extents: Vec::new(),
+            list_change: ListChange::default(),
+            saved_last_id: 0,
             last_used: 0,
         }
     }
@@ -386,134 +400,126 @@ impl StreamDelivery {
         }
     }
 
-    /// Both cores of a seal report its extents, so one may arrive twice.
-    pub fn add_extent(&mut self, path: &Path, extent: &StreamExtent) {
+    /// An object holding `id_first..=id_last` of the stream. Both cores of a seal report it, so
+    /// it may arrive twice.
+    pub fn add_object(&mut self, id: ObjectId, id_first: u64, id_last: u64) {
         self.held_elsewhere
-            .retain(|id| !(extent.id_first <= *id && *id <= extent.id_last));
-        let at = self
-            .extents
-            .partition_point(|known| known.extent.id_first < extent.id_first);
-        // A report arriving late can also find a compacted extent already covering it.
-        let covered = at
-            .checked_sub(1)
-            .and_then(|before| self.extents.get(before))
-            .is_some_and(|known| known.extent.id_last >= extent.id_first);
-        if covered
-            || self
-                .extents
-                .get(at)
-                .is_some_and(|known| known.extent.id_first <= extent.id_last)
-        {
+            .retain(|held| !(id_first <= *held && *held <= id_last));
+        let Err(at) = self.objects.binary_search(&id) else {
+            return;
+        };
+        self.objects.insert(at, id);
+        if self.track_meta {
+            if at + 1 == self.objects.len() && !self.list_change.rewritten {
+                self.list_change.appended.push(id);
+            } else {
+                self.list_change.rewritten = true;
+            }
+        }
+    }
+
+    /// An object found gone from the store: what it held is lost. The highest expired id goes
+    /// up to below its time only, since the next object or memory can hold ids of that ms and
+    /// later, and memory's are still readable. Whether it was there.
+    pub fn drop_object(&mut self, id: ObjectId, in_memory: Option<u64>) -> bool {
+        let Ok(at) = self.objects.binary_search(&id) else {
+            return false;
+        };
+        self.objects.remove(at);
+        let mut through = make_id(id.time_ms(), 0).saturating_sub(1);
+        if let Some(first) = in_memory {
+            through = through.min(first.saturating_sub(1));
+        }
+        self.expired_through = self.expired_through.max(through);
+        if self.track_meta {
+            self.meta_dirty = true;
+            self.list_change.rewritten = true;
+        }
+        true
+    }
+
+    /// Drops the objects whose time is before the cutoff, which hold nothing still in
+    /// retention. The highest expired id becomes at least the last before the cutoff (section
+    /// 7.4).
+    pub fn expire(&mut self, now_ms: u64, retention_ms: u64) {
+        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+        let expired = self.objects.partition_point(|id| id.time_ms() < cutoff_ms);
+        if expired == 0 {
             return;
         }
-        let extent_ref = ExtentRef {
-            path: path.clone(),
-            extent: extent.clone(),
-        };
-        if self.track_meta {
-            self.meta_dirty = true;
-            self.new_extents.push(extent_ref.clone());
-        }
-        self.extents.insert(at, extent_ref);
-    }
-
-    /// Takes away every extent in the object at `path`. How many there were.
-    pub fn drop_path(&mut self, path: &Path) -> usize {
-        let dropped = &mut self.dropped_extents;
-        let expired_through = &mut self.expired_through;
-        let before = self.extents.len();
-        self.extents.retain(|known| {
-            let keep = known.extent_path() != path;
-            if !keep {
-                dropped.push(known.extent.id_first);
-                *expired_through = (*expired_through).max(known.extent.id_last);
-            }
-            keep
-        });
-        self.new_extents.retain(|known| known.extent_path() != path);
-        let count = before - self.extents.len();
-        if count > 0 {
-            self.meta_dirty = self.track_meta;
-        }
-        count
-    }
-
-    /// Puts `new` where the extents in `sources` are, all of it or none (section 7.5). They must
-    /// still be there, side by side. Anything may be still unsealed, which a merged extent
-    /// mustn't go around.
-    pub fn replace_extents(
-        &mut self,
-        path: &Path,
-        sources: &[(Path, u64, u64)],
-        new: &StreamExtent,
-        merge_below: u64,
-    ) -> ReplaceResult {
-        let Some((_, first, _)) = sources.first() else {
-            return ReplaceResult::Gone;
-        };
-        let at = self
-            .extents
-            .partition_point(|known| known.extent.id_first < *first);
-        let found = self.extents.get(at..at + sources.len()).filter(|known| {
-            known.iter().zip(sources).all(|(known, source)| {
-                known.path == source.0
-                    && known.extent.id_first == source.1
-                    && known.extent.id_last == source.2
-            })
-        });
-        if found.is_none() {
-            let any_left = sources.iter().any(|source| {
-                self.extents
-                    .iter()
-                    .any(|known| known.path == source.0 && known.extent.id_first == source.1)
-            });
-            return if any_left {
-                ReplaceResult::Retry
-            } else {
-                ReplaceResult::Gone
-            };
-        }
-        if sources.len() > 1 && new.id_last >= merge_below {
-            return ReplaceResult::Retry;
-        }
-        let new_ref = ExtentRef {
-            path: path.clone(),
-            extent: new.clone(),
-        };
-        for known in self
-            .extents
-            .splice(at..at + sources.len(), [new_ref.clone()])
-        {
-            self.dropped_extents.push(known.extent.id_first);
-            self.new_extents
-                .retain(|fresh| fresh.extent.id_first != known.extent.id_first);
+        self.objects.drain(..expired);
+        let through = make_id(cutoff_ms, 0).saturating_sub(1);
+        if through > self.expired_through {
+            self.expired_through = through;
+            self.meta_dirty |= self.track_meta;
         }
         if self.track_meta {
-            self.meta_dirty = true;
-            self.new_extents.push(new_ref);
+            let below = self.objects.first().copied().unwrap_or(ObjectId(u64::MAX));
+            self.list_change.appended.retain(|id| *id >= below);
+            self.list_change.expired_below = Some(below);
         }
-        ReplaceResult::Applied
     }
 
-    /// An id known to be above `after` in the extents, and the lowest one if the extent
-    /// starts above it. An extent holding `after` shows only its own last id: what comes
-    /// next inside it isn't known without reading it (D89).
-    pub fn sealed_id_above(&self, after: u64) -> Option<u64> {
-        self.first_extent_after(after).map(|known| {
-            if known.extent.id_first > after {
-                known.extent.id_first
-            } else {
-                known.extent.id_last
+    /// Puts a stream's compacted ids in place of an hour's sealed ones, once every one of them
+    /// has been replaced (section 7.6). A part-compacted hour stays as it is: the table leads a
+    /// reader from each sealed id to its copy, and only whole hours keep the list in order.
+    pub fn rewrite_compacted(&mut self, table: &ObjectTable, class: RetentionClass, hash: u64) {
+        let mut out: Vec<ObjectId> = Vec::with_capacity(self.objects.len());
+        let mut changed = false;
+        let mut at = 0;
+        while at < self.objects.len() {
+            let hour = self.objects[at].hour();
+            let end = at + self.objects[at..].partition_point(|id| id.hour() == hour);
+            let hour_ids = &self.objects[at..end];
+            let replaced: Option<Vec<ObjectId>> = hour_ids
+                .iter()
+                .map(|id| {
+                    if id.is_compacted() {
+                        Some(*id)
+                    } else {
+                        table
+                            .get(ObjectKey::sealed(*id))
+                            .and_then(|row| row.replaced_by(class, hash))
+                    }
+                })
+                .collect();
+            match replaced {
+                Some(mut ids) if hour_ids.iter().any(|id| !id.is_compacted()) => {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    out.extend(ids);
+                    changed = true;
+                }
+                _ => out.extend_from_slice(hour_ids),
             }
-        })
+            at = end;
+        }
+        if changed {
+            self.objects = out;
+            if self.track_meta {
+                self.list_change.rewritten = true;
+            }
+        }
     }
 
-    /// The first extent holding any id above `after`.
-    pub fn first_extent_after(&self, after: u64) -> Option<&ExtentRef> {
-        let at = self
-            .extents
-            .partition_point(|known| known.extent.id_last <= after);
-        self.extents.get(at)
+    /// An id at or below the lowest the list holds: an object's records are from the hour
+    /// before its time at the earliest, since a seal window is at most 120 s and a compacted
+    /// object's sources are of its hour.
+    pub fn earliest_id_bound(&self) -> Option<u64> {
+        let first = self.objects.first()?;
+        let from_ms = first.time_ms().saturating_sub(storage::HOUR_MS);
+        Some(make_id(from_ms, 0).max(self.expired_through.saturating_add(1)))
+    }
+
+    /// The first object that may hold an id above `after`, past `past` if given: its time is at
+    /// least `after`'s ms, since an object's time is at least its newest record's.
+    pub fn next_object(&self, after: u64, past: Option<ObjectId>) -> Option<ObjectId> {
+        let after_ms = format::id_ms(after);
+        let start = past.map_or(0, |past| self.objects.partition_point(|id| *id <= past));
+        self.objects[start..]
+            .iter()
+            .find(|id| id.time_ms() >= after_ms)
+            .copied()
     }
 }
 

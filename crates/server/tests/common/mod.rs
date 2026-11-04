@@ -477,8 +477,13 @@ pub async fn hear_until(
     while !done(heard) {
         assert!(
             std::time::Instant::now() < give_up,
-            "gave up after hearing {} events",
-            heard.events.len()
+            "gave up after hearing {} events: {:?}",
+            heard.events.len(),
+            heard
+                .events
+                .iter()
+                .map(|e| format!("{e:?}").chars().take(300).collect::<String>())
+                .collect::<Vec<_>>()
         );
         if let Some(event) = connection.recv_within(100).await {
             heard.events.push(event);

@@ -556,9 +556,11 @@ impl Worker {
     /// The next object's id: at or after its newest record's ms, and after the last object's
     /// (section 7.3). Handoffs come one at a time, so no two objects share one.
     fn next_object_id(&mut self, last_id: u64, index: u8) -> ObjectId {
-        let time_ms = format::id_ms(last_id)
-            .max(self.last_object_ms + 1)
-            .max(crate::OBJECT_EPOCH_MS);
+        let time_ms = crate::object::sealed_time_ms(
+            format::id_ms(last_id)
+                .max(self.last_object_ms + 1)
+                .max(crate::OBJECT_EPOCH_MS),
+        );
         self.last_object_ms = time_ms;
         ObjectId::new(time_ms, self.config.generation, index)
     }

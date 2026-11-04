@@ -14,18 +14,19 @@ use bytes::Bytes;
 use format::{Clause, Decision, Filter, KeyHash};
 use object_store::ObjectStore;
 use proto::ErrorCode;
-use storage::{BlockTable, SegmentError, SegmentReader};
+use storage::{BlockTable, Ownership, SegmentError, SegmentReader, StreamExtent};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::core::Links;
 use crate::delivery::{
-    ExtentRef, FanOut, Matched, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, walk_records,
+    FanOut, Matched, ObjectRef, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, walk_records,
 };
 use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
     ReadStepMsg, StreamBody, SubRef,
 };
+use crate::pages::PageCache;
 use crate::slab::SlabAccount;
 
 /// `type u8 | flags u8 | sub u32 | len u32` of a `DATA` frame.
@@ -460,6 +461,11 @@ pub(crate) struct DeliverySettings {
 pub(crate) struct Stores {
     pub local: Option<Arc<dyn ObjectStore>>,
     pub object: Arc<dyn ObjectStore>,
+    pub pages: Arc<PageCache>,
+    /// How far each former generation's objects are read (section 8.1).
+    pub ownership: Arc<Ownership>,
+    /// The node's object table, which the cores read and the node and compactor change.
+    pub objects: Arc<std::sync::RwLock<storage::ObjectTable>>,
 }
 
 /// What a home core counts.
@@ -489,12 +495,20 @@ struct QueueItem {
     offset: usize,
 }
 
-/// A catch-up partway through an extent, so its table is read once.
-struct ExtentProgress {
-    extent: ExtentRef,
-    table: Option<Arc<BlockTable>>,
+/// A catch-up partway through an object, so its region is found once.
+struct ObjectProgress {
+    object: ObjectRef,
+    region: Option<Region>,
     next_block: usize,
     limit: u64,
+}
+
+/// A stream's region in an object, and the id a read takes records above.
+#[derive(Debug, Clone)]
+pub(crate) struct Region {
+    pub extent: StreamExtent,
+    pub table: Arc<BlockTable>,
+    pub after: u64,
 }
 
 struct Sub {
@@ -530,9 +544,13 @@ struct Sub {
     read_out: bool,
     /// A `BEHIND` is on its way. Catching up waits until the client has read it (D86, D99).
     behind_unread: bool,
-    extent: Option<ExtentProgress>,
+    object: Option<ObjectProgress>,
+    /// The object read last, so the next step goes past it.
+    past: Option<ObjectRef>,
+    /// The last id of the region read last, for the order check (section 7.5).
+    past_last_id: u64,
     /// An object found missing, for the next step to tell the owner of.
-    gone: Option<object_store::path::Path>,
+    gone: Option<ObjectRef>,
     read_bytes_since: u64,
     state_ver: u64,
     latest_state: Option<(u64, Bytes)>,
@@ -1041,7 +1059,9 @@ impl Home {
             head_progress_owed: false,
             read_out: false,
             behind_unread: false,
-            extent: None,
+            object: None,
+            past: None,
+            past_last_id: 0,
             gone: None,
             read_bytes_since: 0,
             state_ver: 0,
@@ -1662,7 +1682,10 @@ impl Home {
         sub.timer_armed = false;
         sub.head_progress_owed = false;
         sub.behind_unread = true;
-        sub.extent = None;
+        // The position went back, so the list is walked again from it.
+        sub.object = None;
+        sub.past = None;
+        sub.past_last_id = 0;
         let (conn, id, resume_from) = (sub.conn, sub.id, sub.handed_through);
         self.stats.behind_count += 1;
         self.send_event(
@@ -1698,15 +1721,17 @@ impl Home {
             return;
         }
         sub.read_out = true;
-        if let Some(extent) = &sub.extent {
-            let job = ExtentJob {
+        if let Some(progress) = &sub.object {
+            let job = ObjectJob {
                 stores: self.stores.clone(),
-                extent: extent.extent.clone(),
-                table: extent.table.clone(),
-                next_block: extent.next_block,
-                limit: extent.limit,
-                filter: range_filter(&sub.filter, sub.position, extent.limit),
+                object: progress.object,
+                region: progress.region.clone(),
+                next_block: progress.next_block,
+                limit: progress.limit,
+                filter: sub.filter,
                 position: sub.position,
+                past: sub.past,
+                past_last_id: sub.past_last_id,
                 budget_bytes: read_bytes,
                 back: self.links.reads[self.me].clone(),
                 sub: SubRef {
@@ -1715,7 +1740,7 @@ impl Home {
                     uid: sub.uid,
                 },
             };
-            tokio::spawn(run_extent_job(job));
+            tokio::spawn(run_object_job(job));
             return;
         }
         let message = ReadStepMsg {
@@ -1728,6 +1753,7 @@ impl Home {
             filter: sub.filter,
             after: sub.position,
             read_bytes: std::mem::take(&mut sub.read_bytes_since),
+            past: sub.past,
             gone: sub.gone.take(),
         };
         let _ = self.links.reads[self.me].send(ReadMsg::Step(Box::new(message)));
@@ -1803,10 +1829,10 @@ impl Home {
                     sub.position = position;
                 }
             }
-            CatchReply::Extent { extent, limit } => {
-                sub.extent = Some(ExtentProgress {
-                    extent,
-                    table: None,
+            CatchReply::Object { object, limit } => {
+                sub.object = Some(ObjectProgress {
+                    object,
+                    region: None,
                     next_block: 0,
                     limit,
                 });
@@ -1858,8 +1884,8 @@ impl Home {
         match done {
             ReadDone::Retry => {}
             ReadDone::Gone => {
-                // Compaction may have moved these records, and the owner knows where.
-                sub.gone = sub.extent.take().map(|progress| progress.extent.path);
+                // The owner knows if a compacted object has these records now.
+                sub.gone = sub.object.take().map(|progress| progress.object);
             }
             ReadDone::Fail { code, msg } => {
                 let (conn, id, tag) = (sub.conn, sub.id, sub.tag);
@@ -1876,15 +1902,26 @@ impl Home {
                 return;
             }
             ReadDone::Read(read) => {
-                let limit = sub.extent.as_ref().map_or(read.position, |e| e.limit);
-                let filter = range_filter(&sub.filter, sub.position, limit);
+                let limit = read.limit;
+                let after = read
+                    .region
+                    .as_ref()
+                    .map_or(sub.position, |region| region.after);
+                let filter = range_filter(&sub.filter, after, limit);
                 sub.position = sub.position.max(read.position);
-                if let Some(extent) = &mut sub.extent {
-                    extent.table = Some(read.table);
-                    extent.next_block = read.next_block;
+                if let Some(progress) = &mut sub.object {
+                    progress.region = read.region.clone();
+                    progress.next_block = read.next_block;
+                    progress.limit = limit;
                 }
-                if read.done {
-                    sub.extent = None;
+                if read.done
+                    && let Some(progress) = sub.object.take()
+                    && read.passed
+                {
+                    sub.past = Some(progress.object);
+                    if let Some(region) = &read.region {
+                        sub.past_last_id = region.extent.id_last;
+                    }
                 }
                 let local = read.from_local;
                 self.stats.blocks_read_count += read.blocks_read_count;
@@ -1921,99 +1958,195 @@ fn range_filter(filter: &Filter, position: u64, limit: u64) -> Filter {
     ranged
 }
 
-/// One read of an extent: its table if needed, then one run of blocks.
-struct ExtentJob {
+/// One read of an object: the stream's region if not found yet, then one run of blocks.
+struct ObjectJob {
     stores: Stores,
-    extent: ExtentRef,
-    table: Option<Arc<BlockTable>>,
+    object: ObjectRef,
+    region: Option<Region>,
     next_block: usize,
     limit: u64,
     filter: Filter,
     position: u64,
+    past: Option<ObjectRef>,
+    past_last_id: u64,
     budget_bytes: u64,
     back: mpsc::UnboundedSender<ReadMsg>,
     sub: SubRef,
 }
 
-/// What came back from one read of an extent.
+/// What came back from one read of an object.
 #[derive(Debug)]
-pub(crate) struct ExtentRead {
-    pub table: Arc<BlockTable>,
+pub(crate) struct ObjectRead {
+    /// `None` if the stream has no region there.
+    pub region: Option<Region>,
     pub next_block: usize,
     /// Everything at or below this id has been looked at.
     pub position: u64,
+    /// The read's limit, lowered for a former generation's object (section 8.1).
+    pub limit: u64,
     pub done: bool,
+    /// Done, and nothing of the object is left above the owner's limit, so the next read goes
+    /// past it.
+    pub passed: bool,
     pub bytes: Option<Bytes>,
     pub blocks_read_count: u64,
     pub blocks_skipped_count: u64,
     pub from_local: bool,
 }
 
+/// The stream's region in the object, through the page cache: the top index and the page
+/// are fetched only on a miss (section 7.3).
+async fn find_region(
+    reader: &SegmentReader,
+    pages: &PageCache,
+    path: &object_store::path::Path,
+    stream: KeyHash,
+) -> Result<Option<(StreamExtent, BlockTable)>, SegmentError> {
+    let top = match pages.top(path) {
+        Some(top) => top,
+        None => {
+            let top = Arc::new(reader.read_top_index().await?);
+            pages.put_top(path, Arc::clone(&top));
+            top
+        }
+    };
+    let Some(number) = top.page_number_for(storage::stream_hash(stream)) else {
+        return Ok(None);
+    };
+    let page = match pages.page(path, number) {
+        Some(page) => page,
+        None => {
+            let page = Arc::new(reader.read_page(&top, number).await?);
+            pages.put_page(path, number, Arc::clone(&page));
+            page
+        }
+    };
+    reader.find_region(&page, stream).await
+}
+
 async fn read_from(
     store: Arc<dyn ObjectStore>,
-    job: &ExtentJob,
-) -> Result<ExtentRead, SegmentError> {
-    let reader = SegmentReader::new(store, job.extent.path.clone());
-    let table = match &job.table {
-        Some(table) => Arc::clone(table),
-        None => Arc::new(reader.read_table(&job.extent.extent).await?),
+    job: &ObjectJob,
+) -> Result<ObjectRead, SegmentError> {
+    let path = job.object.key.path();
+    let reader = SegmentReader::new(store, path.clone());
+    // A sealed object of a former generation holds what it accepted only (section 8.1).
+    let accepted = match job.object.key.class {
+        None => job
+            .stores
+            .ownership
+            .limit_for(job.object.key.id.generation())
+            .unwrap_or(u64::MAX),
+        Some(_) => u64::MAX,
     };
-    let blocks = &table.blocks;
+    let limit = job.limit.min(accepted);
+    let region = match &job.region {
+        Some(region) => region.clone(),
+        None => match find_region(&reader, &job.stores.pages, &path, job.object.stream).await? {
+            Some((extent, table)) => {
+                // A list is in record order, so a former generation's sealed region starting
+                // at or below the last one's end was uploaded late. Its records are read too,
+                // rather than passed over (section 7.5).
+                let late = job.object.key.class.is_none()
+                    && job.past.is_some_and(|past| {
+                        job.object.key.id.generation() < past.key.id.generation()
+                    })
+                    && extent.id_first <= job.past_last_id.min(job.position);
+                let after = if late {
+                    extent.id_first.saturating_sub(1)
+                } else {
+                    job.position
+                };
+                Region {
+                    extent,
+                    table: Arc::new(table),
+                    after,
+                }
+            }
+            None => {
+                return Ok(ObjectRead {
+                    region: None,
+                    next_block: 0,
+                    position: job.position,
+                    limit,
+                    done: true,
+                    passed: true,
+                    bytes: None,
+                    blocks_read_count: 0,
+                    blocks_skipped_count: 0,
+                    from_local: false,
+                });
+            }
+        },
+    };
+    let filter = range_filter(&job.filter, region.after, limit);
+    let blocks = &region.table.blocks;
     let mut position = job.position;
     let mut at = job.next_block;
     let mut skipped = 0;
     let mut done = false;
     // Blocks the summaries rule out cost nothing beyond the table (section 4.1).
     while let Some(block) = blocks.get(at) {
-        if block.summary.id_first > job.limit {
-            // Extents are in id order, so nothing at or below the limit is left anywhere.
-            position = position.max(job.limit);
+        if block.summary.id_first > limit {
+            // A list is in id order, so nothing at or below the limit is left anywhere.
+            position = position.max(limit);
             done = true;
             break;
         }
-        if job.filter.decide_block(&block.summary) != Decision::None {
+        if filter.decide_block(&block.summary) != Decision::None {
             break;
         }
         skipped += 1;
-        position = position.max(block.summary.id_last.min(job.limit));
+        position = position.max(block.summary.id_last.min(limit));
         at += 1;
     }
     let start = at;
     let mut bytes = 0;
     while let Some(block) = blocks.get(at) {
-        if block.summary.id_first > job.limit
+        if block.summary.id_first > limit
             || bytes >= job.budget_bytes
-            || job.filter.decide_block(&block.summary) == Decision::None
+            || filter.decide_block(&block.summary) == Decision::None
         {
             break;
         }
         bytes += block.summary.bytes;
-        position = position.max(block.summary.id_last.min(job.limit));
+        position = position.max(block.summary.id_last.min(limit));
         at += 1;
     }
     let data = if start < at {
         Some(
             reader
-                .read_blocks(&job.extent.extent, &table, start..at)
+                .read_blocks(&region.extent, &region.table, start..at)
                 .await?,
         )
     } else {
         None
     };
+    if blocks
+        .get(at)
+        .is_some_and(|block| block.summary.id_first > limit)
+    {
+        position = position.max(limit);
+        done = true;
+    }
     done |= at >= blocks.len();
-    Ok(ExtentRead {
+    // What a former generation's object holds above its limit is never read (section 8.1).
+    let passed = done && region.extent.id_last.min(accepted) <= job.limit;
+    Ok(ObjectRead {
         next_block: at,
         position,
+        limit,
         done,
+        passed,
         bytes: data,
         blocks_read_count: (at - start) as u64,
         blocks_skipped_count: skipped,
         from_local: false,
-        table,
+        region: Some(region),
     })
 }
 
-async fn run_extent_job(job: ExtentJob) {
+async fn run_object_job(job: ObjectJob) {
     // A miss or a bad copy in the local tier isn't an error: S3 has it (section 6.2).
     let local_read = match &job.stores.local {
         Some(local) => read_from(Arc::clone(local), &job).await.ok(),

@@ -2,9 +2,9 @@
 //! that brings a stream back, and the thread that saves what changed at each seal. Cores reach
 //! both with messages and never wait for them, which keeps the store off the write path.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,15 +12,24 @@ use format::KeyHash;
 use object_store::{ObjectStore, PutPayload};
 use storage::{
     CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, MetadataError, MetadataStore,
-    StreamMeta, build_checkpoint, checkpoint_path, decode_extent, decode_meta, encode_extent,
-    encode_meta, merge_meta, put_checkpoint, put_checkpoint_payload, retry_delay,
+    NewerObjects, ObjectId, ObjectKey, ObjectRow, ObjectState, ObjectTable, ROW_KEY_BYTES,
+    StreamMeta, build_checkpoint, checkpoint_path, decode_ids, decode_meta, encode_ids,
+    encode_meta, put_checkpoint, put_checkpoint_payload, retry_delay,
 };
 use tokio::sync::mpsc;
 
+use crate::clock::Clock;
+use crate::delivery::{Gathered, ListChange};
 use crate::message::ControlMsg;
 
 const TAG_STREAM: u8 = b's';
-const TAG_EXTENT: u8 = b'x';
+/// A chunk of a stream's object list, keyed by its first id (section 7.6).
+const TAG_LIST: u8 = b'l';
+/// An object table row.
+const TAG_ROW: u8 = b'r';
+/// How many ids a list chunk holds, so a seal appends to the last one and expiry deletes whole
+/// ones.
+const LIST_CHUNK_COUNT: usize = 256;
 const KEY_COMPLETE: &[u8] = b"c";
 const KEY_MAX_ID: &[u8] = b"g";
 /// The file of the seal saved last: `generation u64 | seq u64 | file`. It goes in with that
@@ -37,10 +46,25 @@ fn stream_key(tag: u8, stream: KeyHash) -> Vec<u8> {
     key
 }
 
-fn extent_key(name: KeyHash, id_first: u64) -> Vec<u8> {
-    let mut key = stream_key(TAG_EXTENT, name);
-    key.extend_from_slice(&id_first.to_be_bytes());
+fn chunk_key(name: KeyHash, first: ObjectId) -> Vec<u8> {
+    let mut key = stream_key(TAG_LIST, name);
+    key.extend_from_slice(&first.0.to_be_bytes());
     key
+}
+
+fn row_key(key: ObjectKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + ROW_KEY_BYTES);
+    out.push(TAG_ROW);
+    out.extend_from_slice(&key.encode());
+    out
+}
+
+fn chunk_changes(name: KeyHash, ids: &[ObjectId], changes: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    for chunk in ids.chunks(LIST_CHUNK_COUNT) {
+        let mut value = Vec::with_capacity(4 + chunk.len() * 3);
+        encode_ids(&mut value, chunk);
+        changes.push((chunk_key(name, chunk[0]), Some(value)));
+    }
 }
 
 #[derive(Debug)]
@@ -93,8 +117,9 @@ pub(crate) async fn put_owed_checkpoint(
         .map_err(|error| error.to_string())
 }
 
-/// The local key-value store, with a stream's fields under one key and each extent under its
-/// own, so a seal writes what changed and not everything the stream has.
+/// The local key-value store, with a stream's fields under one key, its object list in chunks
+/// and each object table row under its own key, so a seal writes what changed and not
+/// everything a stream has (section 7.6).
 pub(crate) struct LocalMeta {
     store: MetadataStore,
     /// Whether this store has seen every stream, so a miss means no such stream. After the
@@ -141,15 +166,81 @@ impl LocalMeta {
         if meta.stream != name {
             return Err(LocalError::Corrupt(format!("{name} holds {}", meta.stream)));
         }
-        for (_, value) in self.store.scan_prefix(&stream_key(TAG_EXTENT, name))? {
-            let extent =
-                decode_extent(&value).map_err(|error| LocalError::Corrupt(error.to_string()))?;
-            if extent.id_last > meta.floor_id {
-                meta.extents.push(extent);
+        meta.objects = self.list(name)?;
+        Ok(Some(meta))
+    }
+
+    /// A stream's object list, from its chunks in key order.
+    fn list(&self, name: KeyHash) -> Result<Vec<ObjectId>, LocalError> {
+        let mut ids = Vec::new();
+        for (_, value) in self.store.scan_prefix(&stream_key(TAG_LIST, name))? {
+            let chunk =
+                decode_ids(&value).map_err(|error| LocalError::Corrupt(error.to_string()))?;
+            ids.extend(chunk);
+        }
+        Ok(ids)
+    }
+
+    /// The writes that bring a stream's chunks in line with what its list did.
+    fn list_changes(
+        &self,
+        name: KeyHash,
+        list: &ListChange,
+        changes: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), MetadataError> {
+        if list.is_empty() {
+            return Ok(());
+        }
+        let chunks = self.store.scan_prefix(&stream_key(TAG_LIST, name))?;
+        if list.rewritten {
+            for (key, _) in chunks {
+                changes.push((key, None));
+            }
+            chunk_changes(name, &list.appended, changes);
+            return Ok(());
+        }
+        // A chunk wholly below the cut goes: the next one starts at or below it.
+        let mut kept = chunks.len();
+        if let Some(below) = list.expired_below {
+            let firsts: Vec<ObjectId> = chunks.iter().map(|(key, _)| chunk_first(key)).collect();
+            let mut gone = 0;
+            while gone < chunks.len() {
+                let wholly = match firsts.get(gone + 1) {
+                    Some(next) => *next <= below,
+                    None => below == ObjectId(u64::MAX),
+                };
+                if !wholly {
+                    break;
+                }
+                gone += 1;
+            }
+            for (key, _) in &chunks[..gone] {
+                changes.push((key.clone(), None));
+            }
+            kept -= gone;
+        }
+        if list.appended.is_empty() {
+            return Ok(());
+        }
+        // The last chunk takes what fits, and the rest start new ones.
+        let mut appended = &list.appended[..];
+        if kept > 0
+            && let Some((key, value)) = chunks.last()
+        {
+            let mut last = decode_ids(value).unwrap_or_default();
+            let room = LIST_CHUNK_COUNT
+                .saturating_sub(last.len())
+                .min(appended.len());
+            if room > 0 {
+                last.extend_from_slice(&appended[..room]);
+                appended = &appended[room..];
+                let mut value = Vec::with_capacity(4 + last.len() * 3);
+                encode_ids(&mut value, &last);
+                changes.push((key.clone(), Some(value)));
             }
         }
-        meta.extents.sort_by_key(|extent| extent.id_first);
-        Ok(Some(meta))
+        chunk_changes(name, appended, changes);
+        Ok(())
     }
 
     pub(crate) fn max_id(&self) -> Result<u64, MetadataError> {
@@ -162,47 +253,37 @@ impl LocalMeta {
         }))
     }
 
-    /// One atomic write of everything in `metas`, and of the file that owes S3 the same. A
-    /// meta's extents are added to what the store has, and a tombstone clears them.
+    /// One atomic write of everything gathered, the table's changed rows, and the file that
+    /// owes S3 the same.
     pub(crate) fn apply(
         &self,
-        metas: &[StreamMeta],
+        gathered: &[Gathered],
+        rows: &[ObjectRow],
+        removed: &[ObjectKey],
         max_id: u64,
         owed: Option<&[u8]>,
     ) -> Result<(), MetadataError> {
-        let mut changes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(metas.len() + 1);
-        for meta in metas {
-            if meta.deleted {
-                for (key, _) in self
-                    .store
-                    .scan_prefix(&stream_key(TAG_EXTENT, meta.stream))?
-                {
-                    changes.push((key, None));
-                }
-            }
-            for id_first in &meta.dropped_extents {
-                if !meta
-                    .extents
-                    .iter()
-                    .any(|extent| extent.id_first == *id_first)
-                {
-                    changes.push((extent_key(meta.stream, *id_first), None));
-                }
-            }
-            for extent in &meta.extents {
-                let mut value = Vec::with_capacity(64 + extent.path.len());
-                encode_extent(&mut value, extent);
-                changes.push((extent_key(meta.stream, extent.id_first), Some(value)));
-            }
+        let mut changes: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            Vec::with_capacity(gathered.len() + rows.len() + 2);
+        for one in gathered {
+            let meta = &one.meta;
+            self.list_changes(meta.stream, &one.list, &mut changes)?;
             let fields = StreamMeta {
-                extents: Vec::new(),
-                dropped_extents: Vec::new(),
+                objects: Vec::new(),
                 ..meta.clone()
             };
             changes.push((
                 stream_key(TAG_STREAM, meta.stream),
                 Some(encode_meta(&fields)),
             ));
+        }
+        for row in rows {
+            let mut value = Vec::with_capacity(4 + row.replacements.len() * 25);
+            row.encode(&mut value);
+            changes.push((row_key(row.key), Some(value)));
+        }
+        for key in removed {
+            changes.push((row_key(*key), None));
         }
         changes.push((KEY_MAX_ID.to_vec(), Some(max_id.to_le_bytes().to_vec())));
         if let Some(owed) = owed {
@@ -216,6 +297,28 @@ impl LocalMeta {
     }
 }
 
+fn chunk_first(key: &[u8]) -> ObjectId {
+    let mut field = [0u8; 8];
+    if let Some(tail) = key.len().checked_sub(8).and_then(|at| key.get(at..)) {
+        field.copy_from_slice(tail);
+    }
+    ObjectId(u64::from_be_bytes(field))
+}
+
+/// A whole meta as a gathered change: its list replaces what the store has.
+pub(crate) fn whole(meta: StreamMeta) -> Gathered {
+    let list = ListChange {
+        appended: meta.objects.clone(),
+        expired_below: None,
+        rewritten: true,
+    };
+    Gathered {
+        meta,
+        meta_changed: true,
+        list,
+    }
+}
+
 /// What the loader does.
 pub(crate) enum MetaMsg {
     Load {
@@ -225,6 +328,12 @@ pub(crate) enum MetaMsg {
     },
     /// A new checkpoint file, for lookups to walk.
     Installed(Box<CheckpointFile>),
+    /// A sealed object the next file records, with each stream's last id in it, which lists
+    /// are rebuilt from until a full file holds them (section 7.6).
+    Newer {
+        id: ObjectId,
+        last_ids: Vec<(KeyHash, u64)>,
+    },
 }
 
 /// Brings a stream back: the local store, then the checkpoints (section 7.6). A failed read is
@@ -238,6 +347,7 @@ pub(crate) fn run_loader(
     local: Arc<LocalMeta>,
     store: Arc<dyn ObjectStore>,
     mut checkpoints: CheckpointSet,
+    mut newer: NewerObjects,
     control: Vec<mpsc::UnboundedSender<ControlMsg>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -256,8 +366,12 @@ pub(crate) fn run_loader(
         'messages: while let Some(message) = rx.recv().await {
             match message {
                 MetaMsg::Installed(file) => {
+                    if file.head.full {
+                        newer.clear();
+                    }
                     checkpoints.add_newest(*file);
                 }
+                MetaMsg::Newer { id, last_ids } => newer.add(id, last_ids),
                 MetaMsg::Load {
                     core,
                     stream,
@@ -265,7 +379,7 @@ pub(crate) fn run_loader(
                 } => {
                     let mut attempt = 0;
                     let found = loop {
-                        match load_stream(&local, &checkpoints, &store, stream).await {
+                        match load_stream(&local, &checkpoints, &newer, &store, stream).await {
                             Ok(found) => break Some(found),
                             Err(error) if stop.load(Ordering::SeqCst) => {
                                 eprintln!("loading stream metadata: {error}");
@@ -313,6 +427,7 @@ async fn delete_superseded(store: Arc<dyn ObjectStore>, superseded: Vec<object_s
 pub(crate) async fn load_stream(
     local: &LocalMeta,
     checkpoints: &CheckpointSet,
+    newer: &NewerObjects,
     store: &Arc<dyn ObjectStore>,
     name: KeyHash,
 ) -> Result<(Option<StreamMeta>, bool), String> {
@@ -323,16 +438,18 @@ pub(crate) async fn load_stream(
         return Ok((None, false));
     }
     let found = checkpoints
-        .lookup(store, name)
+        .lookup(store, name, newer)
         .await
         .map_err(|error: CheckpointError| error.to_string())?;
     let Some(meta) = found else {
         return Ok((None, false));
     };
-    // What a later seal adds has the rest of the stream's extents to sit beside.
+    // What a later seal adds has the rest of the stream's list to sit beside.
     local
         .apply(
-            std::slice::from_ref(&meta),
+            &[whole(meta.clone())],
+            &[],
+            &[],
             local.max_id().map_err(|e| e.to_string())?.max(meta.last_id),
             None,
         )
@@ -340,12 +457,21 @@ pub(crate) async fn load_stream(
     Ok((Some(meta), true))
 }
 
+/// An uploaded sealed object a checkpoint may now record, with each stream's last id in it.
+#[derive(Debug, Clone)]
+pub(crate) struct Upload {
+    pub id: ObjectId,
+    pub state: ObjectState,
+    pub last_ids: Vec<(KeyHash, u64)>,
+}
+
 /// One seal's metadata.
 pub(crate) struct CheckpointJob {
     pub seal: u64,
     pub gather: u64,
-    pub metas: Vec<StreamMeta>,
-    pub objects: Vec<String>,
+    pub metas: Vec<Gathered>,
+    /// Uploads whose manifests are safe, so their rows can be recorded (D180).
+    pub uploads: Vec<Upload>,
     /// The WAL file this seal closed, if all it holds is now safely elsewhere (D137).
     pub remove_seq: Option<u64>,
 }
@@ -368,21 +494,34 @@ pub(crate) struct Checkpointer {
     pub stop: Arc<AtomicBool>,
     /// Every stream with a sink, which each file lists (D198).
     pub sink_streams: std::collections::BTreeSet<KeyHash>,
+    /// The node's object table, whose changed rows each file takes.
+    pub objects: Arc<RwLock<ObjectTable>>,
+    /// Sealed objects no full file holds yet, which a full file's lists are rebuilt from.
+    pub newer: NewerObjects,
+    pub clock: Arc<dyn Clock>,
 }
 
 /// A stream gathered twice in one job, as a tombstone on the core it left and alive on the
 /// next: the one with the most recent ids wins, and a live one above the tombstone beats it.
-fn latest_per_stream(metas: Vec<StreamMeta>) -> Vec<StreamMeta> {
-    let mut latest: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
-    for meta in metas {
+fn latest_per_stream(metas: Vec<Gathered>) -> Vec<Gathered> {
+    let mut latest: BTreeMap<KeyHash, Gathered> = BTreeMap::new();
+    for one in metas {
+        let meta = &one.meta;
         match latest.get(&meta.stream) {
-            Some(known) if (known.last_id, !known.deleted) >= (meta.last_id, !meta.deleted) => {}
+            Some(known)
+                if (known.meta.last_id, !known.meta.deleted) >= (meta.last_id, !meta.deleted) => {}
             _ => {
-                latest.insert(meta.stream, meta);
+                latest.insert(meta.stream, one);
             }
         }
     }
     latest.into_values().collect()
+}
+
+fn write_table(table: &RwLock<ObjectTable>) -> std::sync::RwLockWriteGuard<'_, ObjectTable> {
+    table
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Checkpointer {
@@ -410,22 +549,39 @@ impl Checkpointer {
     /// Local first, with the file it owes S3, so a crash leaves S3 trailing by one file that the
     /// next startup puts there. `None` if the node stopped first.
     pub(crate) async fn save(&mut self, job: CheckpointJob) -> Option<CheckpointDone> {
-        let metas = latest_per_stream(job.metas);
-        for meta in &metas {
-            self.max_id = self.max_id.max(meta.last_id);
-        }
-        for meta in &metas {
-            if meta.sinks.is_empty() {
-                self.sink_streams.remove(&meta.stream);
+        let gathered = latest_per_stream(job.metas);
+        for one in &gathered {
+            self.max_id = self.max_id.max(one.meta.last_id);
+            if one.meta.sinks.is_empty() {
+                self.sink_streams.remove(&one.meta.stream);
             } else {
-                self.sink_streams.insert(meta.stream);
+                self.sink_streams.insert(one.meta.stream);
             }
         }
-        let changed = !metas.is_empty() || !job.objects.is_empty();
+        for upload in job.uploads {
+            write_table(&self.objects).set_state(ObjectKey::sealed(upload.id), upload.state);
+            self.newer.add(upload.id, upload.last_ids.clone());
+            let _ = self.loader.send(MetaMsg::Newer {
+                id: upload.id,
+                last_ids: upload.last_ids,
+            });
+        }
+        // Another machine can't read a local file, so a file records uploaded objects only.
+        let (rows, removed) = write_table(&self.objects).take_changed();
+        let (rows, local_rows): (Vec<ObjectRow>, Vec<ObjectRow>) =
+            rows.into_iter().partition(|row| row.state.is_uploaded());
+        // The object store's file takes changes beyond the last id and the list (section 7.6).
+        let metas: Vec<StreamMeta> = gathered
+            .iter()
+            .filter(|one| one.meta_changed)
+            .map(|one| one.meta.clone())
+            .collect();
+        let changed = !metas.is_empty() || !rows.is_empty() || !removed.is_empty();
         let head = CheckpointHead {
             full: false,
             max_id: self.max_id,
-            objects: job.objects,
+            rows: rows.clone(),
+            removed: removed.clone(),
             sink_streams: self.sink_streams.iter().copied().collect(),
         };
         let built = if changed {
@@ -453,14 +609,15 @@ impl Checkpointer {
                     .for_each(|part| owed.extend_from_slice(part));
                 owed
             });
+            let all_rows: Vec<ObjectRow> = rows.iter().chain(&local_rows).cloned().collect();
             self.retry("writing the local metadata store", async || {
-                local.apply(&metas, max_id, owed.as_deref())
+                local.apply(&gathered, &all_rows, &removed, max_id, owed.as_deref())
             })
             .await?;
         }
         storage::crash_point("checkpoint.before_put");
         if let Some(built) = built {
-            self.put_file(job.seal, head, metas, built).await?;
+            self.put_file(job.seal, head, gathered, built).await?;
         }
         Some(CheckpointDone {
             seal: job.seal,
@@ -474,15 +631,16 @@ impl Checkpointer {
         &mut self,
         seq: u64,
         delta: CheckpointHead,
-        metas: Vec<StreamMeta>,
+        gathered: Vec<Gathered>,
         delta_file: storage::BuiltCheckpoint,
     ) -> Option<()> {
         let full = self.checkpoints.files.len() + 1 >= self.full_every_count;
         let (head, built) = if full {
             let store = Arc::clone(&self.store);
             let checkpoints = self.checkpoints.clone();
+            let newer = self.newer.clone();
             let merged = self.retry("merging checkpoints", async || {
-                checkpoints.merge_all(&store).await
+                checkpoints.merge_all(&store, &newer).await
             });
             // One read per stream per file, so this can outlast any wait for a stop. The next
             // startup puts the file this seal owes (D262).
@@ -496,26 +654,41 @@ impl Checkpointer {
                 merged = merged => merged?,
                 () = stopped => return None,
             };
-            for meta in metas {
-                merge_meta(&mut all, meta);
+            // This seal's changes, with the lists the merge rebuilt.
+            for one in gathered.into_iter().filter(|one| one.meta_changed) {
+                let mut meta = one.meta;
+                let known = all.remove(&meta.stream);
+                if !meta.deleted
+                    && let Some(known) = known
+                    && known.floor_id == meta.floor_id
+                {
+                    meta.objects = known.objects;
+                    meta.last_id = meta.last_id.max(known.last_id);
+                }
+                all.insert(meta.stream, meta);
             }
-            // Everything recorded so far: nothing older than this file will be read, and an
-            // object in no list gets looked at on the next startup.
-            let mut known: HashSet<String> = delta.objects.into_iter().collect();
-            known.extend(self.checkpoints.recorded_objects().map(str::to_owned));
-            // What has expired needn't stay on the list for ever (D149). A failed listing only
-            // keeps it one more file.
-            if let Ok(existing) = storage::list_sealed_objects(self.store.as_ref()).await {
-                let existing: HashSet<String> = existing
-                    .into_iter()
-                    .map(|object| object.location.to_string())
-                    .collect();
-                known.retain(|object| existing.contains(object));
+            // What has expired needn't stay on a list (section 7.4).
+            let now_ms = self.clock.now_ms();
+            for meta in all.values_mut() {
+                let cutoff_ms = now_ms.saturating_sub(meta.retention_ms);
+                meta.objects.retain(|id| id.time_ms() >= cutoff_ms);
             }
+            let rows: Vec<ObjectRow> = {
+                let table = self
+                    .objects
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                table
+                    .rows()
+                    .filter(|row| row.state.is_uploaded())
+                    .cloned()
+                    .collect()
+            };
             let head = CheckpointHead {
                 full,
                 max_id: delta.max_id,
-                objects: known.into_iter().collect(),
+                rows,
+                removed: Vec::new(),
                 sink_streams: delta.sink_streams,
             };
             let metas: Vec<StreamMeta> = all.into_values().collect();
@@ -535,6 +708,9 @@ impl Checkpointer {
             put_checkpoint(store.as_ref(), &path, &built).await
         })
         .await?;
+        if full {
+            self.newer.clear();
+        }
         let file = CheckpointFile::new(self.generation, seq, built.top, head);
         self.checkpoints.add_newest(file.clone());
         let _ = self.loader.send(MetaMsg::Installed(Box::new(file)));

@@ -7,6 +7,7 @@ mod crash;
 mod meta_format;
 mod metadata;
 mod object;
+mod object_table;
 mod ownership;
 mod segment_builder;
 mod segment_format;
@@ -18,22 +19,26 @@ mod wal_writer;
 
 pub use cache::{CacheError, MappedSegments, PendingWriter, SegmentCache, upload_pending};
 pub use checkpoint::{
-    BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet,
-    build_checkpoint, checkpoint_path, merge_meta, put_checkpoint, put_checkpoint_payload,
-    retry_delay,
+    BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, NewerObjects,
+    build_checkpoint, checkpoint_path, put_checkpoint, put_checkpoint_payload, retry_delay,
 };
 pub use crash::crash_point;
 #[cfg(feature = "test-hooks")]
 pub use crash::hold_wal_writes;
 pub use meta_format::{
-    MetaCursor, MetaError, MetaExtent, MetaSink, MetaSinkGap, StreamMeta, decode_extent,
-    decode_meta, encode_extent, encode_meta,
+    MetaCursor, MetaError, MetaSink, MetaSinkGap, StreamMeta, decode_ids, decode_meta, encode_ids,
+    encode_meta,
 };
 pub use metadata::{MAX_METADATA_KEY_BYTES, MetadataEntry, MetadataError, MetadataStore};
 pub use object::{
-    MAX_GENERATION, OBJECT_EPOCH_MS, ObjectId, ObjectStoreConfig, S3Config, SEALED_PREFIX,
-    build_store, check_conditional_create, list_hour_objects, list_hours, list_sealed_objects,
-    object_generation, object_hour, object_path, parse_store_config, sealed_path,
+    HOUR_MS, MAX_GENERATION, OBJECT_EPOCH_MS, ObjectId, ObjectStoreConfig, RetentionClass,
+    S3Config, SEALED_PREFIX, build_store, check_conditional_create, list_hour_objects, list_hours,
+    list_sealed_objects, object_generation, object_hour, object_path, parse_store_config,
+    sealed_path, sealed_time_ms,
+};
+pub use object_table::{
+    ObjectKey, ObjectRow, ObjectState, ObjectTable, ROW_KEY_BYTES, Replacement, decode_rows,
+    encode_rows,
 };
 pub use ownership::{
     OWNERSHIP_MAGIC, OWNERSHIP_RECORD_BYTES, Ownership, OwnershipError, claim_generation,
@@ -41,7 +46,7 @@ pub use ownership::{
 };
 pub use segment_builder::{BuiltSegment, SegmentBuilder};
 pub use segment_format::{
-    BLOCK_ENTRY_BYTES, BlockEntry, BlockTable, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES,
+    BLOCK_ENTRY_BYTES, BlockEntry, BlockTable, DEFAULT_BLOCK_BYTES, DEFAULT_PAGE_BYTES, IndexEntry,
     SEGMENT_MAGIC, SegmentError, StreamExtent, TRAILER_BYTES, TopIndex, decode_block_table,
     decode_last_ids, decode_top_index, stream_hash,
 };

@@ -13,7 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use format::{
     ENTRY_SEAL_MANIFEST, HEADER_BYTES, IdAllocator, KeyHash, ValidatedForward, ValidatedPublish,
-    encode_system_record, validate_forward, validate_publish,
+    encode_system_record, make_id, validate_forward, validate_publish,
 };
 use proto::ErrorCode;
 use storage::{MetaCursor, StreamMeta, UploadEvent, UploadKey, WalEntry, WalSendError, WalSender};
@@ -24,16 +24,15 @@ use crate::compaction::RetentionClass;
 use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
-    FanOut, PendingVisible, RecordSpan, ReplaceResult, STATE_ONLY_FILTER_ID, SharedBytes,
+    FanOut, Gathered, ObjectRef, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
     StreamDelivery, UnsavedStep, retention_start_id, walk_records,
 };
 use crate::keys::Keys;
 use crate::message::{
-    AttachMsg, AttachWalk, CatchReply, CompactSource, CompactView, ControlMsg, CoreStats, CursorOp,
-    CursorReport, DeliveryMsg, ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply,
-    ReplyTx, SINK_GAPS_KEPT_COUNT, ShardHandoff, SinkGap, SinkOp, SinkReport, SinkStart,
-    SnapshotReply, StateChange, StateOpMsg, StreamBody, StreamConfig, StreamHandoff, StreamInfo,
-    SubRef, WriteMsg,
+    AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
+    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, SINK_GAPS_KEPT_COUNT,
+    ShardHandoff, SinkGap, SinkOp, SinkReport, SinkStart, SnapshotReply, StateChange, StateOpMsg,
+    StreamBody, StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
 };
 use crate::metadata::MetaMsg;
 use crate::placement::{ShardCounters, shard_of};
@@ -454,6 +453,8 @@ pub(crate) struct Core {
 
     loader: Option<mpsc::UnboundedSender<MetaMsg>>,
     sink_notes: mpsc::UnboundedSender<SinkNote>,
+    /// The node's object table (section 7.6).
+    objects: Arc<std::sync::RwLock<storage::ObjectTable>>,
     loading: HashMap<KeyHash, Loading>,
     load_count: u64,
     /// While a load's parked messages run, that a stream it found no trace of is known new.
@@ -500,6 +501,7 @@ impl Core {
                 }
             })
             .collect();
+        let objects = Arc::clone(&parts.stores.objects);
         let home = Home::new(
             config.id,
             parts.links.clone(),
@@ -549,6 +551,7 @@ impl Core {
             spans: Vec::new(),
             loader: parts.loader,
             sink_notes: parts.sink_notes,
+            objects,
             loading: HashMap::new(),
             load_count: 0,
             load_passed: None,
@@ -1649,8 +1652,14 @@ impl Core {
                 .logs
                 .get(&message.stream)
                 .and_then(|log| next_id_in_log(log, cursor, u64::MAX));
+            // An object older than the cutoff holds only expired records (section 7.4).
+            let expired_object = stream
+                .delivery
+                .next_object(cursor, None)
+                .filter(|id| make_id(id.time_ms(), 0) < retention_start)
+                .map(|id| make_id(id.time_ms(), 0));
             let lowest_id = [
-                stream.delivery.sealed_id_above(cursor),
+                expired_object,
                 own_id,
                 message.walk.as_ref().and_then(|walk| walk.found_id),
             ]
@@ -1844,12 +1853,19 @@ impl Core {
         if let Some(shard) = self.shards.get_mut(&stream.shard) {
             shard.counters.catch_up_bytes += message.read_bytes;
         }
-        // Still listed, with the object gone: these records are lost to this reader. A list
-        // that has moved on means compaction has them, and the read carries on from there,
-        // unless what moved it on was their expiry (D178).
-        if let Some(gone) = &message.gone
-            && stream.delivery.drop_path(gone) > 0
-        {
+        // Gone, with no compacted object to lead to now: these records are lost to this
+        // reader. One that leads elsewhere now is read from there (D178).
+        let class = RetentionClass::of_retention(stream.config.retention_ms);
+        let hash = storage::stream_hash(message.stream);
+        let in_memory = self
+            .logs
+            .get(&message.stream)
+            .and_then(|log| next_id_in_log(log, 0, u64::MAX));
+        let lost = message.gone.is_some_and(|gone| {
+            let now = read_table(&self.objects).resolve(gone.listed, class, hash);
+            now == gone.key && stream.delivery.drop_object(gone.listed, in_memory)
+        });
+        if lost {
             self.send_catch(
                 message.sub,
                 CatchReply::Fail {
@@ -1896,14 +1912,15 @@ impl Core {
             sub: message.sub,
             after: message.after,
             limit,
+            past: message.past,
             hops,
             batches: Vec::new(),
         }));
     }
 
     /// The oldest core holding anything wanted gives its batches, and then the owner, last,
-    /// compares them with its extents. Asking in that order means a batch dropped anywhere
-    /// has its extent at the owner by then (D83).
+    /// compares them with its object list. Asking in that order means a batch dropped
+    /// anywhere has its object at the owner by then (D83).
     fn on_read_chain(&mut self, mut chain: Box<ReadChain>) {
         while let Some((end, core)) = chain.hops.pop_front() {
             if core != self.config.id {
@@ -1929,29 +1946,73 @@ impl Core {
             self.park(&name, Parked::Read(ReadMsg::Chain(chain)));
             return;
         }
-        let extent = self
-            .streams
-            .get(&chain.stream)
-            .and_then(|stream| stream.delivery.first_extent_after(chain.after))
-            .cloned();
         let memory_first = chain.batches.first().map(first_id);
+        // Memory that carries straight on from the position needs no object.
+        let object = match memory_first {
+            Some(first) if first <= chain.after.saturating_add(1) => None,
+            _ => self.next_object_ref(chain.stream, chain.after, chain.past),
+        };
         let ReadChain {
             sub,
             limit,
             batches,
             ..
         } = *chain;
-        let reply = match (extent, memory_first) {
-            (Some(extent), memory_first)
-                if memory_first.is_none_or(|first| extent.extent.id_first < first) =>
-            {
-                // An extent of a former generation ends at its last accepted record (D138).
-                let limit = limit.min(extent.extent.id_last);
-                CatchReply::Extent { extent, limit }
-            }
-            _ => CatchReply::Memory { batches, limit },
+        let reply = match object {
+            // An object stops below what memory holds, so the read comes back to memory there.
+            Some(object) => CatchReply::Object {
+                object,
+                limit: memory_first.map_or(limit, |first| limit.min(first - 1)),
+            },
+            None => CatchReply::Memory { batches, limit },
         };
         self.send_catch(sub, reply);
+    }
+
+    /// The next object in a stream's list that may hold an id above `after`, as the table
+    /// resolves it, past the one read last. Two ids that resolve to the same compacted object
+    /// are read once (section 7.6).
+    fn next_object_ref(
+        &self,
+        name: KeyHash,
+        after: u64,
+        past: Option<ObjectRef>,
+    ) -> Option<ObjectRef> {
+        let stream = self.streams.get(&name)?;
+        let class = RetentionClass::of_retention(stream.config.retention_ms);
+        let hash = storage::stream_hash(name);
+        let table = read_table(&self.objects);
+        let mut from = past.map(|past| past.listed);
+        loop {
+            let listed = stream.delivery.next_object(after, from)?;
+            let key = table.resolve(listed, class, hash);
+            if past.is_some_and(|past| past.key == key) {
+                from = Some(listed);
+                continue;
+            }
+            return Some(ObjectRef {
+                stream: name,
+                listed,
+                key,
+            });
+        }
+    }
+
+    /// The front of a stream's list that has expired goes, and an hour compaction has wholly
+    /// replaced takes the compacted ids. A load and an append do this (sections 7.4, 7.6).
+    fn tidy_list(&mut self, name: KeyHash) {
+        let now_ms = self.clock.now_ms();
+        let Some(stream) = self.streams.get_mut(&name) else {
+            return;
+        };
+        let retention_ms = stream.config.retention_ms;
+        stream.delivery.expire(now_ms, retention_ms);
+        if let Some(class) = RetentionClass::of_retention(retention_ms) {
+            let table = read_table(&self.objects);
+            stream
+                .delivery
+                .rewrite_compacted(&table, class, storage::stream_hash(name));
+        }
     }
 
     fn on_cursor(
@@ -2056,9 +2117,14 @@ impl Core {
         for name in names {
             let own = by_stream.remove(name).unwrap_or_default();
             if let Some(stream) = self.streams.get_mut(name) {
-                for extent in &own {
-                    stream.delivery.add_extent(path, extent);
+                if let Some(id) = storage::ObjectId::of_path(path) {
+                    for extent in &own {
+                        stream
+                            .delivery
+                            .add_object(id, extent.id_first, extent.id_last);
+                    }
                 }
+                self.tidy_list(*name);
                 self.note_batches(*name, tag);
             } else if let Route::Forward(to) = self.route(*name) {
                 let _ = self.links.control[to].send(ControlMsg::AddExtents {
@@ -2283,9 +2349,7 @@ impl Core {
                             stamped_id: stream.ids.last_id(),
                             earliest_id: stream
                                 .delivery
-                                .extents
-                                .first()
-                                .map(|known| known.extent.id_first)
+                                .earliest_id_bound()
                                 .into_iter()
                                 .chain(memory_first_id)
                                 .min()
@@ -2527,9 +2591,14 @@ impl Core {
                     return;
                 }
                 if let Some(known) = self.streams.get_mut(&stream) {
-                    for extent in &extents {
-                        known.delivery.add_extent(&path, extent);
+                    if let Some(id) = storage::ObjectId::of_path(&path) {
+                        for extent in &extents {
+                            known
+                                .delivery
+                                .add_object(id, extent.id_first, extent.id_last);
+                        }
                     }
+                    self.tidy_list(stream);
                 }
                 if origin == self.config.id {
                     self.note_batches(stream, tag);
@@ -2540,69 +2609,16 @@ impl Core {
             }
             ControlMsg::ExtentsNoted { stream, tag } => self.note_batches(stream, tag),
             ControlMsg::PublishManifest { doc, reply } => self.on_publish_manifest(doc, reply),
-            ControlMsg::CompactView {
-                stream,
-                path,
-                footer,
-                reply,
-            } => {
+            ControlMsg::RetentionOf { stream, reply } => {
                 if let Route::Forward(to) = self.route(stream) {
-                    let _ = self.links.control[to].send(ControlMsg::CompactView {
-                        stream,
-                        path,
-                        footer,
-                        reply,
-                    });
+                    let _ = self.links.control[to].send(ControlMsg::RetentionOf { stream, reply });
                     return;
                 }
-                let _ = reply.send(self.compact_view(stream, &path, &footer));
-            }
-            ControlMsg::ReplaceExtents {
-                stream,
-                path,
-                sources,
-                extent,
-                reply,
-            } => {
-                if let Route::Forward(to) = self.route(stream) {
-                    let _ = self.links.control[to].send(ControlMsg::ReplaceExtents {
-                        stream,
-                        path,
-                        sources,
-                        extent,
-                        reply,
-                    });
-                    return;
-                }
-                let merge_below = self.merge_below(stream);
-                let result = self
+                let retention = self
                     .streams
-                    .get_mut(&stream)
-                    .map_or(ReplaceResult::Gone, |known| {
-                        known
-                            .delivery
-                            .replace_extents(&path, &sources, &extent, merge_below)
-                    });
-                let _ = reply.send(result);
-            }
-            ControlMsg::DropExtents {
-                stream,
-                path,
-                reply,
-            } => {
-                if let Route::Forward(to) = self.route(stream) {
-                    let _ = self.links.control[to].send(ControlMsg::DropExtents {
-                        stream,
-                        path,
-                        reply,
-                    });
-                    return;
-                }
-                let dropped = self
-                    .streams
-                    .get_mut(&stream)
-                    .is_some_and(|known| known.delivery.drop_path(&path) > 0);
-                let _ = reply.send(dropped);
+                    .get(&stream)
+                    .map(|known| known.config.retention_ms);
+                let _ = reply.send(retention);
             }
             ControlMsg::DurableSeen { core, ticket } => {
                 self.durable_by_core[core] = self.durable_by_core[core].max(ticket);
@@ -2904,56 +2920,6 @@ impl Core {
         );
     }
 
-    /// Records at or above this may have no extent yet, here or on an earlier owner.
-    fn merge_below(&self, name: KeyHash) -> u64 {
-        let elsewhere = self
-            .streams
-            .get(&name)
-            .is_some_and(|stream| !stream.delivery.held_elsewhere.is_empty());
-        if elsewhere {
-            return 0;
-        }
-        self.logs
-            .get(&name)
-            .and_then(|log| log.batches.front())
-            .map_or(u64::MAX, |batch| batch.first_id)
-    }
-
-    fn compact_view(
-        &self,
-        name: KeyHash,
-        path: &object_store::path::Path,
-        footer: &[(u64, u64)],
-    ) -> Option<CompactView> {
-        let stream = self.streams.get(&name)?;
-        let delivery = &stream.delivery;
-        let unnoted = footer.iter().any(|(id_first, id_last)| {
-            *id_last > delivery.floor_id
-                && delivery
-                    .first_extent_after(id_first.saturating_sub(1))
-                    .is_none_or(|known| known.extent.id_first > *id_last)
-        });
-        let sources = delivery
-            .extents
-            .iter()
-            .enumerate()
-            .filter(|(_, known)| known.path == *path)
-            .map(|(at, known)| CompactSource {
-                extent: known.extent.clone(),
-                next_id_first: delivery
-                    .extents
-                    .get(at + 1)
-                    .map(|next| next.extent.id_first),
-            })
-            .collect();
-        Some(CompactView {
-            retention_ms: stream.config.retention_ms,
-            unnoted,
-            sources,
-            merge_below: self.merge_below(name),
-        })
-    }
-
     fn install_meta(&mut self, name: &KeyHash, meta: StreamMeta, shard: u32) {
         let mut delivery = StreamDelivery::new(self.config.core_count);
         delivery.track_meta = true;
@@ -2966,11 +2932,7 @@ impl Core {
             .iter()
             .map(|cursor| (cursor.name, cursor.id))
             .collect();
-        delivery.extents = meta
-            .extents
-            .iter()
-            .map(|extent| crate::recovery::extent_ref(name, extent))
-            .collect();
+        delivery.objects = meta.objects;
         delivery.sinks = meta
             .sinks
             .iter()
@@ -3003,6 +2965,7 @@ impl Core {
                 delivery,
             },
         );
+        self.tidy_list(*name);
     }
 
     /// A stream as the startup put it back. What its WAL entries hold and no extent covers
@@ -3017,11 +2980,8 @@ impl Core {
         let stream = self.streams.get_mut(&name).expect("just installed");
         stream.dedupe = restored.dedupe;
         stream.delivery.meta_dirty = true;
-        stream.delivery.new_extents = restored
-            .new_extents
-            .iter()
-            .map(|extent| crate::recovery::extent_ref(&name, extent))
-            .collect();
+        // The startup rebuilt the list, so the local store takes it whole.
+        stream.delivery.list_change.rewritten = true;
         if restored.batches.is_empty() {
             return;
         }
@@ -3072,16 +3032,24 @@ impl Core {
 
     /// What changed, as of each stream's last visible record. A change above that comes back
     /// from the WAL, or never happened (D136).
-    fn gather(&mut self, gather: u64) -> Vec<StreamMeta> {
+    fn gather(&mut self, gather: u64) -> Vec<Gathered> {
         let mut metas = Vec::new();
         for stream in self.streams.values_mut() {
             let delivery = &mut stream.delivery;
-            if !delivery.meta_dirty {
+            let last_id = stream.ids.last_id();
+            let moved = last_id != delivery.saved_last_id;
+            if !delivery.meta_dirty && delivery.list_change.is_empty() && !moved {
                 continue;
             }
-            delivery.meta_dirty = false;
+            let meta_changed = std::mem::take(&mut delivery.meta_dirty);
+            let mut list = std::mem::take(&mut delivery.list_change);
+            if list.rewritten {
+                list.appended = delivery.objects.clone();
+                list.expired_below = None;
+            }
             delivery.saved_gather = gather;
-            metas.push(StreamMeta {
+            delivery.saved_last_id = last_id;
+            let meta = StreamMeta {
                 stream: stream.name,
                 deleted: false,
                 last_id: stream.ids.last_id(),
@@ -3106,22 +3074,29 @@ impl Core {
                     .iter()
                     .map(|(id, spec)| crate::recovery::meta_sink(*id, spec))
                     .collect(),
-                extents: delivery
-                    .new_extents
-                    .drain(..)
-                    .map(|known| crate::recovery::meta_extent(&known))
-                    .collect(),
-                dropped_extents: std::mem::take(&mut delivery.dropped_extents),
+                objects: Vec::new(),
+            };
+            metas.push(Gathered {
+                meta,
+                meta_changed,
+                list,
             });
         }
         for (name, last_id) in self.dirty_tombstones.drain(..) {
-            metas.push(StreamMeta {
-                stream: name,
-                deleted: true,
-                last_id,
-                floor_id: last_id,
-                applied_id: last_id,
-                ..StreamMeta::default()
+            metas.push(Gathered {
+                meta: StreamMeta {
+                    stream: name,
+                    deleted: true,
+                    last_id,
+                    floor_id: last_id,
+                    applied_id: last_id,
+                    ..StreamMeta::default()
+                },
+                meta_changed: true,
+                list: crate::delivery::ListChange {
+                    rewritten: true,
+                    ..Default::default()
+                },
             });
         }
         metas
@@ -3143,6 +3118,8 @@ impl Core {
             .filter(|stream| {
                 let delivery = &stream.delivery;
                 !delivery.meta_dirty
+                    && delivery.list_change.is_empty()
+                    && delivery.saved_last_id == stream.ids.last_id()
                     && delivery.saved_gather <= done_gather
                     && delivery.pending.is_empty()
                     && delivery.unsaved.is_empty()
@@ -3601,9 +3578,7 @@ fn control_stream(message: &ControlMsg, keys: &Keys) -> Option<KeyHash> {
         | ControlMsg::Snapshot { stream, .. }
         | ControlMsg::Configure { stream, .. }
         | ControlMsg::Cursor { stream, .. }
-        | ControlMsg::CompactView { stream, .. }
-        | ControlMsg::ReplaceExtents { stream, .. }
-        | ControlMsg::DropExtents { stream, .. }
+        | ControlMsg::RetentionOf { stream, .. }
         | ControlMsg::AddExtents { stream, .. } => Some(*stream),
         ControlMsg::PublishManifest { .. } => Some(keys.manifest),
         ControlMsg::Attach(message) => Some(message.stream),
@@ -3647,6 +3622,16 @@ fn internal_cursors(keys: &Keys, stream: KeyHash, delivery: &StreamDelivery) -> 
         internal.extend(RetentionClass::ALL.map(|class| keys.hash(&class.cursor_name())));
     }
     internal
+}
+
+/// The object table, read. A writer that panicked left it whole, since each change is one
+/// row's.
+fn read_table(
+    table: &std::sync::RwLock<storage::ObjectTable>,
+) -> std::sync::RwLockReadGuard<'_, storage::ObjectTable> {
+    table
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn first_id(batch: &SlabBytes) -> u64 {

@@ -1220,7 +1220,11 @@ async fn a_late_checkpoint_over_the_limit_does_not_hide_its_object() {
     let head = storage::CheckpointHead {
         full: false,
         max_id: limit + 1,
-        objects: vec![sealed_path(ObjectId::new(format::id_ms(limit - 1), 1, 255)).to_string()],
+        rows: vec![storage::ObjectRow::new(
+            storage::ObjectKey::sealed(ObjectId::new(format::id_ms(limit - 1), 1, 255)),
+            storage::ObjectState::Remote,
+        )],
+        removed: Vec::new(),
         sink_streams: Vec::new(),
     };
     let built = storage::build_checkpoint(&head, &[meta]).unwrap();

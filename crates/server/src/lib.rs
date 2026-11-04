@@ -18,6 +18,7 @@ mod message;
 mod metadata;
 pub mod net;
 mod node;
+mod pages;
 mod placement;
 mod recovery;
 mod sink;

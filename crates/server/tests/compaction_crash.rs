@@ -348,8 +348,8 @@ async fn a_crash_after_the_output_before_any_extent_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_crash_after_extents_change_before_a_checkpoint() {
-    crash_while_compacting("compact.after_extents").await;
+async fn a_crash_after_rows_change_before_a_checkpoint() {
+    crash_while_compacting("compact.after_rows").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

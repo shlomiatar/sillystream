@@ -6,10 +6,12 @@
 //! file := (key hash | metadata)* page* last_ids top_index trailer
 //! ```
 //!
-//! An entry holds only the extents new since the stream's last entry. A *full* file holds
-//! every stream's whole metadata and every object recorded so far, and nothing older is needed
-//! once a reader can trust one. A file's entry under the all-zero key hash, which no stream has
-//! in practice, holds its head.
+//! The head, under the all-zero key hash that no stream has in practice, holds the object
+//! table rows that changed, for uploaded objects only, and which rows went. An entry holds a
+//! stream's metadata, from a stream whose state, config, cursors, sinks or tombstone changed.
+//! Object lists are left out, and rebuilt from the last ids of the objects newer than the
+//! newest full file. A *full* file holds every row and every stream's whole metadata, lists
+//! included, and nothing older is needed once a reader can trust one.
 //!
 //! A former generation can still upload one of these after losing ownership. An entry from
 //! generation `g` whose last id is above `limit_for(g)` is ignored (section 8.1).
@@ -24,6 +26,8 @@ use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 
 use crate::meta_format::{MetaError, StreamMeta, decode_meta, encode_meta};
+use crate::object::ObjectId;
+use crate::object_table::{ObjectKey, ObjectRow, ROW_KEY_BYTES, decode_rows, encode_rows};
 use crate::ownership::Ownership;
 use crate::segment_builder::encode_index;
 use crate::segment_format::{DEFAULT_PAGE_BYTES, SegmentError, TopIndex};
@@ -50,9 +54,10 @@ pub struct CheckpointHead {
     pub full: bool,
     /// The highest stream last id it knows of, including through earlier files.
     pub max_id: u64,
-    /// Segment objects whose extents are recorded by now, so a startup needn't look in them.
-    /// A full file's list includes those of the files it replaces.
-    pub objects: Vec<String>,
+    /// Object table rows that changed, or every row in a full file (section 7.6).
+    pub rows: Vec<ObjectRow>,
+    /// Rows gone with their objects since the file before. A full file has none.
+    pub removed: Vec<ObjectKey>,
     /// Every stream with a sink as of this file, so a startup can start them without loading
     /// every stream (D198).
     pub sink_streams: Vec<KeyHash>,
@@ -63,10 +68,10 @@ fn encode_head(head: &CheckpointHead) -> Vec<u8> {
     out.push(u8::from(head.full));
     out.extend_from_slice(&[0; 3]);
     out.extend_from_slice(&head.max_id.to_le_bytes());
-    out.extend_from_slice(&(head.objects.len() as u32).to_le_bytes());
-    for object in &head.objects {
-        out.extend_from_slice(&(object.len() as u32).to_le_bytes());
-        out.extend_from_slice(object.as_bytes());
+    encode_rows(&mut out, &head.rows);
+    out.extend_from_slice(&(head.removed.len() as u32).to_le_bytes());
+    for key in &head.removed {
+        out.extend_from_slice(&key.encode());
     }
     out.extend_from_slice(&(head.sink_streams.len() as u32).to_le_bytes());
     for stream in &head.sink_streams {
@@ -79,32 +84,28 @@ fn encode_head(head: &CheckpointHead) -> Vec<u8> {
 
 fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
     const BAD: MetaError = MetaError("a checkpoint's head is corrupt");
-    if bytes.len() < 20
+    if bytes.len() < 16
         || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != crc32c(&bytes[4..])
+        || bytes[4] > 1
     {
         return Err(BAD);
     }
-    let mut max_id = [0u8; 8];
-    max_id.copy_from_slice(&bytes[8..16]);
-    let count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
-    let mut at = 20;
-    let read_list = |count: usize, at: &mut usize| -> Result<Vec<String>, MetaError> {
-        let mut list = Vec::new();
-        for _ in 0..count {
-            let len_end = *at + 4;
-            let len = bytes.get(*at..len_end).ok_or(BAD)?;
-            let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-            let end = len_end.checked_add(len).ok_or(BAD)?;
-            let text = bytes.get(len_end..end).ok_or(BAD)?;
-            list.push(std::str::from_utf8(text).map_err(|_| BAD)?.to_owned());
-            *at = end;
-        }
-        Ok(list)
+    let max_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let (rows, taken) = decode_rows(&bytes[16..])?;
+    let mut at = 16 + taken;
+    let count = |at: usize| -> Result<usize, MetaError> {
+        let field = bytes.get(at..at + 4).ok_or(BAD)?;
+        Ok(u32::from_le_bytes(field.try_into().unwrap()) as usize)
     };
-    let objects = read_list(count, &mut at)?;
-    let sink_count = bytes.get(at..at + 4).ok_or(BAD)?;
-    let sink_count =
-        u32::from_le_bytes([sink_count[0], sink_count[1], sink_count[2], sink_count[3]]) as usize;
+    let removed_count = count(at)?;
+    at += 4;
+    let mut removed = Vec::with_capacity(removed_count.min(bytes.len() / ROW_KEY_BYTES));
+    for _ in 0..removed_count {
+        let key = bytes.get(at..at + ROW_KEY_BYTES).ok_or(BAD)?;
+        removed.push(ObjectKey::decode(key).ok_or(BAD)?);
+        at += ROW_KEY_BYTES;
+    }
+    let sink_count = count(at)?;
     at += 4;
     if sink_count.checked_mul(KeyHash::BYTES) != bytes.len().checked_sub(at) {
         return Err(BAD);
@@ -117,8 +118,9 @@ fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
         .collect();
     Ok(CheckpointHead {
         full: bytes[4] == 1,
-        max_id: u64::from_le_bytes(max_id),
-        objects,
+        max_id,
+        rows,
+        removed,
         sink_streams,
     })
 }
@@ -358,14 +360,23 @@ impl CheckpointSet {
         self.files.insert(0, file);
     }
 
-    /// The objects whose extents these files record. A file with anything over its generation's
-    /// limit doesn't count: part of what it records is refused, and its objects have to be
-    /// looked at for what readers accept of them (section 8.1).
-    pub fn recorded_objects(&self) -> impl Iterator<Item = &str> {
-        self.files
-            .iter()
-            .filter(|file| self.accepts(file.generation, file.head.max_id))
-            .flat_map(|file| file.head.objects.iter().map(String::as_str))
+    /// The rows these files hold, oldest first, with the removals applied: what the node's
+    /// table starts from. A file with anything over its generation's limit doesn't count, since
+    /// part of what it records is refused (section 8.1).
+    pub fn rows(&self) -> BTreeMap<ObjectKey, ObjectRow> {
+        let mut rows = BTreeMap::new();
+        for file in self.files.iter().rev() {
+            if !self.accepts(file.generation, file.head.max_id) {
+                continue;
+            }
+            for key in &file.head.removed {
+                rows.remove(key);
+            }
+            for row in &file.head.rows {
+                rows.insert(row.key, row.clone());
+            }
+        }
+        rows
     }
 
     pub fn max_id(&self) -> u64 {
@@ -377,48 +388,72 @@ impl CheckpointSet {
             .unwrap_or(0)
     }
 
-    /// A stream's metadata with all its extents, walking newest to oldest (D18).
+    /// The full file lists come from, if the oldest file is one.
+    fn full_file(&self) -> Option<&CheckpointFile> {
+        self.files.last().filter(|file| file.head.full)
+    }
+
+    /// Sealed objects these files record that the full file doesn't, whose last ids lists are
+    /// rebuilt from. A startup reads their last ids once (section 7.6).
+    pub fn newer_objects(&self) -> Vec<ObjectId> {
+        let in_full: HashSet<ObjectKey> = self
+            .full_file()
+            .map(|file| file.head.rows.iter().map(|row| row.key).collect())
+            .unwrap_or_default();
+        let mut ids: Vec<ObjectId> = self
+            .rows()
+            .into_values()
+            .filter(|row| row.key.class.is_none() && !in_full.contains(&row.key))
+            .map(|row| row.key.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A stream's metadata as the files have it: the newest entry a reader accepts, with the
+    /// list and last id of the full file's entry, then every newer object holding the stream
+    /// (section 7.6). `newer` is each such object's last ids.
     pub async fn lookup(
         &self,
         store: &Arc<dyn ObjectStore>,
         stream: KeyHash,
+        newer: &NewerObjects,
     ) -> Result<Option<StreamMeta>, CheckpointError> {
-        let mut found: Option<StreamMeta> = None;
-        let mut extents = Vec::new();
-        // Taken away by a newer entry: compaction or retention (section 7.5, 7.4).
-        let mut dropped: HashSet<u64> = HashSet::new();
+        let mut newest = None;
         for file in &self.files {
             let Some(blob) = read_entry(store, file, stream).await? else {
                 continue;
             };
             let meta = decode_meta(&blob)?;
-            if !self.accepts(file.generation, meta.last_id) {
-                continue;
-            }
-            extents.extend(
-                meta.extents
-                    .iter()
-                    .filter(|extent| !dropped.contains(&extent.id_first))
-                    .cloned(),
-            );
-            dropped.extend(meta.dropped_extents.iter().copied());
-            let stop = meta.deleted;
-            if found.is_none() {
-                found = Some(meta);
-            }
-            if stop {
+            if self.accepts(file.generation, meta.last_id) {
+                newest = Some((file.seq, file.generation, meta));
                 break;
             }
         }
-        let Some(mut meta) = found else {
-            return Ok(None);
+        let full = match self.full_file() {
+            Some(file)
+                if newest.as_ref().is_some_and(|(seq, generation, _)| {
+                    (*generation, *seq) != (file.generation, file.seq)
+                }) =>
+            {
+                match read_entry(store, file, stream).await? {
+                    Some(blob) => Some(decode_meta(&blob)?),
+                    None => None,
+                }
+            }
+            _ => None,
         };
-        extents.retain(|extent| extent.id_last > meta.floor_id);
-        extents.sort_by_key(|extent| extent.id_first);
-        extents.dedup_by_key(|extent| extent.id_first);
-        meta.extents = if meta.deleted { Vec::new() } else { extents };
-        meta.dropped_extents.clear();
-        Ok(Some(meta))
+        let from_newer = newer.of(stream, self);
+        let meta = match newest {
+            Some((_, _, meta)) => meta,
+            // A stream that only ever appended records since the full file has no entry.
+            None if !from_newer.is_empty() => StreamMeta {
+                stream,
+                ..StreamMeta::default()
+            },
+            None => return Ok(None),
+        };
+        Ok(Some(rebuild(meta, full, &from_newer)))
     }
 
     /// Every stream's whole metadata, for a new full file. Holds it all in memory, which is
@@ -426,9 +461,19 @@ impl CheckpointSet {
     pub async fn merge_all(
         &self,
         store: &Arc<dyn ObjectStore>,
+        newer: &NewerObjects,
     ) -> Result<BTreeMap<KeyHash, StreamMeta>, CheckpointError> {
-        let mut all: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
+        let mut full: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
+        let mut newest: BTreeMap<KeyHash, StreamMeta> = BTreeMap::new();
         for file in self.files.iter().rev() {
+            let into = if self
+                .full_file()
+                .is_some_and(|full| full.seq == file.seq && full.generation == file.generation)
+            {
+                &mut full
+            } else {
+                &mut newest
+            };
             let reader = SegmentReader::new(Arc::clone(store), file.path.clone());
             let (entries, data, last_ids) = reader.read_all(&file.top).await?;
             for (entry, (stream, last_id)) in entries.iter().zip(last_ids) {
@@ -447,30 +492,133 @@ impl CheckpointSet {
                     return Err(SegmentError::Corrupt("metadata isn't its last id").into());
                 }
                 if self.accepts(file.generation, meta.last_id) {
-                    merge_meta(&mut all, meta);
+                    into.insert(stream, meta);
                 }
             }
+        }
+        let mut all = BTreeMap::new();
+        let mut streams: HashSet<KeyHash> = full.keys().chain(newest.keys()).copied().collect();
+        let by_stream = newer.by_stream(self);
+        streams.extend(by_stream.keys().copied());
+        for stream in streams {
+            let from_newer = by_stream.get(&stream).cloned().unwrap_or_default();
+            let full_meta = full.remove(&stream);
+            let meta = match newest.remove(&stream) {
+                Some(meta) => meta,
+                None => match &full_meta {
+                    Some(meta) => meta.clone(),
+                    None => StreamMeta {
+                        stream,
+                        ..StreamMeta::default()
+                    },
+                },
+            };
+            all.insert(stream, rebuild(meta, full_meta, &from_newer));
         }
         Ok(all)
     }
 }
 
-/// `newer` on top of what `all` has for its stream: its fields, and the union of extents
-/// above its floor, less what it drops. A tombstone clears them.
-pub fn merge_meta(all: &mut BTreeMap<KeyHash, StreamMeta>, newer: StreamMeta) {
-    let mut extents = match all.remove(&newer.stream) {
-        Some(older) if !newer.deleted => older.extents,
-        _ => Vec::new(),
-    };
-    let mut newer = newer;
-    extents.retain(|extent| !newer.dropped_extents.contains(&extent.id_first));
-    newer.dropped_extents.clear();
-    extents.append(&mut newer.extents);
-    extents.retain(|extent| extent.id_last > newer.floor_id);
-    extents.sort_by_key(|extent| extent.id_first);
-    extents.dedup_by_key(|extent| extent.id_first);
-    newer.extents = extents;
-    all.insert(newer.stream, newer);
+/// `meta`'s fields with its list and last id: those of `full`'s entry unless a tombstone came
+/// between, then the newer objects holding the stream above its floor.
+fn rebuild(
+    mut meta: StreamMeta,
+    full: Option<StreamMeta>,
+    newer: &[(ObjectId, u64)],
+) -> StreamMeta {
+    if meta.deleted {
+        meta.objects.clear();
+        return meta;
+    }
+    if let Some(full) = full
+        && !full.deleted
+        && full.floor_id == meta.floor_id
+    {
+        meta.objects = full.objects;
+        meta.last_id = meta.last_id.max(full.last_id);
+    }
+    for (id, last_id) in newer {
+        if *last_id > meta.floor_id {
+            meta.objects.push(*id);
+            meta.last_id = meta.last_id.max(*last_id);
+        }
+    }
+    meta.objects.sort_unstable();
+    meta.objects.dedup();
+    meta
+}
+
+/// The last ids of the sealed objects newer than the full file, read once at startup.
+#[derive(Debug, Clone, Default)]
+pub struct NewerObjects {
+    objects: BTreeMap<ObjectId, Arc<Vec<(KeyHash, u64)>>>,
+}
+
+impl NewerObjects {
+    /// Reads each object's last ids.
+    pub async fn read(
+        store: &Arc<dyn ObjectStore>,
+        ids: &[ObjectId],
+    ) -> Result<NewerObjects, CheckpointError> {
+        let mut newer = NewerObjects::default();
+        for id in ids {
+            let reader = SegmentReader::new(Arc::clone(store), ObjectKey::sealed(*id).path());
+            let top = match reader.read_top_index().await {
+                Ok(top) => top,
+                // Expired since: it holds nothing a list needs.
+                Err(SegmentError::Store(object_store::Error::NotFound { .. })) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            newer.add(*id, reader.read_last_ids(&top).await?);
+        }
+        Ok(newer)
+    }
+
+    pub fn add(&mut self, id: ObjectId, last_ids: Vec<(KeyHash, u64)>) {
+        self.objects.insert(id, Arc::new(last_ids));
+    }
+
+    /// After a full file, which holds them all.
+    pub fn clear(&mut self) {
+        self.objects.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The objects holding `stream`, with its last id in each, capped at what the object's
+    /// generation may have (section 8.1).
+    pub fn of(&self, stream: KeyHash, set: &CheckpointSet) -> Vec<(ObjectId, u64)> {
+        let mut found = Vec::new();
+        for (id, last_ids) in &self.objects {
+            if let Ok(at) = last_ids.binary_search_by_key(&stream, |(key, _)| *key) {
+                found.push((*id, set.capped(*id, last_ids[at].1)));
+            }
+        }
+        found
+    }
+
+    fn by_stream(&self, set: &CheckpointSet) -> BTreeMap<KeyHash, Vec<(ObjectId, u64)>> {
+        let mut by_stream: BTreeMap<KeyHash, Vec<(ObjectId, u64)>> = BTreeMap::new();
+        for (id, last_ids) in &self.objects {
+            for (stream, last_id) in last_ids.iter() {
+                by_stream
+                    .entry(*stream)
+                    .or_default()
+                    .push((*id, set.capped(*id, *last_id)));
+            }
+        }
+        by_stream
+    }
+}
+
+impl CheckpointSet {
+    fn capped(&self, id: ObjectId, last_id: u64) -> u64 {
+        self.ownership
+            .limit_for(id.generation())
+            .map_or(last_id, |limit| last_id.min(limit))
+    }
 }
 
 /// The wait before a retry of store work that must not be given up on.

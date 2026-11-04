@@ -230,7 +230,7 @@ Each publish asks for an ack level, and the ack is sent only after that level is
 - **Last ids:** after the index, each stream's full key hash and last id, in the same order. Readers never fetch it. Rebuilding metadata (section 7.6) and the startup scan of unrecorded objects read it.
 - There are no per-stream S3 objects on the write path, except that a stream filling its own buffer within the window gets a dedicated object.
 - **Object id:** a u64 of a time in ms since 2026-01-01 UTC (40 bits, enough until 2060), the generation (16 bits) and an index (8 bits).
-  - **Sealed objects:** the time is the object's own: at least its newest record's ms, and at least 1 ms after the node's previous object, so no two share one. Index 0 is the seal's segment, and the window's dedicated objects take 1 to 255. A stream that would need a dedicated object past index 255 stays in the seal.
+  - **Sealed objects:** the time is the object's own: at least its newest record's ms, and at least 1 ms after the node's previous object, so no two share one. It is never an hour's last ms, which only compacted objects take, so the id says which kind it is. Index 0 is the seal's segment, and the window's dedicated objects take 1 to 255. A stream that would need a dedicated object past index 255 stays in the seal.
   - **Compacted objects:** the time is the last ms of the sources' ingest hour, and the index counts the outputs for that class and hour. A compacted id is unique within its class, so it is named together with its class.
 - **Path:** computed from the id, so it is never stored: `sealed/<ingest_hour>/<id in hex>.seg`, or `compacted/<class>/<ingest_hour>/<id in hex>.seg`.
 - Plain files. Segment bytes are the same as wire bytes.
@@ -248,12 +248,12 @@ Deletion is purely retention: whole hour prefixes expire, and nothing else delet
 
 - New segments go to the `sealed/` prefix, which expires after about 2 days. The `1d` class is served from here and is never compacted.
 - Longer classes are copied by compaction into their own prefix, which expires by that class.
-- The delete job checks how far compaction has progressed before expiring anything, so a stalled compactor can't destroy data. An S3 lifecycle rule alone can't do that.
+- The delete job checks how far compaction has progressed before expiring anything, so a stalled compactor can't destroy data. An S3 lifecycle rule alone can't do that. A `sealed/` hour goes only once every class's cursor has passed all its manifests and each object's row says every longer class it holds has a compacted copy. An object a source failure left behind therefore keeps its hour. The job messages no stream.
 - **No per-stream work:** an object id holds its time, so whether an object is expired for a stream follows from the stream's class. The expired front of a stream's object list is dropped whenever the stream is loaded or appended to, and its highest expired id is the larger of the stored one and the first id at the cutoff.
 
 ### 7.5 Compaction
 
-Seal manifests are published to a system stream. A compactor follows it with a named cursor, with one worker per retention class, and merges small segments into larger ones sorted by stream. It copies stream regions without decoding records, then adds object table rows (section 7.6) saying which compacted objects replace each source object for that class. It deletes nothing and changes no stream's metadata.
+Seal manifests are published to a system stream. A compactor follows it with a named cursor, with one worker per retention class, and merges small segments into larger ones sorted by stream. Each batch is the objects of one hour and makes one output, with one region per stream. It copies stream regions without decoding records, then adds object table rows (section 7.6) saying which compacted objects replace each source object for that class. It deletes nothing and changes no stream's metadata.
 
 Unlike a normal sink, it must update the object table. The manifest stream also can't produce manifests for its own segments, so it needs a special rule.
 
@@ -269,7 +269,7 @@ The metadata is last id, the highest expired id, state, config, cursors and the 
 
 **Object list:** the sorted ids of the objects that hold the stream's records, delta-encoded, about 2–3 bytes per id. Records not sealed yet need no entry, because the owning core knows where its unsealed records start. A reader takes the objects whose time covers what it wants and finds the stream in each one's footer (section 7.3).
 
-**Object table:** one row per object, kept per node, holding its kind (seal, dedicated or compacted), its state (local not uploaded, uploaded and cached, or uploaded only), and the compacted objects that replace it, per class and range of stream hashes. An upload or eviction changes one row, never a stream. A reader goes through the row: a local file is read through a memory map, anything else from S3, and a replaced object leads to its compacted object. A stream's list is rewritten to the compacted ids when the stream is next loaded or appended to.
+**Object table:** one row per object, kept per node, holding its kind (seal, dedicated or compacted), its state (local not uploaded, uploaded and cached, or uploaded only), which longer classes it holds streams of (set by the compactor), and the compacted objects that replace it, per class and range of stream hashes. An upload or eviction changes one row, never a stream. A reader goes through the row: a local file is read through a memory map, anything else from S3, and a replaced object leads to its compacted object. A stream's list is rewritten to the compacted ids when the stream is next loaded or appended to, an hour at a time once all of that hour's ids are replaced, so the list stays in record order.
 
 **Local store:** one key per stream for the metadata, the object list in chunks of about 256 ids keyed by the first id so that a seal appends to the last chunk and expiry deletes whole chunks, and one key per object table row.
 
