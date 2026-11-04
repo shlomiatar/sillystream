@@ -366,7 +366,7 @@ async fn read_everything(
 }
 
 #[tokio::test]
-async fn a_flipped_bit_anywhere_fails() {
+async fn a_flipped_bit_outside_block_data_fails() {
     let mut builder = SegmentBuilder::with_limits(128, 128);
     let mut bytes = Vec::new();
     for index in 0..4 {
@@ -385,15 +385,25 @@ async fn a_flipped_bit_anywhere_fails() {
     clean.put(&path, object.clone().into()).await.unwrap();
     read_everything(clean, &path, &streams).await.unwrap();
 
+    // Readers don't check block CRCs, so a flip in block data goes through as written.
+    let in_blocks = |byte: usize| {
+        built.extents.iter().any(|extent| {
+            let blocks =
+                extent.offset as usize + 16 + 8 + extent.block_count as usize * BLOCK_ENTRY_BYTES;
+            (blocks..(extent.offset + extent.len_bytes) as usize).contains(&byte)
+        })
+    };
     for bit in 0..object.len() * 8 {
+        let byte = bit / 8;
         let mut flipped = object.clone();
-        flipped[bit / 8] ^= 1 << (bit % 8);
+        flipped[byte] ^= 1 << (bit % 8);
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         store.put(&path, flipped.into()).await.unwrap();
-        let error = read_everything(store, &path, &streams)
-            .await
-            .expect_err(&format!("bit {bit} went unnoticed"));
-        let byte = bit / 8;
+        let result = read_everything(store, &path, &streams).await;
+        if in_blocks(byte) {
+            continue;
+        }
+        let error = result.expect_err(&format!("bit {bit} went unnoticed"));
         // A trailer flip may instead fail the magic or a range check, and a table's block
         // count its length, which the CRC is found by. All else is a CRC.
         let in_count = built.extents.iter().any(|extent| {
@@ -409,7 +419,7 @@ async fn a_flipped_bit_anywhere_fails() {
 }
 
 #[tokio::test]
-async fn a_flipped_bit_in_a_block_is_named_as_a_crc_failure() {
+async fn a_flipped_bit_in_a_block_is_read_as_stored() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut builder = SegmentBuilder::new();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"data"));
@@ -420,11 +430,13 @@ async fn a_flipped_bit_in_a_block_is_named_as_a_crc_failure() {
     object[region_head_bytes + 33] ^= 4;
     let path = Path::from("x.seg");
     store.put(&path, object.into()).await.unwrap();
-    let error = SegmentReader::new(store, path)
+    let read = SegmentReader::new(store, path)
         .read_stream(key("s"))
         .await
-        .unwrap_err();
-    assert!(matches!(error, SegmentError::Crc("block")), "{error}");
+        .unwrap();
+    let mut expected = bytes.to_vec();
+    expected[33] ^= 4;
+    assert_eq!(read, expected);
 }
 
 #[tokio::test]

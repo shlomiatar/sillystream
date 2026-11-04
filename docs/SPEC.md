@@ -226,6 +226,7 @@ Each publish asks for an ack level, and the ack is sent only after that level is
 
 - Written every seal window, or earlier when the size cap is reached (32–128 MB). The cap is one total per node, counted by the WAL writer, however the load is spread across cores.
 - Grouped by stream, with per-block summaries and CRCs. Readers never scan.
+- Readers check the CRCs of tables, index pages and the trailer, but not of blocks. The object store checksums what it stores, and checking blocks was a full pass over every byte read.
 - **Stream regions:** each stream's records form one region, in order of the stream's key hash (section 1). A region starts with the full key hash, then its block table, then its blocks.
 - **Footer index:** one entry per stream, in the same order: the top 64 bits of the key hash, delta-encoded from the previous entry, and the region's length as a varint. A region's offset is the sum of the lengths before it, and every 64th entry also stores its absolute offset. That is about 8 bytes per stream, so about 8 MB at 1M streams. A reader checks the full key hash at the start of the region.
 - **Pages:** the index is split into fixed-size pages, with a small top index giving each page's first entry and position. A reader fetches the top index once per object and caches it, then makes one small range read for the right page and one for the region. Readers cache pages too, and prefetch the pages of the next objects in a stream's list (section 7.6).

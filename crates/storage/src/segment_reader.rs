@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use format::{Decision, Filter, KeyHash, crc32c};
+use format::{Decision, Filter, KeyHash};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -59,22 +59,15 @@ fn extent_of(bytes: &[u8], entry: &IndexEntry) -> Result<(StreamExtent, BlockTab
     Ok((extent, table))
 }
 
-/// A whole region's records, checking its table and every block's CRC.
+/// A whole region's records, checking its table. Block CRCs aren't checked on reads: the
+/// object store checksums what it stores, and the check was a full pass over every read.
 fn records_of(region: &Bytes, entry: &IndexEntry) -> Result<(StreamExtent, Bytes), SegmentError> {
     if region.len() as u64 != entry.len_bytes {
         return Err(SegmentError::Corrupt("range read came back short"));
     }
-    let (extent, table) = extent_of(region, entry)?;
-    let mut offset = (extent.blocks_offset() - extent.offset) as usize;
-    let records = region.slice(offset..);
-    for block in &table.blocks {
-        let end = offset + block.summary.bytes as usize;
-        if crc32c(&region[offset..end]) != block.crc32c {
-            return Err(SegmentError::Crc("block"));
-        }
-        offset = end;
-    }
-    Ok((extent, records))
+    let (extent, _table) = extent_of(region, entry)?;
+    let offset = (extent.blocks_offset() - extent.offset) as usize;
+    Ok((extent, region.slice(offset..)))
 }
 
 fn check_table(extent: &StreamExtent, table: &BlockTable) -> Result<(), SegmentError> {
@@ -341,7 +334,7 @@ impl SegmentReader {
         Ok(table)
     }
 
-    /// Reads consecutive blocks with one range read, checking each block's CRC. The
+    /// Reads consecutive blocks with one range read, without checking their CRCs. The
     /// result is whole records, byte for byte what the wire carried.
     pub async fn read_blocks(
         &self,
@@ -359,16 +352,7 @@ impl SegmentReader {
             .sum();
         let total: u64 = selected.iter().map(|block| block.summary.bytes).sum();
         let start = extent.blocks_offset() + before;
-        let bytes = self.read_range(start..start + total).await?;
-        let mut offset = 0usize;
-        for block in selected {
-            let end = offset + block.summary.bytes as usize;
-            if crc32c(&bytes[offset..end]) != block.crc32c {
-                return Err(SegmentError::Crc("block"));
-            }
-            offset = end;
-        }
-        Ok(bytes)
+        self.read_range(start..start + total).await
     }
 
     /// One extent's records, with one read of its region.
