@@ -33,6 +33,7 @@ silly bench latency|throughput|idle|catch-up|many-streams|puts|idle-streams|ack-
                         [--timeout-seconds N] [--connect-count N] [--connect-concurrency N,N]
                         [--remote-url HOST:PORT --remote-ca PEM --remote-token-file FILE]
                         [--stream-prefix TEXT] [--rss-command SHELL]
+                        [--connections N,N] [--record-bytes N,N] [--streams N] [--wal-root DIR]
 
 Connecting takes --url HOST:PORT, --ca PEM and --token TEXT or --token-file FILE, or
 SILLYSTREAM_URL, SILLYSTREAM_CA and SILLYSTREAM_TOKEN.

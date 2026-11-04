@@ -30,6 +30,18 @@ struct Remote {
 
 static REMOTE: OnceLock<Remote> = OnceLock::new();
 
+/// `--wal-root`: where a local server's WAL goes instead of its temporary directory, so the
+/// WAL can have a disk of its own.
+static WAL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// The WAL directory of a local server whose other files are in `dir`.
+fn wal_dir(dir: &Path) -> PathBuf {
+    match WAL_ROOT.get() {
+        Some(root) => root.join(dir.file_name().unwrap_or_default()),
+        None => dir.join("wal"),
+    }
+}
+
 fn stream_name(name: &str) -> String {
     match REMOTE.get() {
         Some(remote) => format!("{}{name}", remote.stream_prefix),
@@ -54,6 +66,9 @@ impl Drop for ServerChild {
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
+            if WAL_ROOT.get().is_some() {
+                let _ = std::fs::remove_dir_all(wal_dir(self.dir.path()));
+            }
         }
     }
 }
@@ -169,7 +184,9 @@ fn spawn_server(
         .args(["--key", &path("key.pem")])
         .args(["--token-secret-file", &path("secret")])
         .args(["--stream-key-file", &path("stream-key")])
-        .args(["--wal-dir", &path("wal"), "--data-dir", &path("data")])
+        .arg("--wal-dir")
+        .arg(wal_dir(dir))
+        .args(["--data-dir", &path("data")])
         .arg("--object-store")
         .arg(format!("local:{}", path("objects")))
         .args(["--cores", &settings.cores.to_string()])
@@ -520,7 +537,8 @@ async fn latency(args: &Args, bin: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// As fast as the window allows, for `seconds`, on `connection_count` sockets to one stream.
+/// As fast as the window allows, for `seconds`, on `connection_count` sockets spread over
+/// `stream_count` streams.
 async fn throughput_run(
     server: &ServerChild,
     ack: AckLevel,
@@ -528,20 +546,24 @@ async fn throughput_run(
     data_bytes: usize,
     seconds: u64,
     stream: &str,
+    stream_count: u64,
 ) -> Result<(u64, f64), String> {
     let body = Arc::new(record(data_bytes)?);
     let acked = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let started = Instant::now();
     let mut tasks = Vec::new();
-    for _ in 0..connection_count {
+    // Up to 8 MiB in flight on each of a few connections, and 256 MiB in all past 32.
+    let inflight_bytes = (256 * 1024 * 1024 / connection_count as usize)
+        .clamp(data_bytes * 4, (8 * 1024 * 1024).max(data_bytes * 16));
+    for at in 0..connection_count {
         let client = server.client().await?;
         let mut publisher = client
             .publisher(
-                stream,
+                &stream_name(&format!("{stream}.{}", at % stream_count)),
                 PublisherConfig {
                     ack,
-                    max_inflight_bytes: (8 * 1024 * 1024).max(data_bytes * 16),
+                    max_inflight_bytes: inflight_bytes,
                     ..PublisherConfig::default()
                 },
             )
@@ -589,20 +611,36 @@ async fn throughput_run(
 async fn throughput(args: &Args, bin: &Path) -> Result<(), String> {
     let seconds = args.number("--seconds")?.unwrap_or(10);
     let cores = args.number("--cores")?.unwrap_or(4);
-    println!("### Throughput, one stream, {cores} cores, {seconds} s each\n");
+    let stream_count = args.number("--streams")?.unwrap_or(1).max(1);
+    let connection_counts = number_list(args, "--connections", "1,4")?;
+    let record_sizes = number_list(args, "--record-bytes", "1024,65536")?;
+    let levels = args.one("--levels").unwrap_or("1,2");
+    println!("### Throughput, {stream_count} streams, {cores} cores, {seconds} s each\n");
     println!("| ack | connections | record data bytes | publishes/s | MB/s of data |");
     println!("|---|---|---|---|---|");
     let mut run = 0;
     for (ack, name) in [(AckLevel::Memory, "1"), (AckLevel::WalFsync, "2")] {
-        for connection_count in [1u64, 4] {
-            for data_bytes in [1024usize, 64 * 1024] {
+        if !levels.split(',').any(|level| level == name) {
+            continue;
+        }
+        for &connection_count in &connection_counts {
+            for &data_bytes in &record_sizes {
+                let data_bytes = data_bytes as usize;
                 // A server per row, so that one row's memory cap doesn't slow the next.
                 let server = start_server(bin, cores)?;
                 run += 1;
                 let stream = format!("throughput.{run}");
                 let (acked, elapsed) =
-                    throughput_run(&server, ack, connection_count, data_bytes, seconds, &stream)
-                        .await?;
+                    throughput_run(
+                        &server,
+                        ack,
+                        connection_count,
+                        data_bytes,
+                        seconds,
+                        &stream,
+                        stream_count,
+                    )
+                    .await?;
                 let per_second = acked as f64 / elapsed;
                 println!(
                     "| {name} | {connection_count} | {data_bytes} | {per_second:.0} | {:.1} |",
@@ -790,8 +828,8 @@ async fn many_streams(args: &Args, bin: &Path) -> Result<(), String> {
             for at in 0..stream_count {
                 let server = Arc::clone(&server);
                 runs.push(tokio::spawn(async move {
-                    let stream = stream_name(&format!("many.{at}"));
-                    throughput_run(&server, ack, 1, data_bytes, seconds, &stream).await
+                    let stream = format!("many.{at}");
+                    throughput_run(&server, ack, 1, data_bytes, seconds, &stream, 1).await
                 }));
             }
             let mut per_second = 0.0;
@@ -1740,7 +1778,14 @@ pub(crate) async fn run(args: &Args, what: &str) -> Result<(), String> {
         "--rss-command",
         "--connect-count",
         "--connect-concurrency",
+        "--connections",
+        "--record-bytes",
+        "--streams",
+        "--wal-root",
     ])?;
+    if let Some(root) = args.one("--wal-root") {
+        let _ = WAL_ROOT.set(PathBuf::from(root));
+    }
     let bin = match args.one("--remote-url") {
         Some(url) => {
             set_remote(args, url, what)?;

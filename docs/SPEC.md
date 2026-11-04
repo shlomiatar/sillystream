@@ -203,6 +203,8 @@ What to mount at `wal_dir`:
 
 An acked record survives machine loss only if `wal_dir` is on EBS. The default path doesn't guarantee this, so deployment docs must say to mount EBS there.
 
+`wal_dir` gets a volume of its own: the segment directory, cache and metadata go on another one. Every record is written once to each, and a WAL fsync on a shared filesystem also waits for the other files' writes. On local NVMe, sharing one volume roughly halved throughput.
+
 The local segment directory (section 7.3) must be on a volume as durable as `wal_dir`, because a segment waiting to upload is then the only copy of its records outside the WAL.
 
 A shorter window loses less and makes level 3 acks faster, but costs more PUTs: about 2.6M a month per node at 1 s, 260K at 10 s, and 22K at 120 s.
