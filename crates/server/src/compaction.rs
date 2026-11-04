@@ -559,45 +559,11 @@ impl Compactor {
                     continue;
                 }
             };
-            let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
-            let mut held = 0;
-            let mut found = Vec::new();
-            for extent in footer {
-                // The manifest stream is never compacted (Q4), and what readers ignore of a
-                // former generation isn't copied.
-                if extent.stream == self.keys.manifest
-                    || limit.is_some_and(|limit| extent.id_first > limit)
-                {
-                    continue;
-                }
-                let Some(retention_ms) = self.retention_of(extent.stream).await? else {
-                    continue;
-                };
-                let Some(of) = RetentionClass::of_retention(retention_ms) else {
-                    continue;
-                };
-                held |= of.bit();
-                if of == class {
-                    found.push(extent);
-                }
-            }
             if batch.objects.is_empty() {
                 batch.first_manifest_id = *id;
                 batch.hour = hour;
             }
-            batch.objects.insert(object, held);
-            for extent in found {
-                batch.bytes += extent.len_bytes;
-                batch
-                    .streams
-                    .entry(extent.stream)
-                    .or_default()
-                    .push(Source {
-                        object,
-                        extent,
-                        limit,
-                    });
-            }
+            self.look(&mut batch, object, path, footer, class).await?;
             batch.through = Some(*id);
             if batch.bytes >= self.config.target_output_bytes {
                 closed = true;
@@ -618,6 +584,87 @@ impl Compactor {
             }
         }
         Ok(Planned::Ready(batch))
+    }
+
+    /// Adds an object to a batch: the longer classes its streams have now, and the regions of
+    /// `class` to copy.
+    async fn look(
+        &self,
+        batch: &mut Batch,
+        object: ObjectId,
+        path: &Path,
+        footer: Vec<StreamExtent>,
+        class: RetentionClass,
+    ) -> Result<(), String> {
+        let limit = object_generation(path).and_then(|at| self.ownership.limit_for(at));
+        let mut held = 0;
+        for extent in footer {
+            // The manifest stream is never compacted (Q4), and what readers ignore of a former
+            // generation isn't copied.
+            if extent.stream == self.keys.manifest
+                || limit.is_some_and(|limit| extent.id_first > limit)
+            {
+                continue;
+            }
+            let Some(retention_ms) = self.retention_of(extent.stream).await? else {
+                continue;
+            };
+            let Some(of) = RetentionClass::of_retention(retention_ms) else {
+                continue;
+            };
+            held |= of.bit();
+            if of == class {
+                batch.bytes += extent.len_bytes;
+                batch
+                    .streams
+                    .entry(extent.stream)
+                    .or_default()
+                    .push(Source {
+                        object,
+                        extent,
+                        limit,
+                    });
+            }
+        }
+        batch.objects.insert(object, held);
+        Ok(())
+    }
+
+    /// At expiry every worker has passed the object, so a class its row holds with no copy was
+    /// raised after its worker went by. The delete job copies it then, and the object goes at a
+    /// later run, once a checkpoint holds the rows (section 7.4). Whether it copied.
+    async fn copy_missing_classes(
+        &self,
+        path: &Path,
+        extents: &[StreamExtent],
+    ) -> Result<bool, String> {
+        let Some(object) = ObjectId::of_path(path) else {
+            return Ok(false);
+        };
+        let mut copied = false;
+        for class in RetentionClass::ALL {
+            let mut batch = Batch {
+                hour: object.hour(),
+                ..Batch::default()
+            };
+            self.look(&mut batch, object, path, extents.to_vec(), class)
+                .await?;
+            let fresh = batch.objects.get(&object).copied().unwrap_or(0);
+            let missing = self.row_of(path).is_some_and(|row| {
+                (row.held.unwrap_or(0) | fresh) & class.bit() != 0
+                    && !row.replacements.iter().any(|known| known.class == class)
+            });
+            if !missing {
+                continue;
+            }
+            let mut report = CompactReport::default();
+            self.run_batch(class, batch, true, &mut report).await?;
+            if !report.errors.is_empty() {
+                return Err(report.errors.join("; "));
+            }
+            copied = true;
+        }
+        Ok(copied)
     }
 
     /// Whether a row already leads this class from the object to a copy, which a cursor a crash
@@ -792,34 +839,53 @@ impl Compactor {
         log_complete: bool,
         slowest_cursor: u64,
     ) -> bool {
-        let holds_unread_manifests = extents
-            .iter()
-            .any(|extent| extent.stream == self.keys.manifest && extent.id_last > slowest_cursor);
-        if holds_unread_manifests {
-            return false;
+        if self.manifests_only(extents) {
+            return !self.holds_unread_manifests(extents, slowest_cursor);
         }
-        if extents
+        self.manifest_passed(path, extents, manifest_ids, log_complete, slowest_cursor)
+            && self.row_of(path).is_some_and(|row| row.is_passed())
+    }
+
+    fn manifests_only(&self, extents: &[StreamExtent]) -> bool {
+        extents
             .iter()
             .all(|extent| extent.stream == self.keys.manifest)
-        {
-            return true;
-        }
-        let Some(id) = ObjectId::of_path(path) else {
+    }
+
+    fn holds_unread_manifests(&self, extents: &[StreamExtent], slowest_cursor: u64) -> bool {
+        extents
+            .iter()
+            .any(|extent| extent.stream == self.keys.manifest && extent.id_last > slowest_cursor)
+    }
+
+    /// Every worker has passed the object's manifest, and the manifests it holds.
+    fn manifest_passed(
+        &self,
+        path: &Path,
+        extents: &[StreamExtent],
+        manifest_ids: &HashMap<&Path, u64>,
+        log_complete: bool,
+        slowest_cursor: u64,
+    ) -> bool {
+        if self.holds_unread_manifests(extents, slowest_cursor) {
             return false;
-        };
-        let table = self
-            .objects
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let row = table.get(ObjectKey::sealed(id));
-        let manifest_passed = match manifest_ids.get(path) {
+        }
+        match manifest_ids.get(path) {
             Some(manifest) => *manifest <= slowest_cursor,
             // A recorded object's manifest was saved in an object (D180). With all of the stream
             // read and no sign of it, that object has gone, which takes every worker passing it
             // (D182).
-            None => log_complete && row.is_some(),
-        };
-        manifest_passed && row.is_some_and(storage::ObjectRow::is_passed)
+            None => log_complete && self.row_of(path).is_some(),
+        }
+    }
+
+    fn row_of(&self, path: &Path) -> Option<storage::ObjectRow> {
+        let id = ObjectId::of_path(path)?;
+        let table = self
+            .objects
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.get(ObjectKey::sealed(id)).cloned()
     }
 
     /// The delete job (section 7.4). Only whole hours under a prefix, once expired, and for
@@ -992,6 +1058,18 @@ impl Compactor {
                     // A sealed object nobody could read may hold what was never copied.
                     FooterRead::Corrupt(error) => return Err(error),
                 };
+                if !self.manifests_only(&extents)
+                    && self.manifest_passed(
+                        &path,
+                        &extents,
+                        manifest_ids,
+                        log_complete,
+                        slowest_cursor,
+                    )
+                    && self.copy_missing_classes(&path, &extents).await?
+                {
+                    return Ok(None);
+                }
                 if !self.sealed_object_passed(
                     &path,
                     &extents,

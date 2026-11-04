@@ -1243,7 +1243,6 @@ async fn a_compacted_mixed_seal_keeps_its_class_from_the_newest_record() {
 /// Workers are at different manifests, so a class raised between them is seen by neither as
 /// its own. The delete job finds the stream still listing the object and copies it first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "the delete job no longer copies for a class raised after its worker (open question)"]
 async fn a_class_raised_between_workers_still_gets_its_records_copied() {
     let disk = Disk::new();
     let node = disk.start(config(1));
@@ -1570,7 +1569,6 @@ async fn a_stray_huge_hour_prefix_is_left_alone_and_stops_nothing() {
 
 /// At expiry the class now decides, whichever way it moved after the workers went past (D176).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "the delete job no longer copies for a class raised after its worker (open question)"]
 async fn the_delete_job_copies_for_a_raised_class_and_not_for_a_lowered_one() {
     let disk = Disk::new();
     let node = disk.start(config(1));
