@@ -1785,6 +1785,7 @@ impl Home {
             return;
         };
         sub.read_out = false;
+        let mut prefetch = None;
         match reply {
             CatchReply::Start {
                 head,
@@ -1829,7 +1830,12 @@ impl Home {
                     sub.position = position;
                 }
             }
-            CatchReply::Object { object, limit } => {
+            CatchReply::Object {
+                object,
+                next,
+                limit,
+            } => {
+                prefetch = next;
                 sub.object = Some(ObjectProgress {
                     object,
                     region: None,
@@ -1851,6 +1857,9 @@ impl Home {
                 self.remove_sub(key);
                 return;
             }
+        }
+        if let Some(next) = prefetch {
+            tokio::spawn(prefetch_pages(self.stores.clone(), next));
         }
         self.progress(key, 0, false);
         self.pump_catch_up(key);
@@ -1994,14 +2003,14 @@ pub(crate) struct ObjectRead {
     pub from_local: bool,
 }
 
-/// The stream's region in the object, through the page cache: the top index and the page
-/// are fetched only on a miss (section 7.3).
-async fn find_region(
+/// The page that may hold the stream's index entry, through the page cache: the top index and
+/// the page are fetched only on a miss (section 7.3). `None` if no page can.
+async fn stream_page(
     reader: &SegmentReader,
     pages: &PageCache,
     path: &object_store::path::Path,
     stream: KeyHash,
-) -> Result<Option<(StreamExtent, BlockTable)>, SegmentError> {
+) -> Result<Option<Arc<Vec<storage::IndexEntry>>>, SegmentError> {
     let top = match pages.top(path) {
         Some(top) => top,
         None => {
@@ -2021,7 +2030,39 @@ async fn find_region(
             page
         }
     };
-    reader.find_region(&page, stream).await
+    Ok(Some(page))
+}
+
+/// The stream's region in the object: its page through the cache, then one read for the
+/// region's key and table.
+async fn find_region(
+    reader: &SegmentReader,
+    pages: &PageCache,
+    path: &object_store::path::Path,
+    stream: KeyHash,
+) -> Result<Option<(StreamExtent, BlockTable)>, SegmentError> {
+    match stream_page(reader, pages, path, stream).await? {
+        Some(page) => reader.find_region(&page, stream).await,
+        None => Ok(None),
+    }
+}
+
+/// Fetches the next object's top index and the stream's page into the cache while the current
+/// object is read, so moving on costs one region read, not three reads in a row (section 7.3).
+/// A failure here costs nothing: the read itself fetches them again.
+async fn prefetch_pages(stores: Stores, object: ObjectRef) {
+    let path = object.key.path();
+    if let Some(local) = &stores.local {
+        let reader = SegmentReader::new(Arc::clone(local), path.clone());
+        if stream_page(&reader, &stores.pages, &path, object.stream)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let reader = SegmentReader::new(Arc::clone(&stores.object), path.clone());
+    let _ = stream_page(&reader, &stores.pages, &path, object.stream).await;
 }
 
 async fn read_from(

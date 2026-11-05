@@ -107,7 +107,9 @@ pub struct NodeConfig {
     pub fair_share_bytes: u64,
     /// Bytes a connection can have that its client hasn't taken. M6 has a socket for this.
     pub connection_window_bytes: u64,
-    /// How much one catch-up read asks for.
+    /// How much one catch-up read asks for. A read from the object store waits tens of ms
+    /// for its first byte and only one is in flight per subscription, so this is about half
+    /// the subscriber queue: the most that fits once the queue is down to its low mark.
     pub catch_up_read_bytes: u64,
     /// With a metadata store, how many streams may stay in RAM with nobody on them, split over
     /// the cores (section 7.6). `None` never evicts.
@@ -191,7 +193,7 @@ impl NodeConfig {
             partial_frame_timeout_ms: 60_000,
             fair_share_bytes: 256 * 1024,
             connection_window_bytes: 4 * 1024 * 1024,
-            catch_up_read_bytes: 1024 * 1024,
+            catch_up_read_bytes: 4 * 1024 * 1024,
             active_stream_limit: None,
             full_checkpoint_every_count: 64,
             compaction: None,

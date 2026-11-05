@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use format::{Decision, Filter, KeyHash};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -27,6 +28,9 @@ pub const SEGMENT_TAIL_READ_BYTES: usize = 256 * 1024;
 /// A lookup's first read of a region: its key and a table of up to 63 blocks. A longer
 /// table takes a second read for the rest.
 const REGION_HEAD_READ_BYTES: u64 = 4096;
+/// How many range reads one call sends at once, for the startup scan's region heads and a
+/// filter's runs of blocks. One at a time, each would wait out a GET's latency.
+const READS_IN_FLIGHT: usize = 32;
 
 /// The region in `bytes`, which start at its key and hold at least its key and table.
 fn extent_of(bytes: &[u8], entry: &IndexEntry) -> Result<(StreamExtent, BlockTable), SegmentError> {
@@ -196,8 +200,7 @@ impl SegmentReader {
         stream: KeyHash,
     ) -> Result<Vec<StreamExtent>, SegmentError> {
         for entry in self.candidates(top, stream).await? {
-            // Read whole even when the key is another's: a key the CRC fails is corruption, not
-            // a miss.
+            // Only the region's full key says whether it is this stream's.
             let (extent, _) = self.read_head(&entry).await?;
             if extent.stream == stream {
                 return Ok(vec![extent]);
@@ -243,7 +246,8 @@ impl SegmentReader {
     }
 
     /// Every region's key and table, without its blocks: one read of the index and last ids,
-    /// then one per region. For the startup scan of unrecorded objects (section 7.3).
+    /// then one per region, several at once. For the startup scan of unrecorded objects
+    /// (section 7.3).
     pub async fn read_heads(
         &self,
         top: &TopIndex,
@@ -264,15 +268,17 @@ impl SegmentReader {
         if last_ids.len() != entries.len() {
             return Err(SegmentError::Corrupt("last ids don't match the index"));
         }
-        let mut heads = Vec::with_capacity(entries.len());
-        for (entry, (stream, last_id)) in entries.iter().zip(last_ids) {
-            let (extent, table) = self.read_head(entry).await?;
-            if extent.stream != stream || extent.id_last != last_id {
-                return Err(SegmentError::Corrupt("region doesn't match its last id"));
-            }
-            heads.push((extent, table));
-        }
-        Ok(heads)
+        futures::stream::iter(entries.iter().zip(last_ids))
+            .map(|(entry, (stream, last_id))| async move {
+                let (extent, table) = self.read_head(entry).await?;
+                if extent.stream != stream || extent.id_last != last_id {
+                    return Err(SegmentError::Corrupt("region doesn't match its last id"));
+                }
+                Ok((extent, table))
+            })
+            .buffered(READS_IN_FLIGHT)
+            .try_collect()
+            .await
     }
 
     /// Every index entry, in order, with the regions' bytes and their last ids: one read from
@@ -333,7 +339,8 @@ impl SegmentReader {
         Ok(table)
     }
 
-    /// Reads consecutive blocks with one range read. The result is whole records, byte for byte what the wire carried.
+    /// Reads consecutive blocks with one range read. The result is whole records, byte for byte
+    /// what the wire carried.
     pub async fn read_blocks(
         &self,
         extent: &StreamExtent,
@@ -392,7 +399,8 @@ impl SegmentReader {
     }
 
     /// The blocks a filter can't rule out, using summaries alone (section 4.1). Each
-    /// run of neighbouring blocks is one read. Filtering inside a block is the caller's.
+    /// run of neighbouring blocks is one read, and the reads go out together. Filtering inside
+    /// a block is the caller's.
     pub async fn read_matching_blocks(
         &self,
         extent: &StreamExtent,
@@ -415,11 +423,11 @@ impl SegmentReader {
         if let Some(first) = start {
             runs.push(first..table.blocks.len());
         }
-        let mut out = Vec::with_capacity(runs.len());
-        for run in runs {
-            out.push(self.read_blocks(extent, table, run).await?);
-        }
-        Ok(out)
+        futures::stream::iter(runs)
+            .map(|run| self.read_blocks(extent, table, run))
+            .buffered(READS_IN_FLIGHT)
+            .try_collect()
+            .await
     }
 
     /// All of a stream's records, for the common case of a reader without a cached top

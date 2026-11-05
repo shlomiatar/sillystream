@@ -1993,6 +1993,7 @@ impl Core {
             Some(first) if first <= chain.after.saturating_add(1) => None,
             _ => self.next_object_ref(chain.stream, chain.after, chain.past),
         };
+        let next = object.and_then(|object| self.next_object_ref(name, chain.after, Some(object)));
         let ReadChain {
             sub,
             limit,
@@ -2003,6 +2004,7 @@ impl Core {
             // An object stops below what memory holds, so the read comes back to memory there.
             Some(object) => CatchReply::Object {
                 object,
+                next,
                 limit: memory_first.map_or(limit, |first| limit.min(first - 1)),
             },
             None => CatchReply::Memory { batches, limit },

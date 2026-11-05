@@ -1633,10 +1633,14 @@ async fn a_manifest_read_left_below_expired_records_starts_again() {
     disk.clock.advance(3 * DAY_MS);
     let node = disk.start(config(1));
     let mut client = node.client(0).await;
-    disk.store.slow_get_once.lock().unwrap().push((
-        last_holder.filename().unwrap().to_owned(),
-        std::time::Duration::from_secs(6),
-    ));
+    // Twice: the reader prefetches the object's pages while it reads the one before, and then
+    // reads them itself (section 7.3). Whichever comes first, both wait.
+    for _ in 0..2 {
+        disk.store.slow_get_once.lock().unwrap().push((
+            last_holder.filename().unwrap().to_owned(),
+            std::time::Duration::from_secs(6),
+        ));
+    }
     let report = node.expire_now().await.unwrap();
     assert_eq!(report.deleted_object_count, 0, "{report:?}");
     assert!(

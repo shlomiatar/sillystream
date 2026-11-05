@@ -728,6 +728,8 @@ pub(crate) enum CatchReply {
     },
     Object {
         object: ObjectRef,
+        /// The object after it in the list, whose pages the reader fetches ahead (section 7.3).
+        next: Option<ObjectRef>,
         limit: u64,
     },
     Fail {
