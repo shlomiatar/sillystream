@@ -1467,7 +1467,8 @@ async fn a_corrupt_footer_holds_only_its_own_hour() {
 
     let bytes = disk.store.get(&bad).await.unwrap().bytes().await.unwrap();
     let mut flipped = bytes.to_vec();
-    let at = flipped.len() - 3;
+    // The trailer's magic. Readers check no CRCs (section 7.3), so it takes a structural fault.
+    let at = flipped.len() - 24;
     flipped[at] ^= 0xFF;
     disk.store
         .put(&bad, PutPayload::from(flipped))
@@ -1522,7 +1523,9 @@ async fn corrupt_records_hold_only_their_own_hour() {
 
     let bytes = disk.store.get(&bad).await.unwrap().bytes().await.unwrap();
     let mut flipped = bytes.to_vec();
-    flipped[40] ^= 0xFF;
+    // The first block's byte count, past the region's key hash and table head: the table no
+    // longer adds up to the region. Readers check no CRCs (section 7.3).
+    flipped[16 + 8 + 40] ^= 0xFF;
     disk.store
         .put(&bad, PutPayload::from(flipped))
         .await
