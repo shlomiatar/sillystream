@@ -39,7 +39,6 @@ fn extent_of(bytes: &[u8], entry: &IndexEntry) -> Result<(StreamExtent, BlockTab
     let count = u32::from_le_bytes([count[0], count[1], count[2], count[3]]);
     let table_end = table_start + TABLE_HEAD_BYTES + count as usize * BLOCK_ENTRY_BYTES;
     let table = decode_block_table(
-        stream,
         bytes
             .get(table_start..table_end)
             .ok_or(SegmentError::Corrupt("region is truncated"))?,
@@ -59,8 +58,8 @@ fn extent_of(bytes: &[u8], entry: &IndexEntry) -> Result<(StreamExtent, BlockTab
     Ok((extent, table))
 }
 
-/// A whole region's records, checking its table. Block CRCs aren't checked on reads: the
-/// object store checksums what it stores, and the check was a full pass over every read.
+/// A whole region's records, checking that its table fits together. Readers don't check CRCs
+/// (section 7.3).
 fn records_of(region: &Bytes, entry: &IndexEntry) -> Result<(StreamExtent, Bytes), SegmentError> {
     if region.len() as u64 != entry.len_bytes {
         return Err(SegmentError::Corrupt("range read came back short"));
@@ -329,13 +328,12 @@ impl SegmentReader {
             .checked_add(KeyHash::BYTES as u64 + extent.table_bytes())
             .ok_or(SegmentError::Corrupt("extent offset"))?;
         let bytes = self.read_range(extent.offset..end).await?;
-        let table = decode_block_table(extent.stream, &bytes[KeyHash::BYTES..])?;
+        let table = decode_block_table(&bytes[KeyHash::BYTES..])?;
         check_table(extent, &table)?;
         Ok(table)
     }
 
-    /// Reads consecutive blocks with one range read, without checking their CRCs. The
-    /// result is whole records, byte for byte what the wire carried.
+    /// Reads consecutive blocks with one range read. The result is whole records, byte for byte what the wire carried.
     pub async fn read_blocks(
         &self,
         extent: &StreamExtent,

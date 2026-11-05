@@ -103,29 +103,25 @@ proptest! {
 
     #[test]
     fn decoders_never_panic_on_random_bytes(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
-        let _ = decode_block_table(key("s"), &bytes);
+        let _ = decode_block_table(&bytes);
         let _ = decode_last_ids(&bytes);
         let _ = decode_top_index(&bytes);
     }
 }
 
-/// `decode_*` also see valid CRCs over nonsense, the case a CRC doesn't catch.
+/// Counts that don't fit the bytes are refused, not trusted.
 #[test]
-fn decoders_refuse_nonsense_that_has_a_valid_crc() {
+fn decoders_refuse_counts_that_dont_fit() {
     let mut last_ids = vec![0u8; 8];
     last_ids[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-    let crc = crc32c(&last_ids[4..]);
-    last_ids[..4].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(
         decode_last_ids(&last_ids),
         Err(SegmentError::Corrupt(_))
     ));
     let mut table = vec![0u8; 8];
     table[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-    let crc = crc32c_append(crc32c(&key("s").0), &table[4..]);
-    table[..4].copy_from_slice(&crc.to_le_bytes());
     assert!(matches!(
-        decode_block_table(key("s"), &table),
+        decode_block_table(&table),
         Err(SegmentError::Corrupt(_))
     ));
 }
@@ -366,7 +362,7 @@ async fn read_everything(
 }
 
 #[tokio::test]
-async fn a_flipped_bit_outside_block_data_fails() {
+async fn a_flipped_bit_anywhere_never_panics() {
     let mut builder = SegmentBuilder::with_limits(128, 128);
     let mut bytes = Vec::new();
     for index in 0..4 {
@@ -385,36 +381,14 @@ async fn a_flipped_bit_outside_block_data_fails() {
     clean.put(&path, object.clone().into()).await.unwrap();
     read_everything(clean, &path, &streams).await.unwrap();
 
-    // Readers don't check block CRCs, so a flip in block data goes through as written.
-    let in_blocks = |byte: usize| {
-        built.extents.iter().any(|extent| {
-            let blocks =
-                extent.offset as usize + 16 + 8 + extent.block_count as usize * BLOCK_ENTRY_BYTES;
-            (blocks..(extent.offset + extent.len_bytes) as usize).contains(&byte)
-        })
-    };
+    // Readers don't check CRCs (section 7.3): a flip anywhere may read as stored or fail
+    // as corrupt, but never panics.
     for bit in 0..object.len() * 8 {
-        let byte = bit / 8;
         let mut flipped = object.clone();
-        flipped[byte] ^= 1 << (bit % 8);
+        flipped[bit / 8] ^= 1 << (bit % 8);
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         store.put(&path, flipped.into()).await.unwrap();
-        let result = read_everything(store, &path, &streams).await;
-        if in_blocks(byte) {
-            continue;
-        }
-        let error = result.expect_err(&format!("bit {bit} went unnoticed"));
-        // A trailer flip may instead fail the magic or a range check, and a table's block
-        // count its length, which the CRC is found by. All else is a CRC.
-        let in_count = built.extents.iter().any(|extent| {
-            let at = (extent.offset + 16 + 4) as usize;
-            (at..at + 4).contains(&byte)
-        });
-        let in_trailer = byte >= object.len() - TRAILER_BYTES;
-        assert!(
-            matches!(error, SegmentError::Crc(_)) || in_count || in_trailer,
-            "bit {bit}: {error}"
-        );
+        let _ = read_everything(store, &path, &streams).await;
     }
 }
 

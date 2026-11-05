@@ -52,9 +52,7 @@ pub fn stream_hash(stream: KeyHash) -> u64 {
 #[derive(Debug)]
 pub enum SegmentError {
     Store(object_store::Error),
-    /// A CRC didn't match. The name says which structure.
-    Crc(&'static str),
-    /// Bytes that passed no CRC, or don't fit together.
+    /// Bytes that don't fit together. Readers don't check CRCs, so this is all a reader finds.
     Corrupt(&'static str),
     /// Bytes given to the builder aren't whole stamped records.
     Records(FormatError),
@@ -68,7 +66,6 @@ impl fmt::Display for SegmentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SegmentError::Store(error) => write!(f, "object store: {error}"),
-            SegmentError::Crc(what) => write!(f, "CRC mismatch in {what}"),
             SegmentError::Corrupt(what) => write!(f, "corrupt segment: {what}"),
             SegmentError::Records(error) => write!(f, "bad records: {error}"),
             SegmentError::OutOfOrder(what) => write!(f, "out of order: {what}"),
@@ -140,7 +137,7 @@ pub(crate) fn encode_block_table(stream: KeyHash, blocks: &[BlockEntry]) -> Vec<
     out
 }
 
-pub fn decode_block_table(stream: KeyHash, bytes: &[u8]) -> Result<BlockTable, SegmentError> {
+pub fn decode_block_table(bytes: &[u8]) -> Result<BlockTable, SegmentError> {
     if bytes.len() < TABLE_HEAD_BYTES {
         return Err(SegmentError::Corrupt("block table is truncated"));
     }
@@ -151,9 +148,6 @@ pub fn decode_block_table(stream: KeyHash, bytes: &[u8]) -> Result<BlockTable, S
         != Some(bytes.len())
     {
         return Err(SegmentError::Corrupt("block table has the wrong length"));
-    }
-    if crc32c_append(crc32c(&stream.0), &bytes[4..]) != u32_at(bytes, 0) {
-        return Err(SegmentError::Crc("block table"));
     }
     let mut blocks = Vec::with_capacity(count);
     for entry in bytes[TABLE_HEAD_BYTES..].as_chunks::<BLOCK_ENTRY_BYTES>().0 {
@@ -256,9 +250,6 @@ pub(crate) fn decode_page(bytes: &[u8], page: &TopEntry) -> Result<Vec<IndexEntr
     if bytes.len() < PAGE_HEAD_BYTES {
         return Err(SegmentError::Corrupt("page is truncated"));
     }
-    if crc32c(&bytes[4..]) != u32_at(bytes, 0) {
-        return Err(SegmentError::Crc("footer page"));
-    }
     let count = u32_at(bytes, 4) as usize;
     let mut entries = Vec::with_capacity(count);
     let mut at = PAGE_HEAD_BYTES;
@@ -308,9 +299,6 @@ pub(crate) fn encode_last_ids(last_ids: &[(KeyHash, u64)]) -> Vec<u8> {
 pub fn decode_last_ids(bytes: &[u8]) -> Result<Vec<(KeyHash, u64)>, SegmentError> {
     if bytes.len() < 8 {
         return Err(SegmentError::Corrupt("last ids are truncated"));
-    }
-    if crc32c(&bytes[4..]) != u32_at(bytes, 0) {
-        return Err(SegmentError::Crc("last ids"));
     }
     let count = u32_at(bytes, 4) as usize;
     if count
@@ -422,7 +410,6 @@ pub(crate) fn encode_footer(top: &TopIndex, top_offset: u64) -> Vec<u8> {
 pub(crate) struct Trailer {
     pub(crate) top_offset: u64,
     pub(crate) top_len: u32,
-    pub(crate) crc32c: u32,
 }
 
 pub(crate) fn decode_trailer(bytes: &[u8]) -> Result<Trailer, SegmentError> {
@@ -435,20 +422,16 @@ pub(crate) fn decode_trailer(bytes: &[u8]) -> Result<Trailer, SegmentError> {
     Ok(Trailer {
         top_offset: u64_at(bytes, 8),
         top_len: u32_at(bytes, 16),
-        crc32c: u32_at(bytes, 20),
     })
 }
 
-/// Decodes the bytes `top_index | trailer`, checking the trailer's CRC.
+/// Decodes the bytes `top_index | trailer`.
 pub fn decode_top_index(bytes: &[u8]) -> Result<TopIndex, SegmentError> {
     if bytes.len() < TRAILER_BYTES {
         return Err(SegmentError::Corrupt("footer is truncated"));
     }
     let (top, trailer_bytes) = bytes.split_at(bytes.len() - TRAILER_BYTES);
     let trailer = decode_trailer(trailer_bytes)?;
-    if crc32c(&bytes[..bytes.len() - 4]) != trailer.crc32c {
-        return Err(SegmentError::Crc("top index"));
-    }
     if trailer.top_len as usize != top.len() || top.len() < TOP_HEAD_BYTES {
         return Err(SegmentError::Corrupt("top index has the wrong length"));
     }
