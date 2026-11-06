@@ -762,7 +762,10 @@ async fn a_client_that_never_reads_is_closed_after_the_hello_deadline() {
         .await
         .is_ok();
     writer.abort();
-    assert!(closed, "a connection past its HELLO deadline was still open at 20 s");
+    assert!(
+        closed,
+        "a connection past its HELLO deadline was still open at 20 s"
+    );
     server.server.shutdown();
 }
 

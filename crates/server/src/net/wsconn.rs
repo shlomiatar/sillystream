@@ -276,7 +276,9 @@ struct WsConn<'a> {
     retry_at: Option<Instant>,
     /// When a frame or fragmented message still arriving runs out of time.
     partial_deadline: Option<Instant>,
-    closing: bool,
+    /// Set once the Close frame is queued: the socket gets until then to take what is left,
+    /// however much else keeps happening, and nothing more is queued after it.
+    closing_by: Option<Instant>,
     hello_deadline: Instant,
     /// The token's expiry timer ended the subscriptions, so it needn't fire again.
     expiry_seen: bool,
@@ -335,7 +337,7 @@ pub(super) async fn run(shared: &Shared, home: usize, tls: Tls, leftover: Vec<u8
         pending: VecDeque::new(),
         retry_at: None,
         partial_deadline: None,
-        closing: false,
+        closing_by: None,
         hello_deadline: Instant::now() + Duration::from_millis(HELLO_TIMEOUT_MS),
         expiry_seen: false,
     };
@@ -373,7 +375,7 @@ impl WsConn<'_> {
         loop {
             self.out.pump(&mut self.tls)?;
             let want_write = !self.out.is_empty() || self.tls.get_ref().1.wants_write();
-            if self.closing && !want_write {
+            if self.closing_by.is_some() && !want_write {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(CLOSE_TIMEOUT_MS),
                     self.tls.shutdown(),
@@ -382,8 +384,10 @@ impl WsConn<'_> {
                 return Ok(());
             }
             let held_up = self.is_held_up();
-            let may_read = !self.closing && !held_up && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES;
-            let want_events = !self.closing && self.out_has_event_room();
+            let may_read = self.closing_by.is_none()
+                && !held_up
+                && self.out.reply_bytes < OUT_REPLY_HIGH_BYTES;
+            let want_events = self.closing_by.is_none() && self.out_has_event_room();
             if !held_up {
                 self.retry_at = None;
             } else if self.retry_at.is_none() {
@@ -393,14 +397,14 @@ impl WsConn<'_> {
             let partial_deadline = self.update_partial_deadline();
             // Once closing, the deadline has done its work. Left armed it is always past, and
             // being ahead of `writable` and the close timer it would starve both for ever.
-            let hello_due = self.session.is_none() && !self.closing;
+            let hello_due = self.session.is_none() && self.closing_by.is_none();
             let hello_deadline = self.hello_deadline;
             let release_parts_at = self
                 .out
                 .parts_since
                 .map(|since| since + Duration::from_millis(OUT_PART_HOLD_MS));
             let expiry = self.expiry_wait();
-            let close_wait = self.closing;
+            let closing_by = self.closing_by;
             let read_again = self.read_again;
             let tcp = self.tls.get_ref().0;
             let (client, connection) = match &mut self.session {
@@ -421,7 +425,7 @@ impl WsConn<'_> {
                 // rustls may hold plaintext the socket no longer says anything about.
                 _ = std::future::ready(()), if read_again && may_read => Wake::Readable(Ok(())),
                 ready = tcp.readable(), if may_read => Wake::Readable(ready),
-                _ = tokio::time::sleep(Duration::from_millis(CLOSE_TIMEOUT_MS)), if close_wait => {
+                _ = sleep_until_some(closing_by) => {
                     return Ok(());
                 }
             };
@@ -503,7 +507,7 @@ impl WsConn<'_> {
 
     /// Starts the clock when a frame or message begins, and stops it when none is under way.
     fn update_partial_deadline(&mut self) -> Option<Instant> {
-        if self.closing || (self.part.is_none() && self.fragments.is_none()) {
+        if self.closing_by.is_some() || (self.part.is_none() && self.fragments.is_none()) {
             self.partial_deadline = None;
         } else if self.partial_deadline.is_none() {
             let timeout = Duration::from_millis(self.shared.partial_frame_timeout_ms);
@@ -519,7 +523,7 @@ impl WsConn<'_> {
         // Only a read that found nothing clears this.
         self.read_again = true;
         for _ in 0..READS_PER_WAKE_COUNT {
-            if self.closing || self.is_held_up() {
+            if self.closing_by.is_some() || self.is_held_up() {
                 return Ok(());
             }
             if let Some((_, part)) = &mut self.part {
@@ -572,8 +576,8 @@ impl WsConn<'_> {
     /// Takes frames out of what was read. Whatever is whole is handled where it lies.
     async fn feed(&mut self, mut rest: SlabRegion) -> io::Result<()> {
         while !rest.is_empty() {
-            if !self.pending.is_empty() || self.closing || self.commands_are_full() {
-                if !self.closing {
+            if !self.pending.is_empty() || self.closing_by.is_some() || self.commands_are_full() {
+                if self.closing_by.is_none() {
                     self.counters()
                         .held_buffer_count
                         .fetch_add(1, Ordering::Relaxed);
@@ -1182,7 +1186,7 @@ impl WsConn<'_> {
     /// (section 12), so a subscription can't outlast it.
     fn expiry_wait(&self) -> Option<Duration> {
         let session = self.session.as_ref()?;
-        if session.subs.is_empty() || self.expiry_seen || self.closing {
+        if session.subs.is_empty() || self.expiry_seen || self.closing_by.is_some() {
             return None;
         }
         let now_ms = self.shared.clock.now_ms();
@@ -1209,12 +1213,19 @@ impl WsConn<'_> {
         }
     }
 
+    /// Nothing goes after the Close frame (RFC 6455 section 5.5.1).
     fn push_ws_frame(&mut self, opcode: u8, payload: &[u8]) {
+        if self.closing_by.is_some() {
+            return;
+        }
         let (head, head_bytes) = header_array(opcode, payload.len() as u64);
         self.out.push_reply(&[&head[..head_bytes], payload]);
     }
 
     fn send_frame(&mut self, frame: ServerFrame<'_>) {
+        if self.closing_by.is_some() {
+            return;
+        }
         let (shared, home) = (self.shared, self.home);
         let out = &mut self.out;
         with_core_io(shared, home, |io| {
@@ -1250,9 +1261,9 @@ impl WsConn<'_> {
 
     /// Says goodbye, and the loop ends once the socket has taken what is left.
     fn close(&mut self, code: u16) {
-        if !self.closing {
+        if self.closing_by.is_none() {
             self.push_ws_frame(OP_CLOSE, &code.to_be_bytes());
-            self.closing = true;
+            self.closing_by = Some(Instant::now() + Duration::from_millis(CLOSE_TIMEOUT_MS));
         }
     }
 }
