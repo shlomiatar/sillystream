@@ -300,11 +300,15 @@ impl StreamLog {
         waiting
     }
 
-    /// The object not uploaded yet that holds `id`, if its batches have gone.
+    /// The object not uploaded yet that holds `id`, if its batches have gone. Each object took
+    /// the batches after the one before it, so that is the lowest one reaching `id`. Objects
+    /// are noted in the order their puts write them, not the order they were sealed, so the
+    /// first one in the list may be a later object.
     fn unuploaded_holding(&self, id: u64) -> Option<UploadTag> {
         self.unuploaded
             .iter()
-            .find(|(_, last_id)| *last_id >= id)
+            .filter(|(_, last_id)| *last_id >= id)
+            .min_by_key(|(_, last_id)| *last_id)
             .map(|(tag, _)| *tag)
     }
 }
@@ -3769,5 +3773,23 @@ fn fan_out(stream: &mut Stream, entry: PendingVisible, parts: FanOutParts<'_>) {
                 body,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Puts run at once, so a later object can be noted first. An id still belongs to the
+    /// object that took it.
+    #[test]
+    fn an_id_waits_on_its_own_object_whatever_order_they_were_noted() {
+        let mut log = StreamLog::default();
+        log.unuploaded.push_back((UploadTag::Seal(2), 200));
+        log.unuploaded.push_back((UploadTag::Seal(1), 100));
+        assert_eq!(log.unuploaded_holding(50), Some(UploadTag::Seal(1)));
+        assert_eq!(log.unuploaded_holding(100), Some(UploadTag::Seal(1)));
+        assert_eq!(log.unuploaded_holding(101), Some(UploadTag::Seal(2)));
+        assert_eq!(log.unuploaded_holding(201), None);
     }
 }
