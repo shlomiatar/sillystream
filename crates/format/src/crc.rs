@@ -10,6 +10,11 @@ pub fn crc32c_append(crc: u32, bytes: &[u8]) -> u32 {
     crc32c::crc32c_append(crc, bytes)
 }
 
+/// The CRC of `a` then `b`, from `crc32c(a)`, `crc32c(b)` and `b.len()`, without reading the bytes.
+pub fn crc32c_combine(crc_a: u32, crc_b: u32, len_b: usize) -> u32 {
+    crc32c::crc32c_combine(crc_a, crc_b, len_b)
+}
+
 /// CRC32C of the little-endian `seed` followed by `bytes`.
 ///
 /// The WAL seeds entries with the file's `seq`, so a stale entry in a reused
@@ -29,6 +34,14 @@ mod tests {
         assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
         assert_eq!(crc32c(&[0xFFu8; 32]), 0x62A8_AB43);
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn combine_equals_whole() {
+        assert_eq!(
+            crc32c_combine(crc32c(b"1234"), crc32c(b"56789"), 5),
+            crc32c(b"123456789")
+        );
     }
 
     #[test]

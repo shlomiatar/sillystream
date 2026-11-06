@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use format::{KeyHash, crc32c, crc32c_append, crc32c_seeded};
+use format::{KeyHash, crc32c, crc32c_append, crc32c_combine, crc32c_seeded};
 
 /// `SSWAL002` as little-endian bytes on disk.
 pub const WAL_MAGIC: u64 = u64::from_le_bytes(*b"SSWAL002");
@@ -61,6 +61,9 @@ pub struct WalEntry<R> {
     producer_id: u64,
     producer_seq: u64,
     records: R,
+    /// `crc32c(records)`, computed in `new` on the sending core while the bytes are still in its
+    /// cache, so the writer thread only combines it into the seeded CRC.
+    records_crc: u32,
     /// The core to tell when this entry is durable.
     core: usize,
     /// Increases per core. The writer reports the highest durable one.
@@ -77,11 +80,13 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         ticket: u64,
     ) -> Result<WalEntry<R>, WalEntryError> {
         check_entry(records.as_ref())?;
+        let records_crc = crc32c(records.as_ref());
         Ok(WalEntry {
             stream,
             producer_id,
             producer_seq,
             records,
+            records_crc,
             core,
             ticket,
         })
@@ -112,15 +117,16 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
         self.records
     }
 
-    /// Appends the entry's head (everything before `records`) to `out`, computing
-    /// the CRC over the records, and returns how much padding follows them.
+    /// Appends the entry's head (everything before `records`) to `out`, with the
+    /// CRC over the records, and returns how much padding follows them.
     pub(crate) fn write_head(&self, seq: u64, out: &mut Vec<u8>) -> usize {
         write_head(
             seq,
             self.stream,
             self.producer_id,
             self.producer_seq,
-            self.records.as_ref(),
+            self.records.as_ref().len(),
+            self.records_crc,
             out,
         )
     }
@@ -141,18 +147,19 @@ fn write_head(
     stream: KeyHash,
     producer_id: u64,
     producer_seq: u64,
-    records: &[u8],
+    records_len: usize,
+    records_crc: u32,
     out: &mut Vec<u8>,
 ) -> usize {
     let start = out.len();
     out.extend_from_slice(&stream.0);
     out.extend_from_slice(&producer_id.to_le_bytes());
     out.extend_from_slice(&producer_seq.to_le_bytes());
-    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
-    let total = ENTRY_FIXED_BYTES + records.len();
+    out.extend_from_slice(&(records_len as u32).to_le_bytes());
+    let total = ENTRY_FIXED_BYTES + records_len;
     let padding = total.next_multiple_of(8) - total;
     let mut crc = crc32c_seeded(seq, &out[start..]);
-    crc = crc32c_append(crc, records);
+    crc = crc32c_combine(crc, records_crc, records_len);
     crc = crc32c_append(crc, &ZERO_PADDING[..padding]);
     out.extend_from_slice(&crc.to_le_bytes());
     padding
@@ -169,7 +176,15 @@ pub fn encode_wal_entry(
 ) -> Result<Vec<u8>, WalEntryError> {
     check_entry(records)?;
     let mut out = Vec::with_capacity(ENTRY_FIXED_BYTES + records.len() + 8);
-    let padding = write_head(seq, stream, producer_id, producer_seq, records, &mut out);
+    let padding = write_head(
+        seq,
+        stream,
+        producer_id,
+        producer_seq,
+        records.len(),
+        crc32c(records),
+        &mut out,
+    );
     out.extend_from_slice(records);
     out.extend_from_slice(&ZERO_PADDING[..padding]);
     Ok(out)

@@ -15,7 +15,7 @@ mod record;
 mod summary;
 mod system;
 
-pub use crc::{crc32c, crc32c_append, crc32c_seeded};
+pub use crc::{crc32c, crc32c_append, crc32c_combine, crc32c_seeded};
 pub use error::FormatError;
 pub use filter::{Clause, Filter, MAX_CLAUSES, OP_ANY, OP_EQ};
 pub use id::{
