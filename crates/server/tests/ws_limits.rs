@@ -721,6 +721,51 @@ async fn a_ping_flood_doesnt_outlive_the_hello_deadline() {
     server.server.shutdown();
 }
 
+/// A client that never sends `HELLO` and never reads still loses its connection: once the
+/// deadline has closed it, the close timer has to get its turn with the socket full.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_never_reads_is_closed_after_the_hello_deadline() {
+    let server = start_node(node_config(1));
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let socket = socket.connect(server.server.local_addr()).await.unwrap();
+    let mut tls = server
+        .connector
+        .connect("localhost".try_into().unwrap(), socket)
+        .await
+        .unwrap();
+    tls.write_all(
+        b"GET /v1/ws HTTP/1.1\r\nhost: l\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\
+          sec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(tls.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    // Never read: reading would let the connection drain and hide a stuck close.
+    let (_read_half, mut write_half) = tokio::io::split(tls);
+    // PONGs nobody reads fill the socket, so the connection is still writing when it closes.
+    let batch: Vec<u8> = [0x89u8, 0x80, 1, 2, 3, 4].repeat(2_000);
+    let mut writer = tokio::spawn(async move {
+        while write_half.write_all(&batch).await.is_ok() {
+            if write_half.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    // Writing fails once the server has dropped the socket: past the 10 s deadline and the
+    // 1 s close timer.
+    let closed = tokio::time::timeout(Duration::from_secs(20), &mut writer)
+        .await
+        .is_ok();
+    writer.abort();
+    assert!(closed, "a connection past its HELLO deadline was still open at 20 s");
+    server.server.shutdown();
+}
+
 /// Frames a connection has taken for its socket are out of the core's reach, and each can keep
 /// a whole slab alive for one matching byte. A client that stops reading must not keep them.
 #[tokio::test(flavor = "multi_thread")]

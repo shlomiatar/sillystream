@@ -391,7 +391,9 @@ impl WsConn<'_> {
             }
             let retry_at = self.retry_at;
             let partial_deadline = self.update_partial_deadline();
-            let no_session = self.session.is_none();
+            // Once closing, the deadline has done its work. Left armed it is always past, and
+            // being ahead of `writable` and the close timer it would starve both for ever.
+            let hello_due = self.session.is_none() && !self.closing;
             let hello_deadline = self.hello_deadline;
             let release_parts_at = self
                 .out
@@ -411,7 +413,7 @@ impl WsConn<'_> {
                 _ = sleep_until_some(retry_at) => Wake::Retry,
                 _ = sleep_until_some(partial_deadline) => Wake::PartialTimeout,
                 _ = sleep_until_some(release_parts_at) => Wake::ReleaseParts,
-                _ = tokio::time::sleep_until(hello_deadline), if no_session => Wake::HelloTimeout,
+                _ = tokio::time::sleep_until(hello_deadline), if hello_due => Wake::HelloTimeout,
                 _ = tokio::time::sleep(expiry.unwrap_or_default()), if expiry.is_some() => Wake::Expiry,
                 ready = tcp.writable(), if want_write => Wake::Writable(ready),
                 reply = recv_reply(client) => Wake::Reply(reply),
