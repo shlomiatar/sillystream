@@ -774,6 +774,51 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     assert_eq!(uploader.shutdown().unfinished.len(), 4);
 }
 
+/// What a former process left in `pending/` is part of what `finish` waits for, even with
+/// nothing new sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_waits_for_what_pending_held_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
+    let failing = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
+    failing.fail_next_puts.store(u64::MAX, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = failing;
+    let (mut first, mut events) = config(store);
+    first.cache = Some(SegmentCache::open(dir.path(), 1 << 20).unwrap());
+    let (sender, uploader) = Uploader::start(first).unwrap();
+    sender.try_send(dedicated("s", 0, vec![bytes])).unwrap();
+    assert!(matches!(
+        next_event(&mut events).await,
+        Some(UploadEvent::Retrying { .. })
+    ));
+    drop(sender);
+    assert_eq!(uploader.shutdown().unfinished.len(), 1);
+
+    // A store that refuses a few times first, so the restore is still going when the last
+    // sender goes.
+    let inner = Arc::new(InMemory::new());
+    let counting = Arc::new(CountingStore::new(Arc::clone(&inner) as Arc<dyn ObjectStore>));
+    counting.fail_next_puts.store(20, Ordering::SeqCst);
+    let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
+    let (mut second, mut events) = config(store);
+    second.cache = Some(SegmentCache::open(dir.path(), 1 << 20).unwrap());
+    let (sender, uploader) = Uploader::start(second).unwrap();
+    drop(sender);
+    let exit = tokio::task::spawn_blocking(move || uploader.finish())
+        .await
+        .unwrap();
+    assert!(exit.unfinished.is_empty());
+    assert_eq!(counting.put_count.load(Ordering::SeqCst), 1);
+    let mut restored = false;
+    while let Ok(event) = events.try_recv() {
+        restored |= matches!(event, UploadEvent::Restored { .. });
+    }
+    assert!(restored, "finish returned before the restore");
+    let mut files = Vec::new();
+    list_files(&dir.path().join("pending"), &mut files);
+    assert!(files.is_empty(), "{files:?}");
+}
+
 fn list_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
     for item in std::fs::read_dir(dir).unwrap() {
         let item = item.unwrap();

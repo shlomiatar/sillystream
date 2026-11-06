@@ -498,6 +498,10 @@ impl Worker {
         while let Some(finished) = in_flight.next().await {
             self.finish(finished);
         }
+        // So do the restores: `finish` means `pending/` is in the store too.
+        while let Some((path, len_bytes, result)) = restoring.next().await {
+            self.restored(path, len_bytes, result);
+        }
         // The flag is set or every sender is gone, so nothing can arrive after these
         // sends (see `UploaderSender::send`). They take a moment, so this is a short wait.
         while self.sending_count.load(Ordering::SeqCst) != 0 {
