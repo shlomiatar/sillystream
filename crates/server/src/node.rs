@@ -1879,7 +1879,7 @@ impl Client {
     pub(crate) async fn publish_forward(
         &mut self,
         target: KeyHash,
-        record: &[u8],
+        records: &[Bytes],
         producer_id: u64,
         producer_seq: u64,
         ack_level: u8,
@@ -1889,8 +1889,16 @@ impl Client {
         }
         self.wait_for_barrier(target).await?;
         let (stream, core) = self.route(target);
-        let mut records = self.pool.copy_in_exact(record);
-        records[format::ID_OFFSET..format::ID_OFFSET + 8].fill(0);
+        let mut records = self.pool.copy_in_parts(records);
+        // Each record keeps the id it had in the source until here; the target stamps its own.
+        let mut at = 0;
+        while let Ok(header) = format::RecordHeader::read(&records[at..]) {
+            records[at + format::ID_OFFSET..at + format::ID_OFFSET + 8].fill(0);
+            at += header.total_bytes();
+            if at >= records.len() {
+                break;
+            }
+        }
         let message = WriteMsg::Publish(Box::new(PublishMsg {
             stream,
             handle: 0,

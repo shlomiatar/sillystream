@@ -1064,8 +1064,50 @@ fn check_wal_fields(harness: &Harness, target: &str, sink_id: u64, run: &Forward
     seqs.dedup();
     let producer_id = format::forward_producer_id(key(STREAM), sink_id);
     assert!(entries.iter().all(|entry| entry.producer_id == producer_id));
-    let wanted: Vec<u64> = run.sent.keys().copied().collect();
-    assert_eq!(seqs, wanted, "producer_seq is the source first_id");
+    // A publish's seq is the source id of its last record, so they rise and end at the last.
+    let last_ids: Vec<u64> = run
+        .sent
+        .iter()
+        .map(|(first_id, (item_count, _))| first_id + item_count - 1)
+        .collect();
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "{seqs:?}");
+    assert!(seqs.iter().all(|seq| last_ids.contains(seq)), "{seqs:?}");
+    assert_eq!(seqs.last(), last_ids.last());
+}
+
+/// What built up before the sink started goes as two publishes: one record alone, since the
+/// target may already have a run of them from before, then all the rest at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_sends_what_has_built_up_in_one_publish() {
+    let harness = Harness::new(config());
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let run = publish_for_forward(&mut client, STREAM, 5).await;
+    put_sink(
+        &mut client,
+        STREAM,
+        44,
+        forward_spec(TARGET),
+        SinkStart::Earliest,
+    )
+    .await;
+    wait_for_cursor(&mut client, STREAM, 44, run.last_id).await;
+    check_forwarded(node, TARGET, &run).await;
+    let seqs: Vec<u64> = harness
+        .wal
+        .stream_entries(TARGET)
+        .iter()
+        .map(|entry| entry.producer_seq)
+        .collect();
+    let (first_id, (item_count, _)) = run.sent.iter().next().unwrap();
+    let (last_first, (last_count, _)) = run.sent.iter().next_back().unwrap();
+    assert_eq!(
+        seqs,
+        [first_id + item_count - 1, last_first + last_count - 1]
+    );
+    drop(client);
+    harness.finish();
 }
 
 const TARGET: &str = "sink.target";

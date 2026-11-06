@@ -139,6 +139,8 @@ struct Delivery {
 
 enum Outcome {
     Delivered,
+    /// `forward`: the target had it already, from a try before a crash or an update.
+    AlreadyThere,
     Retry(String),
     Permanent(String),
     Killed,
@@ -330,6 +332,10 @@ struct Reading<'a> {
     /// `archive`: a window the clock has closed, and the last id given out once it had. Nothing
     /// more can join that window, so it is fully read when reading reaches this id.
     closed_window: Option<(u64, u64)>,
+    /// `forward`: one record per publish until the target takes one as new. What was published
+    /// before this spell began can be any run of what is read again, and a batch overlapping
+    /// its end would be taken whole as new or dropped whole (D189).
+    probing: bool,
 }
 
 impl<'a> Reading<'a> {
@@ -399,6 +405,7 @@ impl<'a> Reading<'a> {
             next_retention_refresh_ms: 0,
             gap_from: None,
             closed_window: None,
+            probing: true,
             spec,
             worker,
         })
@@ -409,6 +416,9 @@ impl<'a> Reading<'a> {
         let mut subscription = Subscription::new(self.sub, self.worker.key.0, from);
         subscription.clauses = &self.clauses;
         subscription.author = self.author;
+        // System records are never sent on, but reading past them is what closes a batch window
+        // whose last stamped id is one: no progress would come for them otherwise.
+        subscription.include_system = true;
         connection.subscribe(subscription);
     }
 
@@ -488,9 +498,11 @@ impl<'a> Reading<'a> {
             Event::Progress { sub, id } if sub == self.sub => {
                 self.read_id = self.read_id.max(id);
                 self.progress_id = self.progress_id.max(id);
-                if let Some(first_id) = self.gap_from.take()
+                // Progress short of the gap's start says nothing about the gap yet.
+                if let Some(first_id) = self.gap_from
                     && id >= first_id
                 {
+                    self.gap_from = None;
                     self.record_gap(first_id, id).await;
                 }
                 self.commit_progress().await;
@@ -536,6 +548,11 @@ impl<'a> Reading<'a> {
                 return Err("reading: a record runs off its frame".to_owned());
             }
             let (first_id, last_id) = (header.id, header.last_id());
+            // A system record isn't sent on, but it has been read: a batch window that closed at
+            // its id is complete once reading is past it.
+            if last_id > self.read_id && header.is_system() {
+                self.read_id = last_id;
+            }
             // After a `BEHIND`, what has already been read can come again.
             if last_id > self.read_id && !header.is_system() {
                 self.read_id = last_id;
@@ -597,6 +614,11 @@ impl<'a> Reading<'a> {
 
     /// What the sink asked for, up to the node's figure, as with the byte budget (D209, D222).
     fn concurrency_limit(&self) -> usize {
+        // A target keeps only the highest seq it has taken, so a forward overtaken by the next
+        // would be dropped as old.
+        if self.kind == Kind::Forward {
+            return 1;
+        }
         let max_count = self.worker.context.config.concurrency_max_count;
         self.spec.concurrency.min(max_count).max(1) as usize
     }
@@ -607,23 +629,24 @@ impl<'a> Reading<'a> {
             let Some(first) = self.unread.front() else {
                 return;
             };
-            let delivery = match self.kind {
-                Kind::Deliver | Kind::Forward => self.new_delivery(first, now_ms),
-                Kind::Notify => {
+            let delivery = match (self.kind, self.window_ms()) {
+                (Kind::Notify, _) => {
                     if !self.deliveries.is_empty() || now_ms < self.worker.next_notify_ms {
                         return;
                     }
                     self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
                     self.new_delivery(first, now_ms)
                 }
-                Kind::Archive => match self.archive_batch(now_ms) {
+                (Kind::Forward, _) if !self.probing => self.greedy_batch(now_ms),
+                (_, Some(_)) => match self.window_batch(now_ms) {
                     Some(delivery) => delivery,
                     None => return,
                 },
+                (_, None) => self.new_delivery(first, now_ms),
             };
             let take = match self.kind {
-                Kind::Archive => delivery.bytes.len(),
-                _ => 1,
+                Kind::Notify => 1,
+                _ => delivery.bytes.len(),
             };
             self.unread.drain(..take);
             self.deliveries.push_back(delivery);
@@ -633,13 +656,12 @@ impl<'a> Reading<'a> {
     /// Once the clock has passed the window of what is first in line, asks how far the stream
     /// has got. Ids never go back, so nothing given out after this can join that window.
     async fn note_closed_window(&mut self, now_ms: u64) {
-        if self.kind != Kind::Archive {
+        let Some(window_ms) = self.window_ms() else {
             return;
-        }
+        };
         let Some(first) = self.unread.front() else {
             return;
         };
-        let window_ms = self.worker.context.config.archive_window_ms.max(1);
         let window = id_ms(first.first_id) / window_ms;
         if now_ms / window_ms <= window
             || self.closed_window.is_some_and(|(known, _)| known == window)
@@ -658,12 +680,38 @@ impl<'a> Reading<'a> {
         }
     }
 
+    /// `archive`'s window, which its objects' records share. The other kinds have none.
+    fn window_ms(&self) -> Option<u64> {
+        match self.kind {
+            Kind::Archive => Some(self.worker.context.config.archive_window_ms.max(1)),
+            Kind::Deliver | Kind::Forward | Kind::Notify => None,
+        }
+    }
+
+    /// `forward`: everything unread, up to the budget, as one publish. A batch forms while the
+    /// one before it is in flight, so it is as big as the target is slow, and waits on no clock.
+    fn greedy_batch(&self, now_ms: u64) -> Delivery {
+        let mut records = self.unread.iter();
+        let first = records.next().expect("a batch starts at an unread record");
+        let mut delivery = self.new_delivery(first, now_ms);
+        for next in records {
+            if delivery.byte_count + next.bytes.len() as u64 > self.budget_bytes {
+                break;
+            }
+            delivery.last_id = next.last_id;
+            delivery.item_count += next.item_count;
+            delivery.byte_count += next.bytes.len() as u64;
+            delivery.bytes.push(next.bytes.clone());
+        }
+        delivery
+    }
+
     /// Everything unread in one window, up to the budget, once no more can join it and all of it
     /// has been read: a later record has arrived, or the clock has passed the window and reading
     /// has reached what was given out by then. So the batch doesn't depend on how the records
     /// happened to be framed, and a repeat has the same `{first_id, last_id}` (D190).
-    fn archive_batch(&self, now_ms: u64) -> Option<Delivery> {
-        let window_ms = self.worker.context.config.archive_window_ms.max(1);
+    fn window_batch(&self, now_ms: u64) -> Option<Delivery> {
+        let window_ms = self.window_ms()?;
         let first = self.unread.front()?;
         let window = id_ms(first.first_id) / window_ms;
         let mut delivery = self.new_delivery(first, now_ms);
@@ -746,7 +794,11 @@ impl<'a> Reading<'a> {
             .position(|delivery| delivery.first_id == first_id)?;
         self.deliveries[at].running = false;
         match outcome {
-            Outcome::Delivered => {
+            Outcome::Delivered | Outcome::AlreadyThere => {
+                if matches!(outcome, Outcome::Delivered) {
+                    // Taken as new: everything after it is past what an earlier try published.
+                    self.probing = false;
+                }
                 storage::crash_point("sink.after_delivery");
                 if self.worker.hook(SinkStep::AfterDelivery) == SinkAction::Kill {
                     return Some(Spell::End(End::Killed));
@@ -1067,12 +1119,13 @@ impl Attempt {
         self.post(CONTENT_JSON, body.as_bytes()).await
     }
 
-    /// One publish per record, since a publish's seq is the source id of its first record, and
-    /// a batch that differed on a retry would be taken whole as a duplicate (D189).
+    /// One publish per batch, whose seq is the source id of its last record. The target drops a
+    /// seq at or below the highest it has taken, so a record it has is never taken again once
+    /// probing has found where it stopped.
     async fn forward(&self) -> Outcome {
-        let Some(record) = self.bytes.first() else {
+        if self.bytes.is_empty() {
             return Outcome::Delivered;
-        };
+        }
         let Some(target) = self.spec.target else {
             return Outcome::Permanent("the sink has no target".to_owned());
         };
@@ -1081,9 +1134,9 @@ impl Attempt {
         match client
             .publish_forward(
                 target,
-                record,
+                &self.bytes,
                 format::forward_producer_id(self.stream, self.sink_id),
-                self.first_id,
+                self.last_id,
                 FORWARD_ACK_LEVEL,
             )
             .await
@@ -1106,15 +1159,24 @@ impl Attempt {
                 Err(_) => return Outcome::Retry("waiting for the ack timed out".to_owned()),
                 Ok(None) => return Outcome::Retry("the node has stopped".to_owned()),
                 // An answer to an earlier try that timed out.
-                Ok(Some(Reply::Ack { producer_seq, .. })) if producer_seq == self.first_id => {
-                    return Outcome::Delivered;
+                // `first_id = 0`: an older seq than the target's latest, so it has the records.
+                Ok(Some(Reply::Ack {
+                    producer_seq,
+                    first_id,
+                    ..
+                })) if producer_seq == self.last_id => {
+                    return if first_id == 0 {
+                        Outcome::AlreadyThere
+                    } else {
+                        Outcome::Delivered
+                    };
                 }
                 Ok(Some(Reply::Nack {
                     producer_seq,
                     code,
                     msg,
                     ..
-                })) if producer_seq == self.first_id => {
+                })) if producer_seq == self.last_id => {
                     return if code == ErrorCode::RateLimited {
                         Outcome::Retry(msg)
                     } else {
