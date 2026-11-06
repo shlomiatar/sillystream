@@ -821,3 +821,15 @@ Same machines, `41dc36a`, 512 connections in all, level 2. Data on its own RAID0
 | 2 | 64 KiB | 581 | 604 |
 
 About 4% at 64 KiB and noise elsewhere, so it wasn't kept. Closing the gap would take moving the CRC off the WAL thread, `O_DIRECT`, or overlapping one batch's write with the previous batch's sync, each a new mechanism. The remaining 20% is a GCP local SSD limit worth less than the cost of any of them for now.
+
+## CRC on the cores
+
+`8944581` computes each WAL entry's record CRC on the core that sends it, and the WAL thread joins it to the head's CRC with `crc32c_combine`. Same machines and layout as above: WAL and data each on a RAID0 pair, 512 connections, level 2. MB/s of record data across both clients, three separate runs (the third cut short when the laptop lost its network):
+
+| bytes | before | after |
+|---|---|---|
+| 64 KiB | 583, 578, 580, 612, 624 | 632, 639, 599, 602, 619 |
+| 200 KB | 574, 579, 589, 578, 588 | 580, 576, 579, 617, 602 |
+| 1 KiB | 591, 598, 604 | 572, 602, 604 |
+
+About 4% better at 64 KiB and noise at 200 KB and 1 KiB. Never clearly worse, so it stays. The WAL pair is still the limit: md0 wrote 550–620 MB/s either way.
