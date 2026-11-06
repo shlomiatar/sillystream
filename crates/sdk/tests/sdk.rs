@@ -1277,6 +1277,45 @@ async fn a_subscription_to_an_invalid_id_is_refused() {
     fixture.server.shutdown();
 }
 
+/// A subscription the server ends gives its error and then its end, rather than a reader that
+/// waits for ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_the_server_refuses_ends_after_its_error() {
+    let fixture = start();
+    let writer = auth::Token {
+        expiry_ms: u64::MAX,
+        author: std::num::NonZeroU64::new(9).unwrap(),
+        grants: vec![auth::Grant {
+            pattern: "*".to_owned(),
+            perms: auth::PERM_PUBLISH,
+        }],
+    }
+    .sign(SECRET)
+    .unwrap();
+    let mut config = fixture.config();
+    config.token = writer;
+    let client = Client::connect(config).await.unwrap();
+    let mut subscription = client.subscribe(Subscribe::new("no", 0)).unwrap();
+    let error = next_event(&mut subscription).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            SdkError::Server {
+                code: ErrorCode::Unauthorized,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let after = tokio::time::timeout(Duration::from_millis(WAIT_MS), subscription.next())
+        .await
+        .expect("a refused subscription should end, not wait");
+    assert!(after.is_none(), "{after:?}");
+    drop(subscription);
+    drop(client);
+    fixture.server.shutdown();
+}
+
 /// A timed flush on an idle publisher sends nothing, and uses no seq.
 #[tokio::test]
 async fn sending_nothing_sends_nothing() {

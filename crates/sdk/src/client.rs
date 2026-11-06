@@ -264,8 +264,6 @@ struct SubState {
     cursor: u64,
     committed: u64,
     paused: bool,
-    /// The server ended it, and coming back would only get the same answer.
-    ended: bool,
     queued_bytes: Arc<AtomicUsize>,
     events: mpsc::UnboundedSender<Result<Raw, SdkError>>,
 }
@@ -1012,7 +1010,7 @@ impl Driver {
         }
         let keys: Vec<u32> = self.subs.keys().copied().collect();
         for key in keys {
-            if !self.subs[&key].paused && !self.subs[&key].ended {
+            if !self.subs[&key].paused {
                 self.send_subscribe(key);
             }
         }
@@ -1124,7 +1122,6 @@ impl Driver {
                         cursor,
                         committed: 0,
                         paused: false,
-                        ended: false,
                         queued_bytes,
                         events,
                     },
@@ -1152,7 +1149,6 @@ impl Driver {
             Command::Drained { key } => {
                 if let Some(sub) = self.subs.get_mut(&key)
                     && sub.paused
-                    && !sub.ended
                 {
                     sub.paused = false;
                     if self.out.is_some() {
@@ -1435,15 +1431,14 @@ impl Driver {
         }
         if let Some(key) = self.wire_subs.get(&reference).copied() {
             let keep = code == ErrorCode::Malformed;
-            if let Some(sub) = self.subs.get_mut(&key) {
+            if let Some(sub) = self.subs.get(&key) {
                 let _ = sub.events.send(Err(error));
-                if !keep {
-                    sub.wire_sub = None;
-                    sub.ended = true;
-                }
             }
             if !keep {
+                // Coming back would only get the same answer. Its sender goes with it, so the
+                // reader gets the error and then the end, not a wait for ever.
                 self.wire_subs.remove(&reference);
+                self.subs.remove(&key);
             }
             return None;
         }
