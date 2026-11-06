@@ -3516,8 +3516,12 @@ impl Core {
             tombstones,
             done,
         })));
-        self.pass_on_deferred();
+        // Parked first: a stream that was loading has its parked writes go to the front of
+        // `deferred`, ahead of any of its writes that came later, and then all of it follows
+        // the stream in order. The other way round, later writes went first, and with the core
+        // stalled the parked ones stayed in `deferred` for a stream no longer here.
         self.pass_on_parked();
+        self.pass_on_deferred();
     }
 
     fn on_split_stream(
@@ -3563,8 +3567,12 @@ impl Core {
             tombstones,
             done,
         })));
-        self.pass_on_deferred();
+        // Parked first: a stream that was loading has its parked writes go to the front of
+        // `deferred`, ahead of any of its writes that came later, and then all of it follows
+        // the stream in order. The other way round, later writes went first, and with the core
+        // stalled the parked ones stayed in `deferred` for a stream no longer here.
         self.pass_on_parked();
+        self.pass_on_deferred();
     }
 
     fn on_adopt(&mut self, handoff: ShardHandoff) {
