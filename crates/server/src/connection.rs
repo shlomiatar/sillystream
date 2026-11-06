@@ -277,6 +277,28 @@ impl Outbox {
         });
         taken
     }
+
+    /// Removes the unread frames of a subscription the client has ended, returning what they
+    /// took from the window. The client may use its id again at once, and a frame left here
+    /// would then be read as the new one's, by the client and by `take_back`.
+    fn forget(&self, sub: u32) -> u64 {
+        let mut cost_bytes = 0;
+        self.lock().queue.retain(|event| {
+            let (of, cost) = match event {
+                Event::Subscribed { sub, .. } | Event::Behind { sub, .. } => (*sub, 0),
+                Event::Data { sub, records } => (*sub, records.window_cost_bytes),
+                Event::State { sub, doc, .. } => (*sub, doc.len() as u64),
+                Event::Progress { sub, .. } => (*sub, PROGRESS_FRAME_BYTES),
+                Event::Error { .. } => return true,
+            };
+            if of != sub {
+                return true;
+            }
+            cost_bytes += cost;
+            false
+        });
+        cost_bytes
+    }
 }
 
 #[derive(Debug, Default)]
@@ -886,7 +908,14 @@ impl Home {
                     .as_ref()
                     .and_then(|c| c.subs.get(&sub).copied());
                 match key {
-                    Some(key) => self.remove_sub(key),
+                    Some(key) => {
+                        if let Some(Some(connection)) = self.conns.get_mut(conn) {
+                            let returned_bytes = connection.out.forget(sub);
+                            connection.window_left_bytes += returned_bytes as i64;
+                        }
+                        self.remove_sub(key);
+                        self.make_ready(conn);
+                    }
                     None => self.send_event(
                         conn,
                         Event::Error {
@@ -2215,4 +2244,49 @@ async fn run_object_job(job: ObjectJob) {
         sub: job.sub,
         done: Box::new(done),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(sub: u32, sub_serial: u64, before_id: u64) -> Event {
+        Event::Data {
+            sub,
+            records: DataFrame {
+                parts: Vec::new(),
+                len_bytes: 0,
+                window_cost_bytes: 100,
+                sub_serial,
+                before_id,
+            },
+        }
+    }
+
+    /// A client may use an id again as soon as it unsubscribes. What the old subscription had
+    /// queued goes with it, so that nothing later takes it for the new one's.
+    #[test]
+    fn an_ended_subscriptions_frames_go_before_its_id_is_used_again() {
+        let out = Outbox::default();
+        out.push(data(5, 1, 40));
+        out.push(Event::Progress { sub: 5, id: 50 });
+        out.push(data(6, 2, 7));
+        assert_eq!(out.forget(5), 100 + PROGRESS_FRAME_BYTES);
+        out.push(data(5, 3, 900));
+        out.push(Event::Behind {
+            sub: 5,
+            resume_from: 950,
+        });
+        let taken = out.take_back();
+        assert_eq!(taken.first_by_sub.get(&5), Some(&(3, 900)));
+        assert_eq!(taken.first_by_sub.get(&6), Some(&(2, 7)));
+        assert_eq!(taken.window_cost_bytes, 200);
+        match out.try_next() {
+            Some(Event::Behind {
+                sub: 5,
+                resume_from,
+            }) => assert_eq!(resume_from, 900),
+            other => panic!("{other:?}"),
+        }
+    }
 }
