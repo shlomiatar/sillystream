@@ -1683,6 +1683,7 @@ async fn a_report_from_an_older_epoch_is_ignored() {
             SinkOp::Report {
                 sink_id: 1,
                 epoch: old_epoch,
+                update_count: 0,
                 report: SinkReport::Paused {
                     reason: "late".to_owned(),
                 },
@@ -1693,6 +1694,67 @@ async fn a_report_from_an_older_epoch_is_ignored() {
     let (spec, _) = sink_of(&mut client, STREAM, 1).await;
     assert!(!spec.paused);
     assert_eq!(spec.pause_reason, None);
+    drop(client);
+    harness.finish();
+}
+
+/// A put can fix what a spell under the spec before it failed on, so that spell's failures and
+/// pauses are not the new spec's. A gap is the stream's, and counts whatever the spec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_from_a_replaced_spec_says_nothing_of_its_health() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let mut spec = deliver_spec(&receiver.url());
+    spec.paused = true;
+    put_sink(&mut client, STREAM, 1, spec.clone(), SinkStart::Earliest).await;
+    spec.paused = false;
+    client
+        .sink_op(
+            key(STREAM),
+            SinkOp::SetPaused {
+                sink_id: 1,
+                paused: false,
+            },
+        )
+        .await
+        .unwrap();
+    let (old, _) = sink_of(&mut client, STREAM, 1).await;
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    let (now, _) = sink_of(&mut client, STREAM, 1).await;
+    assert_eq!(now.update_count, old.update_count + 1);
+    for report in [
+        SinkReport::Failure {
+            count: 7,
+            error: "late".to_owned(),
+        },
+        SinkReport::Paused {
+            reason: "late".to_owned(),
+        },
+        SinkReport::Gap {
+            first_id: 5,
+            last_id: 6,
+        },
+    ] {
+        client
+            .sink_op(
+                key(STREAM),
+                SinkOp::Report {
+                    sink_id: 1,
+                    epoch: old.epoch,
+                    update_count: old.update_count,
+                    report,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let (spec, _) = sink_of(&mut client, STREAM, 1).await;
+    assert!(!spec.paused);
+    assert_eq!(spec.pause_reason, None);
+    assert_eq!(spec.failure_count, 0);
+    assert_eq!(spec.gap_count, 1, "a gap counts under any spec");
     drop(client);
     harness.finish();
 }
@@ -2116,13 +2178,14 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
         .await
         .unwrap();
     // A gap reported, and a stream that has since lost its sink, which stays gone.
-    let epoch = sink_of(&mut client, "keep.b", 3).await.0.epoch;
+    let (keep_b, _) = sink_of(&mut client, "keep.b", 3).await;
     client
         .sink_op(
             key("keep.b"),
             SinkOp::Report {
                 sink_id: 3,
-                epoch,
+                epoch: keep_b.epoch,
+                update_count: keep_b.update_count,
                 report: SinkReport::Gap {
                     first_id: 5,
                     last_id: 6,

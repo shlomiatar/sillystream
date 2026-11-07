@@ -3439,6 +3439,7 @@ impl Core {
             SinkOp::Report {
                 sink_id,
                 epoch,
+                update_count,
                 report,
             } => {
                 let spec = delivery
@@ -3447,6 +3448,15 @@ impl Core {
                     .ok_or(ErrorCode::NotFound)?;
                 // A spell before a reset or a delete has nothing to say about this one.
                 if spec.epoch != epoch {
+                    return Ok(());
+                }
+                // Failures and pauses are about the spec the spell ran, which a put may have
+                // fixed. Warnings and gaps are about the stream, whatever the spec.
+                let about_the_spec = matches!(
+                    report,
+                    SinkReport::Failure { .. } | SinkReport::Healthy | SinkReport::Paused { .. }
+                );
+                if about_the_spec && spec.update_count != update_count {
                     return Ok(());
                 }
                 match report {

@@ -61,6 +61,7 @@ pub(crate) async fn run(
         notes,
         next_notify_ms: 0,
         epoch: 0,
+        update_count: 0,
     };
     let end = worker.run(home, &mut guard.seen_note_count).await;
     guard.restart = end == End::Killed;
@@ -158,8 +159,9 @@ struct Worker {
     notes: watch::Receiver<u64>,
     /// `webhook.notify`'s next allowed send. Held here so an update or a resume doesn't forget it.
     next_notify_ms: u64,
-    /// The sink's epoch as last read, which its reports carry.
+    /// The sink's epoch and spec revision as last read, which its reports carry.
     epoch: u64,
+    update_count: u64,
 }
 
 impl Worker {
@@ -176,11 +178,12 @@ impl Worker {
 
     async fn report(&self, report: SinkReport) {
         let sink_id = self.key.1;
-        let epoch = self.epoch;
+        let (epoch, update_count) = (self.epoch, self.update_count);
         let _ = self
             .op(SinkOp::Report {
                 sink_id,
                 epoch,
+                update_count,
                 report,
             })
             .await;
@@ -208,6 +211,7 @@ impl Worker {
                 return End::Done;
             };
             self.epoch = spec.epoch;
+            self.update_count = spec.update_count;
             let cursor = cursor.unwrap_or(0);
             let retention_ms = info.config.retention_ms;
             let Some(kind) = kind_of(&spec) else {

@@ -179,6 +179,8 @@ pub enum SinkOp {
         sink_id: u64,
         /// The spell's sink: a report from before a reset or a delete is ignored.
         epoch: u64,
+        /// The spell's spec: what it says of its own health is ignored once a put replaced it.
+        update_count: u64,
         report: SinkReport,
     },
 }
