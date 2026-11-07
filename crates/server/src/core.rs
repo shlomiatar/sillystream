@@ -1868,8 +1868,7 @@ impl Core {
             return;
         }
         if let Some(stream) = self.streams.get_mut(&name) {
-            stream.delivery.table.detach(filter_id, home);
-            if filter_id != STATE_ONLY_FILTER_ID
+            if stream.delivery.table.detach(filter_id, home)
                 && let Some(shard) = self.shards.get_mut(&stream.shard)
             {
                 shard.counters.subscriber_count = shard.counters.subscriber_count.saturating_sub(1);
@@ -3291,6 +3290,11 @@ impl Core {
         };
         if let Some(shard) = self.shards.get_mut(&shard) {
             shard.streams.remove(name);
+            // Their detaches come after this and find no stream.
+            shard.counters.subscriber_count = shard
+                .counters
+                .subscriber_count
+                .saturating_sub(stream.delivery.table.subscriber_count());
         }
         for sink_id in stream.delivery.sinks.keys() {
             let _ = self.sink_notes.send(SinkNote {

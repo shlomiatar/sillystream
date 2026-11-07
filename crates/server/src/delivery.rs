@@ -175,8 +175,10 @@ impl FilterTable {
         }
     }
 
-    /// Adds a subscriber, and returns its filter's id. An id isn't reused, so that a late
-    /// message can't be taken for a later filter.
+    /// Adds a subscriber, and returns its filter's id. An id isn't reused while the stream
+    /// lives, so that a late message can't be taken for a later filter. A stream made again
+    /// after a delete starts again from 0, and a late detach from before is only taken for
+    /// one of its filters if its home core has a subscriber there to lose.
     pub fn attach(&mut self, filter: Filter, home: usize) -> u32 {
         let at = match self.index.get(&filter) {
             Some(at) => *at,
@@ -201,17 +203,18 @@ impl FilterTable {
         self.state_subs_by_core[home] += 1;
     }
 
-    pub fn detach(&mut self, filter_id: u32, home: usize) {
+    /// Whether it took a filter's subscriber away. A late detach finds nothing to take.
+    pub fn detach(&mut self, filter_id: u32, home: usize) -> bool {
         if filter_id == STATE_ONLY_FILTER_ID {
             self.state_subs_by_core[home] = self.state_subs_by_core[home].saturating_sub(1);
-            return;
+            return false;
         }
         let Some(at) = self.entries.iter().position(|entry| entry.id == filter_id) else {
-            return;
+            return false;
         };
         let entry = &mut self.entries[at];
         if entry.subs_by_core[home] == 0 {
-            return;
+            return false;
         }
         entry.subs_by_core[home] -= 1;
         self.subs_by_core[home] -= 1;
@@ -222,6 +225,15 @@ impl FilterTable {
                 self.index.insert(moved.filter, at);
             }
         }
+        true
+    }
+
+    /// Filter subscribers from every core, as a shard's `subscriber_count` counts them.
+    pub fn subscriber_count(&self) -> u64 {
+        self.subs_by_core
+            .iter()
+            .map(|count| u64::from(*count))
+            .sum()
     }
 
     /// Nobody is subscribed from any core, so the stream may leave RAM (section 7.6).
@@ -569,6 +581,23 @@ mod tests {
 
     fn filter(value: u64) -> Filter {
         Filter::new(&[Clause::Eq { mask: 1, value }]).unwrap()
+    }
+
+    /// A detach that comes late takes nothing, and says so, so that the shard's count of
+    /// subscribers only goes down for one that was there.
+    #[test]
+    fn a_detach_says_whether_it_took_a_subscriber() {
+        let mut table = FilterTable::new(2);
+        let id = table.attach(filter(1), 0);
+        table.attach(filter(1), 1);
+        assert_eq!(table.subscriber_count(), 2);
+        assert!(table.detach(id, 0));
+        assert!(!table.detach(id, 0));
+        assert!(!table.detach(id + 1, 1));
+        assert!(!table.detach(STATE_ONLY_FILTER_ID, 1));
+        assert_eq!(table.subscriber_count(), 1);
+        assert!(table.detach(id, 1));
+        assert_eq!(table.subscriber_count(), 0);
     }
 
     /// Thousands of subscribers under each filter change nothing: the count comes from where
