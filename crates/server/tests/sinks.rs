@@ -2319,6 +2319,39 @@ async fn a_lifecycle_change_outlives_a_stop_with_no_seal() {
     drop(node.shutdown());
 }
 
+/// A sink that paused itself after the last seal is still paused after a restart, with its
+/// reason, since the change was saved locally as it happened (section 5.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_outlives_a_stop_with_no_seal() {
+    let disk = Disk::new();
+    let receiver = Receiver::start().await;
+    receiver.answer(Answer::Status(404));
+    let node = disk.start(config());
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    send(&mut client, STREAM, b"x", 1).await;
+    put_sink(
+        &mut client,
+        STREAM,
+        1,
+        deliver_spec(&receiver.url()),
+        SinkStart::Earliest,
+    )
+    .await;
+    let reason = wait_for_pause(&mut client, STREAM, 1).await;
+    drop(client);
+    drop(node.shutdown());
+
+    let node = disk.start(config());
+    let mut client = node.client(0).await;
+    let (spec, _) = sink_of(&mut client, STREAM, 1).await;
+    assert!(spec.paused);
+    assert_eq!(spec.pause_reason, Some(reason));
+    receiver.stays_at(1).await;
+    drop(client);
+    drop(node.shutdown());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forward_across_a_restart_with_a_stale_cursor_writes_no_duplicate() {
     let disk = Disk::new();
@@ -2339,7 +2372,7 @@ async fn a_forward_across_a_restart_with_a_stale_cursor_writes_no_duplicate() {
     // saved, so the restart goes back to `earliest` (D143) and every record is forwarded again.
     drop(client);
     drop(node.shutdown());
-    forget_saved_cursors(&disk.dir.path().join("metadata"));
+    forget_saved_between_seals(&disk.dir.path().join("metadata"));
 
     let node = disk.start(config());
     let mut client = node.client(0).await;

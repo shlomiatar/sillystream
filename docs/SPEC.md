@@ -115,6 +115,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 - A client-held cursor needs nothing on the server.
 - A named cursor is stored on the server as `(stream, name) → id`, with the stream and the name each kept as a key hash (section 1). It moves forward only, through `COMMIT`, which gives at-least-once delivery. Rewinding is an explicit reset.
 - Every change to a named cursor, a sink's included, is written at once to the node's local key-value store under a key of its own, so a process crash doesn't move it back. The core doesn't wait for it: one writer keeps the latest value of each cursor and saves them in batches. S3 gets cursors with the stream's metadata at each seal, for when the machine is lost.
+- A sink is saved the same way whenever what is kept of it changes, a pause it made itself or a gap included.
 
 ### 5.2 Delivery to connected clients
 

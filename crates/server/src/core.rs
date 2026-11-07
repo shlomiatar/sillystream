@@ -34,7 +34,7 @@ use crate::message::{
     ShardHandoff, SinkGap, SinkOp, SinkReport, SinkStart, SnapshotReply, StateChange, StateOpMsg,
     StreamBody, StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
 };
-use crate::metadata::{CursorSave, MetaMsg};
+use crate::metadata::{LocalSave, MetaMsg};
 use crate::placement::{ShardCounters, shard_of};
 use crate::sink::{SINK_CAP_COUNT, SinkNote};
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
@@ -495,7 +495,7 @@ pub(crate) struct Core {
     spans: Vec<RecordSpan>,
 
     loader: Option<mpsc::UnboundedSender<MetaMsg>>,
-    cursor_saves: Option<mpsc::UnboundedSender<CursorSave>>,
+    local_saves: Option<mpsc::UnboundedSender<LocalSave>>,
     sink_notes: mpsc::UnboundedSender<SinkNote>,
     /// The node's object table (section 7.6).
     objects: Arc<std::sync::RwLock<storage::ObjectTable>>,
@@ -528,7 +528,7 @@ pub(crate) struct CoreParts {
     /// `None` on a node without a metadata store.
     pub loader: Option<mpsc::UnboundedSender<MetaMsg>>,
     /// Where each cursor change goes to be saved at once (section 5.1). `None` with no store.
-    pub cursor_saves: Option<mpsc::UnboundedSender<CursorSave>>,
+    pub local_saves: Option<mpsc::UnboundedSender<LocalSave>>,
     /// Where a change to a sink is told, so that the pool looks at it (section 9).
     pub sink_notes: mpsc::UnboundedSender<SinkNote>,
 }
@@ -598,7 +598,7 @@ impl Core {
             filter_check_count: 0,
             spans: Vec::new(),
             loader: parts.loader,
-            cursor_saves: parts.cursor_saves,
+            local_saves: parts.local_saves,
             sink_notes: parts.sink_notes,
             objects,
             loading: HashMap::new(),
@@ -1746,7 +1746,7 @@ impl Core {
             }
             let at = *stream.delivery.cursors.entry(*name).or_insert(cursor);
             stream.delivery.meta_dirty = stream.delivery.track_meta;
-            save_cursor(&self.cursor_saves, message.stream, *name, Some(at));
+            save_cursor(&self.local_saves, message.stream, *name, Some(at));
         }
         let (state_ver, visible_doc) = &stream.delivery.visible_state;
         let state_ver = *state_ver;
@@ -2131,11 +2131,11 @@ impl Core {
                 // Forward only: a lower one is ignored (section 5.1).
                 let at = stream.delivery.cursors.entry(cursor).or_insert(id);
                 *at = (*at).max(id);
-                save_cursor(&self.cursor_saves, name, cursor, Some(*at));
+                save_cursor(&self.local_saves, name, cursor, Some(*at));
             }
             CursorOp::Reset(id) => {
                 stream.delivery.cursors.insert(cursor, id);
-                save_cursor(&self.cursor_saves, name, cursor, Some(id));
+                save_cursor(&self.local_saves, name, cursor, Some(id));
             }
             CursorOp::Read(reply) => {
                 let _ = reply.send(stream.delivery.cursors.get(&cursor).copied());
@@ -2151,7 +2151,7 @@ impl Core {
                 }
                 let at = stream.delivery.cursors.entry(cursor).or_insert(id);
                 *at = if reset { id } else { (*at).max(id) };
-                save_cursor(&self.cursor_saves, name, cursor, Some(*at));
+                save_cursor(&self.local_saves, name, cursor, Some(*at));
                 let _ = reply.send(Ok(*at));
             }
         }
@@ -3302,7 +3302,10 @@ impl Core {
         };
         // After whatever this core sent before, so none of it outlives the delete (section 7.6).
         for cursor in stream.delivery.cursors.keys() {
-            save_cursor(&self.cursor_saves, *name, *cursor, None);
+            save_cursor(&self.local_saves, *name, *cursor, None);
+        }
+        for sink_id in stream.delivery.sinks.keys() {
+            save_sink(&self.local_saves, *name, *sink_id, None);
         }
         if let Some(shard) = self.shards.get_mut(&shard) {
             shard.streams.remove(name);
@@ -3390,15 +3393,17 @@ impl Core {
                     spec.epoch = now_ms.max(delivery.deleted_sink_epoch.saturating_add(1));
                     let (cursor, id) = (keys.sink_cursor(sink_id), cursor_at(start));
                     delivery.cursors.insert(cursor, id);
-                    save_cursor(&self.cursor_saves, name, cursor, Some(id));
+                    save_cursor(&self.local_saves, name, cursor, Some(id));
                 }
+                save_sink(&self.local_saves, name, sink_id, Some(&spec));
                 delivery.sinks.insert(sink_id, spec);
             }
             SinkOp::Delete { sink_id } => {
                 let spec = delivery.sinks.remove(&sink_id).ok_or(ErrorCode::NotFound)?;
                 delivery.deleted_sink_epoch = delivery.deleted_sink_epoch.max(spec.epoch);
                 delivery.cursors.remove(&keys.sink_cursor(sink_id));
-                save_cursor(&self.cursor_saves, name, keys.sink_cursor(sink_id), None);
+                save_cursor(&self.local_saves, name, keys.sink_cursor(sink_id), None);
+                save_sink(&self.local_saves, name, sink_id, None);
             }
             SinkOp::SetPaused { sink_id, paused } => {
                 let spec = delivery
@@ -3408,6 +3413,7 @@ impl Core {
                 spec.paused = paused;
                 spec.pause_reason = None;
                 spec.failure_count = 0;
+                save_sink(&self.local_saves, name, sink_id, Some(spec));
             }
             SinkOp::Reset { sink_id, start } => {
                 let spec = delivery
@@ -3422,7 +3428,7 @@ impl Core {
                 spec.expiry_warning_id = None;
                 let (cursor, id) = (keys.sink_cursor(sink_id), cursor_at(start));
                 delivery.cursors.insert(cursor, id);
-                save_cursor(&self.cursor_saves, name, cursor, Some(id));
+                save_cursor(&self.local_saves, name, cursor, Some(id));
             }
             SinkOp::Commit {
                 sink_id,
@@ -3447,7 +3453,7 @@ impl Core {
                     let cursor = keys.sink_cursor(sink_id);
                     let at = delivery.cursors.entry(cursor).or_insert(id);
                     *at = (*at).max(id);
-                    save_cursor(&self.cursor_saves, name, cursor, Some(*at));
+                    save_cursor(&self.local_saves, name, cursor, Some(*at));
                 }
             }
             SinkOp::Report {
@@ -3483,6 +3489,7 @@ impl Core {
                     SinkReport::Paused { reason } => {
                         spec.paused = true;
                         spec.pause_reason = Some(reason);
+                        save_sink(&self.local_saves, name, sink_id, Some(spec));
                     }
                     SinkReport::Gap { first_id, last_id } => {
                         spec.gaps.push(SinkGap { first_id, last_id });
@@ -3490,6 +3497,7 @@ impl Core {
                             spec.gaps.remove(0);
                         }
                         spec.gap_count += 1;
+                        save_sink(&self.local_saves, name, sink_id, Some(spec));
                     }
                 }
             }
@@ -3732,13 +3740,30 @@ fn next_id_in_log(log: &StreamLog, after: u64, through: u64) -> Option<u64> {
 
 /// Has a cursor saved as it is now, or removed (section 5.1).
 fn save_cursor(
-    saves: &Option<mpsc::UnboundedSender<CursorSave>>,
+    saves: &Option<mpsc::UnboundedSender<LocalSave>>,
     stream: KeyHash,
     name: KeyHash,
     id: Option<u64>,
 ) {
     if let Some(saves) = saves {
-        let _ = saves.send(CursorSave { stream, name, id });
+        let _ = saves.send(LocalSave::Cursor { stream, name, id });
+    }
+}
+
+/// A sink's saved fields as they are now, `None` once it is gone (section 5.1).
+fn save_sink(
+    saves: &Option<mpsc::UnboundedSender<LocalSave>>,
+    stream: KeyHash,
+    sink_id: u64,
+    spec: Option<&crate::message::SinkSpec>,
+) {
+    if let Some(saves) = saves {
+        let sink = spec.map(|spec| Box::new(crate::recovery::meta_sink(sink_id, spec)));
+        let _ = saves.send(LocalSave::Sink {
+            stream,
+            sink_id,
+            sink,
+        });
     }
 }
 

@@ -584,12 +584,13 @@ async fn wait_for_memory(node: &Node, stream: &str, empty: bool) {
     }
 }
 
-/// Drops the cursors a stopped node saved as they changed, leaving what its last seal saved:
-/// what a crash before the saver wrote, or a lost metadata disk, leaves (section 5.1). The
-/// keys are `k | stream | name`.
-pub fn forget_saved_cursors(metadata_dir: &std::path::Path) {
+/// Drops the cursors and sinks a stopped node saved as they changed, leaving what its last seal
+/// saved: what a crash before the saver wrote, or a lost metadata disk, leaves (section 5.1).
+/// The keys are `k | stream | name` and `n | stream | sink_id`.
+pub fn forget_saved_between_seals(metadata_dir: &std::path::Path) {
     let store = storage::MetadataStore::open(metadata_dir).unwrap();
-    let saved = store.scan_prefix(b"k").unwrap();
+    let mut saved = store.scan_prefix(b"k").unwrap();
+    saved.extend(store.scan_prefix(b"n").unwrap());
     store
         .apply(saved.iter().map(|(key, _)| (key.as_slice(), None)))
         .unwrap();

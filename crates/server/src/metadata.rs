@@ -11,10 +11,11 @@ use bytes::Bytes;
 use format::KeyHash;
 use object_store::{ObjectStore, PutPayload};
 use storage::{
-    CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, MetaCursor, MetadataError,
-    MetadataStore, NewerObjects, ObjectId, ObjectKey, ObjectRow, ObjectState, ObjectTable,
-    ROW_KEY_BYTES, StreamMeta, build_checkpoint, checkpoint_path, decode_ids, decode_meta,
-    encode_ids, encode_meta, put_checkpoint, put_checkpoint_payload, retry_delay,
+    CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, MetaCursor, MetaSink,
+    MetadataError, MetadataStore, NewerObjects, ObjectId, ObjectKey, ObjectRow, ObjectState,
+    ObjectTable, ROW_KEY_BYTES, StreamMeta, build_checkpoint, checkpoint_path, decode_ids,
+    decode_meta, decode_sink, encode_ids, encode_meta, encode_sink, put_checkpoint,
+    put_checkpoint_payload, retry_delay,
 };
 use tokio::sync::mpsc;
 
@@ -29,6 +30,8 @@ const TAG_LIST: u8 = b'l';
 const TAG_ROW: u8 = b'r';
 /// A named cursor, written as it changes: `stream | name → id` (section 5.1).
 const TAG_CURSOR: u8 = b'k';
+/// A sink, written as it changes: `stream | sink_id → sink` (section 5.1).
+const TAG_SINK: u8 = b'n';
 /// How many ids a list chunk holds, so a seal appends to the last one and expiry deletes whole
 /// ones.
 const LIST_CHUNK_COUNT: usize = 256;
@@ -51,6 +54,12 @@ fn stream_key(tag: u8, stream: KeyHash) -> Vec<u8> {
 fn cursor_key(stream: KeyHash, name: KeyHash) -> Vec<u8> {
     let mut key = stream_key(TAG_CURSOR, stream);
     key.extend_from_slice(&name.0);
+    key
+}
+
+fn sink_key(stream: KeyHash, sink_id: u64) -> Vec<u8> {
+    let mut key = stream_key(TAG_SINK, stream);
+    key.extend_from_slice(&sink_id.to_be_bytes());
     key
 }
 
@@ -194,8 +203,19 @@ impl LocalMeta {
         Ok(cursors)
     }
 
-    /// Puts the saved cursors over the metadata's copies. A deleted stream has none.
-    pub(crate) fn overlay_cursors(&self, meta: &mut StreamMeta) -> Result<(), LocalError> {
+    /// The sinks saved as they changed, which are newer than the metadata's (section 5.1).
+    fn saved_sinks(&self, stream: KeyHash) -> Result<Vec<MetaSink>, LocalError> {
+        let mut sinks = Vec::new();
+        for (_, value) in self.store.scan_prefix(&stream_key(TAG_SINK, stream))? {
+            let sink = decode_sink(&value)
+                .map_err(|error| LocalError::Corrupt(format!("a sink of {stream}: {error}")))?;
+            sinks.push(sink);
+        }
+        Ok(sinks)
+    }
+
+    /// Puts the saved cursors and sinks over the metadata's copies. A deleted stream has none.
+    pub(crate) fn overlay_saved(&self, meta: &mut StreamMeta) -> Result<(), LocalError> {
         if meta.deleted {
             return Ok(());
         }
@@ -205,22 +225,28 @@ impl LocalMeta {
                 None => meta.cursors.push(MetaCursor { name, id }),
             }
         }
+        for sink in self.saved_sinks(meta.stream)? {
+            match meta
+                .sinks
+                .iter_mut()
+                .find(|old| old.sink_id == sink.sink_id)
+            {
+                Some(old) => *old = sink,
+                None => meta.sinks.push(sink),
+            }
+        }
         Ok(())
     }
 
-    /// Saves cursor changes, `None` removing one, in one write.
-    pub(crate) fn save_cursors(
+    /// Saves changes the saver gathered, `None` removing a key, in one write.
+    pub(crate) fn save(
         &self,
-        changes: &BTreeMap<(KeyHash, KeyHash), Option<u64>>,
+        changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<(), MetadataError> {
-        let changes: Vec<(Vec<u8>, Option<[u8; 8]>)> = changes
-            .iter()
-            .map(|((stream, name), id)| (cursor_key(*stream, *name), id.map(u64::to_le_bytes)))
-            .collect();
         self.store.apply(
             changes
                 .iter()
-                .map(|(key, id)| (key.as_slice(), id.as_ref().map(|id| &id[..]))),
+                .map(|(key, value)| (key.as_slice(), value.as_deref())),
         )
     }
 
@@ -332,11 +358,10 @@ impl LocalMeta {
             ));
             // A stream made again under this name starts with none of them (section 7.6).
             if meta.deleted {
-                for (key, _) in self
-                    .store
-                    .scan_prefix(&stream_key(TAG_CURSOR, meta.stream))?
-                {
-                    changes.push((key, None));
+                for tag in [TAG_CURSOR, TAG_SINK] {
+                    for (key, _) in self.store.scan_prefix(&stream_key(tag, meta.stream))? {
+                        changes.push((key, None));
+                    }
                 }
             }
         }
@@ -382,25 +407,53 @@ pub(crate) fn whole(meta: StreamMeta) -> Gathered {
     }
 }
 
-/// A cursor as it is now, `None` once it is gone, for the saver (section 5.1).
-pub(crate) struct CursorSave {
-    pub stream: KeyHash,
-    pub name: KeyHash,
-    pub id: Option<u64>,
+/// A cursor or a sink as it is now, `None` once it is gone, for the saver (section 5.1).
+pub(crate) enum LocalSave {
+    Cursor {
+        stream: KeyHash,
+        name: KeyHash,
+        id: Option<u64>,
+    },
+    Sink {
+        stream: KeyHash,
+        sink_id: u64,
+        sink: Option<Box<MetaSink>>,
+    },
 }
 
-/// Saves cursor changes as they come, each batch in one write: whatever queued during the last
-/// write goes in the next, keeping only each cursor's latest value. It ends once every core has
-/// dropped its sender. A failed write leaves the cursor to the next seal, which saves it too.
-pub(crate) fn run_cursor_saver(mut rx: mpsc::UnboundedReceiver<CursorSave>, local: Arc<LocalMeta>) {
+impl LocalSave {
+    fn change(self) -> (Vec<u8>, Option<Vec<u8>>) {
+        match self {
+            LocalSave::Cursor { stream, name, id } => (
+                cursor_key(stream, name),
+                id.map(|id| id.to_le_bytes().to_vec()),
+            ),
+            LocalSave::Sink {
+                stream,
+                sink_id,
+                sink,
+            } => (
+                sink_key(stream, sink_id),
+                sink.map(|sink| encode_sink(&sink)),
+            ),
+        }
+    }
+}
+
+/// Saves changes as they come, each batch in one write: whatever queued during the last write
+/// goes in the next, keeping only each key's latest value. It ends once every core has dropped
+/// its sender. A failed write leaves the change to the next seal, which saves it too.
+pub(crate) fn run_local_saver(mut rx: mpsc::UnboundedReceiver<LocalSave>, local: Arc<LocalMeta>) {
     let mut changes = BTreeMap::new();
     while let Some(first) = rx.blocking_recv() {
-        changes.insert((first.stream, first.name), first.id);
+        let (key, value) = first.change();
+        changes.insert(key, value);
         while let Ok(more) = rx.try_recv() {
-            changes.insert((more.stream, more.name), more.id);
+            let (key, value) = more.change();
+            changes.insert(key, value);
         }
-        if let Err(error) = local.save_cursors(&changes) {
-            eprintln!("saving cursors: {error}. The next seal saves them.");
+        if let Err(error) = local.save(&changes) {
+            eprintln!("saving cursors and sinks: {error}. The next seal saves them.");
         }
         changes.clear();
     }
@@ -520,7 +573,7 @@ pub(crate) async fn load_stream(
 ) -> Result<(Option<StreamMeta>, bool), String> {
     if let Some(mut meta) = local.get(name).map_err(|error| error.to_string())? {
         local
-            .overlay_cursors(&mut meta)
+            .overlay_saved(&mut meta)
             .map_err(|error| error.to_string())?;
         return Ok((Some(meta), false));
     }
@@ -535,7 +588,7 @@ pub(crate) async fn load_stream(
         return Ok((None, false));
     };
     local
-        .overlay_cursors(&mut meta)
+        .overlay_saved(&mut meta)
         .map_err(|error| error.to_string())?;
     // What a later seal adds has the rest of the stream's list to sit beside.
     local

@@ -147,6 +147,49 @@ pub fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>, MetaError> {
     Ok(ids)
 }
 
+fn put_sink(out: &mut Vec<u8>, sink: &MetaSink) {
+    put_u64(out, sink.sink_id);
+    put_bytes(out, sink.kind.as_bytes());
+    put_opt(out, sink.url.as_deref());
+    match sink.target {
+        Some(target) => {
+            out.push(1);
+            out.extend_from_slice(&target.0);
+        }
+        None => out.push(0),
+    }
+    put_opt(out, sink.filter.as_deref());
+    put_bytes(out, sink.on_expire.as_bytes());
+    put_u32(out, sink.concurrency);
+    out.push(u8::from(sink.paused));
+    put_opt(out, sink.secret.as_deref());
+    put_u64(out, sink.interval_ms);
+    put_u64(out, sink.budget_bytes);
+    put_opt(out, sink.pause_reason.as_deref());
+    put_u32(out, sink.gaps.len() as u32);
+    for gap in &sink.gaps {
+        put_u64(out, gap.first_id);
+        put_u64(out, gap.last_id);
+    }
+    put_u64(out, sink.gap_count);
+}
+
+/// One sink alone, as the local store keeps it between seals (section 5.1).
+pub fn encode_sink(sink: &MetaSink) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    put_sink(&mut out, sink);
+    out
+}
+
+pub fn decode_sink(bytes: &[u8]) -> Result<MetaSink, MetaError> {
+    let mut reader = Reader { bytes, at: 0 };
+    let sink = reader.sink()?;
+    if reader.at != bytes.len() {
+        return Err(MetaError("bytes after the sink"));
+    }
+    Ok(sink)
+}
+
 pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + meta.state.len());
     put_u32(&mut out, 0);
@@ -169,30 +212,7 @@ pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     }
     put_u32(&mut out, meta.sinks.len() as u32);
     for sink in &meta.sinks {
-        put_u64(&mut out, sink.sink_id);
-        put_bytes(&mut out, sink.kind.as_bytes());
-        put_opt(&mut out, sink.url.as_deref());
-        match sink.target {
-            Some(target) => {
-                out.push(1);
-                out.extend_from_slice(&target.0);
-            }
-            None => out.push(0),
-        }
-        put_opt(&mut out, sink.filter.as_deref());
-        put_bytes(&mut out, sink.on_expire.as_bytes());
-        put_u32(&mut out, sink.concurrency);
-        out.push(u8::from(sink.paused));
-        put_opt(&mut out, sink.secret.as_deref());
-        put_u64(&mut out, sink.interval_ms);
-        put_u64(&mut out, sink.budget_bytes);
-        put_opt(&mut out, sink.pause_reason.as_deref());
-        put_u32(&mut out, sink.gaps.len() as u32);
-        for gap in &sink.gaps {
-            put_u64(&mut out, gap.first_id);
-            put_u64(&mut out, gap.last_id);
-        }
-        put_u64(&mut out, sink.gap_count);
+        put_sink(&mut out, sink);
     }
     encode_ids(&mut out, &meta.objects);
     let crc = crc32c(&out[4..]);
@@ -294,6 +314,46 @@ impl<'a> Reader<'a> {
         Ok(ids)
     }
 
+    fn sink(&mut self) -> Result<MetaSink, MetaError> {
+        let sink_id = self.u64()?;
+        let kind = self.text()?;
+        let (url, target, filter) = (self.opt()?, self.opt_key()?, self.opt()?);
+        let on_expire = self.text()?;
+        let concurrency = self.u32()?;
+        let paused = match self.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(MetaError("a paused flag isn't 0 or 1")),
+        };
+        let secret = self.opt()?;
+        let (interval_ms, budget_bytes) = (self.u64()?, self.u64()?);
+        let pause_reason = self.opt()?;
+        let mut gaps = Vec::new();
+        for _ in 0..self.count(16)? {
+            gaps.push(MetaSinkGap {
+                first_id: self.u64()?,
+                last_id: self.u64()?,
+            });
+        }
+        let gap_count = self.u64()?;
+        Ok(MetaSink {
+            sink_id,
+            kind,
+            url,
+            target,
+            filter,
+            on_expire,
+            concurrency,
+            paused,
+            secret,
+            interval_ms,
+            budget_bytes,
+            pause_reason,
+            gaps,
+            gap_count,
+        })
+    }
+
     /// A count can't promise more than the bytes left could hold, so a corrupt one can't
     /// make a huge allocation.
     fn count(&mut self, min_entry_bytes: usize) -> Result<usize, MetaError> {
@@ -350,43 +410,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
         });
     }
     for _ in 0..reader.count(55)? {
-        let sink_id = reader.u64()?;
-        let kind = reader.text()?;
-        let (url, target, filter) = (reader.opt()?, reader.opt_key()?, reader.opt()?);
-        let on_expire = reader.text()?;
-        let concurrency = reader.u32()?;
-        let paused = match reader.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(MetaError("a paused flag isn't 0 or 1")),
-        };
-        let secret = reader.opt()?;
-        let (interval_ms, budget_bytes) = (reader.u64()?, reader.u64()?);
-        let pause_reason = reader.opt()?;
-        let mut gaps = Vec::new();
-        for _ in 0..reader.count(16)? {
-            gaps.push(MetaSinkGap {
-                first_id: reader.u64()?,
-                last_id: reader.u64()?,
-            });
-        }
-        let gap_count = reader.u64()?;
-        meta.sinks.push(MetaSink {
-            sink_id,
-            kind,
-            url,
-            target,
-            filter,
-            on_expire,
-            concurrency,
-            paused,
-            secret,
-            interval_ms,
-            budget_bytes,
-            pause_reason,
-            gaps,
-            gap_count,
-        });
+        meta.sinks.push(reader.sink()?);
     }
     meta.objects = reader.ids()?;
     if reader.at != bytes.len() {
