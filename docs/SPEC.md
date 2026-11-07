@@ -327,7 +327,7 @@ A sink is a source stream, a filter, a destination, and a named cursor `sink:<id
 
 ### 9.1 Forwarding between streams
 
-A `forward` sink publishes with a `producer_id` the server derives from the source stream and `sink_id`, with the top bit set, and `producer_seq = source first_id`. A publisher that sets the top bit is rejected with error 8, so forwards have a dedupe key space of their own. Retries therefore dedupe through normal idempotency, and duplicate records in the target only when a dedupe entry is gone (section 3). It keeps each record's original author.
+A `forward` sink publishes with a `producer_id` the server derives from the source stream and `sink_id`, with the top bit set, and `producer_seq` = the source id of the batch's last record (see Batches above). A publisher that sets the top bit is rejected with error 8, so forwards have a dedupe key space of their own. Retries therefore dedupe through normal idempotency, and duplicate records in the target only when a dedupe entry is gone (section 3). It keeps each record's original author.
 
 The sink stores its target stream as a key hash (section 1), which is all it needs to publish there.
 
