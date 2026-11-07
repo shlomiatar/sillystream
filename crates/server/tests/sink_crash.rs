@@ -287,11 +287,21 @@ async fn webhook_case(point: &str) {
 
     let before = seen.lock().unwrap().clone();
     let running = start(&files, "second", None);
-    wait_for("every record to arrive", async || {
+    // What the killed node delivered counts only once its cursor moved: otherwise it comes
+    // again, so wait for that rather than stop at the first copy.
+    let committed = if point == "sink.after_cursor" {
+        before.len()
+    } else {
+        0
+    };
+    wait_for("every record to arrive after the restart", async || {
         let seen = seen.lock().unwrap();
         (0..COUNT).all(|at| {
             let want = format!("record {at}").into_bytes();
-            seen.iter().any(|(_, _, data)| data.contains(&want))
+            seen[..committed]
+                .iter()
+                .chain(&seen[before.len()..])
+                .any(|(_, _, data)| data.contains(&want))
         })
     })
     .await;
