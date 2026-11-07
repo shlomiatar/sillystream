@@ -2429,9 +2429,17 @@ impl Core {
         }
         match message {
             ControlMsg::Run(work) => (work.0)(),
-            ControlMsg::StreamInfo { stream, reply } => match self.route(stream) {
+            ControlMsg::StreamInfo {
+                stream,
+                only_sink,
+                reply,
+            } => match self.route(stream) {
                 Route::Forward(to) => {
-                    let _ = self.links.control[to].send(ControlMsg::StreamInfo { stream, reply });
+                    let _ = self.links.control[to].send(ControlMsg::StreamInfo {
+                        stream,
+                        only_sink,
+                        reply,
+                    });
                 }
                 Route::Here(_) => {
                     let memory_first_id = self
@@ -2458,6 +2466,7 @@ impl Core {
                                 .delivery
                                 .sinks
                                 .iter()
+                                .filter(|(id, _)| only_sink.is_none_or(|only| **id == only))
                                 .map(|(id, spec)| {
                                     let cursor = stream
                                         .delivery

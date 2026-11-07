@@ -405,6 +405,8 @@ pub(crate) enum ControlMsg {
     },
     StreamInfo {
         stream: KeyHash,
+        /// Only this sink in `sinks`, so a sink's worker doesn't copy every spec on its stream.
+        only_sink: Option<u64>,
         reply: oneshot::Sender<Result<StreamInfo, ErrorCode>>,
     },
     ConfigurePatch {

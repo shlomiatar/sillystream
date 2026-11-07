@@ -1864,9 +1864,30 @@ impl Client {
     }
 
     pub async fn stream_info(&mut self, stream: KeyHash) -> Result<StreamInfo, ErrorCode> {
+        self.info(stream, None).await
+    }
+
+    /// `stream_info` with only this sink in `sinks`, or none if it doesn't exist.
+    pub(crate) async fn sink_info(
+        &mut self,
+        stream: KeyHash,
+        sink_id: u64,
+    ) -> Result<StreamInfo, ErrorCode> {
+        self.info(stream, Some(sink_id)).await
+    }
+
+    async fn info(
+        &mut self,
+        stream: KeyHash,
+        only_sink: Option<u64>,
+    ) -> Result<StreamInfo, ErrorCode> {
         let (stream, core) = self.route(stream);
         let (reply, answer) = oneshot::channel();
-        let _ = self.links.control[core].send(ControlMsg::StreamInfo { stream, reply });
+        let _ = self.links.control[core].send(ControlMsg::StreamInfo {
+            stream,
+            only_sink,
+            reply,
+        });
         answer.await.unwrap_or(Err(ErrorCode::NotFound))
     }
 

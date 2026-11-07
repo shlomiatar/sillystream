@@ -196,7 +196,12 @@ impl Worker {
     async fn run(&mut self, home: usize, seen_note_count: &mut u64) -> End {
         loop {
             *seen_note_count = *self.notes.borrow_and_update();
-            let info = self.client.lock().await.stream_info(self.key.0).await;
+            let info = self
+                .client
+                .lock()
+                .await
+                .sink_info(self.key.0, self.key.1)
+                .await;
             let info = match info {
                 Ok(info) => info,
                 // Its metadata can't be read just now (D243).
@@ -281,7 +286,12 @@ impl Worker {
                 }
                 () = tokio::time::sleep(check) => {}
             }
-            let info = self.client.lock().await.stream_info(self.key.0).await;
+            let info = self
+                .client
+                .lock()
+                .await
+                .sink_info(self.key.0, self.key.1)
+                .await;
             let Ok(info) = info else {
                 return Spell::Reload;
             };
@@ -921,7 +931,7 @@ impl<'a> Reading<'a> {
                 .client
                 .lock()
                 .await
-                .stream_info(self.worker.key.0)
+                .sink_info(self.worker.key.0, self.worker.key.1)
                 .await;
             if let Ok(info) = info {
                 self.retention_ms = info.config.retention_ms;
@@ -1069,7 +1079,13 @@ impl Attempt {
 
     /// `{stream, head, unread}`, with ids as strings like everywhere else in JSON (D111).
     async fn notify(&self) -> Outcome {
-        let head = match self.client.lock().await.stream_info(self.stream).await {
+        let head = match self
+            .client
+            .lock()
+            .await
+            .sink_info(self.stream, self.sink_id)
+            .await
+        {
             Ok(info) => info.head,
             Err(code) => return Outcome::Retry(format!("reading the head: {code:?}")),
         };
