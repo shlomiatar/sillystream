@@ -24,7 +24,9 @@ use tokio::sync::{oneshot, watch};
 
 use crate::crash::{crash_point, wal_write_gate};
 use crate::uploader::{Handoff, SealExtent};
-use crate::wal_format::{WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header};
+use crate::wal_format::{
+    DedupeCarry, WAL_FILE_HEADER_BYTES, WalEntry, ZERO_PADDING, encode_file_header,
+};
 use crate::wal_replay::wal_file_name;
 
 /// An open WAL file. The real one is a `File`, and tests inject others to record calls.
@@ -190,6 +192,8 @@ pub struct WalConfig {
     /// seal, each extent as it is, since the caller splits a stream wherever another object's
     /// extent lies between its records.
     pub carried: Vec<SealExtent>,
+    /// Dedupe entries replay refilled, which the first file begins with (section 3).
+    pub carried_dedupe: Vec<DedupeCarry>,
 }
 
 /// What a finished writer did. `largest_group_count` and the totals are what the
@@ -375,6 +379,7 @@ where
         },
         last_tickets: Vec::new(),
         dedicated_count: 0,
+        carries: config.carried_dedupe,
     };
     let thread = std::thread::Builder::new()
         .name("wal-writer".to_owned())
@@ -409,6 +414,9 @@ struct Writer<V: WalVolume, N, S> {
     /// Per core, the highest ticket written.
     last_tickets: Vec<u64>,
     dedicated_count: u64,
+    /// Dedupe entries the active file is still to begin with, while there is no file to hold
+    /// them (section 3).
+    carries: Vec<DedupeCarry>,
 }
 
 /// What the active file holds that no object has taken yet.
@@ -422,6 +430,9 @@ struct OpenFile {
     full_told: bool,
     /// The index the window's last dedicated object took, 0 before any (section 7.3).
     last_dedicated_index: u8,
+    /// Per `(stream, producer_id)`, the latest publish's dedupe entry, which the next file
+    /// carries (section 3).
+    dedupe: HashMap<(KeyHash, u64), DedupeCarry>,
 }
 
 struct OpenStream {
@@ -446,6 +457,7 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
     ) -> Result<WalStats, WalError> {
         let mut batch = Vec::new();
         let mut heads = Vec::new();
+        self.write_carries()?;
         while let Ok(first) = rx.recv() {
             let mut control = match first {
                 WalCommand::Append(entry) => {
@@ -471,7 +483,7 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
             self.commit_held(&mut batch, &mut heads)?;
             match control {
                 Some(WalCommand::Seal { seal, done }) => {
-                    let rotated = self.seal(seal).map_err(WalError::Rotate)?;
+                    let rotated = self.seal(seal)?;
                     // A core that stopped waiting doesn't matter to the writer.
                     let _ = done.send(rotated);
                 }
@@ -491,6 +503,7 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
                     }
                     if self.file.is_none() {
                         self.open_active().map_err(WalError::Rotate)?;
+                        self.write_carries()?;
                     }
                 }
                 Some(WalCommand::Append(_)) | None => {}
@@ -525,9 +538,19 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
     fn keep<R: AsRef<[u8]> + Send + 'static>(&mut self, entry: WalEntry<R>) {
         let (core, ticket) = (entry.core(), entry.ticket());
         let stream = entry.stream();
+        let carry = entry.dedupe_carry();
         let records = Bytes::from_owner(entry.into_records());
         raise(&mut self.last_tickets, core, ticket);
         let open = &mut self.open;
+        if let Some(carry) = carry {
+            let latest = open
+                .dedupe
+                .entry((stream, carry.producer_id))
+                .or_insert(carry);
+            if carry.producer_seq >= latest.producer_seq {
+                *latest = carry;
+            }
+        }
         open.entry_count += 1;
         open.record_bytes += records.len() as u64;
         let at = open.extents.len();
@@ -583,16 +606,19 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
 
     /// Rotates unless the file is empty, and hands what it holds to the uploader, even when
     /// that is nothing, since the seal's checkpoint follows its upload event.
-    fn seal(&mut self, seal: u64) -> io::Result<WalRotated> {
+    fn seal(&mut self, seal: u64) -> Result<WalRotated, WalError> {
         let rotated = if self.file.is_some() && self.open.entry_count == 0 {
             WalRotated {
                 closed_seq: self.active_seq - 1,
                 new_seq: self.active_seq,
             }
         } else {
-            self.rotate()?
+            self.rotate().map_err(WalError::Rotate)?
         };
         let open = std::mem::take(&mut self.open);
+        // Before the closed file is handed over, since its removal follows that.
+        self.carries.extend(open.dedupe.into_values());
+        self.write_carries()?;
         self.sealer.seal(Handoff::Seal {
             seal,
             extents: open
@@ -603,6 +629,25 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
             tickets: self.last_tickets.clone(),
         });
         Ok(rotated)
+    }
+
+    /// Begins the active file with the dedupe entries it carries. With no file they wait for one.
+    /// They aren't entries of the file's own: they go in no object, and don't make it rotate.
+    fn write_carries(&mut self) -> Result<(), WalError> {
+        let Some(file) = &mut self.file else {
+            return Ok(());
+        };
+        if self.carries.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for carry in &self.carries {
+            carry.encode(self.active_seq, &mut bytes);
+        }
+        write_all_vectored(file, &mut [IoSlice::new(&bytes)]).map_err(WalError::Write)?;
+        file.sync_data().map_err(WalError::Sync)?;
+        self.carries.clear();
+        Ok(())
     }
 
     /// Tries again for the file `active_seq` names. Still none to be had isn't an error.

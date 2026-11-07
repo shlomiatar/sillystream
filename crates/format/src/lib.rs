@@ -31,8 +31,9 @@ pub use record::{
 };
 pub use summary::{BlockAuthor, BlockSummary, Decision};
 pub use system::{
-    ENTRY_SEAL_MANIFEST, ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET, SystemRecord,
-    decode_manifest_doc, encode_manifest_doc, encode_system_record,
+    ENTRY_DEDUPE_CARRY, ENTRY_SEAL_MANIFEST, ENTRY_STATE_INCR, ENTRY_STATE_MERGE, ENTRY_STATE_SET,
+    SystemRecord, decode_dedupe_carry, decode_manifest_doc, encode_dedupe_carry,
+    encode_manifest_doc, encode_system_record,
 };
 
 /// Set in the producer id of every forward sink, and refused on any other publish, so forwards

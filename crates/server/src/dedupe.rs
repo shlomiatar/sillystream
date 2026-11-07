@@ -36,7 +36,7 @@ impl DedupeEntry {
     }
 
     /// Idle age comes from `first_id`'s timestamp (D6e).
-    fn is_expired(&self, now_ms: u64) -> bool {
+    pub(crate) fn is_expired(&self, now_ms: u64) -> bool {
         now_ms >= id_ms(self.first_id).saturating_add(DEDUPE_IDLE_MS)
     }
 }

@@ -68,6 +68,8 @@ pub struct WalEntry<R> {
     core: usize,
     /// Increases per core. The writer reports the highest durable one.
     ticket: u64,
+    /// The publish's `(first_id, count)`, for a dedupe entry the next file carries (section 3).
+    carry: Option<(u64, u32)>,
 }
 
 impl<R: AsRef<[u8]>> WalEntry<R> {
@@ -89,6 +91,24 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
             records_crc,
             core,
             ticket,
+            carry: None,
+        })
+    }
+
+    /// Has the next file carry this publish's dedupe entry (section 3).
+    pub fn carrying(mut self, first_id: u64, count: u32) -> WalEntry<R> {
+        self.carry = Some((first_id, count));
+        self
+    }
+
+    /// The dedupe entry the next file carries for this publish, if it has one.
+    pub(crate) fn dedupe_carry(&self) -> Option<DedupeCarry> {
+        self.carry.map(|(first_id, count)| DedupeCarry {
+            stream: self.stream,
+            producer_id: self.producer_id,
+            producer_seq: self.producer_seq,
+            first_id,
+            count,
         })
     }
 
@@ -129,6 +149,34 @@ impl<R: AsRef<[u8]>> WalEntry<R> {
             self.records_crc,
             out,
         )
+    }
+}
+
+/// A dedupe entry a new WAL file begins with (section 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupeCarry {
+    pub stream: KeyHash,
+    pub producer_id: u64,
+    pub producer_seq: u64,
+    pub first_id: u64,
+    pub count: u32,
+}
+
+impl DedupeCarry {
+    /// Appends it to `out` as one whole entry of the file `seq`.
+    pub(crate) fn encode(&self, seq: u64, out: &mut Vec<u8>) {
+        let mut record = Vec::new();
+        format::encode_dedupe_carry(&mut record, self.first_id, self.count)
+            .expect("a carried entry's doc is 12 bytes");
+        let entry = encode_wal_entry(
+            seq,
+            self.stream,
+            self.producer_id,
+            self.producer_seq,
+            &record,
+        )
+        .expect("a carried entry has one record");
+        out.extend_from_slice(&entry);
     }
 }
 

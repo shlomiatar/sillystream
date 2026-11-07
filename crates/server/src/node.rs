@@ -17,10 +17,10 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use proto::ErrorCode;
 use storage::{
-    CheckpointSet, DirVolume, DurableWatch, MetadataStore, NewerObjects, ObjectId, ObjectState,
-    ObjectTable, Ownership, SealExtent, SegmentCache, StreamExtent, UploadEvent, UploadKey,
-    UploadSealer, Uploader, UploaderConfig, WalConfig, WalError, WalHandle, WalSendError,
-    WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
+    CheckpointSet, DedupeCarry, DirVolume, DurableWatch, MetadataStore, NewerObjects, ObjectId,
+    ObjectState, ObjectTable, Ownership, SealExtent, SegmentCache, StreamExtent, UploadEvent,
+    UploadKey, UploadSealer, Uploader, UploaderConfig, WalConfig, WalError, WalHandle,
+    WalSendError, WalSender, WalStats, WalVolume, durable_watches, start_wal_writer,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -1078,6 +1078,9 @@ impl Node {
                 carried: recovered
                     .as_ref()
                     .map_or_else(Vec::new, |parts| carried_extents(&parts.restored)),
+                carried_dedupe: recovered.as_ref().map_or_else(Vec::new, |parts| {
+                    carried_dedupe(&parts.restored, clock.now_ms())
+                }),
             },
         )?;
 
@@ -2064,6 +2067,28 @@ impl Client {
     pub fn pinned_bytes(&self) -> u64 {
         self.pool.account().pinned_bytes()
     }
+}
+
+/// The dedupe entries replay refilled, which the first WAL file carries so that they outlive the
+/// files they came from by one (section 3).
+fn carried_dedupe(restored: &[crate::recovery::RestoredStream], now_ms: u64) -> Vec<DedupeCarry> {
+    restored
+        .iter()
+        .flat_map(|stream| {
+            stream
+                .dedupe
+                .entries()
+                .iter()
+                .filter(move |entry| !entry.is_expired(now_ms))
+                .map(|entry| DedupeCarry {
+                    stream: stream.meta.stream,
+                    producer_id: entry.producer_id(),
+                    producer_seq: entry.producer_seq(),
+                    first_id: entry.first_id(),
+                    count: entry.count(),
+                })
+        })
+        .collect()
 }
 
 /// What startup replay found that no object holds, for the WAL writer's first seal: one extent

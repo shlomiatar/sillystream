@@ -200,14 +200,14 @@ async fn a_restart_restores_state_dedupe_and_cursors() {
     node.shutdown();
 }
 
-/// Dedupe entries are never saved (section 3): once a checkpoint lets the WAL file holding a
-/// publish go, a restart can't dedupe a retry of it, and publishing is at-least-once.
+/// A dedupe entry outlives its WAL file by one (section 3): the next file carries it, and a
+/// restart carries what replay refilled, so a retry after its file is gone still dedupes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_retry_after_its_wal_file_is_gone_is_a_new_record() {
+async fn a_retry_after_its_wal_file_is_gone_dedupes_from_the_next_file() {
     let disk = Disk::new();
     let (node, _) = disk.start(manual_config(1));
     let mut client = node.client(0).await;
-    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    let (first, count) = publish_one(&mut client, "a", 1, b"one").await;
     assert!(node.seal_and_checkpoint().await);
     drop(client);
     wait_for_wal_files(&disk, 1, "after the checkpoint").await;
@@ -215,9 +215,52 @@ async fn a_retry_after_its_wal_file_is_gone_is_a_new_record() {
 
     let (node, _) = disk.start(manual_config(1));
     let mut client = node.client(0).await;
+    assert_eq!(
+        publish_one(&mut client, "a", 1, b"one").await,
+        (first, count)
+    );
+    // The files replay read go, and the one startup began holds the entry now.
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    wait_for_wal_files(&disk, 1, "after the second checkpoint").await;
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    assert_eq!(
+        publish_one(&mut client, "a", 1, b"one").await,
+        (first, count)
+    );
+    assert_eq!(read_all(&node, "a", 1).await.len(), 1);
+    drop(client);
+    node.shutdown();
+}
+
+/// Once a file after the carrying one is released, the entry is gone, and publishing is
+/// at-least-once (section 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_two_files_on_is_a_new_record() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    assert!(node.seal_and_checkpoint().await);
+    // Another producer makes the carrying file rotate, and the next carries only its entry.
+    let records = record_with(0, b"other");
+    let mut other = publish("a", &records, 1, 2);
+    other.producer_id = 2;
+    client.publish(other).await.unwrap();
+    expect_ack(&mut client).await;
+    assert!(node.seal_and_checkpoint().await);
+    drop(client);
+    wait_for_wal_files(&disk, 1, "after the checkpoints").await;
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
     let (again, _) = publish_one(&mut client, "a", 1, b"one").await;
     assert!(again > first);
-    assert_eq!(read_all(&node, "a", 2).await.len(), 2);
+    assert_eq!(read_all(&node, "a", 3).await.len(), 3);
     drop(client);
     node.shutdown();
 }

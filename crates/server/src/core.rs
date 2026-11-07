@@ -1293,6 +1293,11 @@ impl Core {
             ticket,
         )
         .expect("the stream id and the length were checked, and there is at least one record");
+        // What the dedupe entry holds, so the next WAL file can carry it (section 3).
+        let entry = match u32::try_from(ids.last_id - ids.first_id + 1) {
+            Ok(count) if ids.producer_id != 0 => entry.carrying(ids.first_id, count),
+            _ => entry,
+        };
 
         let shard_id = self.streams.get(name).map(|stream| stream.shard);
         if let Some(shard) = shard_id.and_then(|shard| self.shards.get_mut(&shard)) {

@@ -53,12 +53,18 @@ impl WalScript {
         self.hold_sync.store(false, Ordering::SeqCst);
     }
 
-    /// Everything written, in file order, whether synced or not.
+    /// Every publish written, in file order, whether synced or not. The dedupe entries a file
+    /// carries from the one before aren't publishes (section 3).
     pub fn entries(&self) -> Vec<ReplayedEntry> {
         let files = self.files.lock().unwrap();
         files
             .iter()
             .flat_map(|(seq, bytes)| replay_bytes(&Bytes::copy_from_slice(bytes), *seq).entries)
+            .filter(|entry| {
+                format::RecordHeader::read(&entry.records).map_or(true, |header| {
+                    !header.is_system() || header.options != format::ENTRY_DEDUPE_CARRY
+                })
+            })
             .collect()
     }
 

@@ -55,7 +55,7 @@ Records group on an exact `options` value, so high-cardinality fields such as re
 A record with `author = 0` is a system record. **The server reads a record's data only when `author = 0`; everything else is opaque.**
 
 - Clients can't write these directly, because authors come from the token and are never 0. The server writes them.
-- On a system record, `options` belongs to the server and holds the entry type: 1 state set, 2 state merge, 3 state incr.
+- On a system record, `options` belongs to the server and holds the entry type: 1 state set, 2 state merge, 3 state incr, 4 seal manifest (section 7.5), 5 carried dedupe entry (section 3).
 - Data is `actor u64 | doc`, where `actor` is the author who made the change.
 - Subscribers receive system records only if they ask, using `INCLUDE_SYSTEM`.
 
@@ -68,6 +68,7 @@ A publish is one or more records, and it commits as one unit with consecutive id
 - **Idempotency:** `(producer_id, producer_seq)`, carried on the publish frame and in the WAL entry, not in records. Duplicates are dropped and never re-stamped. `producer_seq` must increase per stream, and gaps are allowed.
 - **Dedupe entries:** one per `(stream, producer_id)`, about 28 bytes, holding the highest `producer_seq` with its `first_id` and `count`. Entries expire after 24 hours idle, with a cap of 1,000 per stream that evicts the oldest first.
 - **Memory only:** dedupe entries live in the owning core and are never saved to the local store or a checkpoint. After a restart, WAL replay refills them from the entries' `(producer_id, producer_seq)`.
+- **One WAL file longer:** when the WAL writer rotates, it starts the new file with a carried entry for each `(stream, producer_id)` the closed file wrote, so a dedupe entry outlives the release of its own file by one file. A carried entry is never carried again, and startup carries whatever replay refilled into its first file. It's a system record of type 5 whose id is the publish's last id and whose doc is `first_id u64 | count u32`. It's in the WAL only: no stream, segment or reader ever sees it.
 - **At-least-once:** publishing is at-least-once. A retry creates a duplicate when its entry is gone: it expired, its stream was evicted while idle, or a restart's WAL no longer held it.
 - **Retries:** a retry of the latest publish gets the original `ACK`. A retry of an older one is dropped and acked with `first_id = 0`, meaning it is already committed and its id wasn't kept.
 - **Validation:** the owner rejects the whole publish with error 8 if the record lengths don't add up exactly to the frame, `count = 0`, `id` or `author` isn't 0, padding isn't 0, or a state doc is over 64 KB or isn't valid CBOR. This never reads a record's data. Forward sinks may set `author`, because they keep the original.
@@ -165,10 +166,10 @@ loop {
 ```
 
 - **Group commit needs no timer:** whatever queued during the last fsync goes in the next one, which gives one group commit across the whole node.
-- **Entries:** `stream key hash | producer_id | producer_seq | len | crc32c`, then the record bytes. The CRC detects torn writes during recovery.
+- **Entries:** `stream key hash | producer_id | producer_seq | len | crc32c`, then the record bytes. The CRC detects torn writes during recovery. A new file begins with the dedupe entries carried from the one before it (section 3).
 - **Backpressure:** the channel is bounded and cores use `try_send`. A full queue becomes backpressure on publishers and never blocks a core.
 - **Waking cores:** cores can't block on a crossbeam `recv`, so the writer wakes them through a mechanism they can await.
-- **Seals:** the writer seals when its active file reaches the size cap (section 7.3), or when the node asks at the end of a seal window. A file with no entries isn't rotated, so an idle node makes no files and no objects. A seal is the file: its segment holds exactly the entries the file holds.
+- **Seals:** the writer seals when its active file reaches the size cap (section 7.3), or when the node asks at the end of a seal window. A file with no entries isn't rotated, so an idle node makes no files and no objects. Carried entries don't count. A seal is the file: its segment holds exactly the entries the file holds.
 - **Dedicated objects:** the writer counts each stream's bytes in the active file. A stream that reaches its buffer has those entries handed to the uploader as a dedicated object, and they are left out of the file's segment. The file is removed once every object holding its entries is uploaded and checkpointed.
 
 ### 6.4 Uploader

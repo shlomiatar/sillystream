@@ -37,6 +37,7 @@ fn run_once(entry_bytes: usize, sender_count: usize, entry_count: u64) -> (Durat
             segment_cap_bytes: u64::MAX,
             stream_buffer_bytes: u64::MAX,
             carried: Vec::new(),
+            carried_dedupe: Vec::new(),
         },
     )
     .unwrap();
@@ -151,6 +152,7 @@ fn one_at_a_time(c: &mut Criterion) {
                     segment_cap_bytes: u64::MAX,
                     stream_buffer_bytes: u64::MAX,
                     carried: Vec::new(),
+                    carried_dedupe: Vec::new(),
                 },
             )
             .unwrap();
@@ -208,6 +210,7 @@ fn group_commit(c: &mut Criterion) {
                         segment_cap_bytes: u64::MAX,
                         stream_buffer_bytes: u64::MAX,
                         carried: Vec::new(),
+                        carried_dedupe: Vec::new(),
                     },
                 )
                 .unwrap();

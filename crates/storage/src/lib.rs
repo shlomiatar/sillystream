@@ -58,7 +58,8 @@ pub use uploader::{
     Uploader, UploaderConfig, UploaderExit, UploaderSender, put_compacted, put_object,
 };
 pub use wal_format::{
-    WAL_FILE_HEADER_BYTES, WAL_MAGIC, WalEntry, WalEntryError, encode_file_header, encode_wal_entry,
+    DedupeCarry, WAL_FILE_HEADER_BYTES, WAL_MAGIC, WalEntry, WalEntryError, encode_file_header,
+    encode_wal_entry,
 };
 pub use wal_replay::{
     ReplayedEntry, ReplayedFile, WalFileInfo, list_wal_files, replay_bytes, replay_dir,

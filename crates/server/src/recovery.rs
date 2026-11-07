@@ -234,6 +234,16 @@ pub(crate) fn accepted_prefix(bytes: &Bytes, limit: u64) -> Option<(u64, Bytes)>
     last_id.map(|last_id| (last_id, bytes.slice(..accepted_bytes)))
 }
 
+/// A carried dedupe entry's `(first_id, count)`, if that is what this WAL entry is (section 3).
+fn dedupe_carry(entry: &storage::ReplayedEntry) -> Option<(u64, u32)> {
+    let record = Records::new(&entry.records).next()?.ok()?;
+    if !record.header.is_system() || record.header.options != format::ENTRY_DEDUPE_CARRY {
+        return None;
+    }
+    let system = format::SystemRecord::parse(&record).ok()?;
+    format::decode_dedupe_carry(system.doc).ok()
+}
+
 /// A publish commits as one unit (section 3), so any of it over the limit rules out all of it.
 fn entry_is_above(entry: &storage::ReplayedEntry, limit: u64) -> bool {
     Records::new(&entry.records)
@@ -455,8 +465,17 @@ fn replay_stream(
     let mut covering: Vec<(u64, u64)> = Vec::new();
 
     enum Item {
-        Scanned { blocks: Vec<Bytes>, last_id: u64 },
+        Scanned {
+            blocks: Vec<Bytes>,
+            last_id: u64,
+        },
         Wal(storage::ReplayedEntry),
+        /// A dedupe entry, which says nothing else of the stream (section 3).
+        Carried {
+            producer_id: u64,
+            producer_seq: u64,
+            count: u32,
+        },
     }
     let mut items: Vec<(u64, Item)> = Vec::new();
     let listed: HashSet<ObjectId> = meta.objects.iter().copied().collect();
@@ -489,6 +508,15 @@ fn replay_stream(
     meta.objects.sort_unstable();
     meta.objects.dedup();
     for entry in pending.wal {
+        if let Some((first_id, count)) = dedupe_carry(&entry) {
+            let carried = Item::Carried {
+                producer_id: entry.producer_id,
+                producer_seq: entry.producer_seq,
+                count,
+            };
+            items.push((first_id, carried));
+            continue;
+        }
         let first_id = format::RecordHeader::read(&entry.records)
             .map_err(|error| format!("a WAL entry for {name}: {error}"))?
             .id;
@@ -513,6 +541,18 @@ fn replay_stream(
                 Some((entry.producer_id, entry.producer_seq)),
                 None,
             ),
+            Item::Carried {
+                producer_id,
+                producer_seq,
+                count,
+            } => {
+                let last_id = first_id + u64::from((*count).max(1)) - 1;
+                // None outlives its stream's delete.
+                if alive && last_id > floor_id {
+                    dedupe.record(*producer_id, *producer_seq, first_id, *count, now_ms);
+                }
+                continue;
+            }
         };
         let mut last_id = first_id;
         let mut item_count = 0u64;
@@ -666,7 +706,9 @@ pub(crate) async fn prepare(
         if replayed.damaged_tail && wal_files.last().is_some_and(|last| last.seq != file.seq) {
             report.damaged_wal_seqs.push(file.seq);
         }
-        if replayed.entries.is_empty() {
+        // Carried dedupe entries count as nothing here: replay reads them, and the new file
+        // carries them again, so a crash loop doesn't keep a file per start.
+        if replayed.entries.iter().all(|entry| dedupe_carry(entry).is_some()) {
             empty_files.push(file);
         }
         // A file from before generations were known to it has nothing to say.
@@ -682,7 +724,9 @@ pub(crate) async fn prepare(
                 }
                 continue;
             }
-            report.replayed_entry_count += 1;
+            if dedupe_carry(&entry).is_none() {
+                report.replayed_entry_count += 1;
+            }
             pending.entry(entry.stream).or_default().wal.push(entry);
         }
     }
@@ -696,6 +740,7 @@ pub(crate) async fn prepare(
     let oldest_entry_ms = pending
         .values()
         .flat_map(|one| one.wal.iter())
+        .filter(|entry| dedupe_carry(entry).is_none())
         .filter_map(|entry| format::RecordHeader::read(&entry.records).ok())
         .map(|header| format::id_ms(header.id))
         .min();
@@ -715,6 +760,12 @@ pub(crate) async fn prepare(
     let mut covering_by_stream = HashMap::new();
     for (name, one) in pending {
         let (meta, _) = load_stream(&local, &checkpoints, &newer, store, name).await?;
+        // Carried dedupe entries alone don't make a stream (section 3).
+        let only_carried =
+            one.scanned.is_empty() && one.wal.iter().all(|entry| dedupe_carry(entry).is_some());
+        if meta.is_none() && only_carried {
+            continue;
+        }
         let meta = meta.unwrap_or_else(|| new_meta(name));
         let recorded = newer.of(name, &checkpoints);
         let sealed_through = recent

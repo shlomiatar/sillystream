@@ -9,6 +9,9 @@ pub const ENTRY_STATE_MERGE: u64 = 2;
 pub const ENTRY_STATE_INCR: u64 = 3;
 /// A seal manifest, in the manifest stream (section 7.5, Q3).
 pub const ENTRY_SEAL_MANIFEST: u64 = 4;
+/// A dedupe entry carried into the next WAL file. It's in the WAL only, never in a stream
+/// (section 3).
+pub const ENTRY_DEDUPE_CARRY: u64 = 5;
 
 const ACTOR_BYTES: usize = 8;
 
@@ -55,6 +58,30 @@ pub fn decode_manifest_doc(doc: &[u8]) -> Result<(u64, &str), FormatError> {
     }
     let path = std::str::from_utf8(&doc[8..]).map_err(|_| FormatError::TruncatedSystemRecord)?;
     Ok((read_u64(doc, 0), path))
+}
+
+/// A carried dedupe entry's record: its id is the publish's last id, so a replay's generation
+/// limit treats it as it would the publish, and its doc is `first_id u64 | count u32`.
+pub fn encode_dedupe_carry(
+    out: &mut Vec<u8>,
+    first_id: u64,
+    count: u32,
+) -> Result<(), FormatError> {
+    let mut doc = [0u8; 12];
+    doc[..8].copy_from_slice(&first_id.to_le_bytes());
+    doc[8..].copy_from_slice(&count.to_le_bytes());
+    let last_id = first_id + u64::from(count.max(1)) - 1;
+    encode_system_record(out, last_id, ENTRY_DEDUPE_CARRY, 0, &doc)
+}
+
+/// `(first_id, count)`.
+pub fn decode_dedupe_carry(doc: &[u8]) -> Result<(u64, u32), FormatError> {
+    if doc.len() < 12 {
+        return Err(FormatError::TruncatedSystemRecord);
+    }
+    let mut count = [0u8; 4];
+    count.copy_from_slice(&doc[8..12]);
+    Ok((read_u64(doc, 0), u32::from_le_bytes(count)))
 }
 
 /// The parsed contents of a system record.

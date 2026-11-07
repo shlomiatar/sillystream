@@ -175,6 +175,7 @@ fn config(channel_capacity: usize) -> WalConfig {
         segment_cap_bytes: u64::MAX,
         stream_buffer_bytes: u64::MAX,
         carried: Vec::new(),
+        carried_dedupe: Vec::new(),
     }
 }
 
@@ -696,6 +697,7 @@ fn a_removed_file_is_gone_and_the_next_one_is_new() {
             segment_cap_bytes: u64::MAX,
             stream_buffer_bytes: u64::MAX,
             carried: Vec::new(),
+            carried_dedupe: Vec::new(),
         },
     )
     .unwrap();
@@ -924,6 +926,7 @@ fn carried_records_go_into_the_first_seal_first() {
     };
     let (sender, handle, sealed) = start_sealing(WalConfig {
         carried: vec![carried(100), carried(101)],
+        carried_dedupe: Vec::new(),
         ..config(64)
     });
     sender.try_append(entry_for("s", 0, 1)).unwrap();
@@ -942,4 +945,124 @@ fn carried_records_go_into_the_first_seal_first() {
         ]
     );
     assert_eq!(shape(&handoffs[1]).0, [(key("s"), vec![2])]);
+}
+
+/// `(stream, producer_id, producer_seq, first_id, count)` of each carried dedupe entry in a file.
+fn carried_in(file: &storage::WalFileInfo) -> Vec<(format::KeyHash, u64, u64, u64, u32)> {
+    let mut carried: Vec<_> = storage::replay_file(file)
+        .unwrap()
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let record = format::Records::new(&entry.records).next()?.ok()?;
+            let system = format::SystemRecord::parse(&record).ok()?;
+            (system.entry_type == format::ENTRY_DEDUPE_CARRY).then(|| {
+                let (first_id, count) = format::decode_dedupe_carry(system.doc).unwrap();
+                (
+                    entry.stream,
+                    entry.producer_id,
+                    entry.producer_seq,
+                    first_id,
+                    count,
+                )
+            })
+        })
+        .collect();
+    carried.sort();
+    carried
+}
+
+/// A new file begins with the latest dedupe entry of each `(stream, producer_id)` the closed one
+/// wrote, once: the carried entries go in no object, and alone they don't make a file rotate
+/// (section 3).
+#[test]
+fn a_new_file_carries_the_closed_files_dedupe_entries_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (notify, _receivers) = durable_watches(2);
+    let sealed = Arc::new(Sealed::default());
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
+        DirVolume::new(dir.path(), 1 << 16),
+        notify,
+        RecordingSealer(Arc::clone(&sealed)),
+        config(16),
+    )
+    .unwrap();
+    let publish = |stream: &str, seq: u64, ticket: u64| {
+        let records = Bytes::from(vec![ticket as u8; 40]);
+        WalEntry::new(key(stream), 7, seq, records, 0, ticket).unwrap()
+    };
+    sender
+        .try_append(publish("a", 1, 1).carrying(100, 2))
+        .unwrap();
+    sender
+        .try_append(publish("a", 2, 2).carrying(102, 1))
+        .unwrap();
+    sender
+        .try_append(publish("b", 1, 3).carrying(200, 3))
+        .unwrap();
+    // No producer: nothing to carry.
+    sender.try_append(publish("c", 0, 4)).unwrap();
+    assert_eq!(
+        sender.try_seal(1).unwrap().blocking_recv().unwrap().new_seq,
+        2
+    );
+    let idle = sender.try_seal(2).unwrap().blocking_recv().unwrap();
+    assert_eq!(idle.new_seq, 2, "carried entries alone don't rotate a file");
+    sender
+        .try_append(publish("b", 2, 5).carrying(203, 1))
+        .unwrap();
+    assert_eq!(
+        sender.try_seal(3).unwrap().blocking_recv().unwrap().new_seq,
+        3
+    );
+    drop(sender);
+    handle.join().unwrap();
+
+    let files = storage::list_wal_files(dir.path()).unwrap();
+    assert_eq!(
+        files.iter().map(|file| file.seq).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(carried_in(&files[0]), []);
+    let (a, b) = (key("a"), key("b"));
+    let mut expected = vec![(a, 7, 2, 102, 1), (b, 7, 1, 200, 3)];
+    expected.sort();
+    assert_eq!(carried_in(&files[1]), expected);
+    // The file before's own entries, not what it carried.
+    assert_eq!(carried_in(&files[2]), [(b, 7, 2, 203, 1)]);
+    let handoffs = sealed.handoffs.lock().unwrap();
+    assert_eq!(
+        shape(&handoffs[1]).0,
+        [],
+        "an idle seal holds no carried entry"
+    );
+    assert_eq!(shape(&handoffs[2]).0, [(b, vec![5])]);
+}
+
+/// The first file begins with what replay refilled (section 3).
+#[test]
+fn the_first_file_carries_what_replay_refilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (notify, _receivers) = durable_watches(1);
+    let carry = storage::DedupeCarry {
+        stream: key("a"),
+        producer_id: 9,
+        producer_seq: 4,
+        first_id: 500,
+        count: 2,
+    };
+    let (sender, handle) = start_wal_writer::<Bytes, _, _, _>(
+        DirVolume::new(dir.path(), 1 << 16),
+        notify,
+        (),
+        WalConfig {
+            carried_dedupe: vec![carry],
+            ..config(16)
+        },
+    )
+    .unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    let files = storage::list_wal_files(dir.path()).unwrap();
+    assert_eq!(carried_in(&files[0]), [(key("a"), 9, 4, 500, 2)]);
 }
