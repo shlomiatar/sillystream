@@ -11,10 +11,13 @@ bench = false
 
 [dependencies]
 auth.workspace = true
+format.workspace = true
 rcgen.workspace = true
+rustls.workspace = true
 sdk.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls.workspace = true
 
 [dev-dependencies]
 object_store.workspace = true

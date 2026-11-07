@@ -1,6 +1,7 @@
 //! `silly`: tokens, stream and sink admin, publish, tail and the load generator.
 
 mod bench;
+mod receiver;
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -24,6 +25,7 @@ silly sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filte
 silly sink delete|pause|resume STREAM ID
 silly sink reset STREAM ID [--start S]
 silly publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
+silly bench webhook-receiver --name HOST --ca-out PEM [--listen ADDR] [--delay-ms N]
 silly tail STREAM [--from start|live|ID] [--to ID] [--filter F] [--limit N] [--name CURSOR]
 silly bench latency|throughput|idle|catch-up|many-streams|puts|idle-streams|ack-matrix|
                   fan-out|connect|recovery|all
@@ -101,7 +103,7 @@ impl Args {
     }
 
     /// Refuses anything the command doesn't read, so that a typo isn't quietly ignored.
-    fn only(&self, known: &[&str]) -> Result<(), String> {
+    pub(crate) fn only(&self, known: &[&str]) -> Result<(), String> {
         let globals = ["--url", "--ca", "--token", "--token-file"];
         for name in self.flags.keys() {
             if !known.contains(&name.as_str()) && !globals.contains(&name.as_str()) {
@@ -192,6 +194,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         ["sink", action, stream, id] => sink_command(&parsed, action, stream, id).await,
         ["publish", stream, data @ ..] => publish(&parsed, stream, data).await,
         ["tail", stream] => tail(&parsed, stream).await,
+        ["bench", "webhook-receiver"] => receiver::run(&parsed).await,
         ["bench", what] => bench::run(&parsed, what).await,
         _ => Err(format!("usage:\n{USAGE}")),
     }

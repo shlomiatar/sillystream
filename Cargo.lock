@@ -294,13 +294,16 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "format",
  "object_store",
  "rcgen",
+ "rustls",
  "sdk",
  "server",
  "storage",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
