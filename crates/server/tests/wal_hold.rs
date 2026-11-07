@@ -280,3 +280,108 @@ async fn damage_in_a_closed_wal_file_is_reported_and_a_torn_newest_file_is_not()
     assert_eq!(report.damaged_warning(), None);
     node.shutdown();
 }
+
+/// A stream whose hashed shard starts on `core`, as placement is `shard % core_count`.
+fn name_on_core(core: usize, node: &Node, prefix: &str) -> String {
+    (0..)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|name| {
+            server::shard_of(key(name), node.virtual_shard_count()) as usize % node.core_count()
+                == core
+        })
+        .expect("names go on for ever")
+}
+
+/// A producer's write parked while its stream loads, on a core the held WAL has stalled, and its
+/// next write, which waits behind the stall: when the shard moves, the parked one still goes
+/// first. The other way round, the later write was taken first and the parked one was dropped
+/// as old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_passes_on_writes_parked_for_a_load_before_later_ones() {
+    let _turn = TURN.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(ScriptStore::new());
+    let clock = ManualClock::new(START_MS);
+    let mut config = manual_config(2);
+    config.wal_channel_capacity = 2;
+    let (node, _) = start(dir.path(), &store, &clock, config.clone());
+    let name = name_on_core(1, &node, "m");
+    let shard = server::shard_of(key(&name), node.virtual_shard_count());
+    let records = record_with(0, b"x");
+    let mut client = node.client(1).await;
+    client
+        .publish(publish(&name, &records, 1, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut client).await;
+    assert!(node.seal_and_checkpoint().await);
+    // Long enough that the WAL no longer holds it, so that only a checkpoint can load it.
+    let busy = name_on_core(1, &node, "busy");
+    for seq in 1..=10 {
+        client
+            .publish(publish(&busy, &records, seq, 2))
+            .await
+            .unwrap();
+        expect_ack(&mut client).await;
+        assert!(node.seal_and_checkpoint().await);
+    }
+    drop(client);
+    node.shutdown();
+    std::fs::remove_dir_all(dir.path().join("metadata")).unwrap();
+
+    let (node, _) = start(dir.path(), &store, &clock, config);
+    // Its routes come from now, with the stream's shard on core 1, so core 1 passes its writes
+    // on and core 0 reads them from its forwarded inbox.
+    let mut producer = node.client(1).await;
+    assert!(node.move_shard(shard, 0).await);
+    let filler = name_on_core(0, &node, "filler");
+    let mut stall = node.client(0).await;
+    stall
+        .publish(publish(&filler, &records, 1, 2))
+        .await
+        .unwrap();
+    expect_ack(&mut stall).await;
+
+    // The stream's load waits on this, and the write parks.
+    store
+        .slow_get_once
+        .lock()
+        .unwrap()
+        .push((".ckpt".to_owned(), Duration::from_millis(3_000)));
+    producer
+        .publish(publish(&name, &records, 2, 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    storage::hold_wal_writes(true);
+    let mut seq = 2;
+    while node.stats(0).await.unwrap().outbound_count == 0 {
+        assert!(seq < 100, "the channel should have filled by now");
+        stall
+            .publish(publish(&filler, &records, seq, 1))
+            .await
+            .unwrap();
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Deferred, as core 0 is stalled. A sleep too short here or above only lets this pass
+    // without testing anything, never fail.
+    producer
+        .publish(publish(&name, &records, 3, 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(node.move_shard(shard, 1).await);
+    storage::hold_wal_writes(false);
+
+    let mut acks = [
+        expect_ack(&mut producer).await,
+        expect_ack(&mut producer).await,
+    ];
+    acks.sort();
+    let [(_, parked_id, _), (_, later_id, _)] = acks;
+    assert!(parked_id > 0, "the parked write was dropped as old");
+    assert!(parked_id < later_id, "{parked_id} after {later_id}");
+    drop((producer, stall));
+    node.shutdown();
+}
