@@ -114,6 +114,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 - Reads come from memory, then the local disk, then S3. A reader catching up becomes live when it reaches recent data in memory.
 - A client-held cursor needs nothing on the server.
 - A named cursor is stored on the server as `(stream, name) → id`, with the stream and the name each kept as a key hash (section 1). It moves forward only, through `COMMIT`, which gives at-least-once delivery. Rewinding is an explicit reset.
+- Every change to a named cursor, a sink's included, is written at once to the node's local key-value store under a key of its own, so a process crash doesn't move it back. The core doesn't wait for it: one writer keeps the latest value of each cursor and saves them in batches. S3 gets cursors with the stream's metadata at each seal, for when the machine is lost.
 
 ### 5.2 Delivery to connected clients
 
@@ -275,7 +276,7 @@ The metadata is last id, the highest expired id, state, config, cursors and the 
 
 **Object table:** one row per object, kept per node, holding its kind (seal, dedicated or compacted), its state (local not uploaded, uploaded and cached, or uploaded only), which longer classes it holds streams of (set by the compactor, and added to at each later look), and the compacted objects that replace it, per class and range of stream hashes. An upload or eviction changes one row, never a stream. A reader goes through the row: a local file is read through a memory map, anything else from S3, and a replaced object leads to its compacted object. A stream's list is rewritten to the compacted ids when the stream is next loaded or appended to, an hour at a time once all of that hour's ids are replaced, so the list stays in record order.
 
-**Local store:** one key per stream for the metadata, the object list in chunks of about 256 ids keyed by the first id so that a seal appends to the last chunk and expiry deletes whole chunks, and one key per object table row.
+**Local store:** one key per stream for the metadata, the object list in chunks of about 256 ids keyed by the first id so that a seal appends to the last chunk and expiry deletes whole chunks, one key per object table row, and one key per named cursor (section 5.1). A cursor's key overrides the metadata's copy when the stream is loaded, and a stream's delete removes its cursor keys with its tombstone.
 
 **Checkpoints:** at each seal, changed metadata is written to the local store and to an S3 checkpoint. A checkpoint holds the object table rows that changed, for uploaded objects only since another machine can't read a local file, and the metadata of streams whose state, config, cursors or sinks changed. Object lists and last ids are left out, because they are rebuilt from the last-id sections of objects newer than the last full checkpoint. Every few seals a full checkpoint holds everything. Checkpoints go into shared files, so PUTs don't grow with stream count, and they are separate from segments because they must outlive record retention. The key-value store stays out of the write path.
 

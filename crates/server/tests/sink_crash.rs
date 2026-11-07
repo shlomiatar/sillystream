@@ -293,14 +293,21 @@ async fn webhook_case(point: &str) {
     if point == "sink.after_delivery" {
         assert!(!before.is_empty(), "it delivered, then died");
     }
-    // Whatever was delivered and not committed comes again as the very same delivery.
+    // Whatever was delivered and not committed comes again as the very same delivery. After the
+    // commit, the cursor is saved at once (section 5.1), so it comes again only if the kill beat
+    // that save, and then as the same delivery too.
     for (first_id, last_id, data) in &before {
         let again = seen
             .iter()
             .skip(before.len())
-            .find(|(_, _, other)| other == data)
-            .expect("the record not committed comes again");
-        assert_eq!((again.0, again.1), (*first_id, *last_id));
+            .find(|(_, _, other)| other == data);
+        match again {
+            Some(again) => assert_eq!((again.0, again.1), (*first_id, *last_id)),
+            None => assert_eq!(
+                point, "sink.after_cursor",
+                "the record not committed comes again"
+            ),
+        }
     }
     let order: Vec<u64> = seen[before.len()..].iter().map(|seen| seen.0).collect();
     assert!(

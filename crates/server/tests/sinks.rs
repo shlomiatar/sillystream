@@ -2308,10 +2308,11 @@ async fn a_forward_across_a_restart_with_a_stale_cursor_writes_no_duplicate() {
     )
     .await;
     wait_for_cursor(&mut client, STREAM, 44, run.last_id).await;
-    // The cursor moved after the sink's last checkpoint, so the restart goes back to `earliest`
-    // (D143), and every record is forwarded again.
+    // The cursor moved after the sink's last checkpoint, and a crash took it before it was
+    // saved, so the restart goes back to `earliest` (D143) and every record is forwarded again.
     drop(client);
     drop(node.shutdown());
+    forget_saved_cursors(&disk.dir.path().join("metadata"));
 
     let node = disk.start(config());
     let mut client = node.client(0).await;

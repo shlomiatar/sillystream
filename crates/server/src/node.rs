@@ -37,7 +37,8 @@ use crate::message::{
     StateChange, StateOpMsg, StreamConfig, StreamConfigPatch, StreamInfo, WriteMsg,
 };
 use crate::metadata::{
-    CheckpointDone, CheckpointJob, Checkpointer, LocalMeta, Upload, run_checkpointer, run_loader,
+    CheckpointDone, CheckpointJob, Checkpointer, CursorSave, LocalMeta, Upload, run_checkpointer,
+    run_cursor_saver, run_loader,
 };
 use crate::pages::{PAGE_CACHE_BYTES, PageCache};
 use crate::placement::{ShardMove, plan_moves, shard_of};
@@ -1129,6 +1130,14 @@ impl Node {
         let mut threads = Vec::with_capacity(core_count + 1);
         let (to_control, control_rx) = mpsc::unbounded_channel();
         let loader = recovered.as_ref().map(|_| mpsc::unbounded_channel());
+        // Only the cores hold senders, so the saver ends with them (section 5.1).
+        let (cursor_saves, cursor_saves_rx) = match recovered {
+            Some(_) => {
+                let (tx, rx) = mpsc::unbounded_channel::<CursorSave>();
+                (Some(tx), Some(rx))
+            }
+            None => (None, None),
+        };
         let (sink_notes_tx, sink_notes) = mpsc::unbounded_channel::<SinkNote>();
         let core_limit = config
             .active_stream_limit
@@ -1160,6 +1169,7 @@ impl Node {
                 stores: stores.clone(),
                 accounts: accounts.clone(),
                 loader: loader.as_ref().map(|(tx, _)| tx.clone()),
+                cursor_saves: cursor_saves.clone(),
                 sink_notes: sink_notes_tx.clone(),
             });
             let runtime = runtime()?;
@@ -1175,6 +1185,7 @@ impl Node {
         }
         // Keeps its own copy of what a seal or rebalance needs.
         drop(core_to_node);
+        drop(cursor_saves);
 
         let total_shards = config.virtual_shard_count + config.override_shard_count;
         let location = (0..total_shards)
@@ -1277,6 +1288,14 @@ impl Node {
                         });
                     })?,
             );
+            if let Some(rx) = cursor_saves_rx {
+                let local = Arc::clone(&parts.local);
+                meta_threads.push(
+                    std::thread::Builder::new()
+                        .name("cursor-saver".to_owned())
+                        .spawn(move || run_cursor_saver(rx, local))?,
+                );
+            }
             let (local, store, control, stop) = (
                 parts.local,
                 Arc::clone(&store),

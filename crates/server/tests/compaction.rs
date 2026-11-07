@@ -619,9 +619,10 @@ async fn a_restart_that_lost_the_cursor_redoes_nothing_and_loses_nothing() {
     node.compact_now(&RetentionClass::ALL).await.unwrap();
     let outputs = disk.objects("7d").await;
     assert_eq!(outputs.len(), 1);
-    // The cursor moved after the checkpoint, and nothing has saved it since.
+    // The cursor moved after the checkpoint, and a crash took it before it was saved.
     drop(client);
     node.shutdown();
+    forget_saved_cursors(&disk.metadata_dir());
 
     let node = disk.start(config(1));
     let connection = node.connection(0).await.unwrap();

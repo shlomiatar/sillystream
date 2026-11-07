@@ -265,6 +265,80 @@ async fn a_retry_two_files_on_is_a_new_record() {
     node.shutdown();
 }
 
+/// A cursor is saved as it changes (section 5.1), so a restart before the next seal keeps a
+/// commit and a reset made since the last one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_change_survives_a_restart_before_the_next_seal() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(2));
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    let (second, _) = publish_one(&mut client, "a", 2, b"two").await;
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut named = Subscription::new(1, key("a"), 0);
+    named.name = Some(key("worker"));
+    connection.subscribe(named);
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.records(1).len() >= 2
+    })
+    .await;
+    assert!(node.seal_and_checkpoint().await);
+
+    connection.commit(1, second);
+    connection.reset_cursor(key("a"), key("other"), first);
+    assert_eq!(
+        connection.read_cursor(key("a"), key("worker")).await,
+        Some(second)
+    );
+    assert_eq!(
+        connection.read_cursor(key("a"), key("other")).await,
+        Some(first)
+    );
+    drop((client, connection));
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(2));
+    let connection = node.connection(0).await.unwrap();
+    assert_eq!(
+        connection.read_cursor(key("a"), key("worker")).await,
+        Some(second)
+    );
+    assert_eq!(
+        connection.read_cursor(key("a"), key("other")).await,
+        Some(first)
+    );
+    drop(connection);
+    node.shutdown();
+}
+
+/// A delete takes its stream's saved cursors with it, so a stream made again under the name
+/// starts with none (section 7.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_made_again_after_a_delete_has_none_of_its_cursors() {
+    let disk = Disk::new();
+    let (node, _) = disk.start(manual_config(1));
+    let mut client = node.client(0).await;
+    let (first, _) = publish_one(&mut client, "a", 1, b"one").await;
+    let connection = node.connection(0).await.unwrap();
+    connection.reset_cursor(key("a"), key("worker"), first);
+    assert_eq!(
+        connection.read_cursor(key("a"), key("worker")).await,
+        Some(first)
+    );
+    assert!(client.delete_stream(key("a")).await);
+    publish_one(&mut client, "a", 2, b"again").await;
+    assert_eq!(connection.read_cursor(key("a"), key("worker")).await, None);
+    drop((client, connection));
+    node.shutdown();
+
+    let (node, _) = disk.start(manual_config(1));
+    let connection = node.connection(0).await.unwrap();
+    assert_eq!(connection.read_cursor(key("a"), key("worker")).await, None);
+    drop(connection);
+    node.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_empty_wal_warning_is_only_for_a_node_that_had_a_generation() {
     let disk = Disk::new();
