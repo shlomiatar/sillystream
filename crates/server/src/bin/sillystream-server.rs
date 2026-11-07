@@ -70,6 +70,37 @@ fn main() -> ExitCode {
     }
 }
 
+/// Raises the soft limit on open files as far as the hard limit and the system allow, since each
+/// sink attempt and client holds one, and returns the soft limit then in force (D295).
+#[allow(unsafe_code)]
+fn raise_open_files_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return 256;
+    }
+    // macOS refuses a soft limit past its per-process maximum, which can be below the hard one,
+    // so OPEN_MAX (10,240) is tried after it.
+    for wanted in [limit.rlim_max.min(1 << 20), 10_240] {
+        if wanted <= limit.rlim_cur {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: wanted,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: setrlimit only reads the struct it is given.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
+            limit.rlim_cur = wanted;
+            break;
+        }
+    }
+    limit.rlim_cur
+}
+
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut listen = None;
@@ -93,6 +124,7 @@ fn run() -> Result<(), String> {
     let mut sink = SinkConfig::default();
     let mut sink_archive_store = None;
     let mut sink_ca_file = None;
+    let mut sink_max_in_flight = None;
     let mut trace_catch_up = false;
     while let Some(flag) = args.next() {
         if flag == "--help" {
@@ -137,8 +169,9 @@ fn run() -> Result<(), String> {
             "--sink-archive-store" => sink_archive_store = Some(value),
             "--sink-pool-threads" => sink.pool_thread_count = number(&value)? as usize,
             "--sink-max-in-flight" => {
-                sink.in_flight_max_count =
-                    u32::try_from(number(&value)?).map_err(|_| format!("{flag} is too large"))?;
+                sink_max_in_flight = Some(
+                    u32::try_from(number(&value)?).map_err(|_| format!("{flag} is too large"))?,
+                );
             }
             "--trace-catch-up" => {
                 trace_catch_up = match value.as_str() {
@@ -212,6 +245,12 @@ fn run() -> Result<(), String> {
         check_store(&config)?;
         sink.archive_store = Some(build_store(&config).map_err(|error| error.to_string())?);
     }
+    let open_files = raise_open_files_limit();
+    sink.in_flight_max_count = sink_max_in_flight.unwrap_or_else(|| {
+        let machine_cores =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        server::in_flight_max_for(machine_cores, open_files)
+    });
     node.sink = sink;
     node.local_cache = Some(LocalCacheConfig {
         dir: data_dir.join("cache"),

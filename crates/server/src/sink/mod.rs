@@ -52,7 +52,8 @@ pub struct SinkConfig {
     pub budget_bytes: u64,
     /// The most webhook and archive attempts in flight across the node, whatever the number of
     /// sinks, since each can hold a socket. It has to stay well under the process's descriptor
-    /// limit. Attempts past it wait their turn, and waiting isn't a failure.
+    /// limit: the server picks it with `in_flight_max_for`. Attempts past it wait their turn, and
+    /// waiting isn't a failure.
     pub in_flight_max_count: u32,
     /// How long before unread data expires the sink warns.
     pub expire_warn_ms: u64,
@@ -69,6 +70,22 @@ pub struct SinkConfig {
     pub extra_roots_pem: Option<Vec<u8>>,
     pub resolver: Option<Arc<dyn SinkResolver>>,
     pub hook: Option<Arc<dyn SinkHook>>,
+}
+
+/// Webhook and archive attempts in flight per core, and the most for any machine (D295).
+const IN_FLIGHT_PER_CORE_COUNT: u32 = 4_096;
+const IN_FLIGHT_CEILING_COUNT: u32 = 65_536;
+
+/// The most webhook and archive attempts a node should have in flight: 4,096 per core up to
+/// 65,536, and no more than half the descriptors the process may open, since clients, the WAL and
+/// segments need the rest (D295).
+pub fn in_flight_max_for(core_count: usize, open_files_limit: u64) -> u32 {
+    let wanted = u32::try_from(core_count)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(IN_FLIGHT_PER_CORE_COUNT)
+        .min(IN_FLIGHT_CEILING_COUNT);
+    let allowed = u32::try_from(open_files_limit / 2).unwrap_or(u32::MAX);
+    wanted.min(allowed).max(1)
 }
 
 impl Default for SinkConfig {

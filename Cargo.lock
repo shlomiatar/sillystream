@@ -1930,6 +1930,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hmac",
+ "libc",
  "object_store",
  "proptest",
  "proto",

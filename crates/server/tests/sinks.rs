@@ -3402,3 +3402,14 @@ async fn a_commit_from_before_an_update_stops_at_what_was_visible_then() {
     drop(client);
     harness.finish();
 }
+
+#[test]
+fn attempts_in_flight_follow_the_cores_and_the_open_file_limit() {
+    let plenty = 1 << 20;
+    assert_eq!(server::in_flight_max_for(1, plenty), 4_096);
+    assert_eq!(server::in_flight_max_for(8, plenty), 32_768);
+    assert_eq!(server::in_flight_max_for(16, plenty), 65_536);
+    assert_eq!(server::in_flight_max_for(192, plenty), 65_536, "2^16 at most");
+    assert_eq!(server::in_flight_max_for(8, 256), 128, "half the descriptors");
+    assert_eq!(server::in_flight_max_for(8, 0), 1);
+}

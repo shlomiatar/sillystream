@@ -47,8 +47,8 @@ pub use placement::{ShardCounters, ShardMove, plan_moves, shard_of};
 pub use recovery::{RecoverConfig, RecoveryReport};
 pub use sink::{
     SINK_CAP_COUNT, SINK_TEXT_MAX_BYTES, SinkAction, SinkConfig, SinkHook, SinkResolver, SinkStep,
-    StatusClass, WebhookUrl, backoff_ms, classify_status, is_private_address, parse_url,
-    signature_hex,
+    StatusClass, WebhookUrl, backoff_ms, classify_status, in_flight_max_for, is_private_address,
+    parse_url, signature_hex,
 };
 pub use slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
 pub use state::{MAX_STATE_BYTES, StateError, StateOp, StreamState, apply_op, check_doc};
