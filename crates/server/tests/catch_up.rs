@@ -471,9 +471,20 @@ async fn reading_before_retention_by_explicit_id_is_error_7() {
         .await
         .unwrap();
     let old_head = expect_ack(&mut client).await.1;
-    assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
-
-    harness.clock.advance(2 * MS_PER_DAY);
+    // The upload lands after the clock has moved, so adding it to the list expires it at once,
+    // and the highest expired id goes past the head (section 7.4).
+    harness.store.hold();
+    {
+        let seal = node.seal();
+        tokio::pin!(seal);
+        tokio::select! {
+            outcome = &mut seal => panic!("the PUT is held: {outcome:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(QUIET_MS)) => {}
+        }
+        harness.clock.advance(2 * MS_PER_DAY);
+        harness.store.release();
+        assert!(matches!(seal.await, SealOutcome::Uploaded { .. }));
+    }
     let mut connection = node.connection(0).await.unwrap();
     let mut heard = Heard::default();
 

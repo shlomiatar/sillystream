@@ -1671,7 +1671,9 @@ impl Core {
         .max(stream.delivery.floor_id);
         // State outlives records, and this reads no records (section 7.4).
         if from != 0 && from != u64::MAX && !message.state_only {
-            if cursor < stream.delivery.expired_through {
+            // At or past the head nothing can be missed, though expiry puts the highest
+            // expired id at the cutoff, past an idle stream's head (section 7.4).
+            if cursor < stream.delivery.expired_through && cursor < head {
                 self.send_catch(
                     sub,
                     CatchReply::Fail {
@@ -1928,7 +1930,9 @@ impl Core {
             );
             return;
         }
-        if message.after < stream.delivery.expired_through {
+        // As at a subscribe: nothing past the head can have expired.
+        let head = stream.delivery.visible_head(stream.ids.last_id());
+        if message.after < stream.delivery.expired_through && message.after < head {
             self.send_catch(
                 message.sub,
                 CatchReply::Fail {
@@ -1940,7 +1944,6 @@ impl Core {
         }
         let limit = stream.delivery.visible_through;
         if message.after >= limit {
-            let head = stream.delivery.visible_head(stream.ids.last_id());
             let state_ver = stream.delivery.visible_state.0;
             self.attach_live(
                 &message.stream,

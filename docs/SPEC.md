@@ -255,7 +255,7 @@ Deletion is purely retention: whole hour prefixes expire, and nothing else delet
 - New segments go to the `sealed/` prefix, which expires after about 2 days. The `1d` class is served from here and is never compacted.
 - Longer classes are copied by compaction into their own prefix, which expires by that class.
 - The delete job checks how far compaction has progressed before expiring anything, so a stalled compactor can't destroy data. An S3 lifecycle rule alone can't do that. A `sealed/` hour goes only once every class's cursor has passed all its manifests and each object's row says every longer class it holds has a compacted copy. A class raised after its worker passed an object shows up as a class held with no copy: the job copies it then, as compaction would, and the hour goes at a later run. An object a source failure left behind keeps its hour. The job messages no stream.
-- **No per-stream work:** an object id holds its time, so whether an object is expired for a stream follows from the stream's class. The expired front of a stream's object list is dropped whenever the stream is loaded or appended to, and its highest expired id is the larger of the stored one and the first id at the cutoff.
+- **No per-stream work:** an object id holds its time, so whether an object is expired for a stream follows from the stream's class. The expired front of a stream's object list is dropped whenever the stream is loaded or appended to, and its highest expired id is the larger of the stored one and the first id at the cutoff. A position below it has lost records, unless it is at or past the head: nothing after the head can have expired.
 
 ### 7.5 Compaction
 
