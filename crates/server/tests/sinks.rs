@@ -281,6 +281,35 @@ async fn wait_for_cursor(client: &mut Client, stream: &str, sink_id: u64, at_lea
     }
 }
 
+/// An archive writes what has waited its flush time by its own clock (section 9), so this moves
+/// the clock on while it waits.
+async fn wait_for_archive(
+    client: &mut Client,
+    clock: &ManualClock,
+    stream: &str,
+    sink_id: u64,
+    at_least: u64,
+) {
+    let started = Instant::now();
+    loop {
+        let (_, cursor) = sink_of(client, stream, sink_id).await;
+        if cursor >= at_least {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(WAIT_MS),
+            "the cursor stayed at {cursor}, below {at_least}"
+        );
+        clock.advance(1_000);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Every record of the objects, in name order, and that none is in two of them.
+fn each_once(objects: &[(String, Vec<Vec<u8>>)]) -> usize {
+    objects.iter().map(|(_, data)| data.len()).sum()
+}
+
 async fn wait_for_pause(client: &mut Client, stream: &str, sink_id: u64) -> String {
     let started = Instant::now();
     loop {
@@ -1281,7 +1310,7 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = 1_000;
+    config.sink.archive_flush_ms = 1_000;
     let harness = Harness::new(config);
     let node = harness.node();
     let clock = harness.clock.clone();
@@ -1295,18 +1324,17 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
     };
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
 
-    // Three windows' worth, with data bytes the server has no business reading.
+    // In three bursts, with data bytes the server has no business reading.
     let mut last = 0;
     let mut seq = 0;
-    for _window in 0..3 {
+    for _burst in 0..3 {
         for at in 0..5u8 {
             seq += 1;
             let data: Vec<u8> = (0..=at).map(|byte| byte ^ 0xA5).collect();
             last = send(&mut client, STREAM, &data, seq).await;
         }
-        clock.advance(1_000);
+        wait_for_archive(&mut client, &clock, STREAM, 5, last).await;
     }
-    wait_for_cursor(&mut client, STREAM, 5, last).await;
 
     let prefix = object_store::path::Path::from_iter(["archive", &key(STREAM).to_string(), "5"]);
     let listed = store.list_with_delimiter(Some(&prefix)).await.unwrap();
@@ -1316,7 +1344,7 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
         .map(|object| object.location.clone())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 3, "one object per window: {names:?}");
+    assert!(!names.is_empty());
     let mut archived = Vec::new();
     for name in &names {
         let bytes = store.get(name).await.unwrap().bytes().await.unwrap();
@@ -1327,8 +1355,8 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
         let file = name.filename().unwrap();
         assert_eq!(
             file,
-            format!("{:020}-{:020}.records", ids[0], ids[ids.len() - 1]),
-            "the name is the delivery's first and last id"
+            format!("{:020}.records", ids[0]),
+            "the name is the object's first id"
         );
         archived.extend_from_slice(&bytes);
     }
@@ -1345,14 +1373,13 @@ async fn an_archive_killed_after_its_put_doesnt_write_a_second_object() {
     let hook = KillScript::with(&[(SinkStep::AfterDelivery, 2)]);
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = 1_000;
+    config.sink.archive_flush_ms = 1_000;
     config.sink.hook = Some(hook.clone());
     let harness = Harness::new(config);
     let node = harness.node();
     let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
     let last = send(&mut client, STREAM, b"one", 1).await;
-    harness.clock.advance(1_000);
     let spec = SinkSpec {
         kind: "archive".to_owned(),
         on_expire: "stop".to_owned(),
@@ -1360,7 +1387,7 @@ async fn an_archive_killed_after_its_put_doesnt_write_a_second_object() {
         ..SinkSpec::default()
     };
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
-    wait_for_cursor(&mut client, STREAM, 5, last).await;
+    wait_for_archive(&mut client, &harness.clock, STREAM, 5, last).await;
     assert_eq!(hook.kill_count.load(Ordering::SeqCst), 2);
     let prefix = object_store::path::Path::from_iter(["archive", &key(STREAM).to_string(), "5"]);
     let listed = store.list_with_delimiter(Some(&prefix)).await.unwrap();
@@ -2398,16 +2425,16 @@ async fn archive_objects(
     objects
 }
 
-/// However the first read was framed, a repeat has the same `{first_id, last_id}`, so it lands
-/// on the same name and every record is in one object.
+/// However much the first try read, a repeat begins at the same first id, finds that object,
+/// and goes on past its last record, so no record is in two objects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_killed_after_its_put_repeats_the_same_batch_for_many_records() {
+async fn an_archive_killed_after_its_put_goes_on_past_what_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let hook = KillScript::with(&[(SinkStep::AfterDelivery, 1)]);
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = 1_000;
+    config.sink.archive_flush_ms = 1_000;
     config.sink.hook = Some(hook.clone());
     let harness = Harness::new(config);
     let mut client = harness.node().client(0).await;
@@ -2425,14 +2452,12 @@ async fn an_archive_killed_after_its_put_repeats_the_same_batch_for_many_records
     for seq in 1..=150 {
         last = send(&mut client, STREAM, &payload, seq).await;
     }
-    harness.clock.advance(1_000);
-    wait_for_cursor(&mut client, STREAM, 5, last).await;
+    wait_for_archive(&mut client, &harness.clock, STREAM, 5, last).await;
     assert_eq!(hook.kill_count.load(Ordering::SeqCst), 1);
     let objects = archive_objects(&store, STREAM, 5).await;
-    let total: usize = objects.iter().map(|(_, data)| data.len()).sum();
     assert_eq!(
-        (objects.len(), total),
-        (1, 150),
+        each_once(&objects),
+        150,
         "{:?}",
         objects
             .iter()
@@ -2443,24 +2468,34 @@ async fn an_archive_killed_after_its_put_repeats_the_same_batch_for_many_records
     harness.finish();
 }
 
-/// A window the clock has closed isn't closed for this sink until it has read all of it, however
-/// a catch-up happens to be framed. No kill here: the batches themselves must not depend on it.
+/// What a try before a crash wrote can end before what is read again: the sink goes on past
+/// that object's last record, and writes the rest as an object of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_archive_catching_up_waits_to_read_the_whole_window() {
+async fn an_archive_goes_on_past_a_shorter_object_from_an_earlier_try() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = 1_000;
+    config.sink.archive_flush_ms = 1_000;
     let harness = Harness::new(config);
-    let mut client = harness.node().client(0).await;
+    let node = harness.node();
+    let mut client = node.client(0).await;
     make_stream(&mut client, STREAM).await;
-    let payload = vec![7u8; 4 * 1024];
     let mut last = 0;
-    for seq in 1..=1_500 {
-        last = send(&mut client, STREAM, &payload, seq).await;
+    for seq in 1..=5 {
+        last = send(&mut client, STREAM, format!("r{seq}").as_bytes(), seq).await;
     }
-    harness.clock.advance(1_000);
+    let stored = stored_bytes(node, STREAM, last, false).await;
+    let first = format::RecordHeader::read(&stored).unwrap();
+    let first_bytes = stored[..first.total_bytes()].to_vec();
+    let path = object_store::path::Path::from_iter([
+        "archive".to_owned(),
+        key(STREAM).to_string(),
+        "5".to_owned(),
+        format!("{:020}.records", first.id),
+    ]);
+    store.put(&path, first_bytes.into()).await.unwrap();
+
     put_sink(
         &mut client,
         STREAM,
@@ -2469,23 +2504,55 @@ async fn an_archive_catching_up_waits_to_read_the_whole_window() {
         SinkStart::Earliest,
     )
     .await;
-    wait_for_cursor(&mut client, STREAM, 5, last).await;
+    wait_for_archive(&mut client, &harness.clock, STREAM, 5, last).await;
     let objects = archive_objects(&store, STREAM, 5).await;
-    assert_eq!(objects.len(), 1, "{:?}", objects[0].0);
-    assert_eq!(objects[0].1.len(), 1_500);
+    assert_eq!(objects.len(), 2, "{objects:?}");
+    assert_eq!(objects[0].1, [b"r1".to_vec()]);
+    assert_eq!(each_once(&objects), 5);
     drop(client);
     harness.finish();
 }
 
-/// The name holds the ends and not the filter, so a wider read can land on a name that holds
-/// fewer records. What it can't do is pass as delivered.
+/// A catch-up writes every record once, however its reads happen to be framed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_catching_up_writes_each_record_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let mut config = config();
+    config.sink.archive_store = Some(store.clone());
+    config.sink.archive_flush_ms = 1_000;
+    let harness = Harness::new(config);
+    let mut client = harness.node().client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let payload = vec![7u8; 4 * 1024];
+    let mut last = 0;
+    for seq in 1..=1_500 {
+        last = send(&mut client, STREAM, &payload, seq).await;
+    }
+    put_sink(
+        &mut client,
+        STREAM,
+        5,
+        archive_spec(None),
+        SinkStart::Earliest,
+    )
+    .await;
+    wait_for_archive(&mut client, &harness.clock, STREAM, 5, last).await;
+    let objects = archive_objects(&store, STREAM, 5).await;
+    assert_eq!(each_once(&objects), 1_500);
+    drop(client);
+    harness.finish();
+}
+
+/// The name holds the first id and not the filter, so a wider read can land on a name that holds
+/// other records. What it can't do is pass as delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = 1_000;
+    config.sink.archive_flush_ms = 1_000;
     let harness = Harness::new(config);
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
@@ -2501,7 +2568,6 @@ async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently(
             .unwrap();
         ids.push(expect_ack(&mut client).await.1);
     }
-    harness.clock.advance(1_000);
     put_sink(
         &mut client,
         STREAM,
@@ -2510,7 +2576,7 @@ async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently(
         SinkStart::Earliest,
     )
     .await;
-    wait_for_cursor(&mut client, STREAM, 5, ids[2]).await;
+    wait_for_archive(&mut client, &harness.clock, STREAM, 5, ids[2]).await;
     put_sink(
         &mut client,
         STREAM,
@@ -2529,6 +2595,9 @@ async fn an_archive_name_taken_by_other_bytes_pauses_and_loses_nothing_silently(
         )
         .await
         .unwrap();
+    // Read again, then due.
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
+    harness.clock.advance(1_000);
     let reason = wait_for_pause(&mut client, STREAM, 5).await;
     assert!(reason.contains("already holds"), "{reason}");
     let (_, cursor) = sink_of(&mut client, STREAM, 5).await;
@@ -3122,7 +3191,7 @@ async fn an_archive_skip_keeps_a_batch_with_younger_records() {
     std::fs::write(&blocker, b"in the way").unwrap();
     let mut config = config();
     config.sink.archive_store = Some(store.clone());
-    config.sink.archive_window_ms = DAY_MS;
+    config.sink.archive_flush_ms = DAY_MS;
     config.sink.max_failure_count = u32::MAX;
     let harness = Harness::new(config);
     let now_ms = server::Clock::now_ms(&harness.clock);
@@ -3133,10 +3202,12 @@ async fn an_archive_skip_keeps_a_batch_with_younger_records() {
     spec.on_expire = "skip".to_owned();
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
     send(&mut client, STREAM, b"old", 1).await;
+    // Read before the clock moves, so it waits from now.
+    tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
     harness.clock.advance(DAY_MS - 1_000);
     let fresh = send(&mut client, STREAM, b"fresh", 2).await;
     tokio::time::sleep(Duration::from_millis(QUIET_MS)).await;
-    // This closes the window and expires `old`, and the put fails.
+    // `old` has waited its flush time and expired, and the put fails.
     harness.clock.advance(1_000);
     tokio::time::sleep(Duration::from_millis(QUIET_MS * 3)).await;
     let (spec, cursor) = sink_of(&mut client, STREAM, 5).await;

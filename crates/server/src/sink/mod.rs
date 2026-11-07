@@ -58,8 +58,9 @@ pub struct SinkConfig {
     pub in_flight_max_count: u32,
     /// How long before unread data expires the sink warns.
     pub expire_warn_ms: u64,
-    /// `archive`: records of one such window go in one object, up to the byte budget.
-    pub archive_window_ms: u64,
+    /// `archive`: how long a record waits for more to join its object, which is written sooner
+    /// once it fills the byte budget (section 9).
+    pub archive_flush_ms: u64,
     /// How often a task looks at the clock while it has something waiting on it.
     pub tick_ms: u64,
     /// How often a paused sink checks whether its unread data is about to expire.
@@ -86,7 +87,7 @@ impl Default for SinkConfig {
             concurrency_max_count: 64,
             in_flight_max_count: 256,
             expire_warn_ms: 3_600_000,
-            archive_window_ms: 10_000,
+            archive_flush_ms: 60_000,
             tick_ms: 50,
             paused_check_ms: 60_000,
             archive_store: None,

@@ -123,6 +123,8 @@ struct Unread {
     last_id: u64,
     item_count: u64,
     bytes: Bytes,
+    /// When the sink read it, by its own clock: `archive` writes what has waited long enough.
+    read_ms: u64,
 }
 
 /// What is sent as one, in order among the others.
@@ -142,6 +144,9 @@ enum Outcome {
     Delivered,
     /// `forward`: the target had it already, from a try before a crash or an update.
     AlreadyThere,
+    /// `archive`: an object of the same first id is there already, from a try before a crash,
+    /// and holds the records up to this id.
+    ArchivedThrough(u64),
     Retry(String),
     Permanent(String),
     Killed,
@@ -333,9 +338,9 @@ struct Reading<'a> {
     next_retention_refresh_ms: u64,
     /// Where a gap starts, if reading had to jump past what expired.
     gap_from: Option<u64>,
-    /// `archive`: a window the clock has closed, and the last id given out once it had. Nothing
-    /// more can join that window, so it is fully read when reading reaches this id.
-    closed_window: Option<(u64, u64)>,
+    /// `archive`: what an object written before this spell holds up to, which is read again
+    /// and skipped.
+    archived_through: u64,
     /// `forward`: one record per publish until the target takes one as new. What was published
     /// before this spell began can be any run of what is read again, and a batch overlapping
     /// its end would be taken whole as new or dropped whole (D189).
@@ -408,7 +413,7 @@ impl<'a> Reading<'a> {
             warned: spec.expiry_warning_id.is_some(),
             next_retention_refresh_ms: 0,
             gap_from: None,
-            closed_window: None,
+            archived_through: 0,
             probing: true,
             spec,
             worker,
@@ -433,7 +438,6 @@ impl<'a> Reading<'a> {
         self.subscribe(&connection, self.read_id);
         loop {
             let now_ms = self.worker.context.clock.now_ms();
-            self.note_closed_window(now_ms).await;
             self.form_deliveries(now_ms);
             if let Some(spell) = self.start_due(now_ms).await {
                 return spell;
@@ -542,6 +546,7 @@ impl<'a> Reading<'a> {
 
     /// Takes a copy of each new record, reading headers alone (section 2.2).
     async fn take_records(&mut self, bytes: &Bytes) -> Result<(), String> {
+        let read_ms = self.worker.context.clock.now_ms();
         let mut at = 0;
         while at < bytes.len() {
             let header =
@@ -578,6 +583,7 @@ impl<'a> Reading<'a> {
                             last_id,
                             item_count,
                             bytes: Bytes::new(),
+                            read_ms,
                         }),
                     }
                 } else {
@@ -590,6 +596,7 @@ impl<'a> Reading<'a> {
                         last_id,
                         item_count,
                         bytes: bytes.slice(at..end),
+                        read_ms,
                     });
                 }
             }
@@ -619,8 +626,8 @@ impl<'a> Reading<'a> {
     /// What the sink asked for, up to the node's figure, as with the byte budget (D209, D222).
     fn concurrency_limit(&self) -> usize {
         // A target keeps only the highest seq it has taken, so a forward overtaken by the next
-        // would be dropped as old.
-        if self.kind == Kind::Forward {
+        // would be dropped as old. An archive object begins where the one before it ended.
+        if matches!(self.kind, Kind::Forward | Kind::Archive) {
             return 1;
         }
         let max_count = self.worker.context.config.concurrency_max_count;
@@ -629,24 +636,30 @@ impl<'a> Reading<'a> {
 
     fn form_deliveries(&mut self, now_ms: u64) {
         let limit = self.concurrency_limit();
+        while let Some(front) = self.unread.front()
+            && front.last_id <= self.archived_through
+        {
+            self.held_bytes = self.held_bytes.saturating_sub(front.bytes.len() as u64);
+            self.unread.pop_front();
+        }
         while self.deliveries.len() < limit {
             let Some(first) = self.unread.front() else {
                 return;
             };
-            let delivery = match (self.kind, self.window_ms()) {
-                (Kind::Notify, _) => {
+            let delivery = match self.kind {
+                Kind::Notify => {
                     if !self.deliveries.is_empty() || now_ms < self.worker.next_notify_ms {
                         return;
                     }
                     self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
                     self.new_delivery(first, now_ms)
                 }
-                (Kind::Forward, _) if !self.probing => self.greedy_batch(now_ms),
-                (_, Some(_)) => match self.window_batch(now_ms) {
+                Kind::Forward if !self.probing => self.greedy_batch(now_ms),
+                Kind::Archive => match self.archive_batch(now_ms) {
                     Some(delivery) => delivery,
                     None => return,
                 },
-                (_, None) => self.new_delivery(first, now_ms),
+                Kind::Forward | Kind::Deliver => self.new_delivery(first, now_ms),
             };
             let take = match self.kind {
                 Kind::Notify => 1,
@@ -654,41 +667,6 @@ impl<'a> Reading<'a> {
             };
             self.unread.drain(..take);
             self.deliveries.push_back(delivery);
-        }
-    }
-
-    /// Once the clock has passed the window of what is first in line, asks how far the stream
-    /// has got. Ids never go back, so nothing given out after this can join that window.
-    async fn note_closed_window(&mut self, now_ms: u64) {
-        let Some(window_ms) = self.window_ms() else {
-            return;
-        };
-        let Some(first) = self.unread.front() else {
-            return;
-        };
-        let window = id_ms(first.first_id) / window_ms;
-        if now_ms / window_ms <= window
-            || self.closed_window.is_some_and(|(known, _)| known == window)
-        {
-            return;
-        }
-        let info = self
-            .worker
-            .client
-            .lock()
-            .await
-            .stream_info(self.worker.key.0)
-            .await;
-        if let Ok(info) = info {
-            self.closed_window = Some((window, info.stamped_id));
-        }
-    }
-
-    /// `archive`'s window, which its objects' records share. The other kinds have none.
-    fn window_ms(&self) -> Option<u64> {
-        match self.kind {
-            Kind::Archive => Some(self.worker.context.config.archive_window_ms.max(1)),
-            Kind::Deliver | Kind::Forward | Kind::Notify => None,
         }
     }
 
@@ -710,33 +688,16 @@ impl<'a> Reading<'a> {
         delivery
     }
 
-    /// Everything unread in one window, up to the budget, once no more can join it and all of it
-    /// has been read: a later record has arrived, or the clock has passed the window and reading
-    /// has reached what was given out by then. So the batch doesn't depend on how the records
-    /// happened to be framed, and a repeat has the same `{first_id, last_id}` (D190).
-    fn window_batch(&self, now_ms: u64) -> Option<Delivery> {
-        let window_ms = self.window_ms()?;
+    /// `archive`: everything unread, up to the budget, once that fills it or its oldest record
+    /// has waited the flush time (section 9). Nothing in it depends on the clock but when.
+    fn archive_batch(&self, now_ms: u64) -> Option<Delivery> {
         let first = self.unread.front()?;
-        let window = id_ms(first.first_id) / window_ms;
-        let mut delivery = self.new_delivery(first, now_ms);
-        let mut closed = self
-            .closed_window
-            .is_some_and(|(known, stamped_id)| known == window && self.read_id >= stamped_id);
-        for next in self.unread.iter().skip(1) {
-            if id_ms(next.first_id) / window_ms != window {
-                closed = true;
-                break;
-            }
-            if delivery.byte_count + next.bytes.len() as u64 > self.budget_bytes {
-                closed = true;
-                break;
-            }
-            delivery.last_id = next.last_id;
-            delivery.item_count += next.item_count;
-            delivery.byte_count += next.bytes.len() as u64;
-            delivery.bytes.push(next.bytes.clone());
-        }
-        (closed || delivery.byte_count >= self.budget_bytes).then_some(delivery)
+        let delivery = self.greedy_batch(now_ms);
+        let full =
+            delivery.byte_count >= self.budget_bytes || delivery.bytes.len() < self.unread.len();
+        let flush_ms = self.worker.context.config.archive_flush_ms;
+        let due = now_ms >= first.read_ms.saturating_add(flush_ms);
+        (full || due).then_some(delivery)
     }
 
     async fn start_due(&mut self, now_ms: u64) -> Option<Spell> {
@@ -797,7 +758,15 @@ impl<'a> Reading<'a> {
             .iter()
             .position(|delivery| delivery.first_id == first_id)?;
         self.deliveries[at].running = false;
+        let outcome = match outcome {
+            Outcome::ArchivedThrough(through) => match self.archived_part(at, through).await {
+                Some(outcome) => outcome,
+                None => return None,
+            },
+            other => other,
+        };
         match outcome {
+            Outcome::ArchivedThrough(_) => unreachable!("taken apart above"),
             Outcome::Delivered | Outcome::AlreadyThere => {
                 if matches!(outcome, Outcome::Delivered) {
                     // Taken as new: everything after it is past what an earlier try published.
@@ -863,6 +832,34 @@ impl<'a> Reading<'a> {
     }
 
     /// Moves the cursor over every delivery at the front that is done. `None` to stop.
+    /// An object already held this delivery's first records, up to `through`. All of them, or
+    /// more: the delivery is done, and what else it holds is skipped as it is read. Fewer: the
+    /// cursor moves past them, and the rest goes as a new object at once.
+    async fn archived_part(&mut self, at: usize, through: u64) -> Option<Outcome> {
+        let delivery = &mut self.deliveries[at];
+        if through >= delivery.last_id {
+            delivery.last_id = through;
+            self.archived_through = self.archived_through.max(through);
+            return Some(Outcome::AlreadyThere);
+        }
+        let mut dropped_bytes = 0;
+        while let Some(part) = delivery.bytes.first() {
+            let header = format::RecordHeader::read(part).ok()?;
+            if header.last_id() > through {
+                delivery.first_id = header.id;
+                break;
+            }
+            dropped_bytes += part.len() as u64;
+            delivery.item_count -= u64::from(header.count);
+            delivery.bytes.remove(0);
+        }
+        delivery.byte_count -= dropped_bytes;
+        delivery.next_try_ms = self.worker.context.clock.now_ms();
+        self.held_bytes = self.held_bytes.saturating_sub(dropped_bytes);
+        self.commit(through).await;
+        None
+    }
+
     async fn commit_delivered(&mut self) -> Option<()> {
         let mut through = None;
         while self.deliveries.front().is_some_and(|front| front.done) {
@@ -1201,7 +1198,7 @@ impl Attempt {
             "archive".to_owned(),
             self.stream.to_string(),
             self.sink_id.to_string(),
-            format!("{:020}-{:020}.records", self.first_id, self.last_id),
+            format!("{:020}.records", self.first_id),
         ]);
         let payload = PutPayload::from_iter(self.bytes.iter().cloned());
         let options = PutOptions {
@@ -1231,21 +1228,36 @@ impl Attempt {
             Ok(Err(error)) => return Outcome::Retry(format!("archive: {error}")),
             Err(_) => return Outcome::Retry("reading the archive object timed out".to_owned()),
         };
+        // One run of the stream's records begins at this first id, so of this delivery and what
+        // a try before a crash wrote, one is the start of the other.
         let mut left = &existing[..];
-        let same = self.bytes.iter().all(|part| {
-            let matches = left.starts_with(part);
-            if matches {
-                left = &left[part.len()..];
+        let mut same = true;
+        for part in &self.bytes {
+            if left.is_empty() {
+                break;
             }
-            matches
-        }) && left.is_empty();
-        if same {
-            Outcome::Delivered
-        } else {
-            Outcome::Permanent(format!(
-                "{path} already holds different records for this range, as a changed filter \
-                 can make; use another sink id to archive these"
-            ))
+            if !left.starts_with(part) {
+                same = false;
+                break;
+            }
+            left = &left[part.len()..];
+        }
+        let through = same
+            .then(|| {
+                format::Records::new(&existing)
+                    .map(|record| record.map(|record| record.header.last_id()))
+                    .collect::<Result<Vec<u64>, _>>()
+                    .ok()
+                    .and_then(|ids| ids.last().copied())
+            })
+            .flatten();
+        match through {
+            Some(through) if through == self.last_id => Outcome::Delivered,
+            Some(through) => Outcome::ArchivedThrough(through),
+            None => Outcome::Permanent(format!(
+                "{path} already holds different records from this id, as a changed filter can \
+                 make; use another sink id to archive these"
+            )),
         }
     }
 }
