@@ -624,7 +624,11 @@ async fn throughput(args: &Args, bin: &Path) -> Result<(), String> {
     println!("| ack | connections | record data bytes | publishes/s | MB/s of data |");
     println!("|---|---|---|---|---|");
     let mut run = 0;
-    for (ack, name) in [(AckLevel::Memory, "1"), (AckLevel::WalFsync, "2")] {
+    for (ack, name) in [
+        (AckLevel::Memory, "1"),
+        (AckLevel::WalFsync, "2"),
+        (AckLevel::SegmentInS3, "3"),
+    ] {
         if !levels.split(',').any(|level| level == name) {
             continue;
         }
