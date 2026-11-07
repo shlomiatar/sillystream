@@ -50,8 +50,6 @@ pub struct SinkConfig {
     pub notify_interval_ms: u64,
     /// What one sink may hold. It can set less, not more. One frame can pass it.
     pub budget_bytes: u64,
-    /// The most deliveries one sink has in flight. Its `concurrency` can be less, not more.
-    pub concurrency_max_count: u32,
     /// The most webhook and archive attempts in flight across the node, whatever the number of
     /// sinks, since each can hold a socket. It has to stay well under the process's descriptor
     /// limit. Attempts past it wait their turn, and waiting isn't a failure.
@@ -84,7 +82,6 @@ impl Default for SinkConfig {
             request_timeout_ms: 30_000,
             notify_interval_ms: 1_000,
             budget_bytes: 8 * 1024 * 1024,
-            concurrency_max_count: 64,
             in_flight_max_count: 256,
             expire_warn_ms: 3_600_000,
             archive_flush_ms: 60_000,

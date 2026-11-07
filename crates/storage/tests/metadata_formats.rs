@@ -38,18 +38,17 @@ fn sink() -> impl Strategy<Value = MetaSink> {
         any::<bool>(),
     )
         .prop_map(
-            |(sink_id, kind, url, target, filter, on_expire, concurrency, paused)| MetaSink {
+            |(sink_id, kind, url, target, filter, on_expire, interval, paused)| MetaSink {
                 sink_id,
                 kind,
                 url: url.clone(),
                 target: target.as_deref().map(key),
                 filter,
                 on_expire,
-                concurrency,
                 paused,
                 secret: url.clone(),
-                interval_ms: concurrency.into(),
-                budget_bytes: u64::from(concurrency) + 1,
+                interval_ms: interval.into(),
+                budget_bytes: u64::from(interval) + 1,
                 pause_reason: target.clone(),
                 gaps: if paused {
                     vec![storage::MetaSinkGap {
@@ -239,7 +238,6 @@ fn meta_bytes_are_exact() {
             target: Some(key("t")),
             filter: None,
             on_expire: "e".to_owned(),
-            concurrency: 13,
             paused: true,
             secret: Some("x".to_owned()),
             interval_ms: 20,
@@ -280,7 +278,6 @@ fn meta_bytes_are_exact() {
     body.extend_from_slice(&key("t").0);
     body.push(0);
     text(&mut body, b"e");
-    u32le(&mut body, 13);
     body.push(1);
     body.push(1);
     text(&mut body, b"x");

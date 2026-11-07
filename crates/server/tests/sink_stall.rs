@@ -99,7 +99,6 @@ async fn one_run(sink_count: u64, url: &str) -> Run {
                         url: Some(url.to_owned()),
                         secret: Some("k".to_owned()),
                         on_expire: "stop".to_owned(),
-                        concurrency: 1,
                         ..SinkSpec::default()
                     }),
                     start: SinkStart::Earliest,

@@ -93,7 +93,6 @@ pub struct SinkSpec {
     /// `D26`'s filter text, already checked.
     pub filter: Option<String>,
     pub on_expire: String,
-    pub concurrency: u32,
     pub paused: bool,
     /// `webhook.*`: the HMAC key. Never shown (D29).
     pub secret: Option<String>,

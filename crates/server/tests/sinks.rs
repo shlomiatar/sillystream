@@ -57,6 +57,14 @@ impl Seen {
         )
     }
 
+    /// `(id, data)` of each record the request held.
+    fn records(&self) -> Vec<(u64, Vec<u8>)> {
+        parse_records(&self.body)
+            .into_iter()
+            .map(|record| (record.0, record.3))
+            .collect()
+    }
+
     fn data(&self) -> Vec<u8> {
         let records = parse_records(&self.body);
         assert_eq!(records.len(), 1, "one record per delivery");
@@ -171,6 +179,30 @@ impl Receiver {
         self.seen.lock().unwrap().len()
     }
 
+    /// `(id, data)` of every record across every request, in the order they came.
+    fn records(&self) -> Vec<(u64, Vec<u8>)> {
+        self.seen().iter().flat_map(Seen::records).collect()
+    }
+
+    fn record_count(&self) -> usize {
+        self.records().len()
+    }
+
+    async fn wait_for_records(&self, count: usize) -> Vec<(u64, Vec<u8>)> {
+        wait_until("records to arrive", || self.record_count() >= count).await;
+        self.records()
+    }
+
+    /// No more records arrive for a while.
+    async fn stays_at_records(&self, count: usize) {
+        tokio::time::sleep(Duration::from_millis(QUIET_MS * 2)).await;
+        assert_eq!(
+            self.record_count(),
+            count,
+            "more records arrived than expected"
+        );
+    }
+
     async fn wait_for_count(&self, count: usize) -> Vec<Seen> {
         wait_until("requests to arrive", || self.count() >= count).await;
         self.seen()
@@ -211,7 +243,6 @@ fn deliver_spec(url: &str) -> SinkSpec {
         url: Some(url.to_owned()),
         secret: Some(SECRET.to_owned()),
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     }
 }
@@ -221,7 +252,6 @@ fn forward_spec(target: &str) -> SinkSpec {
         kind: "forward".to_owned(),
         target: Some(key(target)),
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     }
 }
@@ -401,7 +431,7 @@ impl SinkHook for KillScript {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn killed_between_delivery_and_cursor_it_redelivers_the_same_triple() {
+async fn killed_between_delivery_and_cursor_it_redelivers_from_the_same_id() {
     let receiver = Receiver::start().await;
     let hook = KillScript::with(&[(SinkStep::AfterDelivery, 1)]);
     let mut config = config();
@@ -425,23 +455,30 @@ async fn killed_between_delivery_and_cursor_it_redelivers_the_same_triple() {
         SinkStart::Earliest,
     )
     .await;
-    // More arrives while it is down, which must not change what it sends again.
-    send(&mut client, STREAM, b"later", 2).await;
-    let seen = receiver.wait_for_count(3).await;
+    // More arrives while it is down, which the delivery sent again can take on too.
+    let later = send(&mut client, STREAM, b"later", 2).await;
+    wait_until("the later record to arrive after the kill", || {
+        receiver
+            .seen()
+            .iter()
+            .skip(1)
+            .any(|seen| seen.triple().2 >= later)
+    })
+    .await;
+    let seen = receiver.seen();
     assert_eq!(hook.kill_count.load(Ordering::SeqCst), 1);
-    let want = (7, first_id, first_id + 4);
-    assert_eq!(seen[0].triple(), want);
-    assert_eq!(seen[1].triple(), want, "redelivered as the same delivery");
-    assert_eq!(seen[0].body, seen[1].body);
-    assert_ne!(seen[2].triple(), want);
+    assert_eq!(seen[0].triple().1, first_id);
+    assert_eq!(seen[1].triple().1, first_id, "sent again from the same id");
+    assert!(seen[1].body.starts_with(&seen[0].body));
     drop(client);
     harness.finish();
 }
 
 // ---------- ordered ----------
 
+/// One POST at a time, and what arrives while one is out goes together in the next, in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_delivery_is_in_flight_by_default() {
+async fn deliver_sends_one_batch_at_a_time_holding_what_came_meanwhile() {
     let receiver = Receiver::start().await;
     receiver.answer(Answer::Hold);
     let harness = Harness::new(config());
@@ -456,80 +493,22 @@ async fn one_delivery_is_in_flight_by_default() {
         SinkStart::Earliest,
     )
     .await;
-    let mut ids = Vec::new();
-    for seq in 1..=4 {
-        ids.push(send(&mut client, STREAM, format!("{seq}").as_bytes(), seq).await);
-    }
+    let mut ids = vec![send(&mut client, STREAM, b"1", 1).await];
     receiver.wait_for_count(1).await;
+    for seq in 2..=8 {
+        ids.push(send(&mut client, STREAM, seq.to_string().as_bytes(), seq).await);
+    }
     receiver.stays_at(1).await;
-    assert_eq!(
-        sink_of(&mut client, STREAM, 1).await.1,
-        0,
-        "nothing acked yet"
-    );
     receiver.answer(Answer::Status(200));
     receiver.release();
-    let seen = receiver.wait_for_count(4).await;
-    let firsts: Vec<u64> = seen.iter().map(|seen| seen.triple().1).collect();
-    assert_eq!(firsts, ids, "in id order");
+    let seen = receiver.wait_for_count(2).await;
     assert_eq!(receiver.peak_in_flight.load(Ordering::SeqCst), 1);
-    wait_for_cursor(&mut client, STREAM, 1, ids[3]).await;
-    drop(client);
-    harness.finish();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn opt_in_concurrency_respects_its_limit_and_the_cursor_waits_for_the_oldest() {
-    let receiver = Receiver::start().await;
-    receiver.answer(Answer::Hold);
-    let harness = Harness::new(config());
-    let node = harness.node();
-    let mut client = node.client(0).await;
-    make_stream(&mut client, STREAM).await;
-    let mut spec = deliver_spec(&receiver.url());
-    spec.concurrency = 3;
-    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
-    let mut ids = Vec::new();
-    for seq in 1..=8 {
-        ids.push(send(&mut client, STREAM, b"x", seq).await);
-    }
-    receiver.wait_for_count(3).await;
-    receiver.stays_at(3).await;
-    assert_eq!(receiver.peak_in_flight.load(Ordering::SeqCst), 3);
-    receiver.answer(Answer::Status(200));
-    receiver.release();
-    let seen = receiver.wait_for_count(8).await;
-    assert!(receiver.peak_in_flight.load(Ordering::SeqCst) <= 3);
-    let mut firsts: Vec<u64> = seen.iter().map(|seen| seen.triple().1).collect();
-    firsts.sort_unstable();
-    assert_eq!(firsts, ids, "each exactly once");
+    assert_eq!(seen[0].triple(), (1, ids[0], ids[0]));
+    assert_eq!(seen[1].triple(), (1, ids[1], ids[7]));
+    let held: Vec<u64> = seen[1].records().iter().map(|record| record.0).collect();
+    assert_eq!(held, ids[1..]);
     wait_for_cursor(&mut client, STREAM, 1, ids[7]).await;
-    drop(client);
-    harness.finish();
-}
-
-/// A stream admin asks for what it likes, and the node's figure is what isolates the others.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_sinks_concurrency_stops_at_the_nodes_limit() {
-    let receiver = Receiver::start().await;
-    receiver.answer(Answer::Hold);
-    let mut config = config();
-    config.sink.concurrency_max_count = 4;
-    let harness = Harness::new(config);
-    let node = harness.node();
-    let mut client = node.client(0).await;
-    make_stream(&mut client, STREAM).await;
-    let mut spec = deliver_spec(&receiver.url());
-    spec.concurrency = 1_000_000;
-    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
-    for seq in 1..=20 {
-        send(&mut client, STREAM, b"x", seq).await;
-    }
-    receiver.wait_for_count(4).await;
-    receiver.stays_at(4).await;
-    receiver.answer(Answer::Status(200));
-    receiver.release();
-    receiver.wait_for_count(20).await;
+    receiver.stays_at(2).await;
     drop(client);
     harness.finish();
 }
@@ -540,26 +519,24 @@ async fn sinks_together_stay_within_the_nodes_in_flight_limit() {
     let receiver = Receiver::start().await;
     receiver.answer(Answer::Hold);
     let mut config = config();
-    config.sink.concurrency_max_count = 4;
-    config.sink.in_flight_max_count = 5;
+    config.sink.in_flight_max_count = 2;
     let harness = Harness::new(config);
     let node = harness.node();
     let mut client = node.client(0).await;
     for stream in ["limit.a", "limit.b", "limit.c"] {
         make_stream(&mut client, stream).await;
-        let mut spec = deliver_spec(&receiver.url());
-        spec.concurrency = 4;
+        let spec = deliver_spec(&receiver.url());
         put_sink(&mut client, stream, 1, spec, SinkStart::Earliest).await;
         for seq in 1..=6 {
             send(&mut client, stream, b"x", seq).await;
         }
     }
-    receiver.wait_for_count(5).await;
-    receiver.stays_at(5).await;
-    assert_eq!(receiver.peak_in_flight.load(Ordering::SeqCst), 5);
+    receiver.wait_for_count(2).await;
+    receiver.stays_at(2).await;
+    assert_eq!(receiver.peak_in_flight.load(Ordering::SeqCst), 2);
     receiver.answer(Answer::Status(200));
     receiver.release();
-    receiver.wait_for_count(18).await;
+    wait_until("every record to arrive", || receiver.record_count() >= 18).await;
     for stream in ["limit.a", "limit.b", "limit.c"] {
         let (spec, _) = sink_of(&mut client, stream, 1).await;
         assert_eq!(spec.failure_count, 0, "waiting for a turn isn't a failure");
@@ -704,8 +681,9 @@ async fn deliver_signs_stored_bytes_and_skips_system_records_and_filtered_ones()
     assert_eq!(count, 2);
     last = last.max(state_first);
 
-    let seen = receiver.wait_for_count(4).await;
-    receiver.stays_at(4).await;
+    receiver.wait_for_records(4).await;
+    receiver.stays_at_records(4).await;
+    let seen = receiver.seen();
     let stored = stored_bytes(node, STREAM, last, false).await;
     let mut wanted = Vec::new();
     for record in format::Records::new(&stored) {
@@ -719,8 +697,9 @@ async fn deliver_signs_stored_bytes_and_skips_system_records_and_filtered_ones()
         }
     }
     assert_eq!(wanted.len(), 4);
-    for (seen, wanted) in seen.iter().zip(&wanted) {
-        assert_eq!(&seen.body, wanted, "the delivery is the stored bytes");
+    let bodies: Vec<u8> = seen.iter().flat_map(|seen| seen.body.clone()).collect();
+    assert_eq!(bodies, wanted.concat(), "deliveries are the stored bytes");
+    for seen in &seen {
         let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(&seen.body);
         let hex: String = mac
@@ -731,12 +710,14 @@ async fn deliver_signs_stored_bytes_and_skips_system_records_and_filtered_ones()
             .collect();
         assert_eq!(seen.headers["x-signature"], hex);
         assert_eq!(seen.headers["x-sink-id"], "1");
-        let header = format::RecordHeader::read(&seen.body).unwrap();
-        assert_eq!(seen.triple(), (1, header.id, header.last_id()));
+        let records = parse_records(&seen.body);
+        let (first, last) = (&records[0], &records[records.len() - 1]);
+        assert_eq!(seen.triple(), (1, first.0, last.0 + last.2 - 1));
     }
-    assert_eq!(seen[0].data(), opaque);
+    assert_eq!(receiver.records()[0].1, opaque);
     // The filter's skipped records and the system record still move the cursor, in the end.
-    wait_for_cursor(&mut client, STREAM, 1, seen[3].triple().2).await;
+    let last_sent = seen.last().unwrap().triple().2;
+    wait_for_cursor(&mut client, STREAM, 1, last_sent).await;
     drop(client);
     harness.finish();
 }
@@ -965,7 +946,6 @@ async fn notify_sends_its_three_fields_and_honours_its_rate_under_a_burst() {
         url: Some(receiver.url()),
         interval_ms: 1_000,
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     };
     put_sink(&mut client, STREAM, 3, spec, SinkStart::Earliest).await;
@@ -1319,7 +1299,6 @@ async fn archive_objects_hold_byte_identical_records_on_a_local_file_system() {
     let spec = SinkSpec {
         kind: "archive".to_owned(),
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     };
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
@@ -1383,7 +1362,6 @@ async fn an_archive_killed_after_its_put_doesnt_write_a_second_object() {
     let spec = SinkSpec {
         kind: "archive".to_owned(),
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     };
     put_sink(&mut client, STREAM, 5, spec, SinkStart::Earliest).await;
@@ -1427,9 +1405,13 @@ async fn a_sink_stays_within_its_byte_budget_and_loses_nothing_past_it() {
     assert!(peak >= 16 * 1024, "held {peak} bytes");
     receiver.answer(Answer::Status(200));
     receiver.release();
-    let seen = receiver.wait_for_count(300).await;
-    let firsts: Vec<u64> = seen.iter().map(|seen| seen.triple().1).collect();
-    assert_eq!(firsts, ids, "in order, with nothing lost past the budget");
+    let got: Vec<u64> = receiver
+        .wait_for_records(300)
+        .await
+        .iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(got, ids, "in order, with nothing lost past the budget");
     drop(client);
     harness.finish();
 }
@@ -1828,10 +1810,10 @@ async fn create_starts_at_now_earliest_and_an_id() {
     .await;
     let third = send(&mut client, STREAM, b"3", 3).await;
 
-    let data = |seen: Vec<Seen>| seen.iter().map(Seen::data).collect::<Vec<_>>();
-    assert_eq!(data(now.wait_for_count(1).await), [b"3"]);
-    assert_eq!(data(earliest.wait_for_count(3).await), [b"1", b"2", b"3"]);
-    assert_eq!(data(at_id.wait_for_count(2).await), [b"2", b"3"]);
+    let data = |records: Vec<(u64, Vec<u8>)>| records.into_iter().map(|r| r.1).collect::<Vec<_>>();
+    assert_eq!(data(now.wait_for_records(1).await), [b"3"]);
+    assert_eq!(data(earliest.wait_for_records(3).await), [b"1", b"2", b"3"]);
+    assert_eq!(data(at_id.wait_for_records(2).await), [b"2", b"3"]);
     for sink_id in 1..=3 {
         wait_for_cursor(&mut client, STREAM, sink_id, third).await;
     }
@@ -1857,8 +1839,8 @@ async fn update_finishes_what_is_in_flight_keeps_the_cursor_and_starts_at_the_ne
     )
     .await;
     let first = send(&mut client, STREAM, b"1", 1).await;
-    let second = send(&mut client, STREAM, b"2", 2).await;
     old.wait_for_count(1).await;
+    let second = send(&mut client, STREAM, b"2", 2).await;
 
     // It carries on as it was until the old request ends.
     put_sink(
@@ -1941,9 +1923,9 @@ async fn pause_resume_reset_and_delete() {
         )
         .await
         .unwrap();
-    let seen = receiver.wait_for_count(4).await;
-    assert_eq!(seen[2].data(), b"1");
-    assert_eq!(seen[3].data(), b"2");
+    let records = receiver.wait_for_records(4).await;
+    assert_eq!(records[2].1, b"1");
+    assert_eq!(records[3].1, b"2");
     wait_for_cursor(&mut client, STREAM, 1, second).await;
 
     client
@@ -1956,7 +1938,7 @@ async fn pause_resume_reset_and_delete() {
         )
         .await
         .unwrap();
-    assert_eq!(receiver.wait_for_count(5).await[4].data(), b"2");
+    assert_eq!(receiver.wait_for_records(5).await[4].1, b"2");
     wait_for_cursor(&mut client, STREAM, 1, second).await;
 
     client
@@ -1964,7 +1946,7 @@ async fn pause_resume_reset_and_delete() {
         .await
         .unwrap();
     send(&mut client, STREAM, b"3", 3).await;
-    receiver.stays_at(5).await;
+    receiver.stays_at_records(5).await;
     assert!(
         client
             .stream_info(key(STREAM))
@@ -2074,9 +2056,13 @@ async fn a_sink_moves_with_its_shard() {
             "the sink went with the stream"
         );
     }
-    let seen = receiver.wait_for_count(ids.len()).await;
-    let firsts: Vec<u64> = seen.iter().map(|seen| seen.triple().1).collect();
-    assert_eq!(firsts, ids, "no gap, duplicate or reordering across moves");
+    let got: Vec<u64> = receiver
+        .wait_for_records(ids.len())
+        .await
+        .iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(got, ids, "no gap, duplicate or reordering across moves");
     wait_for_cursor(&mut client, STREAM, 1, *ids.last().unwrap()).await;
 
     // Lifecycle ops find it on its new core, and so does a move while it is paused.
@@ -2092,7 +2078,7 @@ async fn a_sink_moves_with_its_shard() {
         .unwrap();
     assert!(node.move_shard(shard, 1).await);
     let mid = send(&mut client, STREAM, b"paused", 1000).await;
-    receiver.stays_at(ids.len()).await;
+    receiver.stays_at_records(ids.len()).await;
     assert!(node.move_shard(shard, 0).await);
     client
         .sink_op(
@@ -2421,7 +2407,6 @@ fn archive_spec(filter: Option<&str>) -> SinkSpec {
     SinkSpec {
         kind: "archive".to_owned(),
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         filter: filter.map(str::to_owned),
         ..SinkSpec::default()
     }
@@ -2910,7 +2895,6 @@ fn notify_spec(url: String, interval_ms: u64) -> SinkSpec {
         url: Some(url),
         interval_ms,
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     }
 }
@@ -3142,7 +3126,7 @@ async fn a_sinks_budget_cant_pass_the_nodes() {
     assert!(peak <= 1024 * 1024 + 256 * 1024, "held {peak} bytes");
     receiver.answer(Answer::Status(200));
     receiver.release();
-    receiver.wait_for_count(100).await;
+    receiver.wait_for_records(100).await;
     drop(client);
     harness.finish();
 }

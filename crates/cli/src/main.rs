@@ -19,7 +19,7 @@ silly stream create|config NAME [--retention R] [--default-ack N] [--min-ack N]
 silly stream info|delete NAME
 silly stream core NAME --core N      (give the stream its own shard on core N)
 silly sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filter F]
-                        [--on-expire E] [--concurrency N] [--start S] [--secret K]
+                        [--on-expire E] [--start S] [--secret K]
                         [--interval-ms N] [--budget-bytes N]
 silly sink delete|pause|resume STREAM ID
 silly sink reset STREAM ID [--start S]
@@ -296,7 +296,6 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 "--target",
                 "--filter",
                 "--on-expire",
-                "--concurrency",
                 "--start",
                 "--sink-url",
                 "--secret",
@@ -316,9 +315,6 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 if let Some(value) = args.one(flag) {
                     fields.push(format!("\"{field}\":{}", json_string(value)));
                 }
-            }
-            if let Some(concurrency) = args.number("--concurrency")? {
-                fields.push(format!("\"concurrency\":{concurrency}"));
             }
             if let Some(interval_ms) = args.number("--interval-ms")? {
                 fields.push(format!("\"interval_ms\":{interval_ms}"));

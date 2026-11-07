@@ -1,9 +1,10 @@
-//! One sink's task. It reads its stream from the saved cursor, forms deliveries, sends them,
-//! and moves the cursor once what comes before them has gone too. Anything it hasn't finished
-//! when it stops is sent again by the next task, which starts from the cursor.
+//! One sink's task. It reads its stream from the saved cursor and sends one delivery at a time,
+//! moving the cursor past each once it has gone. Anything it hasn't finished when it stops is
+//! sent again by the next task, which starts from the cursor.
 //!
-//! A delivery is one whole record for `webhook.deliver` and `forward`, so what is sent again has
-//! the same `{sink_id, first_id, last_id}` however much more has since arrived (D189).
+//! A delivery is everything read and not yet sent, up to the budget, so it grows while the one
+//! before it is in flight. What is sent again can be a longer run than before: each record
+//! carries its id, and a destination drops those at or below the last it took (section 9).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -127,7 +128,7 @@ struct Unread {
     read_ms: u64,
 }
 
-/// What is sent as one, in order among the others.
+/// What is sent as one.
 struct Delivery {
     first_id: u64,
     last_id: u64,
@@ -136,8 +137,6 @@ struct Delivery {
     byte_count: u64,
     attempt: u32,
     next_try_ms: u64,
-    running: bool,
-    done: bool,
 }
 
 enum Outcome {
@@ -330,8 +329,10 @@ struct Reading<'a> {
     /// Read past `read_id` with nothing matching, for the cursor once nothing is before it.
     progress_id: u64,
     unread: VecDeque<Unread>,
-    deliveries: VecDeque<Delivery>,
-    tasks: JoinSet<(u64, Outcome)>,
+    /// The one delivery being sent or waiting to be tried again.
+    delivery: Option<Delivery>,
+    /// Its try in progress, if any.
+    tasks: JoinSet<Outcome>,
     held_bytes: u64,
     failure_count: u32,
     warned: bool,
@@ -406,7 +407,7 @@ impl<'a> Reading<'a> {
             },
             progress_id: cursor,
             unread: VecDeque::new(),
-            deliveries: VecDeque::new(),
+            delivery: None,
             tasks: JoinSet::new(),
             held_bytes: 0,
             failure_count: spec.failure_count,
@@ -438,14 +439,14 @@ impl<'a> Reading<'a> {
         self.subscribe(&connection, self.read_id);
         loop {
             let now_ms = self.worker.context.clock.now_ms();
-            self.form_deliveries(now_ms);
+            self.form_delivery(now_ms);
             if let Some(spell) = self.start_due(now_ms).await {
                 return spell;
             }
             if let Some(spell) = self.check_expiry(now_ms).await {
                 return spell;
             }
-            let waiting = !self.deliveries.is_empty() || !self.unread.is_empty();
+            let waiting = self.delivery.is_some() || !self.unread.is_empty();
             let tick = if waiting {
                 self.worker.context.config.tick_ms
             } else {
@@ -618,60 +619,47 @@ impl<'a> Reading<'a> {
             byte_count: first.bytes.len() as u64,
             attempt: 0,
             next_try_ms: now_ms,
-            running: false,
-            done: false,
         }
     }
 
-    /// What the sink asked for, up to the node's figure, as with the byte budget (D209, D222).
-    fn concurrency_limit(&self) -> usize {
-        // A target keeps only the highest seq it has taken, so a forward overtaken by the next
-        // would be dropped as old. An archive object begins where the one before it ended.
-        if matches!(self.kind, Kind::Forward | Kind::Archive) {
-            return 1;
-        }
-        let max_count = self.worker.context.config.concurrency_max_count;
-        self.spec.concurrency.min(max_count).max(1) as usize
-    }
-
-    fn form_deliveries(&mut self, now_ms: u64) {
-        let limit = self.concurrency_limit();
+    fn form_delivery(&mut self, now_ms: u64) {
         while let Some(front) = self.unread.front()
             && front.last_id <= self.archived_through
         {
             self.held_bytes = self.held_bytes.saturating_sub(front.bytes.len() as u64);
             self.unread.pop_front();
         }
-        while self.deliveries.len() < limit {
-            let Some(first) = self.unread.front() else {
-                return;
-            };
-            let delivery = match self.kind {
-                Kind::Notify => {
-                    if !self.deliveries.is_empty() || now_ms < self.worker.next_notify_ms {
-                        return;
-                    }
-                    self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
-                    self.new_delivery(first, now_ms)
-                }
-                Kind::Forward if !self.probing => self.greedy_batch(now_ms),
-                Kind::Archive => match self.archive_batch(now_ms) {
-                    Some(delivery) => delivery,
-                    None => return,
-                },
-                Kind::Forward | Kind::Deliver => self.new_delivery(first, now_ms),
-            };
-            let take = match self.kind {
-                Kind::Notify => 1,
-                _ => delivery.bytes.len(),
-            };
-            self.unread.drain(..take);
-            self.deliveries.push_back(delivery);
+        if self.delivery.is_some() {
+            return;
         }
+        let Some(first) = self.unread.front() else {
+            return;
+        };
+        let delivery = match self.kind {
+            Kind::Notify => {
+                if now_ms < self.worker.next_notify_ms {
+                    return;
+                }
+                self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
+                self.new_delivery(first, now_ms)
+            }
+            Kind::Forward if self.probing => self.new_delivery(first, now_ms),
+            Kind::Archive => match self.archive_batch(now_ms) {
+                Some(delivery) => delivery,
+                None => return,
+            },
+            Kind::Forward | Kind::Deliver => self.greedy_batch(now_ms),
+        };
+        let take = match self.kind {
+            Kind::Notify => 1,
+            _ => delivery.bytes.len(),
+        };
+        self.unread.drain(..take);
+        self.delivery = Some(delivery);
     }
 
-    /// `forward`: everything unread, up to the budget, as one publish. A batch forms while the
-    /// one before it is in flight, so it is as big as the target is slow, and waits on no clock.
+    /// Everything unread, up to the budget, as one publish or POST. A batch forms while the one
+    /// before it is in flight, so it is as big as the destination is slow, and waits on no clock.
     fn greedy_batch(&self, now_ms: u64) -> Delivery {
         let mut records = self.unread.iter();
         let first = records.next().expect("a batch starts at an unread record");
@@ -701,65 +689,53 @@ impl<'a> Reading<'a> {
     }
 
     async fn start_due(&mut self, now_ms: u64) -> Option<Spell> {
-        let limit = self.concurrency_limit();
-        let mut starts = Vec::new();
-        for (at, delivery) in self.deliveries.iter().enumerate() {
-            if self.tasks.len() + starts.len() >= limit {
-                break;
-            }
-            if !delivery.running && !delivery.done && delivery.next_try_ms <= now_ms {
-                starts.push(at);
-            }
+        if !self.tasks.is_empty()
+            || self
+                .delivery
+                .as_ref()
+                .is_none_or(|delivery| delivery.next_try_ms > now_ms)
+        {
+            return None;
         }
-        for at in starts {
-            storage::crash_point("sink.before_delivery");
-            if self.worker.hook(SinkStep::BeforeDelivery) == SinkAction::Kill {
-                return Some(Spell::End(End::Killed));
-            }
-            let delivery = &mut self.deliveries[at];
-            if self.kind == Kind::Notify
-                && let Some(run) = self.unread.pop_front()
-            {
-                // `unread` is everything since the last success, retries included (D187).
-                delivery.last_id = run.last_id;
-                delivery.item_count += run.item_count;
-            }
-            delivery.running = true;
-            delivery.attempt += 1;
-            let first_id = delivery.first_id;
-            let attempt = Attempt {
-                context: Arc::clone(&self.worker.context),
-                client: Arc::clone(&self.worker.send_client),
-                stream: self.worker.key.0,
-                sink_id: self.worker.key.1,
-                kind: self.kind,
-                spec: self.spec.clone(),
-                url: self.url.clone(),
-                first_id,
-                last_id: delivery.last_id,
-                item_count: delivery.item_count,
-                bytes: delivery.bytes.clone(),
-            };
-            self.tasks
-                .spawn(async move { (first_id, attempt.run().await) });
+        storage::crash_point("sink.before_delivery");
+        if self.worker.hook(SinkStep::BeforeDelivery) == SinkAction::Kill {
+            return Some(Spell::End(End::Killed));
         }
+        let delivery = self.delivery.as_mut()?;
+        if self.kind == Kind::Notify
+            && let Some(run) = self.unread.pop_front()
+        {
+            // `unread` is everything since the last success, retries included (D187).
+            delivery.last_id = run.last_id;
+            delivery.item_count += run.item_count;
+        }
+        delivery.attempt += 1;
+        let attempt = Attempt {
+            context: Arc::clone(&self.worker.context),
+            client: Arc::clone(&self.worker.send_client),
+            stream: self.worker.key.0,
+            sink_id: self.worker.key.1,
+            kind: self.kind,
+            spec: self.spec.clone(),
+            url: self.url.clone(),
+            first_id: delivery.first_id,
+            last_id: delivery.last_id,
+            item_count: delivery.item_count,
+            bytes: delivery.bytes.clone(),
+        };
+        self.tasks.spawn(attempt.run());
         None
     }
 
     async fn on_outcome(
         &mut self,
-        joined: Result<(u64, Outcome), tokio::task::JoinError>,
+        joined: Result<Outcome, tokio::task::JoinError>,
     ) -> Option<Spell> {
-        let Ok((first_id, outcome)) = joined else {
+        let Ok(outcome) = joined else {
             return Some(Spell::End(End::Killed));
         };
-        let at = self
-            .deliveries
-            .iter()
-            .position(|delivery| delivery.first_id == first_id)?;
-        self.deliveries[at].running = false;
         let outcome = match outcome {
-            Outcome::ArchivedThrough(through) => match self.archived_part(at, through).await {
+            Outcome::ArchivedThrough(through) => match self.archived_part(through).await {
                 Some(outcome) => outcome,
                 None => return None,
             },
@@ -776,7 +752,6 @@ impl<'a> Reading<'a> {
                 if self.worker.hook(SinkStep::AfterDelivery) == SinkAction::Kill {
                     return Some(Spell::End(End::Killed));
                 }
-                self.deliveries[at].done = true;
                 if self.failure_count > 0 {
                     self.failure_count = 0;
                     self.worker.report(SinkReport::Healthy).await;
@@ -791,7 +766,7 @@ impl<'a> Reading<'a> {
                 self.failure_count += 1;
                 let now_ms = self.worker.context.clock.now_ms();
                 let config = &self.worker.context.config;
-                let delivery = &mut self.deliveries[at];
+                let delivery = self.delivery.as_mut()?;
                 let mut wait_ms = backoff_ms(
                     config.retry_initial_ms,
                     config.retry_max_ms,
@@ -831,12 +806,11 @@ impl<'a> Reading<'a> {
         None
     }
 
-    /// Moves the cursor over every delivery at the front that is done. `None` to stop.
     /// An object already held this delivery's first records, up to `through`. All of them, or
     /// more: the delivery is done, and what else it holds is skipped as it is read. Fewer: the
     /// cursor moves past them, and the rest goes as a new object at once.
-    async fn archived_part(&mut self, at: usize, through: u64) -> Option<Outcome> {
-        let delivery = &mut self.deliveries[at];
+    async fn archived_part(&mut self, through: u64) -> Option<Outcome> {
+        let delivery = self.delivery.as_mut()?;
         if through >= delivery.last_id {
             delivery.last_id = through;
             self.archived_through = self.archived_through.max(through);
@@ -860,19 +834,16 @@ impl<'a> Reading<'a> {
         None
     }
 
+    /// Moves the cursor past the delivery that has gone. `None` to stop.
     async fn commit_delivered(&mut self) -> Option<()> {
-        let mut through = None;
-        while self.deliveries.front().is_some_and(|front| front.done) {
-            let delivery = self.deliveries.pop_front()?;
-            self.held_bytes = self.held_bytes.saturating_sub(delivery.byte_count);
-            through = Some(delivery.last_id);
-        }
-        if let Some(id) = through {
-            self.commit(id).await;
-            storage::crash_point("sink.after_cursor");
-            if self.worker.hook(SinkStep::AfterCursor) == SinkAction::Kill {
-                return None;
-            }
+        let Some(delivery) = self.delivery.take() else {
+            return Some(());
+        };
+        self.held_bytes = self.held_bytes.saturating_sub(delivery.byte_count);
+        self.commit(delivery.last_id).await;
+        storage::crash_point("sink.after_cursor");
+        if self.worker.hook(SinkStep::AfterCursor) == SinkAction::Kill {
+            return None;
         }
         Some(())
     }
@@ -890,7 +861,7 @@ impl<'a> Reading<'a> {
 
     /// Progress can move the cursor only with nothing read and not yet delivered before it.
     async fn commit_progress(&mut self) {
-        if self.unread.is_empty() && self.deliveries.is_empty() && self.progress_id > self.cursor {
+        if self.unread.is_empty() && self.delivery.is_none() && self.progress_id > self.cursor {
             self.commit(self.progress_id).await;
         }
     }
@@ -905,21 +876,13 @@ impl<'a> Reading<'a> {
             .await;
     }
 
-    /// What is in progress finishes, and goes into the cursor if it is first in line.
+    /// What is in progress finishes, and goes into the cursor if it went.
     async fn finish_in_flight(&mut self, then: Spell) -> Spell {
+        let mut delivered = false;
         while let Some(joined) = self.tasks.join_next().await {
-            let Ok((first_id, outcome)) = joined else {
-                continue;
-            };
-            let found = self
-                .deliveries
-                .iter_mut()
-                .find(|delivery| delivery.first_id == first_id);
-            if let (Some(delivery), Outcome::Delivered) = (found, outcome) {
-                delivery.done = true;
-            }
+            delivered |= matches!(joined, Ok(Outcome::Delivered));
         }
-        if self.commit_delivered().await.is_none() {
+        if delivered && self.commit_delivered().await.is_none() {
             return Spell::End(End::Killed);
         }
         then
@@ -941,7 +904,7 @@ impl<'a> Reading<'a> {
 
     /// Warns of what is first in line, then follows `on_expire` once it has expired by the clock.
     async fn check_expiry(&mut self, now_ms: u64) -> Option<Spell> {
-        let first_id = match (self.deliveries.front(), self.unread.front()) {
+        let first_id = match (&self.delivery, self.unread.front()) {
             (Some(delivery), _) => delivery.first_id,
             (None, Some(unread)) => unread.first_id,
             (None, None) => {
@@ -1001,15 +964,15 @@ impl<'a> Reading<'a> {
         let extend = |gap: &mut Option<(u64, u64)>, first_id: u64, last_id: u64| {
             *gap = Some(gap.map_or((first_id, last_id), |(first, _)| (first, last_id)));
         };
-        while let Some(front) = self.deliveries.front() {
-            if front.running || front.done || !expired(front.last_id, retention_ms) {
-                break;
-            }
-            let delivery = self.deliveries.pop_front()?;
+        if self.tasks.is_empty()
+            && let Some(delivery) = self
+                .delivery
+                .take_if(|delivery| expired(delivery.last_id, retention_ms))
+        {
             self.held_bytes = self.held_bytes.saturating_sub(delivery.byte_count);
             extend(&mut gap, delivery.first_id, delivery.last_id);
         }
-        if self.deliveries.is_empty() {
+        if self.delivery.is_none() {
             while let Some(front) = self.unread.front() {
                 if !expired(front.last_id, retention_ms) {
                     break;
@@ -1022,7 +985,6 @@ impl<'a> Reading<'a> {
         if let Some((first_id, last_id)) = gap {
             self.record_gap(first_id, last_id).await;
             self.commit(last_id).await;
-            self.commit_delivered().await;
             if self.warned {
                 self.warned = false;
                 self.worker
@@ -1100,11 +1062,12 @@ impl Attempt {
         }
     }
 
+    /// The batch's records as stored, one after another, each with its id in its header.
     async fn deliver(&self) -> Outcome {
-        let Some(body) = self.bytes.first() else {
+        if self.bytes.is_empty() {
             return Outcome::Delivered;
-        };
-        self.post(CONTENT_RECORDS, body).await
+        }
+        self.post(CONTENT_RECORDS, &self.bytes.concat()).await
     }
 
     /// `{stream, head, unread}`, with ids as strings like everywhere else in JSON (D111).

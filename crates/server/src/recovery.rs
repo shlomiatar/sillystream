@@ -160,7 +160,6 @@ pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
         target: sink.target,
         filter: sink.filter.clone(),
         on_expire: sink.on_expire.clone(),
-        concurrency: sink.concurrency,
         paused: sink.paused,
         secret: sink.secret.clone(),
         interval_ms: sink.interval_ms,
@@ -187,7 +186,6 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
         target: spec.target,
         filter: spec.filter.clone(),
         on_expire: spec.on_expire.clone(),
-        concurrency: spec.concurrency,
         paused: spec.paused,
         secret: spec.secret.clone(),
         interval_ms: spec.interval_ms,
@@ -708,7 +706,11 @@ pub(crate) async fn prepare(
         }
         // Carried dedupe entries count as nothing here: replay reads them, and the new file
         // carries them again, so a crash loop doesn't keep a file per start.
-        if replayed.entries.iter().all(|entry| dedupe_carry(entry).is_some()) {
+        if replayed
+            .entries
+            .iter()
+            .all(|entry| dedupe_carry(entry).is_some())
+        {
             empty_files.push(file);
         }
         // A file from before generations were known to it has nothing to say.

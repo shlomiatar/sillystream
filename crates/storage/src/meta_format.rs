@@ -8,7 +8,7 @@
 //!           n u32 | n × cursor | n u32 | n × sink | ids
 //! cursor := name key | id u64
 //! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
-//!           concurrency u32 | paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
+//!           paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
 //!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
 //! ids    := n u32 | n × delta varint      object ids, ascending, each less the one before
 //! str32  := len u32 | bytes        bytes32 likewise
@@ -44,7 +44,6 @@ pub struct MetaSink {
     pub target: Option<KeyHash>,
     pub filter: Option<String>,
     pub on_expire: String,
-    pub concurrency: u32,
     pub paused: bool,
     /// `webhook.*`: the HMAC key (D29).
     pub secret: Option<String>,
@@ -160,7 +159,6 @@ fn put_sink(out: &mut Vec<u8>, sink: &MetaSink) {
     }
     put_opt(out, sink.filter.as_deref());
     put_bytes(out, sink.on_expire.as_bytes());
-    put_u32(out, sink.concurrency);
     out.push(u8::from(sink.paused));
     put_opt(out, sink.secret.as_deref());
     put_u64(out, sink.interval_ms);
@@ -319,7 +317,6 @@ impl<'a> Reader<'a> {
         let kind = self.text()?;
         let (url, target, filter) = (self.opt()?, self.opt_key()?, self.opt()?);
         let on_expire = self.text()?;
-        let concurrency = self.u32()?;
         let paused = match self.u8()? {
             0 => false,
             1 => true,
@@ -343,7 +340,6 @@ impl<'a> Reader<'a> {
             target,
             filter,
             on_expire,
-            concurrency,
             paused,
             secret,
             interval_ms,
@@ -409,7 +405,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             id: reader.u64()?,
         });
     }
-    for _ in 0..reader.count(55)? {
+    for _ in 0..reader.count(51)? {
         meta.sinks.push(reader.sink()?);
     }
     meta.objects = reader.ids()?;

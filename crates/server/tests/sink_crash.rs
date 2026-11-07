@@ -197,9 +197,9 @@ impl Admin {
     }
 }
 
-type Seen = Arc<Mutex<Vec<(u64, u64, Vec<u8>)>>>;
+type Seen = Arc<Mutex<Vec<(u64, u64, Vec<Vec<u8>>)>>>;
 
-/// Answers 200 to everything, keeping `(first_id, last_id, data)` of each request.
+/// Answers 200 to everything, keeping `(first_id, last_id, each record's data)` of each request.
 async fn receiver() -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -234,11 +234,17 @@ async fn receiver() -> (String, Seen) {
                         _ => return,
                     }
                 }
-                let (record, _) = format::decode_record(&buffer[head_end..]).unwrap();
+                let mut body = &buffer[head_end..head_end + len];
+                let mut data = Vec::new();
+                while !body.is_empty() {
+                    let (record, used) = format::decode_record(body).unwrap();
+                    data.push(record.data.to_vec());
+                    body = &body[used..];
+                }
                 keep.lock().unwrap().push((
                     headers["x-first-id"].parse().unwrap(),
                     headers["x-last-id"].parse().unwrap(),
-                    record.data.to_vec(),
+                    data,
                 ));
                 let _ = socket
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
@@ -285,7 +291,7 @@ async fn webhook_case(point: &str) {
         let seen = seen.lock().unwrap();
         (0..COUNT).all(|at| {
             let want = format!("record {at}").into_bytes();
-            seen.iter().any(|(_, _, data)| *data == want)
+            seen.iter().any(|(_, _, data)| data.contains(&want))
         })
     })
     .await;
@@ -293,16 +299,19 @@ async fn webhook_case(point: &str) {
     if point == "sink.after_delivery" {
         assert!(!before.is_empty(), "it delivered, then died");
     }
-    // Whatever was delivered and not committed comes again as the very same delivery. After the
-    // commit, the cursor is saved at once (section 5.1), so it comes again only if the kill beat
-    // that save, and then as the same delivery too.
+    // Whatever was delivered and not committed comes again from the same first id, in a batch
+    // that may hold more than before. After the commit, the cursor is saved at once (section
+    // 5.1), so it comes again only if the kill beat that save.
     for (first_id, last_id, data) in &before {
         let again = seen
             .iter()
             .skip(before.len())
-            .find(|(_, _, other)| other == data);
+            .find(|(_, _, other)| other.starts_with(data));
         match again {
-            Some(again) => assert_eq!((again.0, again.1), (*first_id, *last_id)),
+            Some(again) => {
+                assert_eq!(again.0, *first_id);
+                assert!(again.1 >= *last_id);
+            }
             None => assert_eq!(
                 point, "sink.after_cursor",
                 "the record not committed comes again"

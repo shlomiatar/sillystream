@@ -1495,7 +1495,6 @@ fn parse_sink_reset(body: &[u8]) -> Result<SinkStart, Response> {
 fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<String>), Response> {
     let mut spec = SinkSpec {
         on_expire: "stop".to_owned(),
-        concurrency: 1,
         ..SinkSpec::default()
     };
     let mut start = SinkStart::Now;
@@ -1536,13 +1535,6 @@ fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<S
                     return Err(malformed("on_expire is stop or skip"));
                 }
             }
-            "concurrency" => {
-                spec.concurrency = value
-                    .as_u64()
-                    .and_then(|count| u32::try_from(count).ok())
-                    .filter(|count| *count > 0)
-                    .ok_or_else(|| malformed("concurrency is a count above 0"))?;
-            }
             "secret" => {
                 let secret = text(&value, "secret")?;
                 if secret.is_empty() {
@@ -1574,16 +1566,10 @@ fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<S
             if spec.kind == "webhook.deliver" && spec.secret.is_none() {
                 return Err(malformed("webhook.deliver needs a secret to sign with"));
             }
-            if spec.kind == "webhook.notify" && spec.concurrency > 1 {
-                return Err(malformed("webhook.notify sends one at a time"));
-            }
         }
         "forward" => {
             if spec.target.is_none() {
                 return Err(malformed("forward needs a target stream"));
-            }
-            if spec.concurrency > 1 {
-                return Err(malformed("forward keeps its target's order, one at a time"));
             }
         }
         "archive" => {}

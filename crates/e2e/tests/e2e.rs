@@ -2328,12 +2328,10 @@ async fn a_stream_id_cannot_forge_a_log_line() {
 // What sinks can hold
 // ---------------------------------------------------------------------------------------------
 
-/// `admin` on some streams, a receiver that never answers, and sinks asking for all they can:
-/// the node's default limits hold on the real binary, and another client still gets in.
+/// `admin` on some streams and a receiver that never answers: each sink holds one connection
+/// on the real binary, and another client still gets in.
 async fn sinks_leave_the_node_able_to_take_connections() {
     const SINK_COUNT: usize = 6;
-    const PER_SINK_MAX_COUNT: usize = 64;
-    const NODE_MAX_COUNT: usize = 256;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let held = Arc::new(Mutex::new(Vec::new()));
@@ -2350,33 +2348,19 @@ async fn sinks_leave_the_node_able_to_take_connections() {
     let one = record(0, 0, b"");
     let body = format!(
         r#"{{"kind":"webhook.deliver","url":"http://127.0.0.1:{port}/","secret":"s",
-             "concurrency":1000000,"start":"earliest"}}"#
+             "start":"earliest"}}"#
     );
-
-    http.publish_records("tenant.0", &one.repeat(PER_SINK_MAX_COUNT * 2))
-        .await;
-    let path = "/v1/stream/tenant.0/sink/1";
-    let reply = http.call("PUT", path, &[], body.as_bytes()).await;
-    assert_eq!(reply.status, 200, "{}", reply.text());
     let count = || held.lock().unwrap().len();
-    wait_until("one sink's connections", async || {
-        count() >= PER_SINK_MAX_COUNT
-    })
-    .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(count(), PER_SINK_MAX_COUNT, "one sink's own limit");
-
-    for at in 1..SINK_COUNT {
+    for at in 0..SINK_COUNT {
         let stream = format!("tenant.{at}");
-        http.publish_records(&stream, &one.repeat(PER_SINK_MAX_COUNT * 2))
-            .await;
+        http.publish_records(&stream, &one.repeat(100)).await;
         let path = format!("/v1/stream/{stream}/sink/1");
         let reply = http.call("PUT", &path, &[], body.as_bytes()).await;
         assert_eq!(reply.status, 200, "{}", reply.text());
     }
-    wait_until("the node's connections", async || count() >= NODE_MAX_COUNT).await;
+    wait_until("every sink's connection", async || count() >= SINK_COUNT).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(count(), NODE_MAX_COUNT, "the node's limit");
+    assert_eq!(count(), SINK_COUNT, "one delivery in flight per sink");
 
     let mut other = node.ws(&root).await;
     other.send(&ClientFrame::Ping { nonce: 7 }).await;

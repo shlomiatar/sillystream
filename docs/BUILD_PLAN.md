@@ -184,7 +184,7 @@ Time-based tests use an injected clock, or `test-hooks` on the binary.
 
 **Acceptance.**
 - At-least-once: a sink killed between delivery and cursor update redelivers, with the same `{sink_id, first_id, last_id}`.
-- Ordered: one delivery in flight by default, shown by a receiver that holds its response. Opt-in concurrency respects its limit.
+- Ordered: one delivery in flight, shown by a receiver that holds its response; what arrives meanwhile goes in the next batch (D290).
 - Retryable errors back off exponentially (scripted clock); permanent errors or too many failures pause the sink.
 - `webhook.deliver`: the HMAC verifies, and bytes equal the stored records. Private addresses (IPv4, IPv6 and DNS names resolving to private ranges) are blocked by default, and are allowed only with the node setting.
 - `webhook.notify` sends `{stream, head, unread}` and honours its rate limit under a burst.

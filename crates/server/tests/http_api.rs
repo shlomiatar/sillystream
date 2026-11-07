@@ -871,7 +871,7 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
             .await
     };
     let sink = r#"{"kind":"webhook.deliver","url":"https://example.invalid/x","filter":"any:1",
-                   "secret":"s","on_expire":"skip","concurrency":2,"start":"now"}"#;
+                   "secret":"s","on_expire":"skip","start":"now"}"#;
     assert_code(&call("PUT", "/v1/stream/k/sink/1", sink).await, 404, 2);
 
     let ids = seed(&server, "k", &[b"1", b"2"]).await;
@@ -952,10 +952,6 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
             r#"{"kind":"webhook.deliver","url":"https://example.invalid/x"}"#,
         ),
         (
-            "/v1/stream/k/sink/9",
-            r#"{"kind":"forward","target":"other","concurrency":2}"#,
-        ),
-        (
             "/v1/stream/k/sink/0",
             r#"{"kind":"forward","target":"other"}"#,
         ),
@@ -971,10 +967,6 @@ async fn the_sink_lifecycle_is_recorded_on_the_stream() {
         (
             "/v1/stream/k/sink/9",
             r#"{"kind":"archive","on_expire":"maybe"}"#,
-        ),
-        (
-            "/v1/stream/k/sink/9",
-            r#"{"kind":"archive","concurrency":0}"#,
         ),
         (
             "/v1/stream/k/sink/9",
