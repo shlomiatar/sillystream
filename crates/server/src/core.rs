@@ -1867,12 +1867,11 @@ impl Core {
             });
             return;
         }
-        if let Some(stream) = self.streams.get_mut(&name) {
-            if stream.delivery.table.detach(filter_id, home)
-                && let Some(shard) = self.shards.get_mut(&stream.shard)
-            {
-                shard.counters.subscriber_count = shard.counters.subscriber_count.saturating_sub(1);
-            }
+        if let Some(stream) = self.streams.get_mut(&name)
+            && stream.delivery.table.detach(filter_id, home)
+            && let Some(shard) = self.shards.get_mut(&stream.shard)
+        {
+            shard.counters.subscriber_count = shard.counters.subscriber_count.saturating_sub(1);
         }
     }
 
