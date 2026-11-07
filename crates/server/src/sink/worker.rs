@@ -375,10 +375,7 @@ impl<'a> Reading<'a> {
             return Err("webhook.deliver needs a secret".to_owned());
         }
         let config = &worker.context.config;
-        let interval_ms = match spec.interval_ms {
-            0 => config.notify_interval_ms,
-            own => own,
-        };
+        let interval_ms = config.notify_interval_ms;
         // A sink can ask for less than the node's, never more: what it holds is outside the
         // memory cap (D185), so the node's figure is what isolates the others from it.
         let budget_bytes = match spec.budget_bytes {

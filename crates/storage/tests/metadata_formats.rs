@@ -38,7 +38,7 @@ fn sink() -> impl Strategy<Value = MetaSink> {
         any::<bool>(),
     )
         .prop_map(
-            |(sink_id, kind, url, target, filter, on_expire, interval, paused)| MetaSink {
+            |(sink_id, kind, url, target, filter, on_expire, budget, paused)| MetaSink {
                 sink_id,
                 kind,
                 url: url.clone(),
@@ -47,17 +47,12 @@ fn sink() -> impl Strategy<Value = MetaSink> {
                 on_expire,
                 paused,
                 secret: url.clone(),
-                interval_ms: interval.into(),
-                budget_bytes: u64::from(interval) + 1,
+                budget_bytes: u64::from(budget) + 1,
                 pause_reason: target.clone(),
-                gaps: if paused {
-                    vec![storage::MetaSinkGap {
-                        first_id: sink_id,
-                        last_id: sink_id / 2,
-                    }]
-                } else {
-                    Vec::new()
-                },
+                last_gap: paused.then_some(storage::MetaSinkGap {
+                    first_id: sink_id,
+                    last_id: sink_id / 2,
+                }),
                 gap_count: u64::from(paused),
             },
         )
@@ -240,13 +235,12 @@ fn meta_bytes_are_exact() {
             on_expire: "e".to_owned(),
             paused: true,
             secret: Some("x".to_owned()),
-            interval_ms: 20,
             budget_bytes: 21,
             pause_reason: Some("r".to_owned()),
-            gaps: vec![storage::MetaSinkGap {
+            last_gap: Some(storage::MetaSinkGap {
                 first_id: 22,
                 last_id: 23,
-            }],
+            }),
             gap_count: 24,
         }],
         objects: vec![ObjectId(5), ObjectId(300)],
@@ -258,7 +252,7 @@ fn meta_bytes_are_exact() {
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
         out.extend_from_slice(value);
     };
-    u32le(&mut body, 2);
+    u32le(&mut body, 3);
     u32le(&mut body, 1);
     body.extend_from_slice(&key("s").0);
     for value in [2, 3, 20, 4, 5] {
@@ -282,11 +276,10 @@ fn meta_bytes_are_exact() {
     body.push(1);
     body.push(1);
     text(&mut body, b"x");
-    u64le(&mut body, 20);
     u64le(&mut body, 21);
     body.push(1);
     text(&mut body, b"r");
-    u32le(&mut body, 1);
+    body.push(1);
     u64le(&mut body, 22);
     u64le(&mut body, 23);
     u64le(&mut body, 24);
@@ -328,10 +321,9 @@ fn another_format_version_is_refused_with_both_numbers() {
             on_expire: "stop".to_owned(),
             paused: false,
             secret: None,
-            interval_ms: 0,
             budget_bytes: 0,
             pause_reason: None,
-            gaps: Vec::new(),
+            last_gap: None,
             gap_count: 0,
         });
         sink[..4].copy_from_slice(&found.to_le_bytes());

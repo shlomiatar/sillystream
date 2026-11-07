@@ -96,14 +96,12 @@ pub struct SinkSpec {
     pub paused: bool,
     /// `webhook.*`: the HMAC key. Never shown (D29).
     pub secret: Option<String>,
-    /// `webhook.notify`: least time between sends. 0 takes the node's.
-    pub interval_ms: u64,
     /// What the sink may hold at once, up to the node's. 0 takes the node's.
     pub budget_bytes: u64,
     /// Why it paused itself. A person pausing leaves this empty, and a resume clears it.
     pub pause_reason: Option<String>,
-    /// The latest gaps a skip recorded (D30), and how many there have been.
-    pub gaps: Vec<SinkGap>,
+    /// The latest gap a skip recorded (D30), and how many there have been.
+    pub last_gap: Option<SinkGap>,
     pub gap_count: u64,
     /// Failures in a row, and the last one. Not saved.
     pub failure_count: u32,
@@ -126,9 +124,6 @@ pub struct SinkGap {
     pub first_id: u64,
     pub last_id: u64,
 }
-
-/// How many gaps a sink keeps listed.
-pub(crate) const SINK_GAPS_KEPT_COUNT: usize = 16;
 
 /// `GET /v1/stream/<id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]

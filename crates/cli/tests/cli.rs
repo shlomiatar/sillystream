@@ -168,8 +168,6 @@ fn sink_admin() {
         "https://example.invalid/x",
         "--secret",
         "s",
-        "--interval-ms",
-        "500",
         "--budget-bytes",
         "1024",
     ]);

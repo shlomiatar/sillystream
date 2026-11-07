@@ -9,8 +9,8 @@
 //! cursor := name key | id u64
 //! saved  := version u32 | sink      a sink alone, as the local store keeps it between seals
 //! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
-//!           paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
-//!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
+//!           paused u8 | secret opt | budget_bytes u64 | pause_reason opt |
+//!           last_gap (present u8 | first_id u64 | last_id u64 if present) | gap_count u64
 //! ids    := n u32 | n × delta varint      object ids, ascending, each less the one before
 //! str32  := len u32 | bytes        bytes32 likewise
 //! opt    := present u8 | str32 if present
@@ -32,7 +32,7 @@ use crate::object::ObjectId;
 const FLAG_DELETED: u32 = 1;
 /// The layout above. Raise it whenever the layout changes. Before it had a field of its own,
 /// the word where it sits was `flags`, 0 or 1, so 2 is the first.
-pub const META_VERSION: u32 = 2;
+pub const META_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaCursor {
@@ -53,13 +53,11 @@ pub struct MetaSink {
     pub paused: bool,
     /// `webhook.*`: the HMAC key (D29).
     pub secret: Option<String>,
-    /// `webhook.notify`: least time between sends. 0 takes the node's.
-    pub interval_ms: u64,
     /// What the sink may hold at once. 0 takes the node's.
     pub budget_bytes: u64,
     pub pause_reason: Option<String>,
-    /// The latest gaps a skip recorded (D30), and how many there have been.
-    pub gaps: Vec<MetaSinkGap>,
+    /// The latest gap a skip recorded (D30), and how many there have been.
+    pub last_gap: Option<MetaSinkGap>,
     pub gap_count: u64,
 }
 
@@ -180,13 +178,15 @@ fn put_sink(out: &mut Vec<u8>, sink: &MetaSink) {
     put_bytes(out, sink.on_expire.as_bytes());
     out.push(u8::from(sink.paused));
     put_opt(out, sink.secret.as_deref());
-    put_u64(out, sink.interval_ms);
     put_u64(out, sink.budget_bytes);
     put_opt(out, sink.pause_reason.as_deref());
-    put_u32(out, sink.gaps.len() as u32);
-    for gap in &sink.gaps {
-        put_u64(out, gap.first_id);
-        put_u64(out, gap.last_id);
+    match sink.last_gap {
+        Some(gap) => {
+            out.push(1);
+            put_u64(out, gap.first_id);
+            put_u64(out, gap.last_id);
+        }
+        None => out.push(0),
     }
     put_u64(out, sink.gap_count);
 }
@@ -348,15 +348,16 @@ impl<'a> Reader<'a> {
             _ => return Err(MetaError::new("a paused flag isn't 0 or 1")),
         };
         let secret = self.opt()?;
-        let (interval_ms, budget_bytes) = (self.u64()?, self.u64()?);
+        let budget_bytes = self.u64()?;
         let pause_reason = self.opt()?;
-        let mut gaps = Vec::new();
-        for _ in 0..self.count(16)? {
-            gaps.push(MetaSinkGap {
+        let last_gap = match self.u8()? {
+            0 => None,
+            1 => Some(MetaSinkGap {
                 first_id: self.u64()?,
                 last_id: self.u64()?,
-            });
-        }
+            }),
+            _ => return Err(MetaError::new("a last gap flag isn't 0 or 1")),
+        };
         let gap_count = self.u64()?;
         Ok(MetaSink {
             sink_id,
@@ -367,10 +368,9 @@ impl<'a> Reader<'a> {
             on_expire,
             paused,
             secret,
-            interval_ms,
             budget_bytes,
             pause_reason,
-            gaps,
+            last_gap,
             gap_count,
         })
     }
@@ -434,7 +434,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
             id: reader.u64()?,
         });
     }
-    for _ in 0..reader.count(51)? {
+    for _ in 0..reader.count(40)? {
         meta.sinks.push(reader.sink()?);
     }
     meta.objects = reader.ids()?;

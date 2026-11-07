@@ -20,7 +20,7 @@ silly stream info|delete NAME
 silly stream core NAME --core N      (give the stream its own shard on core N)
 silly sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filter F]
                         [--on-expire E] [--start S] [--secret K]
-                        [--interval-ms N] [--budget-bytes N]
+                        [--budget-bytes N]
 silly sink delete|pause|resume STREAM ID
 silly sink reset STREAM ID [--start S]
 silly publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
@@ -299,7 +299,6 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 "--start",
                 "--sink-url",
                 "--secret",
-                "--interval-ms",
                 "--budget-bytes",
             ])?;
             let kind = args.one("--kind").ok_or("needs --kind")?;
@@ -315,9 +314,6 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 if let Some(value) = args.one(flag) {
                     fields.push(format!("\"{field}\":{}", json_string(value)));
                 }
-            }
-            if let Some(interval_ms) = args.number("--interval-ms")? {
-                fields.push(format!("\"interval_ms\":{interval_ms}"));
             }
             if let Some(budget_bytes) = args.number("--budget-bytes")? {
                 fields.push(format!("\"budget_bytes\":{budget_bytes}"));

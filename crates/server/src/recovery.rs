@@ -162,17 +162,12 @@ pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
         on_expire: sink.on_expire.clone(),
         paused: sink.paused,
         secret: sink.secret.clone(),
-        interval_ms: sink.interval_ms,
         budget_bytes: sink.budget_bytes,
         pause_reason: sink.pause_reason.clone(),
-        gaps: sink
-            .gaps
-            .iter()
-            .map(|gap| SinkGap {
-                first_id: gap.first_id,
-                last_id: gap.last_id,
-            })
-            .collect(),
+        last_gap: sink.last_gap.map(|gap| SinkGap {
+            first_id: gap.first_id,
+            last_id: gap.last_id,
+        }),
         gap_count: sink.gap_count,
         ..SinkSpec::default()
     }
@@ -188,17 +183,12 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
         on_expire: spec.on_expire.clone(),
         paused: spec.paused,
         secret: spec.secret.clone(),
-        interval_ms: spec.interval_ms,
         budget_bytes: spec.budget_bytes,
         pause_reason: spec.pause_reason.clone(),
-        gaps: spec
-            .gaps
-            .iter()
-            .map(|gap| MetaSinkGap {
-                first_id: gap.first_id,
-                last_id: gap.last_id,
-            })
-            .collect(),
+        last_gap: spec.last_gap.map(|gap| MetaSinkGap {
+            first_id: gap.first_id,
+            last_id: gap.last_id,
+        }),
         gap_count: spec.gap_count,
     }
 }

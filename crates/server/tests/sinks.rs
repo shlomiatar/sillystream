@@ -936,7 +936,7 @@ async fn webhooks_work_over_tls_with_a_trusted_certificate_and_fail_without_one(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notify_sends_its_three_fields_and_honours_its_rate_under_a_burst() {
     let receiver = Receiver::start().await;
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(1_000));
     let node = harness.node();
     let clock = harness.clock.clone();
     let mut client = node.client(0).await;
@@ -944,7 +944,6 @@ async fn notify_sends_its_three_fields_and_honours_its_rate_under_a_burst() {
     let spec = SinkSpec {
         kind: "webhook.notify".to_owned(),
         url: Some(receiver.url()),
-        interval_ms: 1_000,
         on_expire: "stop".to_owned(),
         ..SinkSpec::default()
     };
@@ -1493,11 +1492,8 @@ async fn on_expire_skip_continues_and_records_the_gap() {
     loop {
         let (spec, cursor) = sink_of(&mut client, STREAM, 1).await;
         if spec.gap_count == 1 && cursor == first {
-            assert_eq!(spec.gaps.len(), 1);
-            assert_eq!(
-                (spec.gaps[0].first_id, spec.gaps[0].last_id),
-                (first, first)
-            );
+            let gap = spec.last_gap.unwrap();
+            assert_eq!((gap.first_id, gap.last_id), (first, first));
             assert!(!spec.paused);
             break;
         }
@@ -1589,8 +1585,8 @@ async fn a_read_refused_as_expired_is_a_gap_to_a_skip_sink() {
     wait_for_cursor(&mut client, STREAM, 1, new).await;
     let (spec, _) = sink_of(&mut client, STREAM, 1).await;
     assert_eq!(spec.gap_count, 1);
-    assert_eq!(spec.gaps[0].first_id, old);
-    assert_eq!(spec.gaps[0].last_id, new - 1);
+    assert_eq!(spec.last_gap.unwrap().first_id, old);
+    assert_eq!(spec.last_gap.unwrap().last_id, new - 1);
     drop(client);
     harness.finish();
 }
@@ -1638,7 +1634,7 @@ async fn a_paused_sink_warns_too_and_a_skip_acts_on_resume() {
     wait_for_cursor(&mut client, STREAM, 1, unread).await;
     let (spec, _) = sink_of(&mut client, STREAM, 1).await;
     assert_eq!(spec.gap_count, 1);
-    assert_eq!(spec.gaps[0].last_id, unread);
+    assert_eq!(spec.last_gap.unwrap().last_id, unread);
     drop(client);
     harness.finish();
 }
@@ -2244,7 +2240,7 @@ async fn a_restart_restores_every_sink_and_where_it_was() {
     assert_eq!(spec.pause_reason.as_deref(), Some(&reason[..]));
     assert_eq!(cursor, reset_at);
     assert_eq!(spec.gap_count, 1);
-    assert_eq!(spec.gaps[0].first_id, 5);
+    assert_eq!(spec.last_gap.unwrap().first_id, 5);
     assert!(
         client
             .stream_info(key("keep.gone"))
@@ -2889,28 +2885,34 @@ async fn a_start_or_reset_at_u64_max_means_live_only() {
     harness.finish();
 }
 
-fn notify_spec(url: String, interval_ms: u64) -> SinkSpec {
+fn notify_spec(url: String) -> SinkSpec {
     SinkSpec {
         kind: "webhook.notify".to_owned(),
         url: Some(url),
-        interval_ms,
         on_expire: "stop".to_owned(),
         ..SinkSpec::default()
     }
+}
+
+/// `config()` with the node's least time between notify sends, which every notify sink keeps.
+fn notify_config(interval_ms: u64) -> NodeConfig {
+    let mut config = config();
+    config.sink.notify_interval_ms = interval_ms;
+    config
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notify_retries_keep_to_its_rate() {
     let receiver = Receiver::start().await;
     *receiver.answer.lock().unwrap() = Answer::Status(503);
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(60_000));
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
     put_sink(
         &mut client,
         STREAM,
         3,
-        notify_spec(receiver.url(), 60_000),
+        notify_spec(receiver.url()),
         SinkStart::Earliest,
     )
     .await;
@@ -2930,14 +2932,14 @@ async fn notify_retries_keep_to_its_rate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notify_keeps_to_its_rate_across_an_update() {
     let receiver = Receiver::start().await;
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(60_000));
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
     put_sink(
         &mut client,
         STREAM,
         3,
-        notify_spec(receiver.url(), 60_000),
+        notify_spec(receiver.url()),
         SinkStart::Earliest,
     )
     .await;
@@ -2948,7 +2950,7 @@ async fn notify_keeps_to_its_rate_across_an_update() {
             &mut client,
             STREAM,
             3,
-            notify_spec(receiver.url(), 60_000),
+            notify_spec(receiver.url()),
             SinkStart::Earliest,
         )
         .await;
@@ -3136,10 +3138,10 @@ async fn a_sinks_budget_cant_pass_the_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notify_skip_doesnt_pass_over_what_hasnt_expired() {
     let receiver = Receiver::start().await;
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(DAY_MS + DAY_MS / 2));
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
-    let mut spec = notify_spec(receiver.url(), DAY_MS + DAY_MS / 2);
+    let mut spec = notify_spec(receiver.url());
     spec.on_expire = "skip".to_owned();
     put_sink(&mut client, STREAM, 3, spec, SinkStart::Earliest).await;
     let first = send(&mut client, STREAM, b"a", 1).await;
@@ -3154,9 +3156,9 @@ async fn a_notify_skip_doesnt_pass_over_what_hasnt_expired() {
     tokio::time::sleep(Duration::from_millis(QUIET_MS * 2)).await;
     let (spec, cursor) = sink_of(&mut client, STREAM, 3).await;
     assert!(
-        spec.gaps.iter().all(|gap| gap.last_id < fresh),
+        spec.last_gap.is_none_or(|gap| gap.last_id < fresh),
         "{:?} names a record 1 s old",
-        spec.gaps
+        spec.last_gap
     );
     assert!(cursor < fresh, "the cursor passed an undelivered record");
     assert_eq!(receiver.count(), 1);
@@ -3174,10 +3176,10 @@ async fn a_notify_skip_doesnt_pass_over_what_hasnt_expired() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notify_skip_records_a_run_that_has_all_expired() {
     let receiver = Receiver::start().await;
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(3 * DAY_MS));
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
-    let mut spec = notify_spec(receiver.url(), 3 * DAY_MS);
+    let mut spec = notify_spec(receiver.url());
     spec.on_expire = "skip".to_owned();
     put_sink(&mut client, STREAM, 3, spec, SinkStart::Earliest).await;
     let first = send(&mut client, STREAM, b"a", 1).await;
@@ -3192,7 +3194,13 @@ async fn a_notify_skip_records_a_run_that_has_all_expired() {
     wait_for_cursor(&mut client, STREAM, 3, fresh).await;
     let (spec, _) = sink_of(&mut client, STREAM, 3).await;
     assert_eq!(spec.gap_count, 1);
-    assert_eq!((spec.gaps[0].first_id, spec.gaps[0].last_id), (old, fresh));
+    assert_eq!(
+        (
+            spec.last_gap.unwrap().first_id,
+            spec.last_gap.unwrap().last_id
+        ),
+        (old, fresh)
+    );
     assert_eq!(receiver.count(), 1);
     drop(client);
     harness.finish();
@@ -3229,7 +3237,7 @@ async fn an_archive_skip_keeps_a_batch_with_younger_records() {
     tokio::time::sleep(Duration::from_millis(QUIET_MS * 3)).await;
     let (spec, cursor) = sink_of(&mut client, STREAM, 5).await;
     assert!(spec.last_error.is_some(), "the put should have failed");
-    assert_eq!(spec.gap_count, 0, "{:?}", spec.gaps);
+    assert_eq!(spec.gap_count, 0, "{:?}", spec.last_gap);
     assert!(cursor < fresh);
 
     std::fs::remove_file(&blocker).unwrap();
@@ -3248,14 +3256,14 @@ async fn an_archive_skip_keeps_a_batch_with_younger_records() {
 async fn a_notify_retry_counts_what_arrived_while_it_failed() {
     let receiver = Receiver::start().await;
     receiver.answer(Answer::Status(503));
-    let harness = Harness::new(config());
+    let harness = Harness::new(notify_config(1_000));
     let mut client = harness.node().client(0).await;
     make_stream(&mut client, STREAM).await;
     put_sink(
         &mut client,
         STREAM,
         3,
-        notify_spec(receiver.url(), 1_000),
+        notify_spec(receiver.url()),
         SinkStart::Earliest,
     )
     .await;

@@ -30,9 +30,9 @@ use crate::delivery::{
 use crate::keys::Keys;
 use crate::message::{
     AttachMsg, AttachWalk, CatchReply, ControlMsg, CoreStats, CursorOp, CursorReport, DeliveryMsg,
-    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, SINK_GAPS_KEPT_COUNT,
-    ShardHandoff, SinkGap, SinkOp, SinkReport, SinkStart, SnapshotReply, StateChange, StateOpMsg,
-    StreamBody, StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
+    ProbeTarget, PublishMsg, ReadChain, ReadMsg, ReadStepMsg, Reply, ReplyTx, ShardHandoff,
+    SinkGap, SinkOp, SinkReport, SinkStart, SnapshotReply, StateChange, StateOpMsg, StreamBody,
+    StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
 };
 use crate::metadata::{LocalSave, MetaMsg};
 use crate::placement::{ShardCounters, shard_of};
@@ -3378,7 +3378,7 @@ impl Core {
                 if let Some(existing) = delivery.sinks.get(&sink_id) {
                     spec.paused = existing.paused;
                     spec.pause_reason.clone_from(&existing.pause_reason);
-                    spec.gaps.clone_from(&existing.gaps);
+                    spec.last_gap = existing.last_gap;
                     spec.gap_count = existing.gap_count;
                     spec.epoch = existing.epoch;
                     spec.update_count = existing.update_count + 1;
@@ -3495,10 +3495,7 @@ impl Core {
                         save_sink(&self.local_saves, name, sink_id, Some(spec));
                     }
                     SinkReport::Gap { first_id, last_id } => {
-                        spec.gaps.push(SinkGap { first_id, last_id });
-                        if spec.gaps.len() > SINK_GAPS_KEPT_COUNT {
-                            spec.gaps.remove(0);
-                        }
+                        spec.last_gap = Some(SinkGap { first_id, last_id });
                         spec.gap_count += 1;
                         save_sink(&self.local_saves, name, sink_id, Some(spec));
                     }

@@ -1376,26 +1376,22 @@ fn sink_status_json(spec: &SinkSpec, is_admin: bool) -> String {
         Some(_) if !is_admin => "\"hidden\"".to_owned(),
         value => value.map_or("null".to_owned(), quoted),
     };
-    let gaps: Vec<String> = spec
-        .gaps
-        .iter()
-        .map(|gap| {
-            format!(
-                "{{\"first_id\":\"{}\",\"last_id\":\"{}\"}}",
-                gap.first_id, gap.last_id
-            )
-        })
-        .collect();
+    let last_gap = spec.last_gap.map_or("null".to_owned(), |gap| {
+        format!(
+            "{{\"first_id\":\"{}\",\"last_id\":\"{}\"}}",
+            gap.first_id, gap.last_id
+        )
+    });
     format!(
         "{{\"pause_reason\":{},\"failure_count\":{},\"last_error\":{},\"expiry_warning_id\":{},\
-         \"gap_count\":{},\"gaps\":[{}]}}",
+         \"gap_count\":{},\"last_gap\":{}}}",
         text(&spec.pause_reason),
         spec.failure_count,
         text(&spec.last_error),
         spec.expiry_warning_id
             .map_or("null".to_owned(), |id| format!("\"{id}\"")),
         spec.gap_count,
-        gaps.join(",")
+        last_gap
     )
 }
 
@@ -1542,11 +1538,6 @@ fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<S
                     return Err(malformed("secret can't be empty"));
                 }
                 spec.secret = Some(secret);
-            }
-            "interval_ms" => {
-                spec.interval_ms = value
-                    .as_u64()
-                    .ok_or_else(|| malformed("interval_ms is a number"))?;
             }
             "budget_bytes" => {
                 spec.budget_bytes = value
