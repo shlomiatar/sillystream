@@ -57,7 +57,7 @@ impl Files {
         self.dir.path().join(name)
     }
 
-    fn command(&self, stderr: &Path) -> Command {
+    fn command(&self, stderr: &Path, seal_window_ms: u64) -> Command {
         let mut command = Command::new(BIN);
         let path = |name: &str| self.path(name).to_str().unwrap().to_owned();
         command
@@ -70,7 +70,7 @@ impl Files {
             .args(["--stream-key-file", &path("stream-key")])
             .args(["--object-store", &format!("local:{}", path("objects"))])
             .args(["--cores", "2"])
-            .args(["--seal-window-ms", "1000"])
+            .args(["--seal-window-ms", &seal_window_ms.to_string()])
             .args(["--wal-preallocate-bytes", "1048576"])
             .stdout(Stdio::piped())
             .stderr(File::create(stderr).unwrap());
@@ -93,8 +93,17 @@ impl Drop for Running {
 }
 
 fn start(files: &Files, name: &str, crash_at: Option<&str>) -> Running {
+    start_sealing_every(files, name, crash_at, 1_000)
+}
+
+fn start_sealing_every(
+    files: &Files,
+    name: &str,
+    crash_at: Option<&str>,
+    seal_window_ms: u64,
+) -> Running {
     let stderr = files.path(&format!("{name}.stderr"));
-    let mut command = files.command(&stderr);
+    let mut command = files.command(&stderr, seal_window_ms);
     if let Some(point) = crash_at {
         command.env("SILLYSTREAM_CRASH_AT", point);
     }
@@ -392,10 +401,14 @@ async fn entries_a_generation_fenced_off_are_warned_of_and_their_file_is_kept() 
         assert!(producer.publish_next(port).await);
     }
     tokio::time::sleep(Duration::from_millis(2_000)).await;
+    drop(first);
+    // No seal comes in the longest window, so these stay above what the generation saved.
+    let quiet = start_sealing_every(&files, "quiet", None, 120_000);
+    let port = quiet.port.expect("it listens");
     for _ in 0..7 {
         assert!(producer.publish_next(port).await);
     }
-    drop(first);
+    drop(quiet);
 
     let (wal, aside) = (files.path("wal"), files.path("wal.aside"));
     std::fs::rename(&wal, &aside).unwrap();
@@ -490,7 +503,7 @@ fn of_binaries_racing_on_one_bucket_each_generation_has_one_winner() {
         let mut running: Vec<Running> = Vec::new();
         for at in 0..PROCESS_COUNT {
             let stderr = files.path(&format!("{at}.stderr"));
-            let mut command = files.command(&stderr);
+            let mut command = files.command(&stderr, 1_000);
             let path = |name: String| files.path(&name).to_str().unwrap().to_owned();
             // The parser takes the last of a repeated option.
             command

@@ -617,6 +617,8 @@ async fn records_leave_memory_at_the_local_write_and_level_3_waits_for_the_store
         .publish(publish(STREAM, &records, 1, 3))
         .await
         .unwrap();
+    // The seal must take the record, not come before it.
+    wait_for_memory_to_hold(node, STREAM).await;
     {
         let seal = node.seal();
         tokio::pin!(seal);

@@ -558,18 +558,27 @@ pub async fn seal_published(node: &Node) -> server::SealOutcome {
 }
 
 pub async fn wait_for_memory_to_empty(node: &Node, stream: &str) {
+    wait_for_memory(node, stream, true).await;
+}
+
+/// A publish not yet acked may still be on its way to its core: waits until memory holds it.
+pub async fn wait_for_memory_to_hold(node: &Node, stream: &str) {
+    wait_for_memory(node, stream, false).await;
+}
+
+async fn wait_for_memory(node: &Node, stream: &str, empty: bool) {
     let give_up = std::time::Instant::now() + Duration::from_millis(WAIT_MS);
     loop {
         let mut held = 0;
         for core in 0..node.core_count() {
             held += node.read_memory(core, key(stream)).await.len();
         }
-        if held == 0 {
+        if (held == 0) == empty {
             return;
         }
         assert!(
             std::time::Instant::now() < give_up,
-            "{held} batches stayed in memory"
+            "{held} batches in memory"
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }

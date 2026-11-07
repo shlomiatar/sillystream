@@ -55,7 +55,7 @@ async fn a_stale_override_entry_cant_make_a_second_owner() {
     let own = node.set_override(key(&name), 1).await.unwrap();
     let mut client = node.client(0).await;
     client
-        .publish(publish(&name, &records, 5, 1))
+        .publish(publish(&name, &records, 5, 2))
         .await
         .unwrap();
     let original = ack_within(&mut client).await;
@@ -66,7 +66,7 @@ async fn a_stale_override_entry_cant_make_a_second_owner() {
     node.move_shard(hashed, 1).await;
 
     let mut retry = node.client(0).await;
-    retry.publish(publish(&name, &records, 5, 1)).await.unwrap();
+    retry.publish(publish(&name, &records, 5, 2)).await.unwrap();
     assert_eq!(ack_within(&mut retry).await, original);
     assert_eq!(stream_count_total(node).await, 1);
     assert_eq!(node.stats(3).await.unwrap().stream_count, 1);
