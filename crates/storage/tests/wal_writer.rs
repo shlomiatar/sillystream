@@ -602,6 +602,38 @@ fn a_rotation_out_of_descriptors_waits_and_writes_come_back() {
     }
 }
 
+/// An append can pass the flag just before a seal finds no room for the next file. It waits,
+/// unacked, for the file a later removal opens, rather than ending the writer (D233).
+#[test]
+fn an_append_queued_behind_a_seal_that_finds_no_room_waits_for_the_next_file() {
+    let script = Script::default();
+    let (log, gate) = (Arc::clone(&script.log), Arc::clone(&script.gate));
+    let os_error = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let volume = FailingOpens {
+        script,
+        os_error: Arc::clone(&os_error),
+    };
+    let (sender, handle) =
+        start_wal_writer::<Bytes, _, _, _>(volume, LogNotify(Arc::clone(&log)), (), config(8))
+            .unwrap();
+    gate.hold();
+    sender.try_append(entry(0, 1)).unwrap();
+    gate.wait_for_entered(1);
+    let rotated = sender.try_seal(0).unwrap();
+    os_error.store(EMFILE, std::sync::atomic::Ordering::SeqCst);
+    // The writer is still syncing, so nothing has said there is no file.
+    sender.try_append(entry(0, 2)).unwrap();
+    gate.release();
+    assert_eq!(rotated.blocking_recv().unwrap().closed_seq, 1);
+    assert!(!log.calls().contains(&Call::Durable(0, 2)));
+
+    os_error.store(0, std::sync::atomic::Ordering::SeqCst);
+    sender.try_remove(0).unwrap();
+    drop(sender);
+    handle.join().unwrap();
+    assert!(log.calls().contains(&Call::Durable(0, 2)));
+}
+
 /// Anything else is what it was: a disk that can't be trusted, which ends the writer.
 #[test]
 fn a_rotation_with_another_error_still_stops_the_writer() {

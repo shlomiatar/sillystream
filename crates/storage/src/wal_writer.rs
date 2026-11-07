@@ -291,7 +291,8 @@ impl<R> WalSender<R> {
     }
 
     /// Seals the active file as `seal`: it is rotated and handed to the uploader (D8, D268).
-    /// The receiver resolves once the old file is durable and the new one is ready.
+    /// The receiver resolves once the old file is durable and handed over. With the disk full
+    /// the new one may not exist yet, and `has_file` says so.
     pub fn try_seal(&self, seal: u64) -> Result<oneshot::Receiver<WalRotated>, WalSendError<()>> {
         let (done, done_rx) = oneshot::channel();
         match self.tx.try_send(WalCommand::Seal { seal, done }) {
@@ -465,16 +466,9 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
                     }
                 }
             }
-            if !batch.is_empty() {
-                self.commit(&batch, &mut heads)?;
-                for entry in batch.drain(..) {
-                    self.keep(entry);
-                }
-                if self.open.record_bytes >= self.segment_cap_bytes && !self.open.full_told {
-                    self.open.full_told = true;
-                    self.sealer.full();
-                }
-            }
+            // Appends that passed the flag just as a rotation found no room wait here, unacked,
+            // for the file a later seal or removal opens. No more can join them meanwhile.
+            self.commit_held(&mut batch, &mut heads)?;
             match control {
                 Some(WalCommand::Seal { seal, done }) => {
                     let rotated = self.seal(seal).map_err(WalError::Rotate)?;
@@ -501,8 +495,29 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
                 }
                 Some(WalCommand::Append(_)) | None => {}
             }
+            self.commit_held(&mut batch, &mut heads)?;
         }
         Ok(self.stats)
+    }
+
+    /// Commits `batch` into the active file, if there is one.
+    fn commit_held<R: AsRef<[u8]> + Send + 'static>(
+        &mut self,
+        batch: &mut Vec<WalEntry<R>>,
+        heads: &mut Vec<u8>,
+    ) -> Result<(), WalError> {
+        if batch.is_empty() || self.file.is_none() {
+            return Ok(());
+        }
+        self.commit(batch, heads)?;
+        for entry in batch.drain(..) {
+            self.keep(entry);
+        }
+        if self.open.record_bytes >= self.segment_cap_bytes && !self.open.full_told {
+            self.open.full_told = true;
+            self.sealer.full();
+        }
+        Ok(())
     }
 
     /// Keeps a synced entry's records for the seal, and hands over its stream's as a dedicated
@@ -610,10 +625,9 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
         batch: &[WalEntry<R>],
         heads: &mut Vec<u8>,
     ) -> Result<(), WalError> {
-        // Only an append that passed the flag just as a rotation found no room can get here. It
-        // has no file to go in, and it isn't acked, so this ends as any full disk does.
+        // `commit_held` holds a batch while there is no file.
         let Some(file) = &mut self.file else {
-            return Err(WalError::Write(io::ErrorKind::StorageFull.into()));
+            unreachable!("a commit with no active file");
         };
         heads.clear();
         let mut layout = Vec::with_capacity(batch.len());
