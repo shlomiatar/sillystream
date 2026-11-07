@@ -538,6 +538,40 @@ async fn a_former_generations_object_counts_up_to_its_limit() {
     assert_eq!(a.objects, vec![object(2)]);
 }
 
+/// A fenced-off generation's full file is no base, even as the only file: what it says above
+/// its limit is what the next owner never accepted.
+#[tokio::test]
+async fn a_fenced_off_full_file_is_no_base_for_a_lookup() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    put(
+        &store,
+        1,
+        1,
+        head(true, 20, vec![sealed_row(5)], Vec::new()),
+        &[stream("a", 20, &[5])],
+    )
+    .await;
+    // The next owner's own entry, below the limit.
+    put(
+        &store,
+        2,
+        2,
+        head(false, 10, Vec::new(), Vec::new()),
+        &[stream("a", 10, &[])],
+    )
+    .await;
+    let set = CheckpointSet::read(&store, Ownership::from_records([(1, 0), (2, 12)]))
+        .await
+        .unwrap();
+    let a = set
+        .lookup(&store, key("a"), &NewerObjects::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.last_id, 10);
+    assert!(!a.objects.contains(&object(5)), "{:?}", a.objects);
+}
+
 /// A stream deleted and made again: the full file's list was the old stream's.
 #[tokio::test]
 async fn a_floor_since_the_full_file_leaves_its_list_out() {

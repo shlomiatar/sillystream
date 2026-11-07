@@ -388,9 +388,12 @@ impl CheckpointSet {
             .unwrap_or(0)
     }
 
-    /// The full file lists come from, if the oldest file is one.
+    /// The full file lists come from, if the oldest file is one that counts. A fenced-off
+    /// generation's file counts for nothing, here as in `rows`.
     fn full_file(&self) -> Option<&CheckpointFile> {
-        self.files.last().filter(|file| file.head.full)
+        self.files
+            .last()
+            .filter(|file| file.head.full && self.accepts(file.generation, file.head.max_id))
     }
 
     /// Sealed objects these files record that the full file doesn't, whose last ids lists are
