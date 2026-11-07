@@ -258,6 +258,7 @@ fn meta_bytes_are_exact() {
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
         out.extend_from_slice(value);
     };
+    u32le(&mut body, 2);
     u32le(&mut body, 1);
     body.extend_from_slice(&key("s").0);
     for value in [2, 3, 20, 4, 5] {
@@ -296,6 +297,47 @@ fn meta_bytes_are_exact() {
     want.extend_from_slice(&body);
     assert_eq!(encode_meta(&meta), want);
     assert_eq!(decode_meta(&want).unwrap(), meta);
+}
+
+/// Bytes from before the version field, whose word there was `flags`, or from a later layout,
+/// are refused by name rather than misread.
+#[test]
+fn another_format_version_is_refused_with_both_numbers() {
+    let meta = StreamMeta {
+        stream: key("s"),
+        ..StreamMeta::default()
+    };
+    for found in [0u32, 1, storage::META_VERSION + 1] {
+        let mut bytes = encode_meta(&meta);
+        bytes[4..8].copy_from_slice(&found.to_le_bytes());
+        let crc = crc32c(&bytes[4..]);
+        bytes[..4].copy_from_slice(&crc.to_le_bytes());
+        let error = decode_meta(&bytes).unwrap_err().to_string();
+        assert!(error.contains(&format!("version {found}")), "{error}");
+        assert!(
+            error.contains(&storage::META_VERSION.to_string()),
+            "{error}"
+        );
+
+        let mut sink = storage::encode_sink(&MetaSink {
+            sink_id: 1,
+            kind: "archive".to_owned(),
+            url: None,
+            target: None,
+            filter: None,
+            on_expire: "stop".to_owned(),
+            paused: false,
+            secret: None,
+            interval_ms: 0,
+            budget_bytes: 0,
+            pause_reason: None,
+            gaps: Vec::new(),
+            gap_count: 0,
+        });
+        sink[..4].copy_from_slice(&found.to_le_bytes());
+        let error = storage::decode_sink(&sink).unwrap_err().to_string();
+        assert!(error.contains(&format!("version {found}")), "{error}");
+    }
 }
 
 #[test]

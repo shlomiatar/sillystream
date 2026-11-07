@@ -83,7 +83,7 @@ fn encode_head(head: &CheckpointHead) -> Vec<u8> {
 }
 
 fn decode_head(bytes: &[u8]) -> Result<CheckpointHead, MetaError> {
-    const BAD: MetaError = MetaError("a checkpoint's head is corrupt");
+    const BAD: MetaError = MetaError::new("a checkpoint's head is corrupt");
     if bytes.len() < 16
         || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != crc32c(&bytes[4..])
         || bytes[4] > 1

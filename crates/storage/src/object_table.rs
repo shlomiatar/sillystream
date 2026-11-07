@@ -167,7 +167,7 @@ impl ObjectRow {
 
     /// Decodes a row from the front of `bytes`, saying how many bytes it took.
     pub fn decode(key: ObjectKey, bytes: &[u8]) -> Result<(ObjectRow, usize), MetaError> {
-        const BAD: MetaError = MetaError("an object table row is corrupt");
+        const BAD: MetaError = MetaError::new("an object table row is corrupt");
         let head = bytes.get(..4).ok_or(BAD)?;
         let state = ObjectState::of_code(head[0]).ok_or(BAD)?;
         let held = (head[1] != HELD_UNKNOWN).then_some(head[1]);
@@ -207,7 +207,7 @@ pub fn encode_rows(out: &mut Vec<u8>, rows: &[ObjectRow]) {
 
 /// The rows at the front of `bytes`, and how many bytes they took.
 pub fn decode_rows(bytes: &[u8]) -> Result<(Vec<ObjectRow>, usize), MetaError> {
-    const BAD: MetaError = MetaError("object table rows are corrupt");
+    const BAD: MetaError = MetaError::new("object table rows are corrupt");
     let count = bytes.get(..4).ok_or(BAD)?;
     let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
     let mut at = 4;

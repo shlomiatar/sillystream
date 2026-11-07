@@ -2,11 +2,12 @@
 //! blob in a checkpoint. All little-endian.
 //!
 //! ```text
-//! meta   := crc32c u32 | flags u32 | stream key | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
+//! meta   := crc32c u32 | version u32 | flags u32 | stream key | last_id u64 | floor_id u64 | expired_through u64 | applied_id u64 |
 //!           state_ver u64 | state bytes32 | default_ack u8 | min_ack u8 | 0 u16 | 0 u32 |
 //!           retention_ms u64 |
 //!           n u32 | n × cursor | n u32 | n × sink | ids
 //! cursor := name key | id u64
+//! saved  := version u32 | sink      a sink alone, as the local store keeps it between seals
 //! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
 //!           paused u8 | secret opt | interval_ms u64 | budget_bytes u64 |
 //!           pause_reason opt | n u32 | n × (first_id u64 | last_id u64) | gap_count u64
@@ -17,7 +18,9 @@
 //! optkey := present u8 | key if present
 //! ```
 //!
-//! `flags` bit 0 is "deleted" (D20). The CRC covers everything after it.
+//! `version` is `META_VERSION`, and anything else is refused with both numbers: an older build's
+//! bytes would otherwise be misread. `flags` bit 0 is "deleted" (D20). The CRC covers everything
+//! after it.
 
 use std::fmt;
 
@@ -27,6 +30,9 @@ use format::{KeyHash, crc32c};
 use crate::object::ObjectId;
 
 const FLAG_DELETED: u32 = 1;
+/// The layout above. Raise it whenever the layout changes. Before it had a field of its own,
+/// the word where it sits was `flags`, 0 or 1, so 2 is the first.
+pub const META_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaCursor {
@@ -88,8 +94,21 @@ pub struct StreamMeta {
     pub objects: Vec<ObjectId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MetaError(pub &'static str);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaError(pub std::borrow::Cow<'static, str>);
+
+impl MetaError {
+    pub const fn new(text: &'static str) -> MetaError {
+        MetaError(std::borrow::Cow::Borrowed(text))
+    }
+
+    fn version(found: u32) -> MetaError {
+        MetaError(std::borrow::Cow::Owned(format!(
+            "format version {found}, and this build reads only {META_VERSION}: the data is from \
+             another build"
+        )))
+    }
+}
 
 impl fmt::Display for MetaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -141,7 +160,7 @@ pub fn decode_ids(bytes: &[u8]) -> Result<Vec<ObjectId>, MetaError> {
     let mut reader = Reader { bytes, at: 0 };
     let ids = reader.ids()?;
     if reader.at != bytes.len() {
-        return Err(MetaError("bytes after the ids"));
+        return Err(MetaError::new("bytes after the ids"));
     }
     Ok(ids)
 }
@@ -175,15 +194,20 @@ fn put_sink(out: &mut Vec<u8>, sink: &MetaSink) {
 /// One sink alone, as the local store keeps it between seals (section 5.1).
 pub fn encode_sink(sink: &MetaSink) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
+    put_u32(&mut out, META_VERSION);
     put_sink(&mut out, sink);
     out
 }
 
 pub fn decode_sink(bytes: &[u8]) -> Result<MetaSink, MetaError> {
     let mut reader = Reader { bytes, at: 0 };
+    let version = reader.u32()?;
+    if version != META_VERSION {
+        return Err(MetaError::version(version));
+    }
     let sink = reader.sink()?;
     if reader.at != bytes.len() {
-        return Err(MetaError("bytes after the sink"));
+        return Err(MetaError::new("bytes after the sink"));
     }
     Ok(sink)
 }
@@ -191,6 +215,7 @@ pub fn decode_sink(bytes: &[u8]) -> Result<MetaSink, MetaError> {
 pub fn encode_meta(meta: &StreamMeta) -> Vec<u8> {
     let mut out = Vec::with_capacity(128 + meta.state.len());
     put_u32(&mut out, 0);
+    put_u32(&mut out, META_VERSION);
     put_u32(&mut out, if meta.deleted { FLAG_DELETED } else { 0 });
     out.extend_from_slice(&meta.stream.0);
     put_u64(&mut out, meta.last_id);
@@ -228,11 +253,11 @@ impl<'a> Reader<'a> {
         let end = self
             .at
             .checked_add(len)
-            .ok_or(MetaError("a length runs off the end"))?;
+            .ok_or(MetaError::new("a length runs off the end"))?;
         let taken = self
             .bytes
             .get(self.at..end)
-            .ok_or(MetaError("a length runs off the end"))?;
+            .ok_or(MetaError::new("a length runs off the end"))?;
         self.at = end;
         Ok(taken)
     }
@@ -260,14 +285,14 @@ impl<'a> Reader<'a> {
     fn text(&mut self) -> Result<String, MetaError> {
         std::str::from_utf8(self.bytes32()?)
             .map(str::to_owned)
-            .map_err(|_| MetaError("text isn't UTF-8"))
+            .map_err(|_| MetaError::new("text isn't UTF-8"))
     }
 
     fn opt(&mut self) -> Result<Option<String>, MetaError> {
         match self.u8()? {
             0 => Ok(None),
             1 => self.text().map(Some),
-            _ => Err(MetaError("an option flag isn't 0 or 1")),
+            _ => Err(MetaError::new("an option flag isn't 0 or 1")),
         }
     }
 
@@ -279,7 +304,7 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => self.key().map(Some),
-            _ => Err(MetaError("an option flag isn't 0 or 1")),
+            _ => Err(MetaError::new("an option flag isn't 0 or 1")),
         }
     }
 
@@ -293,7 +318,7 @@ impl<'a> Reader<'a> {
             loop {
                 let byte = self.u8()?;
                 if shift > 63 {
-                    return Err(MetaError("a varint is too long"));
+                    return Err(MetaError::new("a varint is too long"));
                 }
                 delta |= u64::from(byte & 0x7F) << shift;
                 if byte & 0x80 == 0 {
@@ -302,11 +327,11 @@ impl<'a> Reader<'a> {
                 shift += 7;
             }
             if index > 0 && delta == 0 {
-                return Err(MetaError("object ids aren't ascending"));
+                return Err(MetaError::new("object ids aren't ascending"));
             }
             previous = previous
                 .checked_add(delta)
-                .ok_or(MetaError("an object id is too big"))?;
+                .ok_or(MetaError::new("an object id is too big"))?;
             ids.push(ObjectId(previous));
         }
         Ok(ids)
@@ -320,7 +345,7 @@ impl<'a> Reader<'a> {
         let paused = match self.u8()? {
             0 => false,
             1 => true,
-            _ => return Err(MetaError("a paused flag isn't 0 or 1")),
+            _ => return Err(MetaError::new("a paused flag isn't 0 or 1")),
         };
         let secret = self.opt()?;
         let (interval_ms, budget_bytes) = (self.u64()?, self.u64()?);
@@ -355,7 +380,7 @@ impl<'a> Reader<'a> {
     fn count(&mut self, min_entry_bytes: usize) -> Result<usize, MetaError> {
         let count = self.u32()? as usize;
         if count > (self.bytes.len() - self.at) / min_entry_bytes {
-            return Err(MetaError("a count runs off the end"));
+            return Err(MetaError::new("a count runs off the end"));
         }
         Ok(count)
     }
@@ -365,11 +390,15 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     let mut reader = Reader { bytes, at: 0 };
     let crc = reader.u32()?;
     if crc != crc32c(&bytes[4..]) {
-        return Err(MetaError("the CRC doesn't match"));
+        return Err(MetaError::new("the CRC doesn't match"));
+    }
+    let version = reader.u32()?;
+    if version != META_VERSION {
+        return Err(MetaError::version(version));
     }
     let flags = reader.u32()?;
     if flags & !FLAG_DELETED != 0 {
-        return Err(MetaError("an unknown flag"));
+        return Err(MetaError::new("an unknown flag"));
     }
     let stream = reader.key()?;
     let (last_id, floor_id, expired_through, applied_id, state_ver) = (
@@ -382,7 +411,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     let state = Bytes::copy_from_slice(reader.bytes32()?);
     let (default_ack_level, min_ack_level) = (reader.u8()?, reader.u8()?);
     if reader.take(6)? != [0; 6] {
-        return Err(MetaError("padding isn't zero"));
+        return Err(MetaError::new("padding isn't zero"));
     }
     let retention_ms = reader.u64()?;
     let mut meta = StreamMeta {
@@ -410,7 +439,7 @@ pub fn decode_meta(bytes: &[u8]) -> Result<StreamMeta, MetaError> {
     }
     meta.objects = reader.ids()?;
     if reader.at != bytes.len() {
-        return Err(MetaError("bytes after the metadata"));
+        return Err(MetaError::new("bytes after the metadata"));
     }
     Ok(meta)
 }
