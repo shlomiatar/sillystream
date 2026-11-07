@@ -833,3 +833,53 @@ About 4% at 64 KiB and noise elsewhere, so it wasn't kept. Closing the gap would
 | 1 KiB | 591, 598, 604 | 572, 602, 604 |
 
 About 4% better at 64 KiB and noise at 200 KB and 1 KiB. Never clearly worse, so it stays. The WAL pair is still the limit: md0 wrote 550–620 MB/s either way.
+
+## Google Cloud Storage: ack levels, catch-up and webhook sinks
+
+`29b7685` plus `34057f8` (level 3 in `bench throughput`), `us-east4-a`, 2026-11-07, Ubuntu 24.04, rustc 1.98.1. Server `n2-standard-16` with two local NVMe SSDs, the WAL on one and data on the other (ext4, `noatime`), `--cores 16`, a 1 s seal window, and `gs:BUCKET` in `us-east4` through an attached service account. Two `n2-standard-8` clients on internal addresses with TLS: one producer and catch-up reader, one HTTPS webhook receiver (`silly bench webhook-receiver`). One run per row unless listed. Headings printed by the tool say "4 cores", but the server always has 16.
+
+**Publish throughput, one producer, 32 streams, 10 s per row,** publishes/s and MB/s of record data:
+
+| connections | bytes | level 1 | level 2 | level 3 |
+|---|---|---|---|---|
+| 4 | 1 KiB | 92,750 / 95 | 79,113 / 81 | 15,070 / 15 |
+| 4 | 64 KiB | 5,243 / 344 | 5,477 / 359 | 463 / 30 |
+| 64 | 1 KiB | 82,650 / 85 | 82,840 / 85 | 85,096 / 87 |
+| 64 | 64 KiB | 5,997 / 393 | 5,158 / 338 | 2,676 / 175 |
+| 512 | 1 KiB | 87,360 / 90 | 87,217 / 89 | 80,792 / 83 |
+| 512 | 64 KiB | 5,752 / 377 | 5,158 / 338 | 2,018 / 132 |
+
+- **Level 3 is bounded by what the bench keeps in flight:** at most 4,096 publishes per connection, and a share of 256 MiB (between 4 and 128 records of 64 KiB). Each waits for a seal and its upload, about 1–2 s, so 4 connections reach about 16,000/s at 1 KiB and 512/s at 64 KiB. With 64 connections, 1 KiB at level 3 matches level 1.
+- **Levels 1 and 2 look client-bound at 1 KiB:** about 85,000/s at any connection count. The host was 12.7% busy over 20 s that took in 10 s of 64 KiB at level 1 (375 MB/s), so roughly 25% while loaded.
+
+**Catch-up from the bucket:** 4 streams of 64 KiB records, 10.6 GB in all. The server was stopped, `data/cache` removed and the server started again (1.2 s), then one `silly tail --from start --to HEAD` per stream, all at once, from the producer machine. The server's catch-up trace counts the bytes by tier.
+
+| read | time | MB/s | from the object store |
+|---|---|---|---|
+| 4 streams at once | 34.4 s | 309 | 10,606 MB, all of it |
+| 4 streams at once, again | 33.4 s | 318 | 10,606 MB, all of it |
+| 1 stream | 28.6 s | 93 | |
+
+- **Reads from the bucket don't fill the local cache:** the second pass read everything from the object store again, and `data/cache` stayed at 12 KB.
+- **One stream reads at about 90 MB/s, and the rate grows with streams.** In the sink runs below, which read the same way, the server's busiest thread stayed under half a core, so the limit is likely the object reads within one stream, one after another. That wasn't confirmed, and the client's CPU wasn't measured.
+
+**`webhook.deliver` from the bucket:** sinks with `--start earliest` on the same 4 streams, delivering over TLS to the receiver in 2 MiB POSTs of 32 records. Every record arrived in every run.
+
+| run | sink pool threads | records | active seconds | MiB/s |
+|---|---|---|---|---|
+| 1 sink | 2 | 40,625 | 28 | 91 |
+| 4 sinks, 1 | 2 | 161,785 | 78 | 130 |
+| 4 sinks, 2 | 2 | 161,885 | 53 | 191 |
+| 4 sinks, 3 | 4 | 162,004 | 65 | 156 |
+| 4 sinks, 4 | 4 | 162,007 | 72 | 141 |
+
+- **A sink delivers at about its stream's catch-up rate.** One sink matched one `silly tail`, at about 90 MiB/s. Four sinks start at about four times that (4,600–4,800 records/s), then step down unevenly as they finish.
+- **Pool threads aren't the limit:** 4 threads did no better than 2. In run 4 the host was 9.1% busy. The compactor used 41% of a core, two sink threads about 39% each, and nothing else over 8%.
+- **Unexplained:** pauses of 3–10 s with no deliveries from any sink, at least once in most runs.
+
+**`webhook.deliver` live:** 4 sinks with `--start now`, then 30 s of 64 KiB publishes at level 1 to their streams from 64 connections, 4,822/s (316 MB/s).
+
+- **The sinks fell behind.** They kept up for about 3 s (5,600–7,700 records/s), then delivered 2,000–3,800/s, and finished about 30 s after publishing stopped. In all, 149,539 records over 62 active seconds, about 150 MiB/s.
+- **Unexplained:** for several seconds in a row the receiver counted exactly 2,434 records in 38 POSTs of 64 records (4 MiB), which looks like a fixed pace somewhere.
+
+**Discarded:** `mpstat` and `pidstat`, started over `ssh` in the background, showed the server about 100% idle while it took in 316 MB/s, against 12.7% busy from `/proc/stat`. Their figures from this session aren't used here. The CPU figures above come from `/proc`.
