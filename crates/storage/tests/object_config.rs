@@ -159,6 +159,7 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
         cache: None,
         events: vec![events_tx],
         last_object_ms: 0,
+        fills: None,
     })
     .unwrap();
     let mut wire = Vec::new();

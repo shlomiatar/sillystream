@@ -48,6 +48,7 @@ fn config(store: Arc<dyn ObjectStore>) -> (UploaderConfig, UnboundedReceiver<Upl
             cache: None,
             events: vec![tx],
             last_object_ms: 0,
+            fills: None,
         },
         rx,
     )
