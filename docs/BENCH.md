@@ -883,3 +883,33 @@ About 4% better at 64 KiB and noise at 200 KB and 1 KiB. Never clearly worse, so
 - **Unexplained:** for several seconds in a row the receiver counted exactly 2,434 records in 38 POSTs of 64 records (4 MiB), which looks like a fixed pace somewhere.
 
 **Discarded:** `mpstat` and `pidstat`, started over `ssh` in the background, showed the server about 100% idle while it took in 316 MB/s, against 12.7% busy from `/proc/stat`. Their figures from this session aren't used here. The CPU figures above come from `/proc`.
+
+## Google Cloud Storage again: kept connections, cache fill, the receiver fix
+
+`e71b3d9`, `us-east4-a`, 2026-11-08, the same machines and layout as the 2026-11-07 run above: server `n2-standard-16` with two local NVMe SSDs (WAL and data apart), `--cores 16`, a 1 s seal window, `gs:BUCKET` in `us-east4`; one `n2-standard-8` producer and reader, one `n2-standard-8` HTTPS receiver. Since that run: webhook connections are kept between POSTs, the sink budget is 4 MiB, a webhook body can be compressed, reads from the bucket fill the local cache, and the receiver flushes its reply. Backlog: 30 s of 64 KiB records at level 1 from 64 connections into 4 streams, 4,932/s (323 MB/s), 9.9 GB in the bucket. One run per row unless listed.
+
+**Catch-up with `data/cache` removed before the first pass,** one `silly tail --from start --to HEAD` per stream:
+
+| read | first pass | from the bucket / local | second pass | from the bucket / local |
+|---|---|---|---|---|
+| 1 stream | 39.1 s | 1,834 / 575 MB | 9.4 s | 0 / 3,170 MB |
+| 4 streams at once | 39.6 s | 8,105 / 1,829 MB | 16.5 s | 0 / 14,312 MB |
+
+- **The second pass is local:** 16.5 s for 4 streams against 33–34 s re-reading the bucket on 2026-11-07. The cache held 9.3 GB afterwards.
+- **The first pass is slower than before** (39.6 s against 33–34 s for 4 streams, 39.1 s against 28.6 s for one). A fill copies whole objects, each holding all 4 streams, while readers still fetch their ranges, so the bucket serves about twice the bytes. The local figures count more than the stream holds; the trace's local tier counting hasn't been checked.
+
+**`webhook.deliver` from the bucket,** 4 sinks from `earliest` with `data/cache` removed, every record arriving, no errors:
+
+| run | records | active seconds | MiB/s of records | on the wire |
+|---|---|---|---|---|
+| plain, 1 | 151,513 | 28 | 338 | 9,474 MiB |
+| plain, 2 | 151,513 | 27 | 351 | 9,474 MiB |
+| zstd | 151,513 | 26 | ~364 | 2.8 MiB |
+| gzip | 151,513 | 26 | ~364 | 126 MiB |
+
+- **About twice the 2026-11-07 rate** (130–191 MiB/s), at a steady 5,000–6,400 records/s with no pauses.
+- **Compression costs CPU, not rate:** the server was at 80% of one core with zstd and 180% with gzip 12 s in. The bench's records are nearly all repeated bytes, so the sizes on the wire say nothing about real data.
+
+**`webhook.deliver` live:** 4 sinks from `now`, then 30 s of 64 KiB publishes at level 1 from 64 connections. 159,346 records arrived over 32 active seconds (311 MiB/s), and the sinks finished within about 2 s of publishing. On 2026-11-07 they fell behind after 3 s and finished 30 s late.
+
+**The pauses were the receiver:** `silly bench webhook-receiver` wrote its 200 without flushing, so a reply could stay in the TLS layer while the sink waited out its 30 s timeout and sent the batch again. Reproduced locally (1–3 stalls a run, 4 sinks, 6.9 GB) and gone after `28737f7`. None of the runs here paused.
