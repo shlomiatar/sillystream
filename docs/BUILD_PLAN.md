@@ -28,7 +28,7 @@ A failure that can't be fixed is reported as a failure. Tests are never weakened
 | `proto` | WebSocket frames | |
 | `auth` | token encode, sign, verify, pattern match | |
 | `storage` | WAL writer, segments, object store, uploader, metadata store | no codec |
-| `server` | cores, write path, delivery, state, APIs, recovery, compaction, sinks; binary `sillystream-server` | no codec |
+| `server` | cores, write path, delivery, state, APIs, recovery, compaction, sinks; binary `sillystream-server` | no codec, except zstd and gzip encoders for sink POST bodies |
 | `sdk` | Rust client, batching, zstd | only crate with zstd |
 | `cli` | binary `silly`: load generator, tokens, config | |
 | `e2e` | black-box suite | starts the real binaries |
@@ -99,7 +99,7 @@ Benchmarks are a deliverable, not an afterthought. SPEC.md says its latency figu
 - Record bytes in a segment equal the wire bytes exactly.
 - Uploader: N sections over many streams produce exactly one PUT per seal, and a dedicated object for a stream filling its buffer, at the section 7.3 path. Store failures retry without losing references.
 - Everything runs on `LocalFileSystem` and `InMemory`. A test proves the S3 config builds a client without connecting.
-- `cargo tree` for `storage` and `server` contains no compression codec (zstd, lz4, flate2, miniz, snappy, brotli), enforced by a test.
+- `cargo tree` for `storage` and `server` contains no compression codec (zstd, lz4, flate2, miniz, snappy, brotli), enforced by a test. The one exception is `server`'s zstd and flate2, which only encode `webhook.deliver` POST bodies (section 9) and never decode record data.
 - `wal_throughput` and `segment` run, with results in `docs/BENCH.md`.
 
 ### M4. Cores, write path and state

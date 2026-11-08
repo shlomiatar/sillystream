@@ -1,5 +1,7 @@
-//! Enforces that `storage` and `server` have no compression codec in their dependency
-//! trees, with every edge kind on every target (SPEC invariants, D19).
+//! Enforces that `storage` has no compression codec in its dependency tree, with every edge kind
+//! on every target (SPEC invariants, D19), and that `server` has only the two a `webhook.deliver`
+//! sink may compress its POST bodies with (section 9). Those encode bytes the runtime sends and
+//! never decode record data.
 
 use std::process::Command;
 
@@ -7,6 +9,8 @@ const BANNED: [&str; 6] = ["zstd", "lz4", "flate2", "miniz", "snappy", "brotli"]
 /// Too short to match inside a name, where `snapshot` would trip it, so these have to
 /// be a whole word of the name. `snap` is the usual Rust Snappy crate.
 const BANNED_WORDS: [&str; 1] = ["snap"];
+/// What a sink's `compression: zstd | gzip` needs in `server`, and nothing else.
+const SINK_ENCODERS: [&str; 4] = ["flate2", "zstd", "zstd-safe", "zstd-sys"];
 
 /// Package names in `cargo tree --prefix none` output containing a banned name.
 fn banned_packages(tree: &str) -> Vec<String> {
@@ -64,11 +68,15 @@ fn storage_has_no_compression_codec() {
 }
 
 #[test]
-fn server_has_no_compression_codec() {
+fn server_has_no_compression_codec_but_the_sink_encoders() {
     let tree = tree("server");
     assert!(tree.contains("storage v"), "{tree}");
     assert!(tree.contains("fjall v"), "{tree}");
-    assert_eq!(banned_packages(&tree), Vec::<String>::new());
+    let others: Vec<String> = banned_packages(&tree)
+        .into_iter()
+        .filter(|name| !SINK_ENCODERS.contains(&name.as_str()))
+        .collect();
+    assert_eq!(others, Vec::<String>::new());
 }
 
 #[test]
