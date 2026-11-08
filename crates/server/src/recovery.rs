@@ -163,6 +163,7 @@ pub(crate) fn sink_spec(sink: &MetaSink) -> SinkSpec {
         paused: sink.paused,
         secret: sink.secret.clone(),
         budget_bytes: sink.budget_bytes,
+        compression: sink.compression.clone(),
         pause_reason: sink.pause_reason.clone(),
         last_gap: sink.last_gap.map(|gap| SinkGap {
             first_id: gap.first_id,
@@ -184,6 +185,7 @@ pub(crate) fn meta_sink(sink_id: u64, spec: &SinkSpec) -> MetaSink {
         paused: spec.paused,
         secret: spec.secret.clone(),
         budget_bytes: spec.budget_bytes,
+        compression: spec.compression.clone(),
         pause_reason: spec.pause_reason.clone(),
         last_gap: spec.last_gap.map(|gap| MetaSinkGap {
             first_id: gap.first_id,

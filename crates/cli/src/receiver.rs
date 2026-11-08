@@ -1,7 +1,9 @@
 //! `silly bench webhook-receiver`: an HTTPS endpoint for `webhook.deliver` sinks that answers
 //! every POST with 200 and prints how many records arrive each second, for benchmarking a sink
 //! across a real network. It makes its own self-signed certificate for `--name` and writes it to
-//! `--ca-out`, for the server's `--sink-ca-file`.
+//! `--ca-out`, for the server's `--sink-ca-file`. A connection carries as many POSTs as the sink
+//! sends on it, and a compressed body is decoded before its records are counted; the MiB it
+//! prints are as they came over the network.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,10 +88,17 @@ async fn serve(mut socket: impl AsyncRead + AsyncWrite + Unpin, counts: &Counts,
                 _ => return,
             }
         }
-        let body = &buffer[head_end..head_end + len];
-        let records = format::Records::new(body).count() as u64;
+        let encoding = head
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("content-encoding:"))
+            .map(str::trim);
+        let body = match decoded(&buffer[head_end..head_end + len], encoding) {
+            Some(body) => body,
+            None => return,
+        };
+        let records = format::Records::new(&body).count() as u64;
         // What the SDK packed into those records, which is what a producer published.
-        let items = sdk::decode_records(body, 0, usize::MAX).map_or(0, |items| items.len()) as u64;
+        let items = sdk::decode_records(&body, 0, usize::MAX).map_or(0, |items| items.len()) as u64;
         buffer.drain(..head_end + len);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -102,6 +111,22 @@ async fn serve(mut socket: impl AsyncRead + AsyncWrite + Unpin, counts: &Counts,
         if socket.write_all(reply).await.is_err() {
             return;
         }
+    }
+}
+
+fn decoded(body: &[u8], encoding: Option<&str>) -> Option<Vec<u8>> {
+    use std::io::Read;
+    match encoding {
+        None => Some(body.to_vec()),
+        Some("zstd") => zstd::decode_all(body).ok(),
+        Some("gzip") => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .read_to_end(&mut out)
+                .ok()?;
+            Some(out)
+        }
+        Some(_) => None,
     }
 }
 

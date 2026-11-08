@@ -57,16 +57,33 @@ impl Seen {
         )
     }
 
+    /// The body as the sink read it, before any `Content-Encoding`.
+    fn decoded(&self) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        match self.headers.get("content-encoding").map(String::as_str) {
+            None => return self.body.clone(),
+            Some("zstd") => out = zstd::decode_all(&self.body[..]).unwrap(),
+            Some("gzip") => {
+                flate2::read::GzDecoder::new(&self.body[..])
+                    .read_to_end(&mut out)
+                    .unwrap();
+            }
+            Some(other) => panic!("no such encoding: {other}"),
+        }
+        out
+    }
+
     /// `(id, data)` of each record the request held.
     fn records(&self) -> Vec<(u64, Vec<u8>)> {
-        parse_records(&self.body)
+        parse_records(&self.decoded())
             .into_iter()
             .map(|record| (record.0, record.3))
             .collect()
     }
 
     fn data(&self) -> Vec<u8> {
-        let records = parse_records(&self.body);
+        let records = parse_records(&self.decoded());
         assert_eq!(records.len(), 1, "one record per delivery");
         records[0].3.clone()
     }
@@ -82,59 +99,69 @@ struct Receiver {
     in_flight: Arc<AtomicU64>,
     peak_in_flight: Arc<AtomicU64>,
     release_all: Arc<AtomicBool>,
+    /// Answers more than one request on a connection.
+    keep_alive: Arc<AtomicBool>,
+    connection_count: Arc<AtomicU64>,
 }
 
 async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, receiver: Receiver) {
+    receiver.connection_count.fetch_add(1, Ordering::SeqCst);
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
-    let head_end = loop {
-        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break end + 4;
-        }
-        match socket.read(&mut chunk).await {
-            Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
-            _ => return,
-        }
-    };
-    let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
-    let mut headers = HashMap::new();
-    for line in head.split("\r\n").skip(1) {
-        if let Some((name, value)) = line.split_once(": ") {
-            headers.insert(name.to_ascii_lowercase(), value.to_owned());
-        }
-    }
-    let len: usize = headers["content-length"].parse().unwrap();
-    while buffer.len() < head_end + len {
-        match socket.read(&mut chunk).await {
-            Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
-            _ => return,
-        }
-    }
-    let answer = *receiver.answer.lock().unwrap();
-    let in_flight = receiver.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-    receiver
-        .peak_in_flight
-        .fetch_max(in_flight, Ordering::SeqCst);
-    receiver.seen.lock().unwrap().push(Seen {
-        headers,
-        body: buffer[head_end..head_end + len].to_vec(),
-    });
-    let status = match answer {
-        Answer::Status(status) => status,
-        Answer::Hold => {
-            while !receiver.release_all.load(Ordering::SeqCst) {
-                tokio::select! {
-                    () = receiver.released.notified() => {}
-                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
-                }
+    loop {
+        let head_end = loop {
+            if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
             }
-            200
+            match socket.read(&mut chunk).await {
+                Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
+                _ => return,
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let mut headers = HashMap::new();
+        for line in head.split("\r\n").skip(1) {
+            if let Some((name, value)) = line.split_once(": ") {
+                headers.insert(name.to_ascii_lowercase(), value.to_owned());
+            }
         }
-    };
-    receiver.in_flight.fetch_sub(1, Ordering::SeqCst);
-    let reply = format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\n\r\n");
-    let _ = socket.write_all(reply.as_bytes()).await;
-    let _ = socket.flush().await;
+        let len: usize = headers["content-length"].parse().unwrap();
+        while buffer.len() < head_end + len {
+            match socket.read(&mut chunk).await {
+                Ok(read) if read > 0 => buffer.extend_from_slice(&chunk[..read]),
+                _ => return,
+            }
+        }
+        let answer = *receiver.answer.lock().unwrap();
+        let in_flight = receiver.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        receiver
+            .peak_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        receiver.seen.lock().unwrap().push(Seen {
+            headers,
+            body: buffer[head_end..head_end + len].to_vec(),
+        });
+        buffer.drain(..head_end + len);
+        let status = match answer {
+            Answer::Status(status) => status,
+            Answer::Hold => {
+                while !receiver.release_all.load(Ordering::SeqCst) {
+                    tokio::select! {
+                        () = receiver.released.notified() => {}
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    }
+                }
+                200
+            }
+        };
+        receiver.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let reply = format!("HTTP/1.1 {status} Status\r\nContent-Length: 0\r\n\r\n");
+        let _ = socket.write_all(reply.as_bytes()).await;
+        let _ = socket.flush().await;
+        if !receiver.keep_alive.load(Ordering::SeqCst) {
+            return;
+        }
+    }
 }
 
 impl Receiver {
@@ -148,6 +175,8 @@ impl Receiver {
             in_flight: Arc::default(),
             peak_in_flight: Arc::default(),
             release_all: Arc::default(),
+            keep_alive: Arc::default(),
+            connection_count: Arc::default(),
         };
         let serving = receiver.clone();
         tokio::spawn(async move {
@@ -509,6 +538,73 @@ async fn deliver_sends_one_batch_at_a_time_holding_what_came_meanwhile() {
     assert_eq!(held, ids[1..]);
     wait_for_cursor(&mut client, STREAM, 1, ids[7]).await;
     receiver.stays_at(2).await;
+    drop(client);
+    harness.finish();
+}
+
+/// A connection whose response ended cleanly carries the next delivery, and one the receiver
+/// closed is replaced without a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliveries_use_one_connection_while_the_receiver_keeps_it() {
+    let receiver = Receiver::start().await;
+    receiver.keep_alive.store(true, Ordering::SeqCst);
+    let harness = Harness::new(config());
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let spec = deliver_spec(&receiver.url());
+    put_sink(&mut client, STREAM, 1, spec, SinkStart::Earliest).await;
+    for seq in 1..=5 {
+        send(&mut client, STREAM, b"x", seq).await;
+        receiver.wait_for_records(seq as usize).await;
+    }
+    assert_eq!(receiver.connection_count.load(Ordering::SeqCst), 1);
+
+    receiver.keep_alive.store(false, Ordering::SeqCst);
+    for seq in 6..=8 {
+        send(&mut client, STREAM, b"x", seq).await;
+        receiver.wait_for_records(seq as usize).await;
+    }
+    let (spec, _) = sink_of(&mut client, STREAM, 1).await;
+    assert_eq!(spec.failure_count, 0, "a closed connection isn't a failure");
+    drop(client);
+    harness.finish();
+}
+
+/// A compressed body says how in `Content-Encoding`, decodes to the records as stored, and is
+/// signed as sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliver_compresses_with_zstd_or_gzip_and_signs_what_it_sends() {
+    let receiver = Receiver::start().await;
+    let harness = Harness::new(config());
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    for (sink_id, encoding) in [(1, "zstd"), (2, "gzip")] {
+        let stream = format!("compressed.{encoding}");
+        make_stream(&mut client, &stream).await;
+        let mut spec = deliver_spec(&receiver.url());
+        spec.compression = Some(encoding.to_owned());
+        put_sink(&mut client, &stream, sink_id, spec, SinkStart::Earliest).await;
+        send(&mut client, &stream, &[7u8; 4096], 1).await;
+    }
+    let seen = receiver.wait_for_records(2).await;
+    assert_eq!(seen.len(), 2);
+    for seen in receiver.seen() {
+        let encoding = &seen.headers["content-encoding"];
+        let sink_id = seen.triple().0;
+        assert_eq!(encoding, if sink_id == 1 { "zstd" } else { "gzip" });
+        assert!(seen.body.len() < 1024, "{encoding} shrank the body");
+        assert_eq!(seen.data(), vec![7u8; 4096]);
+        let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+        mac.update(&seen.body);
+        let hex: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(seen.headers["x-signature"], hex);
+    }
     drop(client);
     harness.finish();
 }
@@ -3409,7 +3505,15 @@ fn attempts_in_flight_follow_the_cores_and_the_open_file_limit() {
     assert_eq!(server::in_flight_max_for(1, plenty), 4_096);
     assert_eq!(server::in_flight_max_for(8, plenty), 32_768);
     assert_eq!(server::in_flight_max_for(16, plenty), 65_536);
-    assert_eq!(server::in_flight_max_for(192, plenty), 65_536, "2^16 at most");
-    assert_eq!(server::in_flight_max_for(8, 256), 128, "half the descriptors");
+    assert_eq!(
+        server::in_flight_max_for(192, plenty),
+        65_536,
+        "2^16 at most"
+    );
+    assert_eq!(
+        server::in_flight_max_for(8, 256),
+        128,
+        "half the descriptors"
+    );
     assert_eq!(server::in_flight_max_for(8, 0), 1);
 }

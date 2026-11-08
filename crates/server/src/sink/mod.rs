@@ -98,7 +98,7 @@ impl Default for SinkConfig {
             max_failure_count: 20,
             request_timeout_ms: 30_000,
             notify_interval_ms: 1_000,
-            budget_bytes: 8 * 1024 * 1024,
+            budget_bytes: 4 * 1024 * 1024,
             in_flight_max_count: 256,
             expire_warn_ms: 3_600_000,
             archive_flush_ms: 60_000,

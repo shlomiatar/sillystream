@@ -33,6 +33,36 @@ const RETENTION_REFRESH_MS: u64 = 1_000;
 const ERROR_WAIT_MS: u64 = 100;
 /// Forwards wait for at least the WAL (section 7.2): a retry is then safe across a crash.
 const FORWARD_ACK_LEVEL: u8 = 2;
+/// How long a webhook connection is kept with nothing to send. Under the 5 s that common servers
+/// keep one, so the other end rarely closes it first.
+const IDLE_CONNECTION_MS: u64 = 4_000;
+
+/// A turn from the node's in-flight limit, given back when dropped. A kept connection holds one,
+/// since it holds a socket (D295).
+struct Turn(Arc<PoolContext>);
+
+impl Turn {
+    async fn take(context: &Arc<PoolContext>) -> Option<Turn> {
+        let permit = context.in_flight.acquire().await.ok()?;
+        permit.forget();
+        Some(Turn(Arc::clone(context)))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.0.in_flight.add_permits(1);
+    }
+}
+
+/// A webhook connection kept between deliveries.
+struct Idle {
+    conn: webhook::Conn,
+    turn: Turn,
+    since_ms: u64,
+}
+
+type IdleSlot = Arc<std::sync::Mutex<Option<Idle>>>;
 
 /// Runs the sink until it no longer exists or the pool stops.
 pub(crate) async fn run(
@@ -343,6 +373,8 @@ struct Reading<'a> {
     delivery: Option<Delivery>,
     /// Its try in progress, if any.
     tasks: JoinSet<Outcome>,
+    /// The webhook connection the last try left open, for the next.
+    idle: IdleSlot,
     held_bytes: u64,
     failure_count: u32,
     warned: bool,
@@ -416,6 +448,7 @@ impl<'a> Reading<'a> {
             unread: VecDeque::new(),
             delivery: None,
             tasks: JoinSet::new(),
+            idle: IdleSlot::default(),
             held_bytes: 0,
             failure_count: spec.failure_count,
             warned: spec.expiry_warning_id.is_some(),
@@ -452,6 +485,16 @@ impl<'a> Reading<'a> {
             }
             if let Some(spell) = self.check_expiry(now_ms).await {
                 return spell;
+            }
+            if self.tasks.is_empty() {
+                let mut idle = self.idle.lock().expect("no try panics holding it");
+                // It gives its turn back once old, or as soon as another sink needs one.
+                let crowded = self.worker.context.in_flight.available_permits() == 0;
+                if idle.as_ref().is_some_and(|idle| {
+                    crowded || now_ms.saturating_sub(idle.since_ms) >= IDLE_CONNECTION_MS
+                }) {
+                    *idle = None;
+                }
             }
             let waiting = self.delivery.is_some() || !self.unread.is_empty();
             let tick = if waiting {
@@ -725,6 +768,7 @@ impl<'a> Reading<'a> {
             kind: self.kind,
             spec: self.spec.clone(),
             url: self.url.clone(),
+            idle: Arc::clone(&self.idle),
             first_id: delivery.first_id,
             last_id: delivery.last_id,
             item_count: delivery.item_count,
@@ -1012,6 +1056,7 @@ struct Attempt {
     kind: Kind,
     spec: SinkSpec,
     url: Option<WebhookUrl>,
+    idle: IdleSlot,
     first_id: u64,
     last_id: u64,
     item_count: u64,
@@ -1020,45 +1065,74 @@ struct Attempt {
 
 impl Attempt {
     async fn run(self) -> Outcome {
-        // Before the attempt's own timeout starts, and held for all of it. A forward only waits
-        // on a core and holds no socket, so a stalled webhook has no reason to hold it up.
-        let _turn = match self.kind {
-            Kind::Forward => None,
-            _ => self.context.in_flight.acquire().await.ok(),
-        };
         match self.kind {
-            Kind::Deliver => self.deliver().await,
-            Kind::Notify => self.notify().await,
             Kind::Forward => self.forward().await,
-            Kind::Archive => self.archive().await,
+            Kind::Archive => {
+                // Before the attempt's own timeout starts, and held for all of it. A forward only
+                // waits on a core and holds no socket, so a stalled webhook has no reason to hold
+                // it up.
+                let _turn = Turn::take(&self.context).await;
+                self.archive().await
+            }
+            Kind::Deliver | Kind::Notify => {
+                let idle = self.idle.lock().expect("no try panics holding it").take();
+                let (turn, reuse) = match idle {
+                    Some(idle) => (Some(idle.turn), Some(idle.conn)),
+                    None => (Turn::take(&self.context).await, None),
+                };
+                let (outcome, kept) = match self.kind {
+                    Kind::Deliver => self.deliver(reuse).await,
+                    _ => self.notify(reuse).await,
+                };
+                if let (Some(conn), Some(turn)) = (kept, turn) {
+                    let since_ms = self.context.clock.now_ms();
+                    *self.idle.lock().expect("no try panics holding it") = Some(Idle {
+                        conn,
+                        turn,
+                        since_ms,
+                    });
+                }
+                outcome
+            }
         }
     }
 
-    async fn post(&self, content_type: &str, body: &[u8]) -> Outcome {
+    async fn post(
+        &self,
+        content_type: &str,
+        content_encoding: Option<&str>,
+        body: &[u8],
+        signature: Option<String>,
+        reuse: Option<webhook::Conn>,
+    ) -> (Outcome, Option<webhook::Conn>) {
         let Some(url) = &self.url else {
-            return Outcome::Permanent("the sink has no url".to_owned());
+            return (Outcome::Permanent("the sink has no url".to_owned()), None);
         };
         let mut headers = vec![
             ("X-Sink-Id", self.sink_id.to_string()),
             ("X-First-Id", self.first_id.to_string()),
             ("X-Last-Id", self.last_id.to_string()),
         ];
-        if let Some(secret) = &self.spec.secret {
-            headers.push(("X-Signature", webhook::signature_hex(secret, body)));
+        if let Some(signature) = signature {
+            headers.push(("X-Signature", signature));
         }
         let config = &self.context.config;
-        let result = webhook::post(PostParts {
-            url,
-            content_type,
-            headers: &headers,
-            body,
-            allow_private: config.allow_private_addresses,
-            resolver: config.resolver.as_ref(),
-            tls: &self.context.tls,
-            timeout_ms: config.request_timeout_ms,
-        })
+        let (result, kept) = webhook::post(
+            PostParts {
+                url,
+                content_type,
+                content_encoding,
+                headers: &headers,
+                body,
+                allow_private: config.allow_private_addresses,
+                resolver: config.resolver.as_ref(),
+                tls: &self.context.tls,
+                timeout_ms: config.request_timeout_ms,
+            },
+            reuse,
+        )
         .await;
-        match result {
+        let outcome = match result {
             Ok(status) => match webhook::classify_status(status) {
                 StatusClass::Delivered => Outcome::Delivered,
                 StatusClass::Retry => Outcome::Retry(format!("status {status}")),
@@ -1066,19 +1140,38 @@ impl Attempt {
             },
             Err(PostError::Blocked(reason)) => Outcome::Permanent(reason),
             Err(PostError::Failed(reason)) => Outcome::Retry(reason),
-        }
+        };
+        (outcome, kept)
     }
 
-    /// The batch's records as stored, one after another, each with its id in its header.
-    async fn deliver(&self) -> Outcome {
+    /// The batch's records as stored, one after another, each with its id in its header, and
+    /// compressed if the sink asks. The signature is of the bytes sent, so a destination checks
+    /// it before it decompresses anything. Both are work for a whole core, so they are done off
+    /// the pool's threads.
+    async fn deliver(&self, reuse: Option<webhook::Conn>) -> (Outcome, Option<webhook::Conn>) {
         if self.bytes.is_empty() {
-            return Outcome::Delivered;
+            return (Outcome::Delivered, reuse);
         }
-        self.post(CONTENT_RECORDS, &self.bytes.concat()).await
+        let (parts, compression) = (self.bytes.clone(), self.spec.compression.clone());
+        let secret = self.spec.secret.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let body = webhook::encode_body(&parts, compression.as_deref())?;
+            let signature = secret.map(|secret| webhook::signature_hex(&secret, &body));
+            Ok::<_, std::io::Error>((body, signature))
+        })
+        .await;
+        let (body, signature) = match built {
+            Ok(Ok(built)) => built,
+            Ok(Err(error)) => return (Outcome::Permanent(format!("the body: {error}")), None),
+            Err(_) => return (Outcome::Killed, None),
+        };
+        let encoding = self.spec.compression.as_deref();
+        self.post(CONTENT_RECORDS, encoding, &body, signature, reuse)
+            .await
     }
 
     /// `{stream, head, unread}`, with ids as strings like everywhere else in JSON (D111).
-    async fn notify(&self) -> Outcome {
+    async fn notify(&self, reuse: Option<webhook::Conn>) -> (Outcome, Option<webhook::Conn>) {
         let head = match self
             .client
             .lock()
@@ -1087,13 +1180,19 @@ impl Attempt {
             .await
         {
             Ok(info) => info.head,
-            Err(code) => return Outcome::Retry(format!("reading the head: {code:?}")),
+            Err(code) => return (Outcome::Retry(format!("reading the head: {code:?}")), reuse),
         };
         let body = format!(
             "{{\"sink_id\":\"{}\",\"head\":\"{head}\",\"unread\":{}}}",
             self.sink_id, self.item_count
         );
-        self.post(CONTENT_JSON, body.as_bytes()).await
+        let signature = self
+            .spec
+            .secret
+            .as_ref()
+            .map(|secret| webhook::signature_hex(secret, body.as_bytes()));
+        self.post(CONTENT_JSON, None, body.as_bytes(), signature, reuse)
+            .await
     }
 
     /// One publish per batch, whose seq is the source id of its last record. The target drops a

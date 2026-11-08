@@ -54,6 +54,7 @@ fn sink() -> impl Strategy<Value = MetaSink> {
                     last_id: sink_id / 2,
                 }),
                 gap_count: u64::from(paused),
+                compression: paused.then(|| "zstd".to_owned()),
             },
         )
 }
@@ -242,6 +243,7 @@ fn meta_bytes_are_exact() {
                 last_id: 23,
             }),
             gap_count: 24,
+            compression: Some("gzip".to_owned()),
         }],
         objects: vec![ObjectId(5), ObjectId(300)],
     };
@@ -252,7 +254,7 @@ fn meta_bytes_are_exact() {
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
         out.extend_from_slice(value);
     };
-    u32le(&mut body, 3);
+    u32le(&mut body, 4);
     u32le(&mut body, 1);
     body.extend_from_slice(&key("s").0);
     for value in [2, 3, 20, 4, 5] {
@@ -283,6 +285,8 @@ fn meta_bytes_are_exact() {
     u64le(&mut body, 22);
     u64le(&mut body, 23);
     u64le(&mut body, 24);
+    body.push(1);
+    text(&mut body, b"gzip");
     // The list: a count, then each id's distance from the one before as a varint.
     u32le(&mut body, 2);
     body.extend_from_slice(&[5, 0xA7, 0x02]);
@@ -325,6 +329,7 @@ fn another_format_version_is_refused_with_both_numbers() {
             pause_reason: None,
             last_gap: None,
             gap_count: 0,
+            compression: None,
         });
         sink[..4].copy_from_slice(&found.to_le_bytes());
         let error = storage::decode_sink(&sink).unwrap_err().to_string();

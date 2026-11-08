@@ -10,7 +10,8 @@
 //! saved  := version u32 | sink      a sink alone, as the local store keeps it between seals
 //! sink   := sink_id u64 | kind str32 | url opt | target optkey | filter opt | on_expire str32 |
 //!           paused u8 | secret opt | budget_bytes u64 | pause_reason opt |
-//!           last_gap (present u8 | first_id u64 | last_id u64 if present) | gap_count u64
+//!           last_gap (present u8 | first_id u64 | last_id u64 if present) | gap_count u64 |
+//!           compression opt
 //! ids    := n u32 | n × delta varint      object ids, ascending, each less the one before
 //! str32  := len u32 | bytes        bytes32 likewise
 //! opt    := present u8 | str32 if present
@@ -32,7 +33,7 @@ use crate::object::ObjectId;
 const FLAG_DELETED: u32 = 1;
 /// The layout above. Raise it whenever the layout changes. Before it had a field of its own,
 /// the word where it sits was `flags`, 0 or 1, so 2 is the first.
-pub const META_VERSION: u32 = 3;
+pub const META_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaCursor {
@@ -59,6 +60,8 @@ pub struct MetaSink {
     /// The latest gap a skip recorded (D30), and how many there have been.
     pub last_gap: Option<MetaSinkGap>,
     pub gap_count: u64,
+    /// `webhook.deliver`: how each POST's body is compressed, if it is.
+    pub compression: Option<String>,
 }
 
 /// Ids a sink skipped because they expired unread.
@@ -189,6 +192,7 @@ fn put_sink(out: &mut Vec<u8>, sink: &MetaSink) {
         None => out.push(0),
     }
     put_u64(out, sink.gap_count);
+    put_opt(out, sink.compression.as_deref());
 }
 
 /// One sink alone, as the local store keeps it between seals (section 5.1).
@@ -359,6 +363,7 @@ impl<'a> Reader<'a> {
             _ => return Err(MetaError::new("a last gap flag isn't 0 or 1")),
         };
         let gap_count = self.u64()?;
+        let compression = self.opt()?;
         Ok(MetaSink {
             sink_id,
             kind,
@@ -372,6 +377,7 @@ impl<'a> Reader<'a> {
             pause_reason,
             last_gap,
             gap_count,
+            compression,
         })
     }
 

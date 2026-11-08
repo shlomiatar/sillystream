@@ -1,8 +1,10 @@
-//! The one HTTP request a webhook sink makes (section 9, D29). HTTP/1.1, one connection per
-//! delivery, no redirects. The address connected to is one that was checked: a name is resolved
-//! once, here, so a second answer can't point it somewhere else.
+//! The one HTTP request a webhook sink makes (section 9, D29). HTTP/1.1, no redirects. The address
+//! connected to is one that was checked: a name is resolved once, here, so a second answer can't
+//! point it somewhere else. A connection whose response ended cleanly is handed back, for the
+//! sink's next delivery to the same URL to use again.
 
 use std::future::Future;
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,9 +17,13 @@ use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 
 /// A response head larger than this isn't one we will read.
 const MAX_RESPONSE_HEAD_BYTES: usize = 64 * 1024;
+/// A response body up to this is read past, so the connection can be used again. A longer one
+/// closes it.
+const MAX_DRAINED_BODY_BYTES: usize = 64 * 1024;
 
 /// A parsed webhook URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +164,8 @@ pub enum PostError {
 pub struct PostParts<'a> {
     pub url: &'a WebhookUrl,
     pub content_type: &'a str,
+    /// `Content-Encoding`, when the body is compressed.
+    pub content_encoding: Option<&'a str>,
     /// Names and values come from this crate and hold only digits and hex.
     pub headers: &'a [(&'static str, String)],
     pub body: &'a [u8],
@@ -167,12 +175,40 @@ pub struct PostParts<'a> {
     pub timeout_ms: u64,
 }
 
-/// The status of the final response, or why there wasn't one. All of it is under `timeout_ms`.
-pub async fn post(parts: PostParts<'_>) -> Result<u16, PostError> {
+/// A connection kept from an earlier POST, to the URL it was opened for.
+pub struct Conn {
+    url: WebhookUrl,
+    socket: Socket,
+}
+
+enum Socket {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl Conn {
+    /// Nothing should arrive on an idle connection: a close, or anything else, means it can't be
+    /// used again. This reads at most a byte, without waiting.
+    fn is_idle(&self) -> bool {
+        let tcp = match &self.socket {
+            Socket::Plain(tcp) => tcp,
+            Socket::Tls(tls) => tls.get_ref().0,
+        };
+        matches!(tcp.try_read(&mut [0u8; 1]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    }
+}
+
+/// The status of the final response, or why there wasn't one, and the connection if it can be
+/// used again. `reuse` is tried first when it was opened for the same URL and is still idle, and
+/// a fresh connection after it if it fails. All of it is under `timeout_ms`.
+pub async fn post(
+    parts: PostParts<'_>,
+    reuse: Option<Conn>,
+) -> (Result<u16, PostError>, Option<Conn>) {
     let timeout = Duration::from_millis(parts.timeout_ms);
-    match tokio::time::timeout(timeout, post_inner(&parts)).await {
+    match tokio::time::timeout(timeout, post_inner(&parts, reuse)).await {
         Ok(result) => result,
-        Err(_) => Err(PostError::Failed("timed out".to_owned())),
+        Err(_) => (Err(PostError::Failed("timed out".to_owned())), None),
     }
 }
 
@@ -207,7 +243,39 @@ async fn resolved(parts: &PostParts<'_>) -> Result<Vec<SocketAddr>, PostError> {
     Ok(addresses)
 }
 
-async fn post_inner(parts: &PostParts<'_>) -> Result<u16, PostError> {
+async fn post_inner(
+    parts: &PostParts<'_>,
+    reuse: Option<Conn>,
+) -> (Result<u16, PostError>, Option<Conn>) {
+    if let Some(conn) = reuse.filter(|conn| conn.url == *parts.url && conn.is_idle()) {
+        // The other end may have closed it as the request went: at-least-once lets it go again.
+        if let Ok((status, kept)) = exchange(conn.socket, parts).await {
+            return (
+                Ok(status),
+                kept.map(|socket| Conn {
+                    url: conn.url,
+                    socket,
+                }),
+            );
+        }
+    }
+    let socket = match connect(parts).await {
+        Ok(socket) => socket,
+        Err(error) => return (Err(error), None),
+    };
+    match exchange(socket, parts).await {
+        Ok((status, kept)) => (
+            Ok(status),
+            kept.map(|socket| Conn {
+                url: parts.url.clone(),
+                socket,
+            }),
+        ),
+        Err(error) => (Err(PostError::Failed(error.to_string())), None),
+    }
+}
+
+async fn connect(parts: &PostParts<'_>) -> Result<Socket, PostError> {
     let addresses = resolved(parts).await?;
     let mut failure = String::new();
     let mut socket = None;
@@ -224,37 +292,52 @@ async fn post_inner(parts: &PostParts<'_>) -> Result<u16, PostError> {
         return Err(PostError::Failed(failure));
     };
     let _ = socket.set_nodelay(true);
-    let failed = |error: std::io::Error| PostError::Failed(error.to_string());
-    if parts.url.https {
-        let name = ServerName::try_from(parts.url.host.clone())
-            .map_err(|error| PostError::Blocked(format!("server name: {error}")))?;
-        let tls = TlsConnector::from(Arc::clone(parts.tls))
-            .connect(name, socket)
-            .await
-            .map_err(failed)?;
-        exchange(tls, parts).await.map_err(failed)
-    } else {
-        exchange(socket, parts).await.map_err(failed)
+    if !parts.url.https {
+        return Ok(Socket::Plain(socket));
+    }
+    let name = ServerName::try_from(parts.url.host.clone())
+        .map_err(|error| PostError::Blocked(format!("server name: {error}")))?;
+    // The config's session cache resumes TLS with a host it has spoken to before.
+    let tls = TlsConnector::from(Arc::clone(parts.tls))
+        .connect(name, socket)
+        .await
+        .map_err(|error| PostError::Failed(error.to_string()))?;
+    Ok(Socket::Tls(Box::new(tls)))
+}
+
+/// One request and its response, and the socket back if it can carry another.
+async fn exchange(socket: Socket, parts: &PostParts<'_>) -> std::io::Result<(u16, Option<Socket>)> {
+    match socket {
+        Socket::Plain(mut tcp) => {
+            let (status, reusable) = exchange_on(&mut tcp, parts).await?;
+            Ok((status, reusable.then_some(Socket::Plain(tcp))))
+        }
+        Socket::Tls(mut tls) => {
+            let (status, reusable) = exchange_on(&mut *tls, parts).await?;
+            Ok((status, reusable.then_some(Socket::Tls(tls))))
+        }
     }
 }
 
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
-    mut socket: S,
+async fn exchange_on<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     parts: &PostParts<'_>,
-) -> std::io::Result<u16> {
+) -> std::io::Result<(u16, bool)> {
     let host = if parts.url.host.contains(':') {
         format!("[{}]", parts.url.host)
     } else {
         parts.url.host.clone()
     };
     let mut head = format!(
-        "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n",
+        "POST {} HTTP/1.1\r\nHost: {host}:{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         parts.url.path,
         parts.url.port,
         parts.content_type,
         parts.body.len()
     );
+    if let Some(encoding) = parts.content_encoding {
+        head.push_str(&format!("Content-Encoding: {encoding}\r\n"));
+    }
     for (name, value) in parts.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -262,20 +345,22 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     socket.write_all(head.as_bytes()).await?;
     socket.write_all(parts.body).await?;
     socket.flush().await?;
-    read_status(&mut socket).await
+    read_response(socket).await
 }
 
-/// The first response that isn't `1xx`. Its body isn't read: only the status counts.
-async fn read_status<S: AsyncRead + Unpin>(socket: &mut S) -> std::io::Result<u16> {
+/// The status of the first response that isn't `1xx`, and whether the connection can carry
+/// another request. Only the status counts: a short body with a length is read past and dropped,
+/// and anything else leaves the connection to be closed.
+async fn read_response<S: AsyncRead + Unpin>(socket: &mut S) -> std::io::Result<(u16, bool)> {
     let bad = |text: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, text.to_owned());
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
         while let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            let line_end = buffer.iter().position(|byte| *byte == b'\r').unwrap_or(end);
-            let line = std::str::from_utf8(&buffer[..line_end])
-                .map_err(|_| bad("a status line isn't text"))?;
-            let mut fields = line.split(' ');
+            let head = std::str::from_utf8(&buffer[..end])
+                .map_err(|_| bad("a response head isn't text"))?;
+            let mut lines = head.split("\r\n");
+            let mut fields = lines.next().unwrap_or("").split(' ');
             let version = fields.next().unwrap_or("");
             if !version.starts_with("HTTP/1.") {
                 return Err(bad("not an HTTP/1 response"));
@@ -288,7 +373,39 @@ async fn read_status<S: AsyncRead + Unpin>(socket: &mut S) -> std::io::Result<u1
                 buffer.drain(..end + 4);
                 continue;
             }
-            return Ok(status);
+            let mut reusable = version == "HTTP/1.1";
+            let mut length = None;
+            for line in lines {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+                match name.as_str() {
+                    "connection" if value.eq_ignore_ascii_case("close") => reusable = false,
+                    "transfer-encoding" => reusable = false,
+                    "content-length" => length = value.parse::<usize>().ok(),
+                    _ => {}
+                }
+            }
+            let length = match length {
+                Some(length) => length,
+                None if status == 204 || status == 304 => 0,
+                // The body runs to the close.
+                None => return Ok((status, false)),
+            };
+            if !reusable || length > MAX_DRAINED_BODY_BYTES {
+                return Ok((status, false));
+            }
+            let total = end + 4 + length;
+            while buffer.len() < total {
+                let read = socket.read(&mut chunk).await?;
+                if read == 0 {
+                    return Ok((status, false));
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            // Bytes past the response were never asked for.
+            return Ok((status, buffer.len() == total));
         }
         if buffer.len() > MAX_RESPONSE_HEAD_BYTES {
             return Err(bad("the response head is too long"));
@@ -298,6 +415,32 @@ async fn read_status<S: AsyncRead + Unpin>(socket: &mut S) -> std::io::Result<u1
             return Err(bad("the connection closed before a response"));
         }
         buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// A delivery's body: its records one after another, compressed as the sink asks.
+pub fn encode_body(parts: &[bytes::Bytes], compression: Option<&str>) -> std::io::Result<Vec<u8>> {
+    let length = parts.iter().map(|part| part.len()).sum::<usize>();
+    match compression {
+        None => Ok(parts.concat()),
+        Some("zstd") => {
+            let mut encoder = zstd::Encoder::new(Vec::with_capacity(length / 2), 1)?;
+            for part in parts {
+                encoder.write_all(part)?;
+            }
+            encoder.finish()
+        }
+        Some("gzip") => {
+            let out = Vec::with_capacity(length / 2);
+            let mut encoder = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
+            for part in parts {
+                encoder.write_all(part)?;
+            }
+            encoder.finish()
+        }
+        Some(other) => Err(std::io::Error::other(format!(
+            "no compression called {other}"
+        ))),
     }
 }
 

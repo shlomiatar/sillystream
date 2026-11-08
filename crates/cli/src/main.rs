@@ -21,7 +21,7 @@ silly stream info|delete NAME
 silly stream core NAME --core N      (give the stream its own shard on core N)
 silly sink create|update STREAM ID --kind K [--sink-url U] [--target T] [--filter F]
                         [--on-expire E] [--start S] [--secret K]
-                        [--budget-bytes N]
+                        [--budget-bytes N] [--compression zstd|gzip]
 silly sink delete|pause|resume STREAM ID
 silly sink reset STREAM ID [--start S]
 silly publish STREAM [--options N] [--ack 0-3] [--no-compress] [DATA ..]   (no DATA: lines of stdin)
@@ -303,6 +303,7 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 "--sink-url",
                 "--secret",
                 "--budget-bytes",
+                "--compression",
             ])?;
             let kind = args.one("--kind").ok_or("needs --kind")?;
             let mut fields = vec![format!("\"kind\":{}", json_string(kind))];
@@ -313,6 +314,7 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
                 ("--on-expire", "on_expire"),
                 ("--start", "start"),
                 ("--secret", "secret"),
+                ("--compression", "compression"),
             ] {
                 if let Some(value) = args.one(flag) {
                     fields.push(format!("\"{field}\":{}", json_string(value)));

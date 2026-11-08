@@ -98,6 +98,8 @@ pub struct SinkSpec {
     pub secret: Option<String>,
     /// What the sink may hold at once, up to the node's. 0 takes the node's.
     pub budget_bytes: u64,
+    /// `webhook.deliver`: `zstd` or `gzip` to compress each POST's body, or none.
+    pub compression: Option<String>,
     /// Why it paused itself. A person pausing leaves this empty, and a resume clears it.
     pub pause_reason: Option<String>,
     /// The latest gap a skip recorded (D30), and how many there have been.

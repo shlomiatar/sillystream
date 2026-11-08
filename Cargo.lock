@@ -294,6 +294,7 @@ name = "cli"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "flate2",
  "format",
  "object_store",
  "rcgen",
@@ -304,6 +305,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "zstd",
 ]
 
 [[package]]
@@ -578,6 +580,15 @@ dependencies = [
  "lsm-tree",
  "tempfile",
  "xxhash-rust",
+]
+
+[[package]]
+name = "flate2"
+version = "1.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "626d4928326b646e70f65ed36fc7cf9f206bdb68a0019ee7c6b4709da4e084c4"
+dependencies = [
+ "zlib-rs",
 ]
 
 [[package]]
@@ -1929,6 +1940,7 @@ dependencies = [
  "bytes",
  "ciborium",
  "criterion",
+ "flate2",
  "format",
  "futures",
  "futures-util",
@@ -1951,6 +1963,7 @@ dependencies = [
  "tokio-tungstenite",
  "webpki-roots",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -2912,6 +2925,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

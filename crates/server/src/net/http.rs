@@ -1544,6 +1544,13 @@ fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<S
                     .as_u64()
                     .ok_or_else(|| malformed("budget_bytes is a number"))?;
             }
+            "compression" => {
+                let compression = text(&value, "compression")?;
+                if compression != "zstd" && compression != "gzip" {
+                    return Err(malformed("compression is zstd or gzip"));
+                }
+                spec.compression = Some(compression);
+            }
             "start" => start = parse_start(&value)?,
             _ => return Err(malformed("unknown sink field")),
         }
@@ -1557,6 +1564,12 @@ fn parse_sink(body: &[u8], keys: &Keys) -> Result<(SinkSpec, SinkStart, Option<S
             if spec.kind == "webhook.deliver" && spec.secret.is_none() {
                 return Err(malformed("webhook.deliver needs a secret to sign with"));
             }
+            if spec.kind == "webhook.notify" && spec.compression.is_some() {
+                return Err(malformed("only webhook.deliver compresses"));
+            }
+        }
+        _ if spec.compression.is_some() => {
+            return Err(malformed("only webhook.deliver compresses"));
         }
         "forward" => {
             if spec.target.is_none() {
