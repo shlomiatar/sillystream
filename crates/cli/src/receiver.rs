@@ -108,7 +108,8 @@ async fn serve(mut socket: impl AsyncRead + AsyncWrite + Unpin, counts: &Counts,
         counts.bytes.fetch_add(len as u64, Ordering::Relaxed);
         counts.posts.fetch_add(1, Ordering::Relaxed);
         let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-        if socket.write_all(reply).await.is_err() {
+        // The reply can sit in the TLS layer until flushed, and the sink waits for it.
+        if socket.write_all(reply).await.is_err() || socket.flush().await.is_err() {
             return;
         }
     }
