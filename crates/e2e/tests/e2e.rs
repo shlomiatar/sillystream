@@ -527,8 +527,7 @@ async fn fill_for_catch_up(node: &Node, token: &str, stream: &str, count: u64) -
 }
 
 /// Reads from `from = 0` on a socket and on the read route. Both must be exactly `expected`, and
-/// the server's own trace must say this tier and no other, except that the read route may find
-/// in the local tier what the first read copied there from the store.
+/// the server's own trace must say this tier and no other.
 async fn check_tier(
     node: &Node,
     token: &str,
@@ -570,11 +569,8 @@ async fn check_tier(
     let through_http = node.http(token).read_bytes(stream, 0, None).await;
     assert!(through_http == expected, "the read route's bytes differ");
     let read = node.tiers_read(stream);
-    // The first read from the store copies its objects into the local tier, so the second can
-    // find some or all of them there (section 7.3).
     assert!(
-        read.iter()
-            .all(|(name, _)| name == tier || (tier == "object" && name == "local")),
+        read.iter().all(|(name, _)| name == tier),
         "wanted only {tier}: {read:?}"
     );
     let total: u64 = read.iter().map(|(_, bytes)| bytes).sum();

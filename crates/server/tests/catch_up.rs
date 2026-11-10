@@ -613,65 +613,6 @@ async fn a_corrupt_local_copy_falls_through_to_the_object_store() {
     harness.finish();
 }
 
-/// An object read from the store is copied into the local tier, and the next read of it is
-/// local (section 7.3).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_read_from_the_store_fills_the_local_tier_for_the_next() {
-    let cache = tempfile::tempdir().unwrap();
-    let harness = Harness::new(cached_config(1, cache.path()));
-    let node = harness.node();
-    let mut client = node.client(0).await;
-    make_stream(&mut client, STREAM).await;
-    let records = record_with(1, &[0x42; 4096]);
-    client
-        .publish(publish(STREAM, &records, 1, 3))
-        .await
-        .unwrap();
-    let SealOutcome::Uploaded { path, .. } = seal_published(node).await else {
-        panic!("the seal should have uploaded");
-    };
-    expect_ack(&mut client).await;
-    wait_for_memory_to_empty(node, STREAM).await;
-    let local = cache.path().join("cached").join(path.as_ref());
-    std::fs::remove_file(&local).unwrap();
-
-    let read_all = |sub: u32| {
-        let node = &node;
-        async move {
-            let mut connection = node.connection(0).await.unwrap();
-            let mut heard = Heard::default();
-            connection.subscribe(Subscription::new(sub, key(STREAM), 0));
-            hear_until(&mut connection, &mut heard, |heard| {
-                heard.records(sub).len() == 1
-            })
-            .await;
-            assert_eq!(heard.records(sub)[0].3, vec![0x42; 4096]);
-        }
-    };
-    read_all(1).await;
-    let first = node.stats(0).await.unwrap();
-    assert!(first.catch_up_object_bytes > 0, "{first:?}");
-    assert_eq!(first.catch_up_local_bytes, 0, "{first:?}");
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !local.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the object never came back to the cache"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    read_all(2).await;
-    let second = node.stats(0).await.unwrap();
-    assert_eq!(
-        second.catch_up_object_bytes, first.catch_up_object_bytes,
-        "{second:?}"
-    );
-    assert!(second.catch_up_local_bytes > 0, "{second:?}");
-    drop(client);
-    harness.finish();
-}
-
 /// A seal's records leave memory once its file is fsynced locally, and are read from that file
 /// while the PUT is held. Level 3 still waits for the store (section 6.2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -488,8 +488,6 @@ pub(crate) struct Stores {
     pub ownership: Arc<Ownership>,
     /// The node's object table, which the cores read and the node and compactor change.
     pub objects: Arc<std::sync::RwLock<storage::ObjectTable>>,
-    /// Asks for an object read from the store to be copied into the local tier (section 7.3).
-    pub fill: Option<storage::FillSender>,
 }
 
 /// What a home core counts.
@@ -2230,13 +2228,7 @@ async fn run_object_job(job: ObjectJob) {
             ReadDone::Read(read)
         }
         None => match read_from(Arc::clone(&job.stores.object), &job).await {
-            Ok(read) => {
-                // The rest of this object is likely read next, here or by another reader.
-                if let Some(fill) = &job.stores.fill {
-                    fill.fill(&job.object.key.path());
-                }
-                ReadDone::Read(read)
-            }
+            Ok(read) => ReadDone::Read(read),
             Err(SegmentError::Store(object_store::Error::NotFound { .. })) => ReadDone::Gone,
             Err(SegmentError::Store(_)) => {
                 tokio::time::sleep(Duration::from_millis(READ_RETRY_MS)).await;

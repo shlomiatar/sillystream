@@ -18,8 +18,7 @@ mod wal_replay;
 mod wal_writer;
 
 pub use cache::{
-    CacheError, FillReceiver, FillSender, FillWriter, MappedSegments, PendingWriter, SegmentCache,
-    fill_channel, list_pending, upload_pending,
+    CacheError, MappedSegments, PendingWriter, SegmentCache, list_pending, upload_pending,
 };
 pub use checkpoint::{
     BuiltCheckpoint, CheckpointError, CheckpointFile, CheckpointHead, CheckpointSet, NewerObjects,

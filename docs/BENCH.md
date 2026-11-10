@@ -897,6 +897,7 @@ About 4% better at 64 KiB and noise at 200 KB and 1 KiB. Never clearly worse, so
 
 - **The second pass is local:** 16.5 s for 4 streams against 33–34 s re-reading the bucket on 2026-11-07. The cache held 9.3 GB afterwards.
 - **The first pass is slower than before** (39.6 s against 33–34 s for 4 streams, 39.1 s against 28.6 s for one). A fill copies whole objects, each holding all 4 streams, while readers still fetch their ranges, so the bucket serves about twice the bytes. The local figures count more than the stream holds; the trace's local tier counting hasn't been checked.
+- **The fill was reverted afterwards:** whole-object copies cost more the more streams an object holds. docs/READ_CACHE.md proposes a range cache instead.
 
 **`webhook.deliver` from the bucket,** 4 sinks from `earliest` with `data/cache` removed, every record arriving, no errors:
 

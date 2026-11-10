@@ -1026,13 +1026,6 @@ impl Node {
             table.load(parts.checkpoints.rows().into_values());
         }
         let objects = Arc::new(std::sync::RwLock::new(table));
-        let (fill, fills) = match &cache {
-            Some(_) => {
-                let (fill, fills) = storage::fill_channel();
-                (Some(fill), Some(fills))
-            }
-            None => (None, None),
-        };
         let stores = Stores {
             local: cache.as_ref().map(|cache| {
                 let store: Arc<dyn ObjectStore> = cache.store();
@@ -1044,7 +1037,6 @@ impl Node {
                 parts.checkpoints.ownership.clone()
             })),
             objects: Arc::clone(&objects),
-            fill,
         };
         let (notify, durable): (DurableWatch, _) = durable_watches(core_count);
         let mut upload_txs = Vec::with_capacity(core_count + 1);
@@ -1066,7 +1058,6 @@ impl Node {
             cache,
             events: upload_txs,
             last_object_ms: recovered.as_ref().map_or(0, |parts| parts.last_object_ms),
-            fills,
         })?;
         let (core_to_node, core_rx) = mpsc::unbounded_channel();
         let seal_requests = core_to_node.clone();

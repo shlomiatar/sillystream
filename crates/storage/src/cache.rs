@@ -4,10 +4,6 @@
 //! `SegmentCache` has one owner, the uploader thread, and takes `&mut self`: it shares no lock
 //! with the cores, which read `cached/` through `MappedSegments`. A startup uploads what
 //! `pending/` holds before anything else reads the store.
-//!
-//! A read that misses here and finds the object in the store asks, through a `FillSender`, for
-//! the whole object to be copied into `cached/`, so the reads after it are local. The uploader
-//! does the copy and counts it like any other cached segment.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -36,11 +32,6 @@ const CACHED_DIR: &str = "cached";
 const TEMP_PREFIX: &str = "tmp-";
 const WRITE_BUFFER_BYTES: usize = 1 << 20;
 const STORE_NAME: &str = "local segments";
-/// Requests to fill that wait for the uploader. More are dropped: the read that asked has
-/// already been served from the store, and a later one asks again.
-const FILL_QUEUE_COUNT: usize = 64;
-/// What a fill writes at once, so that an object is never held whole in memory.
-const FILL_WRITE_BYTES: usize = 8 << 20;
 /// Pending segments a startup uploads at once.
 const CONCURRENT_STARTUP_PUTS: usize = 8;
 
@@ -144,107 +135,6 @@ impl PendingWriter {
     }
 }
 
-/// Asks for objects read from the store to be copied into `cached/`.
-#[derive(Debug, Clone)]
-pub struct FillSender(tokio::sync::mpsc::Sender<Path>);
-
-impl FillSender {
-    /// Never waits: when the uploader is behind, the request is dropped.
-    pub fn fill(&self, path: &Path) {
-        let _ = self.0.try_send(path.clone());
-    }
-}
-
-/// The uploader's end of a `FillSender`.
-pub struct FillReceiver(pub(crate) tokio::sync::mpsc::Receiver<Path>);
-
-pub fn fill_channel() -> (FillSender, FillReceiver) {
-    let (tx, rx) = tokio::sync::mpsc::channel(FILL_QUEUE_COUNT);
-    (FillSender(tx), FillReceiver(rx))
-}
-
-/// What a fill needs to write an object into `cached/`, apart from the owner's accounting.
-#[derive(Debug, Clone)]
-pub struct FillWriter {
-    root: PathBuf,
-    next_temp: Arc<AtomicU64>,
-}
-
-impl FillWriter {
-    /// Copies the whole object from `store` under a temporary name, fsyncs it and gives it its
-    /// name in `cached/`, a few MiB at a time. Refuses one over `room_bytes`, which would only
-    /// push out what the cache holds and then itself. Returns the file and its length.
-    pub async fn fill(
-        &self,
-        store: &dyn ObjectStore,
-        path: &Path,
-        room_bytes: u64,
-    ) -> Result<(PathBuf, u64), String> {
-        let got = store.get(path).await.map_err(|error| error.to_string())?;
-        let len_bytes = got.meta.size as u64;
-        if len_bytes > room_bytes {
-            return Err(format!(
-                "{len_bytes} bytes is more than the cache has room for"
-            ));
-        }
-        let temp = self.root.join(format!(
-            "{TEMP_PREFIX}{}",
-            self.next_temp.fetch_add(1, Ordering::Relaxed)
-        ));
-        let target = file_for(&self.root.join(CACHED_DIR), path);
-        let written = Self::write(got, temp.clone(), target.clone()).await;
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        written.map(|()| (target, len_bytes))
-    }
-
-    async fn write(got: GetResult, temp: PathBuf, target: PathBuf) -> Result<(), String> {
-        let blocking = |error: tokio::task::JoinError| error.to_string();
-        let opened = temp.clone();
-        let mut file = tokio::task::spawn_blocking(move || File::create_new(opened))
-            .await
-            .map_err(blocking)?
-            .map_err(|error| error.to_string())?;
-        let mut stream = got.into_stream();
-        let mut held: Vec<Bytes> = Vec::new();
-        let mut held_bytes = 0;
-        loop {
-            let next = stream.next().await;
-            let last = next.is_none();
-            if let Some(chunk) = next {
-                let chunk = chunk.map_err(|error| error.to_string())?;
-                held_bytes += chunk.len();
-                held.push(chunk);
-            }
-            if held_bytes >= FILL_WRITE_BYTES || (last && !held.is_empty()) {
-                let parts = std::mem::take(&mut held);
-                held_bytes = 0;
-                file = tokio::task::spawn_blocking(move || {
-                    let mut file = file;
-                    for part in parts {
-                        file.write_all(&part)?;
-                    }
-                    Ok::<_, io::Error>(file)
-                })
-                .await
-                .map_err(blocking)?
-                .map_err(|error| error.to_string())?;
-            }
-            if last {
-                break;
-            }
-        }
-        tokio::task::spawn_blocking(move || {
-            file.sync_all()?;
-            rename_into(&temp, &target)
-        })
-        .await
-        .map_err(blocking)?
-        .map_err(|error| error.to_string())
-    }
-}
-
 pub struct SegmentCache {
     root: PathBuf,
     store: Arc<MappedSegments>,
@@ -330,31 +220,6 @@ impl SegmentCache {
 
     pub fn writer(&self) -> PendingWriter {
         self.writer.clone()
-    }
-
-    pub fn fill_writer(&self) -> FillWriter {
-        FillWriter {
-            root: self.root.clone(),
-            next_temp: Arc::clone(&self.writer.next_temp),
-        }
-    }
-
-    /// Whether the directory already has the object, waiting to upload or cached.
-    pub fn holds(&self, path: &Path) -> bool {
-        file_for(&self.root.join(CACHED_DIR), path).exists()
-            || file_for(&self.root.join(PENDING_DIR), path).exists()
-    }
-
-    /// What a fill may take without pushing out more than `cached/` holds.
-    pub fn fill_room_bytes(&self) -> u64 {
-        self.cap_bytes.saturating_sub(self.pending_bytes)
-    }
-
-    /// A fill put this file in `cached/`. It is the newest there, and the last to go.
-    pub fn filled(&mut self, file: PathBuf, len_bytes: u64) -> Result<(), CacheError> {
-        self.cached_bytes += len_bytes;
-        self.cached.push_back((file, len_bytes));
-        self.evict()
     }
 
     pub fn used_bytes(&self) -> u64 {

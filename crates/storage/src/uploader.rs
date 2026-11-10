@@ -5,7 +5,6 @@
 //! nothing is lost and memory stays pinned while the store is down (Q9). An upload that no retry
 //! can help fails on its own, so one object can't stop the ones behind it (D59).
 
-use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +22,7 @@ use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 
-use crate::cache::{FillReceiver, PendingWriter, SegmentCache};
+use crate::cache::{PendingWriter, SegmentCache};
 use crate::object::{ObjectId, sealed_path};
 use crate::segment_builder::{BuiltSegment, SegmentBuilder};
 use crate::segment_format::{SegmentError, StreamExtent};
@@ -162,8 +161,6 @@ pub struct UploaderConfig {
     /// The time in this generation's last object id from before the uploader started, which
     /// its own ids come after (section 7.3). 0 if there is none.
     pub last_object_ms: u64,
-    /// Objects that reads found only in the store, to copy into the cache (section 7.3).
-    pub fills: Option<FillReceiver>,
 }
 
 enum UploadCommand {
@@ -371,11 +368,6 @@ const PUT_TIMEOUT_BYTES_PER_MS: u64 = 1_024;
 /// PUTs running at once. Each is one object, so this bounds how far uploads can fall behind a
 /// store whose single PUT is slow, and it doesn't change how many objects a seal makes (D261).
 const CONCURRENT_PUTS: usize = 8;
-/// Objects copied into the cache at once.
-const CONCURRENT_FILLS: usize = 4;
-
-/// A fill's object, and the file it wrote and its length.
-type Fill = Pin<Box<dyn Future<Output = (Path, Result<(std::path::PathBuf, u64), String>)>>>;
 
 /// What a PUT needs from the uploader, apart from `Worker`, which only runs between them.
 struct Putter {
@@ -448,9 +440,6 @@ impl Worker {
         // What a former process left in `pending/`, uploaded beside the new seals and read
         // locally until then (section 7.3).
         let mut restoring: FuturesUnordered<Restore> = FuturesUnordered::new();
-        let mut fill_rx = self.config.fills.take();
-        let mut fills: FuturesUnordered<Fill> = FuturesUnordered::new();
-        let mut filling: HashSet<Path> = HashSet::new();
         if let Some(cache) = &self.config.cache {
             match cache.pending_segments() {
                 Ok(found) => {
@@ -492,30 +481,6 @@ impl Worker {
                     }
                     continue;
                 },
-                filled = fills.next(), if !fills.is_empty() => {
-                    if let Some((path, result)) = filled {
-                        filling.remove(&path);
-                        if let (Ok((file, len_bytes)), Some(cache)) =
-                            (result, &mut self.config.cache)
-                        {
-                            let _ = cache.filled(file, len_bytes);
-                        }
-                    }
-                    continue;
-                },
-                path = async { fill_rx.as_mut()?.0.recv().await },
-                    if fill_rx.is_some() && fills.len() < CONCURRENT_FILLS =>
-                {
-                    match path {
-                        Some(path) => {
-                            if let Some(fill) = self.start_fill(path, &mut filling) {
-                                fills.push(fill);
-                            }
-                        }
-                        None => fill_rx = None,
-                    }
-                    continue;
-                },
                 command = rx.recv(), if has_room => match command {
                     Some(command) => command,
                     None => break,
@@ -549,22 +514,6 @@ impl Worker {
         UploaderExit {
             unfinished: self.unfinished,
         }
-    }
-
-    /// Copies an object a read found only in the store into the cache, unless it is already
-    /// there or on its way. A failure costs nothing: reads go on to the store.
-    fn start_fill(&self, path: Path, filling: &mut HashSet<Path>) -> Option<Fill> {
-        let cache = self.config.cache.as_ref()?;
-        if filling.contains(&path) || cache.holds(&path) {
-            return None;
-        }
-        filling.insert(path.clone());
-        let (writer, room_bytes) = (cache.fill_writer(), cache.fill_room_bytes());
-        let store = Arc::clone(&self.config.store);
-        Some(Box::pin(async move {
-            let result = writer.fill(store.as_ref(), &path, room_bytes).await;
-            (path, result)
-        }))
     }
 
     fn keep_unfinished(&mut self, command: UploadCommand) {
