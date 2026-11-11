@@ -35,6 +35,7 @@ All fields are little-endian and naturally aligned.
 - **Author:** a non-zero id for the source, such as an agent id or `hash(host)`. A hash that comes out as 0 is remapped to 1. The token issuer chooses it and the token carries it. Producers can't choose it; the owner writes it when stamping.
 - **Data:** opaque to the runtime, with one exception (section 2.2). Producers set it, and it can be compressed, encrypted or anything else. The runtime never parses or decompresses it, which lets it move data by copying bytes.
 - **Items:** with `count = 1`, data is the item's bytes. With `count > 1`, data is client-owned item offsets and item bytes, usually compressed together. Any per-item details, such as event time, also live inside the data.
+- **SDK packing:** the server never looks at it, but every SDK uses the same one. Before compression, data is the item's bytes when `count = 1`, and otherwise `count` little-endian u32 end offsets into the item bytes followed by the item bytes. With `codec = 1` that whole thing, offsets included, is one zstd frame; with `codec = 0` it is as is. The SDK leaves data raw when it is under 64 bytes or zstd wouldn't make it smaller.
 
 ### 2.1 Options layout
 
@@ -97,6 +98,8 @@ all match   if (need1 & !AND) == 0 and (need0 & OR) == 0
 else maybe
 ```
 
+An `eq` clause whose `value` has bits outside `mask` matches nothing, which the formula alone would miss.
+
 For `any`: none match if `OR & mask == 0`; all match if `AND & mask != 0`.
 
 ## 5. Readers
@@ -122,7 +125,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 - **Records are the unit of delivery.** The server sends the original bytes of each matching record, with no copy and no re-encoding.
 - **Resuming inside a record:** the server sends the whole record, and the client skips ahead by id.
 - **Filter table:** each stream keeps a table of its distinct filters, with subscribers listed under each. A record is checked once per distinct filter, and all matching subscribers share the result.
-- **Visibility:** a record is delivered once it is in the WAL, and delivery never waits for S3. Streams that use only ack levels 0–1 deliver immediately, and accept that a crash can erase a record someone already saw.
+- **Visibility:** decided per publish. A publish at ack level 2 or 3 is delivered once it is in the WAL, and one at level 0 or 1 is delivered at once, accepting that a crash can erase a record someone already saw. Delivery never waits for S3. A stream's publishes become visible in order, so a level 0–1 publish behind a level 2 one waits for it.
 - **Ordering:** records arrive in id order.
 - **Linger:** each subscription has a `linger_ms`. Pending records go out when the timer fires or the queue reaches the maximum frame size.
 - **Progress:** after skipping records, the server sends `PROGRESS` at most every few seconds and when the subscriber catches up to the head, so a rare filter doesn't rescan from its old position after a reconnect. It means nothing matches up to that id, and a named cursor can commit it.
@@ -288,7 +291,7 @@ The first version runs on a single node. Shards stay, because cores need them fo
 ### 8.1 Single node
 
 - **Startup:** the server replays whatever is in `wal_dir`, then carries on from S3. The code is the same in every case below.
-- **Clean stop:** the node seals, waits for the segment's upload and checkpoint, and exits with an empty WAL, so a planned stop or handover leaves nothing to replay. A stop that runs past its timeout exits as it is, and startup treats it as a crash.
+- **Clean stop:** the node seals, waits for the segment's upload and checkpoint, and exits with a WAL that holds only the carried dedupe entries (section 3), so a planned stop or handover leaves no records to replay. Replay refills the entries and uploads nothing. A stop that runs past its timeout exits as it is, and startup treats it as a crash.
 - **Process crash:** the process restarts and replays the WAL.
 - **Machine loss:** something external, such as an auto-scaling group, starts a replacement. With EBS, that automation reattaches the volume, and force-detaching it stops the old machine's WAL writes. With local NVMe, the WAL is gone.
 - **Empty WAL check:** if `wal_dir` is empty but the ownership record already has a generation, the server logs a warning that the WAL was lost and that unsealed records may be gone. It can't tell how many. A new node has no generation yet, so it doesn't warn.
@@ -394,18 +397,29 @@ server → client
 0x8F PONG         nonce u32
 ```
 
+- `WITH_STATE`: `SUBSCRIBED` carries the state's version and doc at subscribe time. Nothing more is pushed.
+- `STATE_ONLY`: the same snapshot, then a `STATE` frame for each change as it becomes visible, and no `DATA`.
+
 Error codes: 1 unauthorized, 2 not found, 3 version conflict, 4 rate limited, 5 too many subscriptions, 6 frame too large, 7 retention expired, 8 malformed.
 
 ### 11.2 HTTP
 
 ```
-GET   /v1/stream/<id>                stream info and head
-POST  /v1/stream/<id>/publish        publish records
-GET   /v1/stream/<id>/read?from=&limit=&filter=
-GET   /v1/stream/<id>/state
-PATCH /v1/stream/<id>/state          If-Match for expect_ver
-PUT   /v1/stream/<id>/cursor/<name>
+GET    /v1/stream/<id>                stream info and head
+PUT    /v1/stream/<id>                create, or change config (JSON body)
+DELETE /v1/stream/<id>
+PUT    /v1/stream/<id>/core           move to a core, body {"core": N}
+POST   /v1/stream/<id>/publish        publish records
+GET    /v1/stream/<id>/read?from=&limit=&filter=
+GET    /v1/stream/<id>/state
+PATCH  /v1/stream/<id>/state          If-Match for expect_ver
+PUT    /v1/stream/<id>/cursor/<name>
+PUT    /v1/stream/<id>/sink/<sink>    create or replace a sink (JSON body)
+DELETE /v1/stream/<id>/sink/<sink>
+POST   /v1/stream/<id>/sink/<sink>/pause | resume | reset
 ```
+
+A sink id is a u64 in decimal. A sink needs its source stream to exist, and gets 404 otherwise.
 
 Binary records are the standard format for publish and read. Publish also has a simple form that needs no SDK or JSON, where the body is one item's bytes and the rest goes in headers:
 
@@ -422,6 +436,7 @@ Reads are binary only for now.
 
 A signed token grants access to streams. It lists stream id patterns such as `logs.*`, permissions, an author id and an expiry.
 
+- **Format:** lowercase hex of `body | hmac_sha256(secret, body)`, where body is `expiry_ms u64 | author u64 | n u16 | n × (pattern str | perms u8)`, little-endian. A pattern matches a stream id exactly, or as a prefix when it ends in `*`. Permission bits: 0x01 read, 0x02 publish, 0x04 state, 0x08 admin.
 - The server verifies it without a lookup.
 - Revocation is handled by short expiry.
 - It goes in `HELLO` on WebSocket and as a Bearer token on HTTP.
