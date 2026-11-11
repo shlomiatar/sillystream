@@ -69,7 +69,6 @@ impl WalVolume for NullVolume {
 fn config(core_count: usize) -> NodeConfig {
     let mut config = NodeConfig::new(core_count);
     config.seal_window_ms = None;
-    config.rebalance_period_ms = None;
     // This bench measures to durable. Nothing pinned is ever let go in it.
     config.memory_cap_bytes = u64::MAX;
     config.segment_cap_bytes = u64::MAX;

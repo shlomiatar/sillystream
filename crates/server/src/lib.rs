@@ -43,7 +43,7 @@ pub use node::{
     Client, ClientError, LocalCacheConfig, Node, NodeConfig, NodeExit, Publish, SealOutcome,
     StateOpRequest,
 };
-pub use placement::{ShardCounters, ShardMove, plan_moves, shard_of};
+pub use placement::shard_of;
 pub use recovery::{RecoverConfig, RecoveryReport};
 pub use sink::{
     SINK_CAP_COUNT, SINK_TEXT_MAX_BYTES, SinkAction, SinkConfig, SinkHook, SinkResolver, SinkStep,

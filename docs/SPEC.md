@@ -140,9 +140,8 @@ A node has stream-owning cores, one WAL writer per volume and one uploader. They
 
 Each core exclusively owns a set of streams, including their ids, buffers and subscribers. This is a design requirement, because it determines the system's throughput limits.
 
-- **Placement:** stream → virtual shard → core. A shard is a bucket of streams, so moving one moves all its streams with one small update. A small override table can give a very hot stream its own shard.
-- **Counters per shard:** ingest bytes and records, fan-out bytes, subscribers and catch-up bytes, as moving averages.
-- **Rebalancing:** a periodic check moves shards off overloaded cores through a message handoff.
+- **Placement:** stream → virtual shard → core, by hash, which spreads load evenly. A shard is a bucket of streams, so moving one moves all its streams with one small update, through a message handoff.
+- **Override:** an operator can move a very hot stream to its own core. A small override table gives it its own shard.
 - **Hard limit:** one stream can't ingest more than one core can handle. Fan-out can spread further, because other cores forward the shared bytes to their own connections.
 
 ### 6.2 Write path
@@ -284,7 +283,7 @@ The metadata is last id, the highest expired id, state, config, cursors and the 
 
 ## 8. Ownership and recovery
 
-The first version runs on a single node. Shards stay, because cores need them for placement and rebalancing.
+The first version runs on a single node. Shards stay, because cores need them for placement and for moving a hot stream.
 
 ### 8.1 Single node
 

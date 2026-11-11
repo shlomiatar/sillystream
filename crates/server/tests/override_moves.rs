@@ -128,7 +128,7 @@ async fn a_written_stream_doesnt_bounce_after_its_override_moved_three_times() {
     harness.finish();
 }
 
-/// Any order of moves, as the rebalancer could produce. Clients made along the way start
+/// Any order of moves, as an operator could ask for. Clients made along the way start
 /// from what was true then, so the walk begins from many different cores.
 #[tokio::test]
 async fn any_order_of_moves_ends_at_one_owner() {

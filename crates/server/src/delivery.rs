@@ -228,14 +228,6 @@ impl FilterTable {
         true
     }
 
-    /// Filter subscribers from every core, as a shard's `subscriber_count` counts them.
-    pub fn subscriber_count(&self) -> u64 {
-        self.subs_by_core
-            .iter()
-            .map(|count| u64::from(*count))
-            .sum()
-    }
-
     /// Nobody is subscribed from any core, so the stream may leave RAM (section 7.6).
     pub fn is_unwatched(&self) -> bool {
         self.subs_by_core.iter().all(|count| *count == 0)
@@ -246,24 +238,20 @@ impl FilterTable {
         self.subs_by_core[home] > 0 || (has_state && self.state_subs_by_core[home] > 0)
     }
 
-    /// Each filter's answer, one check per record per filter, and the fan-out bytes that
-    /// come to. Returns `(matches, checks, fan_out_bytes)`.
+    /// Each filter's answer, one check per record per filter. Returns `(matches, checks)`.
     pub fn check(
         &self,
         bytes: &SharedBytes,
         spans: &[RecordSpan],
-    ) -> (Vec<(u32, Arc<Matched>)>, u64, u64) {
+    ) -> (Vec<(u32, Arc<Matched>)>, u64) {
         let mut matches = Vec::with_capacity(self.entries.len());
-        let mut fan_out_bytes = 0;
         let mut check_count = 0;
         for entry in &self.entries {
             if let Some(matched) = Matched::select(bytes, spans, &entry.filter, &mut check_count) {
-                let sub_count: u64 = entry.subs_by_core.iter().map(|n| u64::from(*n)).sum();
-                fan_out_bytes += matched.total_bytes * sub_count;
                 matches.push((entry.id, matched));
             }
         }
-        (matches, check_count, fan_out_bytes)
+        (matches, check_count)
     }
 }
 
@@ -583,21 +571,19 @@ mod tests {
         Filter::new(&[Clause::Eq { mask: 1, value }]).unwrap()
     }
 
-    /// A detach that comes late takes nothing, and says so, so that the shard's count of
-    /// subscribers only goes down for one that was there.
+    /// A detach that comes late takes nothing, and says so: only one that was there goes.
     #[test]
     fn a_detach_says_whether_it_took_a_subscriber() {
         let mut table = FilterTable::new(2);
         let id = table.attach(filter(1), 0);
         table.attach(filter(1), 1);
-        assert_eq!(table.subscriber_count(), 2);
         assert!(table.detach(id, 0));
         assert!(!table.detach(id, 0));
         assert!(!table.detach(id + 1, 1));
         assert!(!table.detach(STATE_ONLY_FILTER_ID, 1));
-        assert_eq!(table.subscriber_count(), 1);
+        assert!(!table.is_unwatched());
         assert!(table.detach(id, 1));
-        assert_eq!(table.subscriber_count(), 0);
+        assert!(table.is_unwatched());
     }
 
     /// Thousands of subscribers under each filter change nothing: the count comes from where
@@ -628,7 +614,7 @@ mod tests {
         let mut spans = Vec::new();
         walk_records(&bytes, &mut spans);
         assert_eq!(spans.len(), 5);
-        let (matches, check_count, _) = table.check(&bytes, &spans);
+        let (matches, check_count) = table.check(&bytes, &spans);
         assert_eq!(check_count, 5 * 3);
         assert_eq!(
             matches.len(),

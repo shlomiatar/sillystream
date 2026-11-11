@@ -90,7 +90,6 @@ struct Rig {
 async fn start(core_count: usize, subscriber_count: usize, filter_count: usize) -> Rig {
     let mut config = NodeConfig::new(core_count);
     config.seal_window_ms = None;
-    config.rebalance_period_ms = None;
     config.segment_cap_bytes = u64::MAX;
     config.max_subscriptions_per_connection = usize::MAX;
     config.subscriber_queue_bytes = u64::MAX / 2;

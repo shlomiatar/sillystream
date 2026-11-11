@@ -32,7 +32,6 @@ struct Fixture {
 fn node_config() -> NodeConfig {
     let mut node = NodeConfig::new(2);
     node.seal_window_ms = None;
-    node.rebalance_period_ms = None;
     node.progress_interval_ms = 50;
     node
 }

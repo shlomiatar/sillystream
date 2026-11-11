@@ -1,10 +1,10 @@
-//! The periodic check moves shards off an overloaded core, and a hot stream can get its
-//! own shard (SPEC section 6.1).
+//! A hot stream can get its own shard through the override table (SPEC section 6.1), and
+//! the seal window's timer runs by itself.
 
 mod common;
 
 use common::*;
-use server::{SealOutcome, shard_of};
+use server::shard_of;
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
 fn key(name: &str) -> format::KeyHash {
@@ -23,95 +23,6 @@ fn names_on_core(core: usize, cores: usize, virtual_shards: u32, count: usize) -
         index += 1;
     }
     names
-}
-
-async fn pump(client: &mut server::Client, names: &[String], records: &[u8], seq: &mut u64) {
-    for name in names {
-        client
-            .publish(publish(name, records, *seq, 1))
-            .await
-            .unwrap();
-        expect_ack(client).await;
-    }
-    *seq += 1;
-}
-
-#[tokio::test]
-async fn skewed_load_moves_shards_off_the_overloaded_core_and_loses_nothing() {
-    let cores = 4;
-    let harness = Harness::new(manual_config(cores));
-    let node = harness.node();
-    let shards = node.virtual_shard_count();
-    let names = names_on_core(0, cores, shards, 16);
-    let records = record_with(1, &[3; 512]);
-    let mut client = node.client(0).await;
-    let mut seq = 1;
-
-    // Nothing moves on a node with no load.
-    assert!(node.rebalance_now().await.is_empty());
-
-    for _ in 0..5 {
-        pump(&mut client, &names, &records, &mut seq).await;
-    }
-    let moves = node.rebalance_now().await;
-    assert!(!moves.is_empty());
-    assert!(
-        moves
-            .iter()
-            .all(|planned| planned.from == 0 && planned.to != 0)
-    );
-
-    let placement = node.placement().await;
-    for planned in &moves {
-        assert_eq!(placement[planned.shard as usize] as usize, planned.to);
-    }
-    let per_core = |placement: &[u16]| {
-        let mut per_core = vec![0; cores];
-        for name in &names {
-            per_core[placement[shard_of(key(name), shards) as usize] as usize] += 1;
-        }
-        per_core
-    };
-    let spread = per_core(&placement);
-    assert!(spread[0] < names.len(), "{spread:?}");
-    assert!(spread.iter().all(|count| *count > 0), "{spread:?}");
-
-    // It settles: with the same load spread out, a later check moves little or nothing,
-    // and never back onto a core above the others.
-    for _ in 0..5 {
-        pump(&mut client, &names, &records, &mut seq).await;
-        node.rebalance_now().await;
-    }
-    pump(&mut client, &names, &records, &mut seq).await;
-    let settled = node.rebalance_now().await;
-    assert!(settled.len() <= 1, "{settled:?}");
-
-    // Each stream's streams live on the core the table says, and nothing was lost.
-    let final_placement = node.placement().await;
-    let mut total = 0;
-    for core in 0..cores {
-        total += node.stats(core).await.unwrap().stream_count;
-    }
-    assert_eq!(total, names.len());
-    let last_seq = seq;
-    for name in &names {
-        client
-            .publish(publish(name, &records, last_seq, 2))
-            .await
-            .unwrap();
-        expect_ack(&mut client).await;
-        let entries = harness.wal.stream_entries(name);
-        assert_eq!(entries.len() as u64, last_seq);
-        let ids: Vec<u64> = entries
-            .iter()
-            .map(|entry| parse_records(&entry.records)[0].0)
-            .collect();
-        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
-        let core = final_placement[shard_of(key(name), shards) as usize] as usize;
-        assert!(core < cores);
-    }
-    assert!(matches!(node.seal().await, SealOutcome::Uploaded { .. }));
-    harness.finish();
 }
 
 #[tokio::test]
@@ -202,9 +113,8 @@ async fn the_override_table_is_small_and_says_when_it_is_full() {
 }
 
 #[tokio::test]
-async fn the_timer_runs_the_check_and_the_seal_by_itself() {
+async fn the_timer_runs_the_seal_by_itself() {
     let mut config = manual_config(2);
-    config.rebalance_period_ms = Some(10);
     // The shortest window section 7.1 allows.
     config.seal_window_ms = Some(1000);
     let harness = Harness::new(config);
@@ -212,37 +122,14 @@ async fn the_timer_runs_the_check_and_the_seal_by_itself() {
     let names = names_on_core(0, 2, node.virtual_shard_count(), 8);
     let records = record_with(1, &[1; 256]);
     let mut client = node.client(0).await;
-    // Taken before any load, since the first check can come at any moment after it.
-    let initial = node.placement().await;
     let start = std::time::Instant::now();
-    let mut seq = 1;
     // Level 3 only comes back if the window's seal happens, with nothing asking for it.
     for name in &names {
-        client
-            .publish(publish(name, &records, seq, 3))
-            .await
-            .unwrap();
+        client.publish(publish(name, &records, 1, 3)).await.unwrap();
     }
     for _ in &names {
         expect_ack(&mut client).await;
     }
-    seq += 1;
     assert!(start.elapsed().as_millis() >= 900);
-    // Load keeps coming, and sooner or later the check moves something by itself.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(WAIT_MS);
-    while node.placement().await == initial {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the check never moved a shard"
-        );
-        for name in &names {
-            client
-                .publish(publish(name, &records, seq, 1))
-                .await
-                .unwrap();
-            expect_ack(&mut client).await;
-        }
-        seq += 1;
-    }
     harness.finish();
 }

@@ -1,5 +1,5 @@
 //! A node: its cores, the WAL writer, the uploader, and a control thread that runs what
-//! is node-wide: the seal window (section 7.1), rebalancing (section 6.1), and the
+//! is node-wide: the seal window (section 7.1), shard moves (section 6.1), and the
 //! in-process API that later milestones put sockets in front of.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -41,7 +41,7 @@ use crate::metadata::{
     run_loader, run_local_saver,
 };
 use crate::pages::{PAGE_CACHE_BYTES, PageCache};
-use crate::placement::{ShardMove, plan_moves, shard_of};
+use crate::placement::shard_of;
 use crate::recovery::{RecoverConfig, RecoveryReport, RestoredStream, ScannedObject, prepare};
 use crate::sink::{SinkConfig, SinkNote, SinkPool};
 use crate::slab::{SlabAccount, SlabBytes, SlabHook, SlabPool, SlabRegion};
@@ -79,11 +79,6 @@ pub struct NodeConfig {
     pub upload_retry_max_ms: u64,
     /// The least one PUT attempt gets before it counts as failed and retries (D242).
     pub upload_put_timeout_min_ms: u64,
-    /// `None` rebalances only when asked.
-    pub rebalance_period_ms: Option<u64>,
-    /// A core is overloaded above this × the mean.
-    pub overload_ratio: f64,
-    pub max_moves_per_check: usize,
     pub slab_hook: Option<Arc<dyn SlabHook>>,
     /// `None` reads sealed records from the object store alone.
     pub local_cache: Option<LocalCacheConfig>,
@@ -176,9 +171,6 @@ impl NodeConfig {
             upload_retry_initial_ms: 100,
             upload_retry_max_ms: 10_000,
             upload_put_timeout_min_ms: 60_000,
-            rebalance_period_ms: Some(10_000),
-            overload_ratio: 1.25,
-            max_moves_per_check: 16,
             slab_hook: None,
             local_cache: None,
             subscriber_queue_bytes: 8 * 1024 * 1024,
@@ -240,9 +232,6 @@ pub(crate) enum NodeMsg {
     Rotated {
         seal: u64,
         closed_seq: Option<u64>,
-    },
-    Rebalance {
-        reply: oneshot::Sender<Vec<ShardMove>>,
     },
     MoveShard {
         shard: u32,
@@ -318,7 +307,6 @@ impl Control {
             period_ms.map(|period_ms| Instant::now() + Duration::from_millis(period_ms))
         };
         let mut next_seal = after(self.config.seal_window_ms);
-        let mut next_rebalance = after(self.config.rebalance_period_ms);
         for (upload, len_bytes) in std::mem::take(&mut self.startup_manifests) {
             self.publish_manifest(upload, len_bytes);
         }
@@ -343,10 +331,6 @@ impl Control {
                     next_seal = after(self.config.seal_window_ms);
                     self.seal_wanted = true;
                     self.begin_seal();
-                },
-                _ = sleep_until_some(next_rebalance) => {
-                    next_rebalance = after(self.config.rebalance_period_ms);
-                    self.rebalance().await;
                 },
             }
         }
@@ -399,9 +383,6 @@ impl Control {
                 } else {
                     self.fail_seal_waiters(seal);
                 }
-            }
-            NodeMsg::Rebalance { reply } => {
-                let _ = reply.send(self.rebalance().await);
             }
             NodeMsg::MoveShard { shard, to, reply } => {
                 let _ = reply.send(self.checked_move(shard, to).await);
@@ -688,8 +669,8 @@ impl Control {
         }
     }
 
-    /// What the API can ask for, unlike the rebalancer's plan, may not exist: a core that
-    /// isn't there, a shard past the table, or an override shard with no stream yet (D80).
+    /// What the API can ask for may not exist: a core that isn't there, a shard past the
+    /// table, or an override shard with no stream yet (D80).
     async fn checked_move(&mut self, shard: u32, to: usize) -> bool {
         let known = self
             .location
@@ -712,32 +693,6 @@ impl Control {
         if sent.is_ok() && finished.await.is_ok() {
             self.location[shard as usize] = to as u16;
         }
-    }
-
-    async fn rebalance(&mut self) -> Vec<ShardMove> {
-        let mut shards = Vec::new();
-        for (core, control) in self.links.control.iter().enumerate() {
-            let (reply, report) = oneshot::channel();
-            if control.send(ControlMsg::ReportLoad { reply }).is_err() {
-                return Vec::new();
-            }
-            let Ok(loads) = report.await else {
-                return Vec::new();
-            };
-            shards.extend(loads.into_iter().map(|(shard, load)| (shard, core, load)));
-        }
-        // Each core's report is in its own map's order.
-        shards.sort_by_key(|(shard, _, _)| *shard);
-        let moves = plan_moves(
-            &shards,
-            self.config.core_count,
-            self.config.overload_ratio,
-            self.config.max_moves_per_check,
-        );
-        for planned in &moves {
-            self.move_shard(planned.shard, planned.to).await;
-        }
-        moves
     }
 
     async fn set_override(&mut self, stream: KeyHash, to: usize) -> Option<u32> {
@@ -1179,7 +1134,7 @@ impl Node {
                     })?,
             );
         }
-        // Keeps its own copy of what a seal or rebalance needs.
+        // Keeps its own copy of what a seal or move needs.
         drop(core_to_node);
         drop(local_saves);
 
@@ -1514,13 +1469,6 @@ impl Node {
             .send(CompactCmd::Expire { reply })
             .ok()?;
         answer.await.ok()
-    }
-
-    /// Runs the periodic check now, and returns its moves once they have finished.
-    pub async fn rebalance_now(&self) -> Vec<ShardMove> {
-        let (reply, answer) = oneshot::channel();
-        let _ = self.to_control.send(NodeMsg::Rebalance { reply });
-        answer.await.unwrap_or_default()
     }
 
     /// False, with nothing changed, if the core or the shard doesn't exist.

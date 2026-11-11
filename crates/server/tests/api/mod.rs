@@ -91,7 +91,6 @@ pub fn start_with(node: NodeConfig, clock: Arc<dyn Clock>, manual: Arc<ManualClo
 pub fn node_config(core_count: usize) -> NodeConfig {
     let mut node = NodeConfig::new(core_count);
     node.seal_window_ms = None;
-    node.rebalance_period_ms = None;
     node.progress_interval_ms = 100;
     // These tests look at what the routes record, so nothing may move a cursor behind them.
     // `sinks.rs` runs the pool.

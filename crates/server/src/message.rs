@@ -12,7 +12,6 @@ use crate::connection::{CommandTicket, Event, ObjectRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
 use crate::delivery::{FanOut, ObjectRef, StreamDelivery};
-use crate::placement::ShardCounters;
 use crate::slab::{SlabBytes, SlabRegion};
 use crate::state::{StateOp, StreamState};
 
@@ -379,7 +378,6 @@ pub(crate) struct StreamHandoff {
 pub(crate) struct ShardHandoff {
     pub shard: u32,
     pub streams: Vec<StreamHandoff>,
-    pub counters: ShardCounters,
     /// Override entries that this shard's owner answers for, with where each one was.
     pub overrides: Vec<(KeyHash, u32, u16)>,
     /// Deleted streams in this shard, with the id a new one must stay above.
@@ -455,10 +453,6 @@ pub(crate) enum ControlMsg {
         done: oneshot::Sender<()>,
     },
     Adopt(Box<ShardHandoff>),
-    /// Samples the counters and reports `(shard, load)`.
-    ReportLoad {
-        reply: oneshot::Sender<Vec<(u32, f64)>>,
-    },
     Stats {
         reply: oneshot::Sender<CoreStats>,
     },
@@ -690,8 +684,6 @@ pub(crate) struct ReadStepMsg {
     pub sub: SubRef,
     pub filter: format::Filter,
     pub after: u64,
-    /// Bytes read since the last step, for the shard's counters.
-    pub read_bytes: u64,
     /// The object the subscriber read last, so the next is after it.
     pub past: Option<ObjectRef>,
     /// The object the subscriber found missing.

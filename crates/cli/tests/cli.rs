@@ -30,7 +30,6 @@ fn start() -> Fixture {
     std::fs::write(&secret_file, SECRET).unwrap();
     let mut node = NodeConfig::new(1);
     node.seal_window_ms = None;
-    node.rebalance_period_ms = None;
     let server = Server::start(
         ServerConfig {
             node,

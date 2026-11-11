@@ -35,7 +35,7 @@ use crate::message::{
     StreamConfig, StreamHandoff, StreamInfo, SubRef, WriteMsg,
 };
 use crate::metadata::{LocalSave, MetaMsg};
-use crate::placement::{ShardCounters, shard_of};
+use crate::placement::shard_of;
 use crate::sink::{SINK_CAP_COUNT, SinkNote};
 use crate::slab::{SlabAccount, SlabBytes, SlabPool};
 use crate::state::{StreamState, apply_op, check_doc};
@@ -325,7 +325,6 @@ struct Stream {
 #[derive(Default)]
 struct Shard {
     streams: HashSet<KeyHash>,
-    counters: ShardCounters,
 }
 
 enum Route {
@@ -399,13 +398,6 @@ impl CheckedRecords<'_> {
         match self {
             CheckedRecords::Publish(records) => records.stamp(first_id, author),
             CheckedRecords::Forward(records) => records.stamp(first_id),
-        }
-    }
-
-    fn record_count(&self) -> u32 {
-        match self {
-            CheckedRecords::Publish(records) => records.record_count(),
-            CheckedRecords::Forward(records) => records.record_count(),
         }
     }
 }
@@ -1030,7 +1022,6 @@ impl Core {
                 return;
             }
         };
-        let has_state = msg.state.is_some();
         let item_count = u64::from(ack_count);
         let now_ms = self.clock.now_ms();
         if msg.producer_id != 0
@@ -1105,7 +1096,6 @@ impl Core {
             );
         }
         validated.stamp(first_id, msg.author);
-        let record_count = u64::from(validated.record_count()) + u64::from(has_state);
 
         let mut state_after = None;
         let bytes = match (&msg.state, new_state) {
@@ -1134,7 +1124,6 @@ impl Core {
                 producer_seq: msg.producer_seq,
                 first_id,
                 last_id,
-                record_count,
                 state_after,
             },
             bytes,
@@ -1217,7 +1206,6 @@ impl Core {
                 producer_seq: 0,
                 first_id: ver,
                 last_id: ver,
-                record_count: 1,
                 state_after,
             },
             bytes,
@@ -1307,11 +1295,6 @@ impl Core {
             _ => entry,
         };
 
-        let shard_id = self.streams.get(name).map(|stream| stream.shard);
-        if let Some(shard) = shard_id.and_then(|shard| self.shards.get_mut(&shard)) {
-            shard.counters.ingest_bytes += len_bytes;
-            shard.counters.ingest_records += ids.record_count;
-        }
         let needs_wal = level >= 2;
         let mut track_meta = false;
         if let Some(stream) = self.streams.get_mut(name) {
@@ -1581,7 +1564,6 @@ impl Core {
                     state: entry.state.clone(),
                 });
             }
-            let counters = self.shards.get_mut(&stream.shard).map(|s| &mut s.counters);
             fan_out(
                 stream,
                 entry,
@@ -1591,7 +1573,6 @@ impl Core {
                     home: &mut self.home,
                     spans: &mut self.spans,
                     filter_check_count: &mut self.filter_check_count,
-                    counters,
                 },
             );
         }
@@ -1833,9 +1814,6 @@ impl Core {
             return;
         };
         let filter_id = stream.delivery.table.attach(filter, sub.home);
-        if let Some(shard) = self.shards.get_mut(&stream.shard) {
-            shard.counters.subscriber_count += 1;
-        }
         self.send_attached(name, sub, filter_id, head, cursor, state_ver, state);
     }
 
@@ -1882,11 +1860,8 @@ impl Core {
             });
             return;
         }
-        if let Some(stream) = self.streams.get_mut(&name)
-            && stream.delivery.table.detach(filter_id, home)
-            && let Some(shard) = self.shards.get_mut(&stream.shard)
-        {
-            shard.counters.subscriber_count = shard.counters.subscriber_count.saturating_sub(1);
+        if let Some(stream) = self.streams.get_mut(&name) {
+            stream.delivery.table.detach(filter_id, home);
         }
     }
 
@@ -1908,9 +1883,6 @@ impl Core {
             );
             return;
         };
-        if let Some(shard) = self.shards.get_mut(&stream.shard) {
-            shard.counters.catch_up_bytes += message.read_bytes;
-        }
         // Gone, with no compacted object to lead to now: these records are lost to this
         // reader. One that leads elsewhere now is read from there (D178).
         let class = RetentionClass::of_retention(stream.config.retention_ms);
@@ -2623,14 +2595,6 @@ impl Core {
                 done,
             } => self.on_split_stream(stream, new_shard, to, done),
             ControlMsg::Adopt(handoff) => self.on_adopt(*handoff),
-            ControlMsg::ReportLoad { reply } => {
-                let mut loads = Vec::with_capacity(self.shards.len());
-                for (id, shard) in &mut self.shards {
-                    shard.counters.sample();
-                    loads.push((*id, shard.counters.load()));
-                }
-                let _ = reply.send(loads);
-            }
             ControlMsg::Stats { reply } => {
                 let _ = reply.send(CoreStats {
                     core: self.config.id,
@@ -3006,7 +2970,6 @@ impl Core {
                 producer_seq: 0,
                 first_id: id,
                 last_id: id,
-                record_count: 1,
                 state_after: None,
             },
             region.freeze(),
@@ -3318,11 +3281,6 @@ impl Core {
         }
         if let Some(shard) = self.shards.get_mut(&shard) {
             shard.streams.remove(name);
-            // Their detaches come after this and find no stream.
-            shard.counters.subscriber_count = shard
-                .counters
-                .subscriber_count
-                .saturating_sub(stream.delivery.table.subscriber_count());
         }
         for sink_id in stream.delivery.sinks.keys() {
             let _ = self.sink_notes.send(SinkNote {
@@ -3553,7 +3511,6 @@ impl Core {
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard,
             streams,
-            counters: state.counters,
             overrides,
             tombstones,
             done,
@@ -3604,7 +3561,6 @@ impl Core {
         let _ = self.links.control[to].send(ControlMsg::Adopt(Box::new(ShardHandoff {
             shard: new_shard,
             streams,
-            counters: ShardCounters::default(),
             overrides: vec![(name, new_shard, to as u16)],
             tombstones,
             done,
@@ -3647,7 +3603,6 @@ impl Core {
         }
         self.tombstones.extend(handoff.tombstones);
         let shard = self.shards.entry(shard_id).or_default();
-        shard.counters = handoff.counters;
         for stream in handoff.streams {
             shard.streams.insert(stream.name);
             // Anything already sent is dropped by the next `clear_wal_waits`.
@@ -3725,7 +3680,6 @@ struct CommitIds {
     producer_seq: u64,
     first_id: u64,
     last_id: u64,
-    record_count: u64,
     state_after: Option<(u64, Bytes)>,
 }
 
@@ -3813,7 +3767,6 @@ struct FanOutParts<'a> {
     home: &'a mut Home,
     spans: &'a mut Vec<RecordSpan>,
     filter_check_count: &'a mut u64,
-    counters: Option<&'a mut ShardCounters>,
 }
 
 /// A batch has become visible: each distinct filter is checked once, here, and every home
@@ -3827,11 +3780,8 @@ fn fan_out(stream: &mut Stream, entry: PendingVisible, parts: FanOutParts<'_>) {
     }
     let bytes = SharedBytes::Slab(entry.bytes);
     walk_records(&bytes, parts.spans);
-    let (matches, check_count, fan_out_bytes) = table.check(&bytes, parts.spans);
+    let (matches, check_count) = table.check(&bytes, parts.spans);
     *parts.filter_check_count += check_count;
-    if let Some(counters) = parts.counters {
-        counters.fan_out_bytes += fan_out_bytes;
-    }
     let fan = Arc::new(FanOut {
         through_id: entry.last_id,
         matches,

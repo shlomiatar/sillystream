@@ -573,7 +573,6 @@ struct Sub {
     past_last_id: u64,
     /// An object found missing, for the next step to tell the owner of.
     gone: Option<ObjectRef>,
-    read_bytes_since: u64,
     state_ver: u64,
     latest_state: Option<(u64, Bytes)>,
 }
@@ -1092,7 +1091,6 @@ impl Home {
             past: None,
             past_last_id: 0,
             gone: None,
-            read_bytes_since: 0,
             state_ver: 0,
             latest_state: None,
         };
@@ -1781,7 +1779,6 @@ impl Home {
             },
             filter: sub.filter,
             after: sub.position,
-            read_bytes: std::mem::take(&mut sub.read_bytes_since),
             past: sub.past,
             gone: sub.gone.take(),
         };
@@ -1852,7 +1849,6 @@ impl Home {
                     self.trace_read("memory", key, memory_bytes);
                 }
                 for one in matched {
-                    self.account_read(key, one.total_bytes);
                     self.enqueue_read(key, Some(one));
                 }
                 if let Some(Some(sub)) = self.subs.get_mut(key) {
@@ -1903,12 +1899,6 @@ impl Home {
                 "trace catch_up tier={tier} bytes={bytes} stream={:?}",
                 sub.stream
             );
-        }
-    }
-
-    fn account_read(&mut self, key: usize, bytes: u64) {
-        if let Some(Some(sub)) = self.subs.get_mut(key) {
-            sub.read_bytes_since += bytes;
         }
     }
 
@@ -1972,7 +1962,6 @@ impl Home {
                         self.stats.object_bytes += bytes.len() as u64;
                         self.trace_read("object", key, bytes.len());
                     }
-                    self.account_read(key, bytes.len() as u64);
                     let bytes = SharedBytes::Plain(bytes);
                     let mut spans = std::mem::take(&mut self.spans);
                     walk_records(&bytes, &mut spans);

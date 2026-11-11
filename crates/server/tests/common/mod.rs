@@ -326,11 +326,10 @@ impl Drop for Harness {
     }
 }
 
-/// No timers: seals and rebalancing happen only when a test asks.
+/// No timers: seals happen only when a test asks.
 pub fn manual_config(core_count: usize) -> NodeConfig {
     let mut config = NodeConfig::new(core_count);
     config.seal_window_ms = None;
-    config.rebalance_period_ms = None;
     config.upload_retry_initial_ms = 1;
     config.upload_retry_max_ms = 4;
     config.slab_bytes = 64 * 1024;
