@@ -7,8 +7,8 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use storage::{
-    Handoff, ObjectId, ObjectStoreConfig, S3Config, UploadEvent, Uploader, UploaderConfig,
-    build_store, check_conditional_create, parse_store_config, sealed_path,
+    Handoff, ObjectId, ObjectStoreConfig, S3Config, SealExtent, UploadEvent, Uploader,
+    UploaderConfig, build_store, check_conditional_create, parse_store_config, sealed_path,
 };
 
 /// A stream id or cursor name's key hash under the all-zero key that `NodeConfig::new` gives.
@@ -172,11 +172,12 @@ async fn the_s3_client_runs_on_the_uploader_runtime_against_a_local_stub() {
     };
     format::encode_record(&mut wire, &header, b"data").unwrap();
     sender
-        .try_send(Handoff::Dedicated {
-            stream: key("s"),
-            number: 0,
-            index: 1,
-            records: vec![bytes::Bytes::from(wire)],
+        .try_send(Handoff::Seal {
+            seal: 0,
+            extents: vec![SealExtent {
+                stream: key("s"),
+                records: vec![bytes::Bytes::from(wire)],
+            }],
             tickets: Vec::new(),
         })
         .unwrap();

@@ -349,7 +349,7 @@ pub fn object_path(root: &str, id: ObjectId) -> Path {
     Path::from(format!("{root}/{}/{id}.seg", id.hour()))
 }
 
-/// A sealed or dedicated object's path.
+/// A sealed object's path.
 pub fn sealed_path(id: ObjectId) -> Path {
     object_path(SEALED_PREFIX, id)
 }

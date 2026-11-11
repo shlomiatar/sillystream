@@ -75,8 +75,6 @@ pub struct NodeConfig {
     pub seal_window_ms: Option<u64>,
     /// Each core asks for a seal at its share of this (Q18, D64).
     pub segment_cap_bytes: u64,
-    /// A stream with this much unsealed gets a dedicated object.
-    pub stream_buffer_bytes: u64,
     pub upload_retry_initial_ms: u64,
     pub upload_retry_max_ms: u64,
     /// The least one PUT attempt gets before it counts as failed and retries (D242).
@@ -175,7 +173,6 @@ impl NodeConfig {
             write_inbox_capacity: 1024,
             seal_window_ms: Some(10_000),
             segment_cap_bytes: 64 * 1024 * 1024,
-            stream_buffer_bytes: 32 * 1024 * 1024,
             upload_retry_initial_ms: 100,
             upload_retry_max_ms: 10_000,
             upload_put_timeout_min_ms: 60_000,
@@ -1075,7 +1072,6 @@ impl Node {
                 closed_seqs,
                 channel_capacity: config.wal_channel_capacity,
                 segment_cap_bytes: config.segment_cap_bytes,
-                stream_buffer_bytes: config.stream_buffer_bytes,
                 carried: recovered
                     .as_ref()
                     .map_or_else(Vec::new, |parts| carried_extents(&parts.restored)),

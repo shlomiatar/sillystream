@@ -1,9 +1,10 @@
 //! The uploader thread: one object per seal (SPEC section 6.4, D12, D55).
 //!
-//! The WAL writer hands over each sealed file and each dedicated object (D268). A seal becomes
-//! one segment, written to the local segment directory and uploaded from that file (D266). A failed PUT is retried with the references still held, so
-//! nothing is lost and memory stays pinned while the store is down (Q9). An upload that no retry
-//! can help fails on its own, so one object can't stop the ones behind it (D59).
+//! The WAL writer hands over each sealed file. A seal becomes one segment, written to the local
+//! segment directory and uploaded from that file (D266). A failed PUT is retried with the
+//! references still held, so nothing is lost and memory stays pinned while the store is down
+//! (Q9). An upload that no retry can help fails on its own, so one object can't stop the ones
+//! behind it (D59).
 
 use std::fmt;
 use std::future::Future;
@@ -36,22 +37,13 @@ pub struct SealExtent {
     pub records: Vec<Bytes>,
 }
 
-/// What the WAL writer hands over. `tickets` holds, per core, the highest ticket the object
-/// covers: for a seal, every entry that core sent up to it that no earlier object took, and
-/// for a dedicated object, that stream's entries up to it.
+/// What the WAL writer hands over. `tickets` holds, per core, the highest ticket the seal
+/// covers: every entry that core sent up to it that no earlier seal took.
 #[derive(Debug, Clone)]
 pub enum Handoff {
     Seal {
         seal: u64,
         extents: Vec<SealExtent>,
-        tickets: Vec<u64>,
-    },
-    /// `index` is its place among the window's dedicated objects, 1 to 255 (section 7.3).
-    Dedicated {
-        stream: KeyHash,
-        number: u64,
-        index: u8,
-        records: Vec<Bytes>,
         tickets: Vec<u64>,
     },
 }
@@ -60,11 +52,6 @@ pub enum Handoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UploadKey {
     Seal(u64),
-    /// A dedicated object: its stream, and the caller's number for it.
-    Dedicated {
-        stream: KeyHash,
-        number: u64,
-    },
 }
 
 /// What cores hear from the uploader, through an awaitable channel.
@@ -110,31 +97,13 @@ pub enum UploadEvent {
 /// handed back, not dropped.
 #[derive(Debug)]
 pub enum UnfinishedUpload {
-    Seal {
-        seal: u64,
-        extents: Vec<SealExtent>,
-    },
-    Dedicated {
-        stream: KeyHash,
-        number: u64,
-        records: Vec<Bytes>,
-    },
+    Seal { seal: u64, extents: Vec<SealExtent> },
 }
 
 impl UnfinishedUpload {
     fn of(handoff: Handoff) -> UnfinishedUpload {
         match handoff {
             Handoff::Seal { seal, extents, .. } => UnfinishedUpload::Seal { seal, extents },
-            Handoff::Dedicated {
-                stream,
-                number,
-                records,
-                ..
-            } => UnfinishedUpload::Dedicated {
-                stream,
-                number,
-                records,
-            },
         }
     }
 }
@@ -212,7 +181,7 @@ impl UploaderSender {
         result
     }
 
-    /// Hands over a sealed file or a dedicated object. Only the WAL writer does.
+    /// Hands over a sealed file. Only the WAL writer does.
     #[allow(clippy::result_large_err)]
     pub fn try_send(&self, handoff: Handoff) -> Result<(), UploadSendError<Handoff>> {
         self.send(UploadCommand::Handoff(handoff))
@@ -252,12 +221,6 @@ impl<F: FnMut() + Send> Sealer for UploadSealer<F> {
                 }
             }
         }
-    }
-
-    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff> {
-        self.uploads.try_send(handoff).map_err(|error| match error {
-            UploadSendError::Full(handoff) | UploadSendError::Stopped(handoff) => handoff,
-        })
     }
 }
 
@@ -576,61 +539,42 @@ impl Worker {
     /// Tells the cores what the object covers before anything else is heard about it, so that
     /// they know which of their records each event is about.
     fn start_handoff(&mut self, handoff: Handoff) -> Put {
-        let (key, tickets, built, index) = match &handoff {
-            Handoff::Seal {
-                seal,
-                extents,
-                tickets,
-            } => (UploadKey::Seal(*seal), tickets, build_seal(extents), 0),
-            Handoff::Dedicated {
-                stream,
-                number,
-                index,
-                records,
-                tickets,
-            } => {
-                let mut builder = SegmentBuilder::new();
-                let built = match builder.add_extent(*stream, records.iter().cloned()) {
-                    Ok(()) => builder.finish(),
-                    Err(error) => Err(error),
-                };
-                let key = UploadKey::Dedicated {
-                    stream: *stream,
-                    number: *number,
-                };
-                (key, tickets, built, *index)
-            }
-        };
+        let Handoff::Seal {
+            seal,
+            extents,
+            tickets,
+        } = &handoff;
+        let (key, built) = (UploadKey::Seal(*seal), build_seal(extents));
         self.emit(UploadEvent::Sealed {
             key: key.clone(),
             tickets: Arc::new(tickets.clone()),
         });
-        self.start(key, built, index, UnfinishedUpload::of(handoff))
+        self.start(key, built, UnfinishedUpload::of(handoff))
     }
 
     /// The next object's id: at or after its newest record's ms, and after the last object's
-    /// (section 7.3). Handoffs come one at a time, so no two objects share one.
-    fn next_object_id(&mut self, last_id: u64, index: u8) -> ObjectId {
+    /// (section 7.3). Handoffs come one at a time, so no two objects share one. A seal's index
+    /// is 0.
+    fn next_object_id(&mut self, last_id: u64) -> ObjectId {
         let time_ms = crate::object::sealed_time_ms(
             format::id_ms(last_id)
                 .max(self.last_object_ms + 1)
                 .max(crate::OBJECT_EPOCH_MS),
         );
         self.last_object_ms = time_ms;
-        ObjectId::new(time_ms, self.config.generation, index)
+        ObjectId::new(time_ms, self.config.generation, 0)
     }
 
     fn start(
         &mut self,
         key: UploadKey,
         built: Result<BuiltSegment, SegmentError>,
-        index: u8,
         keep: UnfinishedUpload,
     ) -> Put {
         let putter = Arc::clone(&self.putter);
         let path = match &built {
             Ok(built) => built.first_id.map(|first_id| {
-                sealed_path(self.next_object_id(built.last_id.unwrap_or(first_id), index))
+                sealed_path(self.next_object_id(built.last_id.unwrap_or(first_id)))
             }),
             Err(_) => None,
         };

@@ -134,49 +134,6 @@ async fn below_the_cap_nothing_seals_without_the_window() {
 }
 
 #[tokio::test]
-async fn a_stream_filling_its_buffer_gets_a_dedicated_object() {
-    let mut config = manual_config(1);
-    config.stream_buffer_bytes = 8 * 1024;
-    let harness = Harness::new(config);
-    let mut client = harness.node().client(0).await;
-    let records = record_with(1, &[5; 4096]);
-    let small = record_with(1, b"small");
-    client
-        .publish(publish("quiet", &small, 1, 2))
-        .await
-        .unwrap();
-    expect_ack(&mut client).await;
-    client
-        .publish(publish("busy", &records, 1, 3))
-        .await
-        .unwrap();
-    let (_, first_id, _) = {
-        client
-            .publish(publish("busy", &records, 2, 3))
-            .await
-            .unwrap();
-        expect_ack(&mut client).await
-    };
-    expect_ack(&mut client).await;
-    assert_eq!(harness.store.put_count.load(Ordering::SeqCst), 1);
-
-    let store: Arc<dyn ObjectStore> = harness.store.clone();
-    let reader = SegmentReader::new(store, sealed_path(ObjectId::new(id_ms(first_id), 1, 1)));
-    let stored = reader.read_stream(key("busy")).await.unwrap();
-    assert_eq!(parse_records(&stored).len(), 2);
-
-    // The stream's bytes aren't in the next seal, and the quiet one's are.
-    match harness.node().seal().await {
-        SealOutcome::Uploaded { extents, .. } => {
-            assert_eq!(extents.len(), 1);
-            assert_eq!(extents[0].stream, key("quiet"));
-        }
-        other => panic!("{other:?}"),
-    }
-    harness.finish();
-}
-
-#[tokio::test]
 async fn a_held_upload_keeps_a_seal_pending_and_the_core_serving() {
     let harness = Harness::new(manual_config(2));
     let mut client = harness.node().client(0).await;

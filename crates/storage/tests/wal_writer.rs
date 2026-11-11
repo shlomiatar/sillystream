@@ -173,7 +173,6 @@ fn config(channel_capacity: usize) -> WalConfig {
         closed_seqs: Vec::new(),
         channel_capacity,
         segment_cap_bytes: u64::MAX,
-        stream_buffer_bytes: u64::MAX,
         carried: Vec::new(),
         carried_dedupe: Vec::new(),
     }
@@ -695,7 +694,6 @@ fn a_removed_file_is_gone_and_the_next_one_is_new() {
             closed_seqs: vec![1],
             channel_capacity: 16,
             segment_cap_bytes: u64::MAX,
-            stream_buffer_bytes: u64::MAX,
             carried: Vec::new(),
             carried_dedupe: Vec::new(),
         },
@@ -723,13 +721,11 @@ fn a_removed_file_is_gone_and_the_next_one_is_new() {
     );
 }
 
-/// What the writer handed over and asked for, in order. A dedicated object is refused while
-/// `refuse_dedicated` is set.
+/// What the writer handed over and asked for, in order.
 #[derive(Default)]
 struct Sealed {
     handoffs: Mutex<Vec<Handoff>>,
     full_count: Mutex<u64>,
-    refuse_dedicated: std::sync::atomic::AtomicBool,
 }
 
 struct RecordingSealer(Arc<Sealed>);
@@ -741,18 +737,6 @@ impl Sealer for RecordingSealer {
 
     fn seal(&mut self, handoff: Handoff) {
         self.0.handoffs.lock().unwrap().push(handoff);
-    }
-
-    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff> {
-        if self
-            .0
-            .refuse_dedicated
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(handoff);
-        }
-        self.0.handoffs.lock().unwrap().push(handoff);
-        Ok(())
     }
 }
 
@@ -779,24 +763,19 @@ fn start_sealing(
 
 /// What a handoff holds, as (stream, first byte of each record) per extent, and its tickets.
 fn shape(handoff: &Handoff) -> (Vec<(format::KeyHash, Vec<u8>)>, Vec<u64>) {
-    let extents: Vec<(format::KeyHash, Vec<u8>)> = match handoff {
-        Handoff::Seal { extents, .. } => extents
-            .iter()
-            .map(|extent| {
-                (
-                    extent.stream,
-                    extent.records.iter().map(|records| records[0]).collect(),
-                )
-            })
-            .collect(),
-        Handoff::Dedicated {
-            stream, records, ..
-        } => vec![(*stream, records.iter().map(|records| records[0]).collect())],
-    };
-    let tickets = match handoff {
-        Handoff::Seal { tickets, .. } | Handoff::Dedicated { tickets, .. } => tickets.clone(),
-    };
-    (extents, tickets)
+    let Handoff::Seal {
+        extents, tickets, ..
+    } = handoff;
+    let extents = extents
+        .iter()
+        .map(|extent| {
+            (
+                extent.stream,
+                extent.records.iter().map(|records| records[0]).collect(),
+            )
+        })
+        .collect();
+    (extents, tickets.clone())
 }
 
 /// A seal is its file: every entry it holds, by stream in write order, with each core's highest
@@ -863,56 +842,26 @@ fn the_size_cap_asks_for_a_seal_once_per_file() {
     );
 }
 
-/// A stream that fills its buffer in one file goes alone, with only its own tickets, and what
-/// it writes after that goes in the seal.
+/// One stream writing past the cap on its own asks for a seal, and the seal holds every record
+/// it wrote, so a hot stream stays bounded with nothing lost.
 #[test]
-fn a_stream_filling_its_buffer_is_handed_over_alone() {
+fn one_stream_past_the_cap_asks_for_a_seal_and_loses_nothing() {
     let (sender, handle, sealed) = start_sealing(WalConfig {
-        stream_buffer_bytes: 80,
+        segment_cap_bytes: 100,
         ..config(64)
     });
-    sender.try_append(entry_for("hot", 0, 1)).unwrap();
-    sender.try_append(entry_for("cold", 1, 2)).unwrap();
-    sender.try_append(entry_for("hot", 1, 3)).unwrap();
-    sender.try_append(entry_for("hot", 0, 4)).unwrap();
+    for ticket in 1..=5 {
+        sender.try_append(entry_for("hot", 0, ticket)).unwrap();
+    }
     sender.try_seal(1).unwrap().blocking_recv().unwrap();
     drop(sender);
     handle.join().unwrap();
-    let handoffs = sealed.handoffs.lock().unwrap();
-    assert!(matches!(handoffs[0], Handoff::Dedicated { number: 0, .. }));
-    assert_eq!(
-        shape(&handoffs[0]),
-        (vec![(key("hot"), vec![1, 3])], vec![1, 3])
-    );
-    assert_eq!(
-        shape(&handoffs[1]),
-        (
-            vec![(key("cold"), vec![2]), (key("hot"), vec![4])],
-            vec![4, 3]
-        )
-    );
-}
-
-/// An uploader that can't take a dedicated object now leaves its records in the seal.
-#[test]
-fn a_dedicated_object_that_cannot_go_stays_in_the_seal() {
-    let (sender, handle, sealed) = start_sealing(WalConfig {
-        stream_buffer_bytes: 40,
-        ..config(64)
-    });
-    sealed
-        .refuse_dedicated
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    sender.try_append(entry_for("hot", 0, 1)).unwrap();
-    sender.try_append(entry_for("hot", 0, 2)).unwrap();
-    sender.try_seal(1).unwrap().blocking_recv().unwrap();
-    drop(sender);
-    handle.join().unwrap();
+    assert_eq!(*sealed.full_count.lock().unwrap(), 1);
     let handoffs = sealed.handoffs.lock().unwrap();
     assert_eq!(handoffs.len(), 1);
     assert_eq!(
         shape(&handoffs[0]),
-        (vec![(key("hot"), vec![1, 2])], vec![2])
+        (vec![(key("hot"), vec![1, 2, 3, 4, 5])], vec![5])
     );
 }
 

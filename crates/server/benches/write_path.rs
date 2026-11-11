@@ -73,7 +73,6 @@ fn config(core_count: usize) -> NodeConfig {
     // This bench measures to durable. Nothing pinned is ever let go in it.
     config.memory_cap_bytes = u64::MAX;
     config.segment_cap_bytes = u64::MAX;
-    config.stream_buffer_bytes = u64::MAX;
     config
 }
 

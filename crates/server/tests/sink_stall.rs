@@ -31,6 +31,8 @@ fn config() -> NodeConfig {
     config.sink.request_timeout_ms = 3_600_000;
     // A low cap, so that any slab a stalled sink kept would soon stop publishers.
     config.memory_cap_bytes = 64 * 1024 * 1024;
+    // Under the cap, so that the size cap seals what the WAL holds and lets its slabs go.
+    config.segment_cap_bytes = 16 * 1024 * 1024;
     config.slab_bytes = 1024 * 1024;
     config
 }

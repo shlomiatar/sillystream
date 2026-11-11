@@ -163,14 +163,12 @@ impl Waiter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum UploadTag {
     Seal(u64),
-    Dedicated(u64),
 }
 
 impl UploadTag {
     fn of(key: &UploadKey) -> UploadTag {
         match key {
             UploadKey::Seal(seal) => UploadTag::Seal(*seal),
-            UploadKey::Dedicated { number, .. } => UploadTag::Dedicated(*number),
         }
     }
 }
@@ -2317,8 +2315,8 @@ impl Core {
         }
     }
 
-    /// The WAL writer has handed over an object: a seal covers every core's batches up to its
-    /// ticket, and a dedicated object only its stream's (D268).
+    /// The WAL writer has handed over a seal, which covers every core's batches up to its
+    /// ticket.
     fn on_sealed(&mut self, key: UploadKey, tickets: &[u64]) {
         let through = tickets.get(self.config.id).copied().unwrap_or(0);
         let (tag, names) = match key {
@@ -2330,10 +2328,6 @@ impl Core {
                 names.sort_unstable();
                 names.dedup();
                 (UploadTag::Seal(seal), names)
-            }
-            UploadKey::Dedicated { stream, number } => {
-                self.dirty.retain(|name| *name != stream);
-                (UploadTag::Dedicated(number), vec![stream])
             }
         };
         let mut touched = Vec::new();
@@ -2373,9 +2367,7 @@ impl Core {
             } => (key, Some((path, extents))),
             UploadEvent::Failed { key, .. } => (key, None),
             UploadEvent::Empty { key } => {
-                if let UploadKey::Seal(seal) = key {
-                    self.in_flight.remove(&UploadTag::Seal(seal));
-                }
+                self.in_flight.remove(&UploadTag::of(&key));
                 return;
             }
             UploadEvent::Retrying { .. } | UploadEvent::Restored { .. } => return,

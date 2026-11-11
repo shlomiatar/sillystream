@@ -1,4 +1,4 @@
-//! The uploader: one PUT per seal, dedicated objects, and retries that lose nothing.
+//! The uploader: one PUT per seal, and retries that lose nothing.
 
 mod common;
 
@@ -90,14 +90,15 @@ fn one_stream_seal(number: u64, stream: &str, bytes: &Bytes) -> Handoff {
     )
 }
 
-fn dedicated(stream: &str, number: u64, records: Vec<Bytes>) -> Handoff {
-    Handoff::Dedicated {
-        stream: stream_key(stream),
+/// A seal of one stream's records.
+fn stream_seal(stream: &str, number: u64, records: Vec<Bytes>) -> Handoff {
+    seal(
         number,
-        index: 1,
-        records,
-        tickets: Vec::new(),
-    }
+        vec![SealExtent {
+            stream: stream_key(stream),
+            records,
+        }],
+    )
 }
 
 /// The next event that isn't `Sealed` or `Written`.
@@ -221,7 +222,7 @@ async fn one_stream_in_two_extents_of_a_seal_gets_one_region() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() {
+async fn a_seal_goes_at_the_spec_path_with_its_own_time_and_index_0() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
     let store: Arc<dyn ObjectStore> = counting.clone();
     let (config, mut events) = config(Arc::clone(&store));
@@ -229,22 +230,16 @@ async fn a_stream_filling_its_buffer_gets_a_dedicated_object_at_the_spec_path() 
     let first = Bytes::from(record(FIRST_ID, 1, 7, b"one"));
     let second = Bytes::from(record(FIRST_ID + 1, 1, 7, b"two"));
     sender
-        .try_send(dedicated(
+        .try_send(stream_seal(
             "logs.busy",
             77,
             vec![first.clone(), second.clone()],
         ))
         .unwrap();
     let (key, path, _) = next_uploaded(&mut events).await;
-    assert_eq!(
-        key,
-        UploadKey::Dedicated {
-            stream: stream_key("logs.busy"),
-            number: 77
-        }
-    );
-    // Its own time, from its newest record, and the index the WAL writer gave it.
-    assert_eq!(path, sealed_path(ObjectId::new(id_ms(FIRST_ID + 1), 3, 1)));
+    assert_eq!(key, UploadKey::Seal(77));
+    // Its own time, from its newest record, and index 0, which only compaction uses.
+    assert_eq!(path, sealed_path(ObjectId::new(id_ms(FIRST_ID + 1), 3, 0)));
     assert_eq!(counting.puts(), 1);
     let reader = SegmentReader::new(store, path);
     let both = [first, second].concat();
@@ -269,8 +264,7 @@ fn key_of(event: &UploadEvent) -> &UploadKey {
     }
 }
 
-/// Cores hear what an object covers before anything else about it, for seals and dedicated
-/// objects alike.
+/// Cores hear what an object covers before anything else about it.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
     let counting = Arc::new(CountingStore::new(Arc::new(InMemory::new())));
@@ -290,19 +284,17 @@ async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
         })
         .unwrap();
     sender
-        .try_send(Handoff::Dedicated {
-            stream: stream_key("d"),
-            number: 8,
-            index: 1,
-            records: vec![bytes],
+        .try_send(Handoff::Seal {
+            seal: 8,
+            extents: vec![SealExtent {
+                stream: stream_key("d"),
+                records: vec![bytes],
+            }],
             tickets: vec![5, 1, 0],
         })
         .unwrap();
     let seal_key = UploadKey::Seal(4);
-    let dedicated_key = UploadKey::Dedicated {
-        stream: stream_key("d"),
-        number: 8,
-    };
+    let other_key = UploadKey::Seal(8);
     let mut seen = Vec::new();
     let mut uploaded = 0;
     while uploaded < 2 {
@@ -312,7 +304,7 @@ async fn the_sealed_event_comes_first_for_each_key_with_the_handoffs_tickets() {
         }
         seen.push(event);
     }
-    for (key, wanted) in [(&seal_key, [3, 0, 9]), (&dedicated_key, [5, 1, 0])] {
+    for (key, wanted) in [(&seal_key, [3, 0, 9]), (&other_key, [5, 1, 0])] {
         let first = seen.iter().find(|event| key_of(event) == key).unwrap();
         match first {
             UploadEvent::Sealed { tickets, .. } => assert_eq!(**tickets, wanted),
@@ -389,32 +381,20 @@ async fn shutdown_during_an_outage_hands_every_reference_back() {
         next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
     ));
-    sender
-        .try_send(dedicated("c", 1, vec![bytes.clone()]))
-        .unwrap();
-    sender.try_send(seal(2, vec![extent("d")])).unwrap();
+    sender.try_send(seal(2, vec![extent("c")])).unwrap();
+    sender.try_send(seal(3, vec![extent("d")])).unwrap();
     // The sender stays alive: shutdown must not depend on the channel closing.
     let exit = uploader.shutdown();
     assert_eq!(counting.puts(), 0);
     let mut seals = Vec::new();
-    let mut dedicated_count = 0;
     for unfinished in exit.unfinished {
-        match unfinished {
-            UnfinishedUpload::Seal { seal, extents } => seals.push((seal, extents.len())),
-            UnfinishedUpload::Dedicated {
-                stream, records, ..
-            } => {
-                assert_eq!(stream, stream_key("c"));
-                assert_eq!(records.len(), 1);
-                dedicated_count += 1;
-            }
-        }
+        let UnfinishedUpload::Seal { seal, extents } = unfinished;
+        seals.push((seal, extents.len()));
     }
     seals.sort();
-    assert_eq!(seals, [(1, 2), (2, 1)]);
-    assert_eq!(dedicated_count, 1);
+    assert_eq!(seals, [(1, 2), (2, 1), (3, 1)]);
     assert!(matches!(
-        sender.try_send(dedicated("e", 2, Vec::new())),
+        sender.try_send(stream_seal("e", 4, Vec::new())),
         Err(UploadSendError::Stopped(_))
     ));
 }
@@ -533,7 +513,7 @@ async fn try_send_on_a_full_channel_returns_at_once() {
     let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     sender
-        .try_send(dedicated("s", 0, vec![bytes.clone()]))
+        .try_send(stream_seal("s", 0, vec![bytes.clone()]))
         .unwrap();
     assert!(matches!(
         next_event(&mut events).await,
@@ -541,7 +521,7 @@ async fn try_send_on_a_full_channel_returns_at_once() {
     ));
     let mut full_count = 0;
     for number in 1..1000 {
-        match sender.try_send(dedicated("s", number, vec![bytes.clone()])) {
+        match sender.try_send(stream_seal("s", number, vec![bytes.clone()])) {
             Ok(()) => {}
             Err(UploadSendError::Full(_)) => full_count += 1,
             Err(UploadSendError::Stopped(_)) => panic!("stopped"),
@@ -564,7 +544,7 @@ async fn uploaded_objects_reach_the_local_cache() {
     let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"cached"));
     sender
-        .try_send(dedicated("s", 0, vec![bytes.clone()]))
+        .try_send(stream_seal("s", 0, vec![bytes.clone()]))
         .unwrap();
     let (_, path, _) = next_uploaded(&mut events).await;
     // Same bytes from both tiers, through the same reader.
@@ -616,7 +596,7 @@ async fn a_store_error_that_retrying_cannot_change_fails_alone() {
     let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
     sender
-        .try_send(dedicated("rejected", 1, vec![bytes.clone()]))
+        .try_send(stream_seal("rejected", 1, vec![bytes.clone()]))
         .unwrap();
     sender
         .try_send(one_stream_seal(1, "healthy", &bytes))
@@ -750,7 +730,7 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     config.cache = Some(cache);
     let (sender, uploader) = Uploader::start(config).unwrap();
     sender
-        .try_send(dedicated("s", 0, vec![bytes.clone()]))
+        .try_send(stream_seal("s", 0, vec![bytes.clone()]))
         .unwrap();
     // The PUT is failing, so the file exists by now.
     assert!(matches!(
@@ -764,7 +744,7 @@ async fn a_full_pending_directory_holds_later_seals_back() {
     for number in 1..4 {
         let later = Bytes::from(record(FIRST_ID + (number << 16), 1, 7, b"x"));
         sender
-            .try_send(dedicated("s", number, vec![later]))
+            .try_send(stream_seal("s", number, vec![later]))
             .unwrap();
     }
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -786,7 +766,7 @@ async fn finish_waits_for_what_pending_held_at_startup() {
     let (mut first, mut events) = config(store);
     first.cache = Some(SegmentCache::open(dir.path(), 1 << 20).unwrap());
     let (sender, uploader) = Uploader::start(first).unwrap();
-    sender.try_send(dedicated("s", 0, vec![bytes])).unwrap();
+    sender.try_send(stream_seal("s", 0, vec![bytes])).unwrap();
     assert!(matches!(
         next_event(&mut events).await,
         Some(UploadEvent::Retrying { .. })
@@ -797,7 +777,9 @@ async fn finish_waits_for_what_pending_held_at_startup() {
     // A store that refuses a few times first, so the restore is still going when the last
     // sender goes.
     let inner = Arc::new(InMemory::new());
-    let counting = Arc::new(CountingStore::new(Arc::clone(&inner) as Arc<dyn ObjectStore>));
+    let counting = Arc::new(CountingStore::new(
+        Arc::clone(&inner) as Arc<dyn ObjectStore>
+    ));
     counting.fail_next_puts.store(20, Ordering::SeqCst);
     let store: Arc<dyn ObjectStore> = Arc::clone(&counting) as Arc<dyn ObjectStore>;
     let (mut second, mut events) = config(store);
@@ -876,13 +858,13 @@ async fn shutdown_does_not_wait_for_a_put_stuck_on_a_blocking_thread() {
     let (config, _events) = config(store);
     let (sender, uploader) = Uploader::start(config).unwrap();
     let bytes = Bytes::from(record(FIRST_ID, 1, 7, b"x"));
-    sender.try_send(dedicated("s", 7, vec![bytes])).unwrap();
+    sender.try_send(stream_seal("s", 7, vec![bytes])).unwrap();
     wait_for_put_attempt(&counting).await;
     let unfinished = shutdown_within_5_s(uploader);
     assert_eq!(unfinished.len(), 1);
     assert!(matches!(
         unfinished[0],
-        UnfinishedUpload::Dedicated { number: 7, .. }
+        UnfinishedUpload::Seal { seal: 7, .. }
     ));
     drop(release);
 }
@@ -1179,8 +1161,8 @@ impl ObjectStore for HoldsPuts {
     }
 }
 
-fn dedicated_records(stream: &str, number: u64, id: u64) -> Handoff {
-    dedicated(
+fn held_records(stream: &str, number: u64, id: u64) -> Handoff {
+    stream_seal(
         stream,
         number,
         vec![Bytes::from(record(id, 0, 7, b"held back"))],
@@ -1213,11 +1195,11 @@ async fn puts_overlap_and_their_events_stay_in_order() {
     let (config, mut events) = config(Arc::clone(&store));
     let (sender, uploader) = Uploader::start(config).unwrap();
     sender
-        .try_send(dedicated_records("slow.stream", 1, FIRST_ID))
+        .try_send(held_records("slow.stream", 1, FIRST_ID))
         .unwrap();
     wait_for("the held PUT", || waiting.load(Ordering::SeqCst) == 1).await;
     sender
-        .try_send(dedicated_records("fast.stream", 2, FIRST_ID + 1))
+        .try_send(held_records("fast.stream", 2, FIRST_ID + 1))
         .unwrap();
 
     let fast = sealed_path_of(&store, "fast.stream").await;
@@ -1264,7 +1246,7 @@ async fn sealed_path_of(store: &Arc<dyn ObjectStore>, stream: &str) -> Option<Pa
 async fn next_number(events: &mut UnboundedReceiver<UploadEvent>) -> u64 {
     match next_event(events).await.expect("the uploader stopped") {
         UploadEvent::Uploaded {
-            key: UploadKey::Dedicated { number, .. },
+            key: UploadKey::Seal(number),
             ..
         } => number,
         other => panic!("unexpected event: {other:?}"),
@@ -1287,7 +1269,7 @@ async fn a_stop_returns_every_put_under_way() {
     let (config, _events) = config(store);
     let (sender, uploader) = Uploader::start(config).unwrap();
     for number in 0..3 {
-        let handoff = dedicated_records(&format!("held.{number}"), number, FIRST_ID + number);
+        let handoff = held_records(&format!("held.{number}"), number, FIRST_ID + number);
         sender.try_send(handoff).unwrap();
     }
     wait_for("three held PUTs", || waiting.load(Ordering::SeqCst) == 3).await;
@@ -1297,7 +1279,7 @@ async fn a_stop_returns_every_put_under_way() {
     assert!(
         exit.unfinished
             .iter()
-            .all(|left| matches!(left, UnfinishedUpload::Dedicated { .. }))
+            .all(|left| matches!(left, UnfinishedUpload::Seal { .. }))
     );
 }
 

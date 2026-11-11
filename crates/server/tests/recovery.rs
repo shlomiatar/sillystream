@@ -1711,8 +1711,8 @@ async fn seals_with_the_same_lowest_id_lose_nothing_across_a_restart() {
     node.shutdown();
 }
 
-/// A dedicated object can land before the seal holding earlier ids, so a crash can leave records
-/// to restore on both sides of an object. They can't go up as one extent around it.
+/// Records to restore on both sides of an object in the store can't go up as one extent around
+/// it. This node's own seals never leave that, so the object is planted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn records_restored_on_both_sides_of_an_object_stay_readable() {
     let disk = Disk::new();
@@ -1740,7 +1740,7 @@ async fn records_restored_on_both_sides_of_an_object_stay_readable() {
         .collect();
     disk.store
         .put(
-            &storage::sealed_path(ObjectId::new(format::id_ms(r2), 1, 1)),
+            &storage::sealed_path(ObjectId::new(format::id_ms(r2), 1, 0)),
             PutPayload::from(body),
         )
         .await

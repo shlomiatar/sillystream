@@ -70,7 +70,7 @@ impl DurableNotify for DurableWatch {
     }
 }
 
-/// Where sealed files and dedicated objects go, and who hears that the active file is full.
+/// Where sealed files go, and who hears that the active file is full.
 pub trait Sealer: Send {
     /// The active file has reached the size cap. Called once per file.
     fn full(&mut self);
@@ -78,9 +78,6 @@ pub trait Sealer: Send {
     /// behind is the backpressure section 7.3 asks for. One that has stopped drops it: the
     /// cores keep their references, and the WAL keeps the file.
     fn seal(&mut self, handoff: Handoff);
-    /// Gives a dedicated object back if it can't be taken now, and it stays in the seal.
-    #[allow(clippy::result_large_err)]
-    fn dedicated(&mut self, handoff: Handoff) -> Result<(), Handoff>;
 }
 
 /// Seals nothing, for a writer whose files nothing uploads.
@@ -88,10 +85,6 @@ impl Sealer for () {
     fn full(&mut self) {}
 
     fn seal(&mut self, _handoff: Handoff) {}
-
-    fn dedicated(&mut self, _handoff: Handoff) -> Result<(), Handoff> {
-        Ok(())
-    }
 }
 
 impl WalFile for File {
@@ -186,8 +179,6 @@ pub struct WalConfig {
     pub channel_capacity: usize,
     /// The active file asks for a seal once it holds this many record bytes (section 7.3).
     pub segment_cap_bytes: u64,
-    /// A stream with this many record bytes in the active file gets a dedicated object.
-    pub stream_buffer_bytes: u64,
     /// What a former process left in closed files and no object holds. It goes into the first
     /// seal, each extent as it is, since the caller splits a stream wherever another object's
     /// extent lies between its records.
@@ -372,13 +363,11 @@ where
         stats: WalStats::default(),
         sealer,
         segment_cap_bytes: config.segment_cap_bytes,
-        stream_buffer_bytes: config.stream_buffer_bytes,
         open: OpenFile {
             extents: config.carried,
             ..OpenFile::default()
         },
         last_tickets: Vec::new(),
-        dedicated_count: 0,
         carries: config.carried_dedupe,
     };
     let thread = std::thread::Builder::new()
@@ -409,11 +398,9 @@ struct Writer<V: WalVolume, N, S> {
     stats: WalStats,
     sealer: S,
     segment_cap_bytes: u64,
-    stream_buffer_bytes: u64,
     open: OpenFile,
     /// Per core, the highest ticket written.
     last_tickets: Vec<u64>,
-    dedicated_count: u64,
     /// Dedupe entries the active file is still to begin with, while there is no file to hold
     /// them (section 3).
     carries: Vec<DedupeCarry>,
@@ -424,23 +411,14 @@ struct Writer<V: WalVolume, N, S> {
 struct OpenFile {
     /// In the order each stream first appeared. A stream's records are in id order.
     extents: Vec<SealExtent>,
-    streams: HashMap<KeyHash, OpenStream>,
+    /// Per stream, where its records are in `extents`.
+    streams: HashMap<KeyHash, usize>,
     entry_count: u64,
     record_bytes: u64,
     full_told: bool,
-    /// The index the window's last dedicated object took, 0 before any (section 7.3).
-    last_dedicated_index: u8,
     /// Per `(stream, producer_id)`, the latest publish's dedupe entry, which the next file
     /// carries (section 3).
     dedupe: HashMap<(KeyHash, u64), DedupeCarry>,
-}
-
-struct OpenStream {
-    /// Where its records are in `extents`.
-    at: usize,
-    record_bytes: u64,
-    /// Per core, the highest ticket among its entries.
-    tickets: Vec<u64>,
 }
 
 fn raise(tickets: &mut Vec<u64>, core: usize, ticket: u64) {
@@ -533,8 +511,7 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
         Ok(())
     }
 
-    /// Keeps a synced entry's records for the seal, and hands over its stream's as a dedicated
-    /// object once they fill its buffer.
+    /// Keeps a synced entry's records for the seal.
     fn keep<R: AsRef<[u8]> + Send + 'static>(&mut self, entry: WalEntry<R>) {
         let (core, ticket) = (entry.core(), entry.ticket());
         let stream = entry.stream();
@@ -553,55 +530,15 @@ impl<V: WalVolume, N: DurableNotify, S: Sealer> Writer<V, N, S> {
         }
         open.entry_count += 1;
         open.record_bytes += records.len() as u64;
-        let at = open.extents.len();
-        let kept = open.streams.entry(stream).or_insert_with(|| OpenStream {
-            at,
-            record_bytes: 0,
-            tickets: Vec::new(),
-        });
-        if kept.at == at {
+        let next = open.extents.len();
+        let at = *open.streams.entry(stream).or_insert(next);
+        if at == next {
             open.extents.push(SealExtent {
                 stream,
                 records: Vec::new(),
             });
         }
-        kept.record_bytes += records.len() as u64;
-        raise(&mut kept.tickets, core, ticket);
-        open.extents[kept.at].records.push(records);
-        if kept.record_bytes >= self.stream_buffer_bytes {
-            self.hand_off_dedicated(stream);
-        }
-    }
-
-    /// One that can't be taken now stays in the seal (D59, D268), as does one past the window's
-    /// 255th, which no object id's index could hold (section 7.3).
-    fn hand_off_dedicated(&mut self, stream: KeyHash) {
-        let Some(index) = self.open.last_dedicated_index.checked_add(1) else {
-            return;
-        };
-        let Some(kept) = self.open.streams.remove(&stream) else {
-            return;
-        };
-        let records = std::mem::take(&mut self.open.extents[kept.at].records);
-        let handoff = Handoff::Dedicated {
-            stream,
-            number: self.dedicated_count,
-            index,
-            records,
-            tickets: kept.tickets.clone(),
-        };
-        match self.sealer.dedicated(handoff) {
-            Ok(()) => {
-                self.dedicated_count += 1;
-                self.open.last_dedicated_index = index;
-            }
-            Err(handoff) => {
-                if let Handoff::Dedicated { records, .. } = handoff {
-                    self.open.extents[kept.at].records = records;
-                }
-                self.open.streams.insert(stream, kept);
-            }
-        }
+        open.extents[at].records.push(records);
     }
 
     /// Rotates unless the file is empty, and hands what it holds to the uploader, even when
