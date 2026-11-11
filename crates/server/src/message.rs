@@ -430,6 +430,14 @@ pub(crate) enum ControlMsg {
         stream: KeyHash,
         reply: oneshot::Sender<Result<SnapshotReply, ErrorCode>>,
     },
+    /// The highest `producer_seq` the stream's dedupe entry for `producer_id` holds: where a
+    /// forward sink's earlier tries got to (section 9). A stream out of RAM has no entries
+    /// (section 3), so this loads nothing and answers `None` for it.
+    DedupeSeq {
+        stream: KeyHash,
+        producer_id: u64,
+        reply: oneshot::Sender<Option<u64>>,
+    },
     /// Stamped batches this core still holds, in id order.
     ReadMemory {
         stream: KeyHash,

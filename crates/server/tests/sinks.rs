@@ -1179,8 +1179,8 @@ fn check_wal_fields(harness: &Harness, target: &str, sink_id: u64, run: &Forward
     assert_eq!(seqs.last(), last_ids.last());
 }
 
-/// What built up before the sink started goes as two publishes: one record alone, since the
-/// target may already have a run of them from before, then all the rest at once.
+/// What built up before the sink started goes as one publish: the target has no entry for the
+/// sink, so there is nothing from before to skip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forward_sends_what_has_built_up_in_one_publish() {
     let harness = Harness::new(config());
@@ -1204,17 +1204,93 @@ async fn a_forward_sends_what_has_built_up_in_one_publish() {
         .iter()
         .map(|entry| entry.producer_seq)
         .collect();
-    let (first_id, (item_count, _)) = run.sent.iter().next().unwrap();
     let (last_first, (last_count, _)) = run.sent.iter().next_back().unwrap();
+    assert_eq!(seqs, [last_first + last_count - 1]);
+    drop(client);
+    harness.finish();
+}
+
+/// A try before a kill published the first records and the cursor never moved past them. The
+/// next spell reads them again and skips them, sends the record of several items the earlier
+/// publish ended on alone, which the target drops as a duplicate, and the rest as one publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_skips_what_an_earlier_try_published_and_sends_the_rest() {
+    let hook = KillScript::with(&[(SinkStep::AfterDelivery, 1)]);
+    let mut config = config();
+    config.sink.hook = Some(hook.clone());
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    // Five records, the third of four items.
+    let run = publish_for_forward(&mut client, STREAM, 5).await;
+    let stored = stored_bytes(node, STREAM, run.last_id, false).await;
+    let sizes: Vec<u64> = format::Records::new(&stored)
+        .map(|record| record.unwrap().header.total_bytes() as u64)
+        .collect();
+    assert_eq!(sizes.len(), 5);
+    // The first batch holds the first three records and no more.
+    let mut spec = forward_spec(TARGET);
+    spec.budget_bytes = sizes[..3].iter().sum();
+    put_sink(&mut client, STREAM, 44, spec, SinkStart::Earliest).await;
+    wait_for_cursor(&mut client, STREAM, 44, run.last_id).await;
+    check_forwarded(node, TARGET, &run).await;
+    assert_eq!(hook.kill_count.load(Ordering::SeqCst), 1);
+    let last_ids: Vec<u64> = run
+        .sent
+        .iter()
+        .map(|(first_id, (item_count, _))| first_id + item_count - 1)
+        .collect();
+    let (third_first, (third_count, _)) = run.sent.iter().nth(2).unwrap();
+    assert_eq!(*third_count, 4);
+    let mut seqs: Vec<u64> = harness
+        .wal
+        .stream_entries(TARGET)
+        .iter()
+        .map(|entry| entry.producer_seq)
+        .collect();
+    seqs.dedup();
+    assert_eq!(seqs, [third_first + 3, last_ids[4]]);
     assert_eq!(
-        seqs,
-        [first_id + item_count - 1, last_first + last_count - 1]
+        total_stat(node, |stats| stats.duplicate_count).await,
+        1,
+        "only the record the earlier publish ended on went again"
     );
     drop(client);
     harness.finish();
 }
 
 const TARGET: &str = "sink.target";
+
+/// A try published everything and was killed before its cursor. The next spell skips all but
+/// the last record, which goes alone: the target acks it as a duplicate once what it holds is
+/// synced, and that ack moves the cursor to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_moves_its_cursor_past_skipped_records_with_the_last_ones_ack() {
+    let hook = KillScript::with(&[(SinkStep::AfterDelivery, 1)]);
+    let mut config = config();
+    config.sink.hook = Some(hook.clone());
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    make_stream(&mut client, STREAM).await;
+    let run = publish_for_forward(&mut client, STREAM, 3).await;
+    put_sink(
+        &mut client,
+        STREAM,
+        44,
+        forward_spec(TARGET),
+        SinkStart::Earliest,
+    )
+    .await;
+    wait_for_cursor(&mut client, STREAM, 44, run.last_id).await;
+    assert_eq!(hook.kill_count.load(Ordering::SeqCst), 1);
+    check_forwarded(node, TARGET, &run).await;
+    check_wal_fields(&harness, TARGET, 44, &run);
+    assert_eq!(total_stat(node, |stats| stats.duplicate_count).await, 1);
+    drop(client);
+    harness.finish();
+}
 
 async fn forward_with_kills(kills: Vec<(SinkStep, u32)>, count: u64) {
     let hook = KillScript::with(&kills);

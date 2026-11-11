@@ -384,10 +384,15 @@ struct Reading<'a> {
     /// `archive`: what an object written before this spell holds up to, which is read again
     /// and skipped.
     archived_through: u64,
-    /// `forward`: one record per publish until the target takes one as new. What was published
-    /// before this spell began can be any run of what is read again, and a batch overlapping
-    /// its end would be taken whole as new or dropped whole (D189).
-    probing: bool,
+    /// `forward`: the highest seq the target holds from this sink as the spell began, which is
+    /// the source id of the last record a try before it published. What is read again up to it
+    /// is skipped: a batch overlapping it would be taken whole as new or dropped whole (D189).
+    /// The record ending at it goes alone, as a duplicate the target acks once what it holds
+    /// has reached the ack level, and the ack moves the cursor.
+    forwarded_through: u64,
+    /// `forward`: records were skipped and no publish has been acked since. The target may hold
+    /// them unsynced, so progress waits: the WAL syncs in order, so an ack covers them.
+    skipped_unacked: bool,
 }
 
 impl<'a> Reading<'a> {
@@ -455,7 +460,8 @@ impl<'a> Reading<'a> {
             next_retention_refresh_ms: 0,
             gap_from: None,
             archived_through: 0,
-            probing: true,
+            forwarded_through: 0,
+            skipped_unacked: false,
             spec,
             worker,
         })
@@ -476,6 +482,19 @@ impl<'a> Reading<'a> {
         let Some(mut connection) = self.worker.context.handle.connection(self.home).await else {
             return Spell::End(End::Done);
         };
+        if self.kind == Kind::Forward
+            && let Some(target) = self.spec.target
+        {
+            let producer_id = format::forward_producer_id(self.worker.key.0, self.worker.key.1);
+            let seq = self
+                .worker
+                .client
+                .lock()
+                .await
+                .forward_seq(target, producer_id)
+                .await;
+            self.forwarded_through = seq.unwrap_or(0);
+        }
         self.subscribe(&connection, self.read_id);
         loop {
             let now_ms = self.worker.context.clock.now_ms();
@@ -622,7 +641,12 @@ impl<'a> Reading<'a> {
                     self.record_gap(gap_from, first_id - 1).await;
                 }
                 let item_count = u64::from(header.count);
-                if self.kind == Kind::Notify {
+                // A seq is a record's last id, and a record keeps its ids when read again, so
+                // this takes whole records only.
+                if self.kind == Kind::Forward && last_id < self.forwarded_through {
+                    self.progress_id = self.progress_id.max(last_id);
+                    self.skipped_unacked = true;
+                } else if self.kind == Kind::Notify {
                     // Only the count matters, so a burst holds one entry and no bytes.
                     match self.unread.back_mut() {
                         Some(run) => {
@@ -693,7 +717,9 @@ impl<'a> Reading<'a> {
                 self.worker.next_notify_ms = now_ms.saturating_add(self.interval_ms);
                 self.new_delivery(first, now_ms)
             }
-            Kind::Forward if self.probing => self.new_delivery(first, now_ms),
+            Kind::Forward if first.last_id == self.forwarded_through => {
+                self.new_delivery(first, now_ms)
+            }
             Kind::Archive => match self.archive_batch(now_ms) {
                 Some(delivery) => delivery,
                 None => return,
@@ -795,10 +821,7 @@ impl<'a> Reading<'a> {
         match outcome {
             Outcome::ArchivedThrough(_) => unreachable!("taken apart above"),
             Outcome::Delivered | Outcome::AlreadyThere => {
-                if matches!(outcome, Outcome::Delivered) {
-                    // Taken as new: everything after it is past what an earlier try published.
-                    self.probing = false;
-                }
+                self.skipped_unacked = false;
                 storage::crash_point("sink.after_delivery");
                 if self.worker.hook(SinkStep::AfterDelivery) == SinkAction::Kill {
                     return Some(Spell::End(End::Killed));
@@ -910,9 +933,14 @@ impl<'a> Reading<'a> {
         let _ = self.worker.op(op).await;
     }
 
-    /// Progress can move the cursor only with nothing read and not yet delivered before it.
+    /// Progress can move the cursor only with nothing read and not yet delivered before it, nor
+    /// skipped and not yet covered by an ack.
     async fn commit_progress(&mut self) {
-        if self.unread.is_empty() && self.delivery.is_none() && self.progress_id > self.cursor {
+        if self.unread.is_empty()
+            && self.delivery.is_none()
+            && !self.skipped_unacked
+            && self.progress_id > self.cursor
+        {
             self.commit(self.progress_id).await;
         }
     }
@@ -1196,8 +1224,9 @@ impl Attempt {
     }
 
     /// One publish per batch, whose seq is the source id of its last record. The target drops a
-    /// seq at or below the highest it has taken, so a record it has is never taken again once
-    /// probing has found where it stopped.
+    /// seq at or below the highest it has taken, and a spell skips what is below the seq it held
+    /// as the spell began and sends the record ending at it alone, so a record it has is never
+    /// taken again.
     async fn forward(&self) -> Outcome {
         if self.bytes.is_empty() {
             return Outcome::Delivered;

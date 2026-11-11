@@ -2554,6 +2554,27 @@ impl Core {
                     let _ = reply.send(result);
                 }
             },
+            ControlMsg::DedupeSeq {
+                stream,
+                producer_id,
+                reply,
+            } => match self.route(stream) {
+                Route::Forward(to) => {
+                    let _ = self.links.control[to].send(ControlMsg::DedupeSeq {
+                        stream,
+                        producer_id,
+                        reply,
+                    });
+                }
+                Route::Here(_) => {
+                    let now_ms = self.clock.now_ms();
+                    let seq = self
+                        .streams
+                        .get(&stream)
+                        .and_then(|stream| stream.dedupe.latest_seq(producer_id, now_ms));
+                    let _ = reply.send(seq);
+                }
+            },
             ControlMsg::ReadMemory { stream, reply } => {
                 let batches = self
                     .logs

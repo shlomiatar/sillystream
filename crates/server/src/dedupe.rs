@@ -101,6 +101,14 @@ impl DedupeTable {
             .binary_search_by_key(&producer_id, DedupeEntry::producer_id)
     }
 
+    /// The highest seq taken from a producer, if its entry is here and hasn't expired. Changes
+    /// nothing.
+    pub fn latest_seq(&self, producer_id: u64, now_ms: u64) -> Option<u64> {
+        let at = self.position(producer_id).ok()?;
+        let entry = self.entries[at];
+        (!entry.is_expired(now_ms)).then(|| entry.producer_seq())
+    }
+
     /// An expired entry is removed here, so it can't answer again.
     pub fn check(&mut self, producer_id: u64, producer_seq: u64, now_ms: u64) -> DedupeCheck {
         let Ok(at) = self.position(producer_id) else {

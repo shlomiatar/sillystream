@@ -1906,6 +1906,19 @@ impl Client {
             .map_err(|_| ClientError::NodeStopped)
     }
 
+    /// The highest seq `target` holds for a forward sink's `producer_id`, or `None` if it has no
+    /// entry for it: not taken, expired, or the stream isn't in RAM or doesn't exist.
+    pub(crate) async fn forward_seq(&mut self, target: KeyHash, producer_id: u64) -> Option<u64> {
+        let (stream, core) = self.route(target);
+        let (reply, answer) = oneshot::channel();
+        let _ = self.links.control[core].send(ControlMsg::DedupeSeq {
+            stream,
+            producer_id,
+            reply,
+        });
+        answer.await.ok().flatten()
+    }
+
     /// A change to a stream's sinks. Stream and sink ops from a person are answered once a
     /// checkpoint holds them, on a node with a store (D196).
     pub async fn sink_op(&mut self, stream: KeyHash, op: SinkOp) -> Result<(), ErrorCode> {
