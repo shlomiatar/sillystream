@@ -144,6 +144,16 @@ pub struct ScriptStore {
     pub slow_get_once: Arc<Mutex<Vec<(String, Duration)>>>,
     /// `PUT`s of a path ending in this wait this long, every time.
     pub slow_put: Arc<Mutex<Vec<(String, Duration)>>>,
+    /// Every `GET` waits this long, like a bucket's time to first byte.
+    pub get_delay_ms: Arc<AtomicU64>,
+    /// If not empty, the `n`th `GET` waits `get_delay_cycle_ms[n % len]` instead.
+    pub get_delay_cycle_ms: Arc<Mutex<Vec<u64>>>,
+    pub get_count: Arc<AtomicU64>,
+    /// `GET`s in flight now, and the most there have been at once.
+    pub gets_in_flight: Arc<AtomicU64>,
+    pub max_gets_in_flight: Arc<AtomicU64>,
+    /// Time with at least one `GET` in flight: (in flight, since, total nanos).
+    pub get_busy: Arc<Mutex<(u64, Option<std::time::Instant>, u64)>>,
 }
 
 impl fmt::Display for ScriptStore {
@@ -165,6 +175,39 @@ impl ScriptStore {
             deleted: Arc::new(Mutex::new(Vec::new())),
             slow_get_once: Arc::new(Mutex::new(Vec::new())),
             slow_put: Arc::new(Mutex::new(Vec::new())),
+            get_delay_ms: Arc::new(AtomicU64::new(0)),
+            get_delay_cycle_ms: Arc::new(Mutex::new(Vec::new())),
+            get_count: Arc::new(AtomicU64::new(0)),
+            gets_in_flight: Arc::new(AtomicU64::new(0)),
+            max_gets_in_flight: Arc::new(AtomicU64::new(0)),
+            get_busy: Arc::new(Mutex::new((0, None, 0))),
+        }
+    }
+
+    /// Nanoseconds so far with at least one `GET` in flight.
+    pub fn get_busy_nanos(&self) -> u64 {
+        let busy = self.get_busy.lock().unwrap();
+        busy.2 + busy.1.map_or(0, |since| since.elapsed().as_nanos() as u64)
+    }
+
+    fn get_began(&self) {
+        let now = self.gets_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_gets_in_flight.fetch_max(now, Ordering::SeqCst);
+        let mut busy = self.get_busy.lock().unwrap();
+        busy.0 += 1;
+        if busy.0 == 1 {
+            busy.1 = Some(std::time::Instant::now());
+        }
+    }
+
+    fn get_ended(&self) {
+        self.gets_in_flight.fetch_sub(1, Ordering::SeqCst);
+        let mut busy = self.get_busy.lock().unwrap();
+        busy.0 -= 1;
+        if busy.0 == 0
+            && let Some(since) = busy.1.take()
+        {
+            busy.2 += since.elapsed().as_nanos() as u64;
         }
     }
 
@@ -259,6 +302,27 @@ impl ObjectStore for ScriptStore {
         if let Some(delay) = slow {
             tokio::time::sleep(delay).await;
         }
+        let n = self.get_count.fetch_add(1, Ordering::SeqCst);
+        let delay_ms = {
+            let cycle = self.get_delay_cycle_ms.lock().unwrap();
+            match cycle.len() {
+                0 => self.get_delay_ms.load(Ordering::SeqCst),
+                len => cycle[n as usize % len],
+            }
+        };
+        if delay_ms == 0 {
+            return self.inner.get_opts(location, options).await;
+        }
+        // Counted only when delayed, so a dropped GET can't leave the count behind.
+        self.get_began();
+        struct Ended<'a>(&'a ScriptStore);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.get_ended();
+            }
+        }
+        let _ended = Ended(self);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         self.inner.get_opts(location, options).await
     }
 

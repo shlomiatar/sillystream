@@ -8,7 +8,7 @@ use format::{IdAllocator, KeyHash};
 use proto::ErrorCode;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::connection::{CommandTicket, Event, ObjectRead, Outbox};
+use crate::connection::{AheadGot, CommandTicket, Event, ObjectRead, Outbox};
 use crate::core::UploadTag;
 use crate::dedupe::DedupeTable;
 use crate::delivery::{FanOut, ObjectRef, StreamDelivery};
@@ -741,6 +741,11 @@ pub(crate) enum CatchReply {
 #[derive(Debug)]
 pub(crate) enum ReadDone {
     Read(ObjectRead),
+    /// A read ahead of delivery, `seq` of the subscription's.
+    Ahead {
+        seq: u64,
+        got: AheadGot,
+    },
     /// The store failed. The next try is the subscriber's to start.
     Retry,
     /// The object isn't there. The owner knows if the records are somewhere else.

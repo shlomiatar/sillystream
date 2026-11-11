@@ -1,6 +1,16 @@
 # Read cache for catch-up: design note
 
-Status: a proposal for discussion. Nothing here is in SPEC.md yet. Once decided, the parts we keep move into section 7.3 and this note goes to `docs/old/`.
+Status: a proposal for discussion. Pieces 3 and 4 are done (SPEC.md section 5.1); the rest is not in SPEC.md yet. Once decided, the parts we keep move into section 7.3 and this note goes to `docs/old/`.
+
+Pieces 3 and 4, measured locally (`crates/server/tests/catch_up_bench.rs`: in-memory store, every GET waits 50 ms, one stream, 4 MiB reads, 4 in flight):
+
+| | before | after |
+|---|---|---|
+| 256 MiB in 1 object | 71.7 MiB/s | 232 MiB/s |
+| 64 MiB in 4 objects | 46.8 MiB/s | 86.9 MiB/s |
+| 64 MiB in 32 objects | 18.4 MiB/s | 18.4 MiB/s |
+
+Before, a GET was in flight 98–100% of the time and never more than one data read at once: the serial reads were the cost. Read-ahead keeps 4 in flight within a region. Moving to the next object still waits for its region lookup (top index, page, region: 3 GETs in a row), and the owner names only the next object, so streams with small regions per object gain little. Naming more of the list ahead would fix that.
 
 ## Why
 
@@ -33,8 +43,8 @@ The goal: a first pass no slower than no fill, and a second pass as fast as whol
 
 1. **Range cache.** Keep the bytes a catch-up read already fetched, keyed by (object id, aligned block). No extra GETs: the cache holds exactly what readers fetched. Block alignment (for example 4 MiB) lets overlapping readers share entries.
 2. **Folded misses.** Concurrent reads of the same block wait on one in-flight GET instead of each issuing their own. Ten readers of the same stream from the start cost one pass over the bucket.
-3. **Node-wide read limit.** One semaphore for bucket GETs in flight on the node, handed out round-robin per subscription, plus a byte bound on buffered blocks. Replaces "one outstanding read per subscription" as the thing that protects the bucket and memory.
-4. **Read-ahead within a stream.** A subscription that is behind may hold up to N blocks in flight (within the node limit), and may start on the stream's region in the next object before finishing this one. This is what makes the first pass faster than today, not just the second.
+3. **Node-wide read limit.** (Done: `object_reads_in_flight`, FIFO, and `read_ahead_bytes`.) One semaphore for bucket GETs in flight on the node, handed out round-robin per subscription, plus a byte bound on buffered blocks. Replaces "one outstanding read per subscription" as the thing that protects the bucket and memory.
+4. **Read-ahead within a stream.** (Done: `catch_up_read_ahead`, 4.) A subscription that is behind may hold up to N blocks in flight (within the node limit), and may start on the stream's region in the next object before finishing this one. This is what makes the first pass faster than today, not just the second.
 5. **Storage for many small entries.** At 1M streams, entries are many and small. Options:
    - append-only cache files with an in-memory index (object, block) → (file, offset), evicted a whole file at a time, oldest first;
    - the metadata KV store, for small blocks only.

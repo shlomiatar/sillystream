@@ -105,6 +105,14 @@ pub struct NodeConfig {
     /// for its first byte and only one is in flight per subscription, so this is about half
     /// the subscriber queue: the most that fits once the queue is down to its low mark.
     pub catch_up_read_bytes: u64,
+    /// How many object-store reads a subscription that is behind may have in flight, for
+    /// consecutive ranges, delivered in id order (section 5.1).
+    pub catch_up_read_ahead: usize,
+    /// Object-store reads of catch-ups in flight on the node, shared by every subscription.
+    pub object_reads_in_flight: usize,
+    /// Bytes read ahead and not yet delivered, on the node. Past it a subscription reads one
+    /// range at a time.
+    pub read_ahead_bytes: u64,
     /// With a metadata store, how many streams may stay in RAM with nobody on them, split over
     /// the cores (section 7.6). `None` never evicts.
     pub active_stream_limit: Option<usize>,
@@ -143,6 +151,9 @@ impl NodeConfig {
         }
         if self.catch_up_read_bytes == 0 {
             return refuse("catch_up_read_bytes is 0");
+        }
+        if self.catch_up_read_ahead == 0 || self.object_reads_in_flight == 0 {
+            return refuse("catch_up_read_ahead and object_reads_in_flight can't be 0");
         }
         if self.max_frame_bytes == 0 {
             return refuse("max_frame_bytes is 0");
@@ -184,6 +195,9 @@ impl NodeConfig {
             fair_share_bytes: 256 * 1024,
             connection_window_bytes: 4 * 1024 * 1024,
             catch_up_read_bytes: 4 * 1024 * 1024,
+            catch_up_read_ahead: 4,
+            object_reads_in_flight: 64,
+            read_ahead_bytes: 256 * 1024 * 1024,
             active_stream_limit: None,
             full_checkpoint_every_count: 64,
             compaction: None,
@@ -989,6 +1003,9 @@ impl Node {
                 parts.checkpoints.ownership.clone()
             })),
             objects: Arc::clone(&objects),
+            reads: Arc::new(tokio::sync::Semaphore::new(config.object_reads_in_flight)),
+            ahead_bytes: Arc::new(AtomicU64::new(0)),
+            ahead_cap_bytes: config.read_ahead_bytes,
         };
         let (notify, durable): (DurableWatch, _) = durable_watches(core_count);
         let mut upload_txs = Vec::with_capacity(core_count + 1);
@@ -1076,6 +1093,7 @@ impl Node {
             share_bytes: config.fair_share_bytes,
             window_bytes: delivery_bound_bytes(&config, config.connection_window_bytes),
             read_bytes: config.catch_up_read_bytes,
+            read_ahead: config.catch_up_read_ahead,
             memory_cap_bytes: config.memory_cap_bytes,
         };
         let mut threads = Vec::with_capacity(core_count + 1);

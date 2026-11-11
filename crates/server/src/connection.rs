@@ -6,6 +6,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -15,7 +16,8 @@ use format::{Clause, Decision, Filter, KeyHash};
 use object_store::ObjectStore;
 use proto::ErrorCode;
 use storage::{BlockTable, Ownership, SegmentError, SegmentReader, StreamExtent};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
+use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::core::Links;
@@ -473,6 +475,8 @@ pub(crate) struct DeliverySettings {
     pub share_bytes: u64,
     pub window_bytes: u64,
     pub read_bytes: u64,
+    /// Object-store reads a subscription that is behind may have in flight.
+    pub read_ahead: usize,
     pub memory_cap_bytes: u64,
 }
 
@@ -486,6 +490,11 @@ pub(crate) struct Stores {
     pub ownership: Arc<Ownership>,
     /// The node's object table, which the cores read and the node and compactor change.
     pub objects: Arc<std::sync::RwLock<storage::ObjectTable>>,
+    /// The node's object-store reads of catch-ups in flight (section 5.1).
+    pub reads: Arc<Semaphore>,
+    /// Bytes read ahead and not yet delivered, on the node, and the most there may be.
+    pub ahead_bytes: Arc<AtomicU64>,
+    pub ahead_cap_bytes: u64,
 }
 
 /// What a home core counts.
@@ -520,6 +529,8 @@ struct QueueItem {
 /// A catch-up partway through an object, so its region is found once.
 struct ObjectProgress {
     object: ObjectRef,
+    /// The object after it in the list, as the owner last said.
+    next: Option<ObjectRef>,
     region: Option<Region>,
     next_block: usize,
     limit: u64,
@@ -573,6 +584,11 @@ struct Sub {
     past_last_id: u64,
     /// An object found missing, for the next step to tell the owner of.
     gone: Option<ObjectRef>,
+    /// Object-store reads started ahead of delivery, in id order (section 5.1).
+    ahead: VecDeque<Ahead>,
+    /// Where the next read ahead starts. `None`: from where delivery is.
+    frontier: Option<Frontier>,
+    next_ahead_seq: u64,
     /// The version of the last state given or queued for it.
     state_ver: u64,
     /// A `STATE` to send before any more of the queue: the queue is all above its version.
@@ -628,6 +644,11 @@ impl Sub {
             self.held_bytes -= size_bytes;
         }
         item.state_after
+    }
+
+    fn clear_ahead(&mut self) {
+        self.ahead.clear();
+        self.frontier = None;
     }
 
     fn clear_queue(&mut self) {
@@ -1126,6 +1147,9 @@ impl Home {
             past: None,
             past_last_id: 0,
             gone: None,
+            ahead: VecDeque::new(),
+            frontier: None,
+            next_ahead_seq: 0,
             state_ver: 0,
             latest_state: None,
             wants_state: with_state || state_only,
@@ -1772,6 +1796,8 @@ impl Home {
         sub.object = None;
         sub.past = None;
         sub.past_last_id = 0;
+        // Reads in flight ahead are dropped with what they would have brought.
+        sub.clear_ahead();
         let (conn, id, resume_from) = (sub.conn, sub.id, sub.handed_through);
         self.stats.behind_count += 1;
         self.send_event(
@@ -1784,19 +1810,34 @@ impl Home {
         self.pump_catch_up(key);
     }
 
-    /// Asks for the next stretch, if the queue has room and the client is reading.
+    /// Asks for the next stretch, if the queue has room and the client is reading. What was
+    /// read ahead is taken first, in id order.
     fn pump_catch_up(&mut self, key: usize) {
+        loop {
+            self.read_ahead(key);
+            match self.pump_once(key) {
+                Pumped::Read(read) => {
+                    self.apply_read(key, *read);
+                    self.progress(key, 0, false);
+                }
+                Pumped::Again => {}
+                Pumped::Done => return,
+            }
+        }
+    }
+
+    fn pump_once(&mut self, key: usize) -> Pumped {
         let queue_low_bytes = self.settings.queue_bytes / 2;
         let read_bytes = self.settings.read_bytes;
         let Some(Some(sub)) = self.subs.get_mut(key) else {
-            return;
+            return Pumped::Done;
         };
         if sub.mode != Mode::CatchUp
             || sub.read_out
             || sub.behind_unread
             || sub.queue_cost_bytes() > queue_low_bytes
         {
-            return;
+            return Pumped::Done;
         }
         let window_open = self
             .conns
@@ -1804,7 +1845,14 @@ impl Home {
             .and_then(Option::as_ref)
             .is_some_and(|conn| conn.window_left_bytes > 0);
         if !window_open {
-            return;
+            return Pumped::Done;
+        }
+        if sub.object.is_some() {
+            if let Some(taken) = take_ahead(sub, &self.stores, read_bytes) {
+                return taken;
+            }
+            // Nothing read ahead fits: the usual read.
+            sub.clear_ahead();
         }
         sub.read_out = true;
         if let Some(progress) = &sub.object {
@@ -1827,7 +1875,7 @@ impl Home {
                 },
             };
             tokio::spawn(run_object_job(job));
-            return;
+            return Pumped::Done;
         }
         let message = ReadStepMsg {
             stream: sub.stream,
@@ -1842,6 +1890,125 @@ impl Home {
             gone: sub.gone.take(),
         };
         let _ = self.links.reads[self.me].send(ReadMsg::Step(Box::new(message)));
+        Pumped::Done
+    }
+
+    /// Starts object-store reads past where delivery is, up to `read_ahead` in flight: the
+    /// rest of the object's region, then the region in the next object of the list.
+    fn read_ahead(&mut self, key: usize) {
+        let read_bytes = self.settings.read_bytes;
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        if sub.mode != Mode::CatchUp || sub.behind_unread {
+            return;
+        }
+        let back = &self.links.reads[self.me];
+        let sub_ref = SubRef {
+            home: self.me,
+            key,
+            uid: sub.uid,
+        };
+        loop {
+            let Some(frontier) = &mut sub.frontier else {
+                return;
+            };
+            let room = sub.ahead.len() < self.settings.read_ahead;
+            let task = match (frontier.next, &frontier.region) {
+                // The next object's region first: its lookup is the longer wait.
+                (Some(next), _) if !frontier.next_asked => {
+                    if !room {
+                        return;
+                    }
+                    frontier.next_asked = true;
+                    (next, None, AheadBytes::default())
+                }
+                // Its region is on its way.
+                (_, None) => return,
+                (next, Some(region)) => {
+                    let accepted = accepted_limit(&self.stores, &frontier.object);
+                    let limit = frontier.limit.min(accepted);
+                    let run = plan_run(
+                        region,
+                        &sub.filter,
+                        limit,
+                        frontier.next_block,
+                        frontier.position,
+                        read_bytes,
+                    );
+                    if run.start == run.end {
+                        // The owner goes on to the next object from here, if it holds nothing
+                        // more at or below the limit.
+                        let passed =
+                            run.done && region.extent.id_last.min(accepted) <= frontier.limit;
+                        let Some(next) = next.filter(|_| passed) else {
+                            return;
+                        };
+                        let region = sub
+                            .ahead
+                            .iter()
+                            .find(|entry| entry.object.key == next.key && entry.blocks.is_none())
+                            .and_then(|entry| match &entry.got {
+                                Some(AheadGot::Region(Some((extent, table)))) => Some(Region {
+                                    extent: extent.clone(),
+                                    table: Arc::clone(table),
+                                    after: run.position,
+                                }),
+                                _ => None,
+                            });
+                        *frontier = Frontier {
+                            object: next,
+                            next: None,
+                            next_asked: false,
+                            region,
+                            next_block: 0,
+                            position: run.position,
+                            limit: frontier.limit,
+                        };
+                        continue;
+                    }
+                    if !room {
+                        return;
+                    }
+                    let bytes = region.table.blocks[run.start..run.end]
+                        .iter()
+                        .map(|block| block.summary.bytes)
+                        .sum();
+                    let Some(reserved) = AheadBytes::take(&self.stores, bytes) else {
+                        return;
+                    };
+                    let blocks = (
+                        region.extent.clone(),
+                        Arc::clone(&region.table),
+                        run.start..run.end,
+                    );
+                    let object = frontier.object;
+                    frontier.next_block = run.end;
+                    frontier.position = run.position;
+                    (object, Some(blocks), reserved)
+                }
+            };
+            let (object, blocks, reserved) = task;
+            let seq = sub.next_ahead_seq;
+            sub.next_ahead_seq += 1;
+            let range = blocks.as_ref().map(|(_, _, range)| range.clone());
+            let handle = tokio::spawn(read_ahead_task(
+                self.stores.clone(),
+                object,
+                blocks,
+                back.clone(),
+                sub_ref,
+                seq,
+            ));
+            sub.ahead.push_back(Ahead {
+                seq,
+                object,
+                blocks: range,
+                got: None,
+                task: handle.abort_handle(),
+                _reserved: reserved,
+            });
+        }
     }
 
     fn enqueue_read(&mut self, key: usize, matched: Option<Arc<Matched>>) {
@@ -1872,6 +2039,19 @@ impl Home {
         };
         sub.read_out = false;
         let mut prefetch = None;
+        // What was read ahead is kept only for the object the owner says comes next.
+        match &reply {
+            CatchReply::Object { object, next, .. } => match &mut sub.frontier {
+                Some(frontier) if frontier.object.key == object.key => {
+                    if frontier.next != *next {
+                        frontier.next = *next;
+                        frontier.next_asked = false;
+                    }
+                }
+                _ => sub.clear_ahead(),
+            },
+            _ => sub.clear_ahead(),
+        }
         match reply {
             CatchReply::Start {
                 head,
@@ -1920,9 +2100,13 @@ impl Home {
                 next,
                 limit,
             } => {
-                prefetch = next;
+                // Reading ahead looks the next region up itself.
+                if sub.frontier.is_none() {
+                    prefetch = next;
+                }
                 sub.object = Some(ObjectProgress {
                     object,
+                    next,
                     region: None,
                     next_block: 0,
                     limit,
@@ -1968,6 +2152,26 @@ impl Home {
         let Some(sub) = self.sub_mut(key, sub_ref.uid) else {
             return;
         };
+        if let ReadDone::Ahead { seq, got } = done {
+            // It waits in the buffer until delivery gets to it.
+            let Some(entry) = sub.ahead.iter_mut().find(|entry| entry.seq == seq) else {
+                return;
+            };
+            if let AheadGot::Region(Some((extent, table))) = &got
+                && let Some(frontier) = &mut sub.frontier
+                && frontier.object.key == entry.object.key
+                && frontier.region.is_none()
+            {
+                frontier.region = Some(Region {
+                    extent: extent.clone(),
+                    table: Arc::clone(table),
+                    after: frontier.position,
+                });
+            }
+            entry.got = Some(got);
+            self.pump_catch_up(key);
+            return;
+        }
         sub.read_out = false;
         match done {
             ReadDone::Retry => {}
@@ -1989,50 +2193,72 @@ impl Home {
                 self.remove_sub(key);
                 return;
             }
-            ReadDone::Read(read) => {
-                let limit = read.limit;
-                let after = read
-                    .region
-                    .as_ref()
-                    .map_or(sub.position, |region| region.after);
-                let filter = range_filter(&sub.filter, after, limit);
-                sub.position = sub.position.max(read.position);
-                if let Some(progress) = &mut sub.object {
-                    progress.region = read.region.clone();
-                    progress.next_block = read.next_block;
-                    progress.limit = limit;
-                }
-                if read.done
-                    && let Some(progress) = sub.object.take()
-                    && read.passed
-                {
-                    sub.past = Some(progress.object);
-                    if let Some(region) = &read.region {
-                        sub.past_last_id = region.extent.id_last;
-                    }
-                }
-                let local = read.from_local;
-                self.stats.blocks_read_count += read.blocks_read_count;
-                self.stats.blocks_skipped_count += read.blocks_skipped_count;
-                if let Some(bytes) = read.bytes {
-                    if local {
-                        self.stats.local_bytes += bytes.len() as u64;
-                        self.trace_read("local", key, bytes.len());
-                    } else {
-                        self.stats.object_bytes += bytes.len() as u64;
-                        self.trace_read("object", key, bytes.len());
-                    }
-                    let bytes = SharedBytes::Plain(bytes);
-                    let mut spans = std::mem::take(&mut self.spans);
-                    walk_records(&bytes, &mut spans);
-                    let matched = Matched::select(&bytes, &spans, &filter, &mut 0);
-                    self.spans = spans;
-                    self.enqueue_read(key, matched);
-                }
-            }
+            ReadDone::Ahead { .. } => {}
+            ReadDone::Read(read) => self.apply_read(key, read),
         }
         self.progress(key, 0, false);
         self.pump_catch_up(key);
+    }
+
+    /// One read of an object, through the subscription's filter into its queue.
+    fn apply_read(&mut self, key: usize, read: ObjectRead) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        let limit = read.limit;
+        let after = read
+            .region
+            .as_ref()
+            .map_or(sub.position, |region| region.after);
+        let filter = range_filter(&sub.filter, after, limit);
+        sub.position = sub.position.max(read.position);
+        if let Some(progress) = &mut sub.object {
+            progress.region = read.region.clone();
+            progress.next_block = read.next_block;
+            progress.limit = limit;
+            // A usual read from the object store: reading ahead starts where it ended.
+            if !read.from_local
+                && sub.frontier.is_none()
+                && let Some(region) = &progress.region
+            {
+                sub.frontier = Some(Frontier {
+                    object: progress.object,
+                    next: progress.next,
+                    next_asked: false,
+                    region: Some(region.clone()),
+                    next_block: progress.next_block,
+                    position: sub.position,
+                    limit: progress.limit,
+                });
+            }
+        }
+        if read.done
+            && let Some(progress) = sub.object.take()
+            && read.passed
+        {
+            sub.past = Some(progress.object);
+            if let Some(region) = &read.region {
+                sub.past_last_id = region.extent.id_last;
+            }
+        }
+        let local = read.from_local;
+        self.stats.blocks_read_count += read.blocks_read_count;
+        self.stats.blocks_skipped_count += read.blocks_skipped_count;
+        if let Some(bytes) = read.bytes {
+            if local {
+                self.stats.local_bytes += bytes.len() as u64;
+                self.trace_read("local", key, bytes.len());
+            } else {
+                self.stats.object_bytes += bytes.len() as u64;
+                self.trace_read("object", key, bytes.len());
+            }
+            let bytes = SharedBytes::Plain(bytes);
+            let mut spans = std::mem::take(&mut self.spans);
+            walk_records(&bytes, &mut spans);
+            let matched = Matched::select(&bytes, &spans, &filter, &mut 0);
+            self.spans = spans;
+            self.enqueue_read(key, matched);
+        }
     }
 }
 
@@ -2139,69 +2365,65 @@ async fn prefetch_pages(stores: Stores, object: ObjectRef) {
             return;
         }
     }
+    let _permit = stores.reads.acquire().await;
     let reader = SegmentReader::new(Arc::clone(&stores.object), path.clone());
     let _ = stream_page(&reader, &stores.pages, &path, object.stream).await;
 }
 
-async fn read_from(
-    store: Arc<dyn ObjectStore>,
-    job: &ObjectJob,
-) -> Result<ObjectRead, SegmentError> {
-    let path = job.object.key.path();
-    let reader = SegmentReader::new(store, path.clone());
-    // A sealed object of a former generation holds what it accepted only (section 8.1).
-    let accepted = match job.object.key.class {
-        None => job
-            .stores
+/// What a sealed object of a former generation accepted: it holds that only (section 8.1).
+fn accepted_limit(stores: &Stores, object: &ObjectRef) -> u64 {
+    match object.key.class {
+        None => stores
             .ownership
-            .limit_for(job.object.key.id.generation())
+            .limit_for(object.key.id.generation())
             .unwrap_or(u64::MAX),
         Some(_) => u64::MAX,
-    };
-    let limit = job.limit.min(accepted);
-    let region = match &job.region {
-        Some(region) => region.clone(),
-        None => match find_region(&reader, &job.stores.pages, &path, job.object.stream).await? {
-            Some((extent, table)) => {
-                // A list is in record order, so a former generation's sealed region starting
-                // at or below the last one's end was uploaded late. Its records are read too,
-                // rather than passed over (section 7.5).
-                let late = job.object.key.class.is_none()
-                    && job.past.is_some_and(|past| {
-                        job.object.key.id.generation() < past.key.id.generation()
-                    })
-                    && extent.id_first <= job.past_last_id.min(job.position);
-                let after = if late {
-                    extent.id_first.saturating_sub(1)
-                } else {
-                    job.position
-                };
-                Region {
-                    extent,
-                    table: Arc::new(table),
-                    after,
-                }
-            }
-            None => {
-                return Ok(ObjectRead {
-                    region: None,
-                    next_block: 0,
-                    position: job.position,
-                    limit,
-                    done: true,
-                    passed: true,
-                    bytes: None,
-                    blocks_read_count: 0,
-                    blocks_skipped_count: 0,
-                    from_local: false,
-                });
-            }
-        },
-    };
-    let filter = range_filter(&job.filter, region.after, limit);
+    }
+}
+
+/// The id a read of a newly found region takes records above.
+fn region_after(
+    object: &ObjectRef,
+    past: Option<ObjectRef>,
+    past_last_id: u64,
+    position: u64,
+    extent: &StreamExtent,
+) -> u64 {
+    // A list is in record order, so a former generation's sealed region starting at or below
+    // the last one's end was uploaded late. Its records are read too, rather than passed over
+    // (section 7.5).
+    let late = object.key.class.is_none()
+        && past.is_some_and(|past| object.key.id.generation() < past.key.id.generation())
+        && extent.id_first <= past_last_id.min(position);
+    if late {
+        extent.id_first.saturating_sub(1)
+    } else {
+        position
+    }
+}
+
+/// One read's blocks of a region: those the summaries rule out are passed over, then whole
+/// blocks up to the budget (section 4.1).
+struct Run {
+    start: usize,
+    end: usize,
+    skipped: u64,
+    position: u64,
+    done: bool,
+}
+
+fn plan_run(
+    region: &Region,
+    filter: &Filter,
+    limit: u64,
+    next_block: usize,
+    position: u64,
+    budget_bytes: u64,
+) -> Run {
+    let filter = range_filter(filter, region.after, limit);
     let blocks = &region.table.blocks;
-    let mut position = job.position;
-    let mut at = job.next_block;
+    let mut position = position;
+    let mut at = next_block;
     let mut skipped = 0;
     let mut done = false;
     // Blocks the summaries rule out cost nothing beyond the table (section 4.1).
@@ -2223,7 +2445,7 @@ async fn read_from(
     let mut bytes = 0;
     while let Some(block) = blocks.get(at) {
         if block.summary.id_first > limit
-            || bytes >= job.budget_bytes
+            || bytes >= budget_bytes
             || filter.decide_block(&block.summary) == Decision::None
         {
             break;
@@ -2232,15 +2454,6 @@ async fn read_from(
         position = position.max(block.summary.id_last.min(limit));
         at += 1;
     }
-    let data = if start < at {
-        Some(
-            reader
-                .read_blocks(&region.extent, &region.table, start..at)
-                .await?,
-        )
-    } else {
-        None
-    };
     if blocks
         .get(at)
         .is_some_and(|block| block.summary.id_first > limit)
@@ -2249,20 +2462,292 @@ async fn read_from(
         done = true;
     }
     done |= at >= blocks.len();
-    // What a former generation's object holds above its limit is never read (section 8.1).
-    let passed = done && region.extent.id_last.min(accepted) <= job.limit;
-    Ok(ObjectRead {
-        next_block: at,
+    Run {
+        start,
+        end: at,
+        skipped,
         position,
-        limit,
         done,
+    }
+}
+
+/// A run's read, once its bytes are in. `owner_limit` is the owner's, `limit` that lowered
+/// for a former generation's object.
+fn object_read(
+    region: Region,
+    run: &Run,
+    limit: u64,
+    owner_limit: u64,
+    accepted: u64,
+    bytes: Option<Bytes>,
+) -> ObjectRead {
+    // What a former generation's object holds above its limit is never read (section 8.1).
+    let passed = run.done && region.extent.id_last.min(accepted) <= owner_limit;
+    ObjectRead {
+        next_block: run.end,
+        position: run.position,
+        limit,
+        done: run.done,
         passed,
-        bytes: data,
-        blocks_read_count: (at - start) as u64,
-        blocks_skipped_count: skipped,
+        bytes,
+        blocks_read_count: (run.end - run.start) as u64,
+        blocks_skipped_count: run.skipped,
         from_local: false,
         region: Some(region),
-    })
+    }
+}
+
+/// The region in an object the stream has nothing in.
+fn no_region(position: u64, limit: u64) -> ObjectRead {
+    ObjectRead {
+        region: None,
+        next_block: 0,
+        position,
+        limit,
+        done: true,
+        passed: true,
+        bytes: None,
+        blocks_read_count: 0,
+        blocks_skipped_count: 0,
+        from_local: false,
+    }
+}
+
+async fn read_from(
+    store: Arc<dyn ObjectStore>,
+    job: &ObjectJob,
+) -> Result<ObjectRead, SegmentError> {
+    let path = job.object.key.path();
+    let reader = SegmentReader::new(store, path.clone());
+    let accepted = accepted_limit(&job.stores, &job.object);
+    let limit = job.limit.min(accepted);
+    let region = match &job.region {
+        Some(region) => region.clone(),
+        None => match find_region(&reader, &job.stores.pages, &path, job.object.stream).await? {
+            Some((extent, table)) => Region {
+                after: region_after(
+                    &job.object,
+                    job.past,
+                    job.past_last_id,
+                    job.position,
+                    &extent,
+                ),
+                extent,
+                table: Arc::new(table),
+            },
+            None => return Ok(no_region(job.position, limit)),
+        },
+    };
+    let run = plan_run(
+        &region,
+        &job.filter,
+        limit,
+        job.next_block,
+        job.position,
+        job.budget_bytes,
+    );
+    let data = if run.start < run.end {
+        Some(
+            reader
+                .read_blocks(&region.extent, &region.table, run.start..run.end)
+                .await?,
+        )
+    } else {
+        None
+    };
+    Ok(object_read(region, &run, limit, job.limit, accepted, data))
+}
+
+/// What `pump_once` did.
+enum Pumped {
+    /// A read taken from what was read ahead, to apply.
+    Read(Box<ObjectRead>),
+    /// Something changed without a read: look again.
+    Again,
+    /// Nothing more until a read comes back or the client takes some.
+    Done,
+}
+
+/// An object-store read started ahead of delivery (section 5.1). Dropping it drops the read.
+struct Ahead {
+    seq: u64,
+    object: ObjectRef,
+    /// The region's blocks it reads, or `None` for the lookup of the region.
+    blocks: Option<Range<usize>>,
+    /// `None` while in flight.
+    got: Option<AheadGot>,
+    task: AbortHandle,
+    _reserved: AheadBytes,
+}
+
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// What a read ahead brought.
+#[derive(Debug)]
+pub(crate) enum AheadGot {
+    Region(Option<(StreamExtent, Arc<BlockTable>)>),
+    Blocks(Bytes),
+    /// The local tier has the object, or the store failed: the usual read does it.
+    Not,
+}
+
+/// Where reading ahead goes on from.
+struct Frontier {
+    object: ObjectRef,
+    next: Option<ObjectRef>,
+    /// The lookup of `next`'s region has started.
+    next_asked: bool,
+    /// `None` while its lookup is in flight.
+    region: Option<Region>,
+    next_block: usize,
+    position: u64,
+    /// The owner's limit.
+    limit: u64,
+}
+
+/// Bytes counted against the node's bound on what is read ahead, given back when dropped.
+#[derive(Default)]
+struct AheadBytes {
+    bytes: u64,
+    held: Option<Arc<AtomicU64>>,
+}
+
+impl AheadBytes {
+    fn take(stores: &Stores, bytes: u64) -> Option<AheadBytes> {
+        let before = stores.ahead_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if before + bytes > stores.ahead_cap_bytes {
+            stores.ahead_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            return None;
+        }
+        Some(AheadBytes {
+            bytes,
+            held: Some(Arc::clone(&stores.ahead_bytes)),
+        })
+    }
+}
+
+impl Drop for AheadBytes {
+    fn drop(&mut self) {
+        if let Some(held) = &self.held {
+            held.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The next read delivery needs, if the front of what was read ahead is it. `None` if it
+/// isn't, and the usual read goes instead.
+fn take_ahead(sub: &mut Sub, stores: &Stores, budget_bytes: u64) -> Option<Pumped> {
+    let progress = sub.object.as_mut()?;
+    let accepted = accepted_limit(stores, &progress.object);
+    let limit = progress.limit.min(accepted);
+    let Some(region) = &progress.region else {
+        let at = sub
+            .ahead
+            .iter()
+            .position(|entry| entry.object.key == progress.object.key && entry.blocks.is_none())?;
+        let Some(got) = &sub.ahead[at].got else {
+            return Some(Pumped::Done);
+        };
+        let AheadGot::Region(found) = got else {
+            return None;
+        };
+        let Some((extent, table)) = found else {
+            sub.ahead.remove(at);
+            return Some(Pumped::Read(Box::new(no_region(sub.position, limit))));
+        };
+        let after = region_after(
+            &progress.object,
+            sub.past,
+            sub.past_last_id,
+            sub.position,
+            extent,
+        );
+        progress.region = Some(Region {
+            extent: extent.clone(),
+            table: Arc::clone(table),
+            after,
+        });
+        sub.ahead.remove(at);
+        return Some(Pumped::Again);
+    };
+    let run = plan_run(
+        region,
+        &sub.filter,
+        limit,
+        progress.next_block,
+        sub.position,
+        budget_bytes,
+    );
+    let read = |bytes| {
+        let read = object_read(region.clone(), &run, limit, progress.limit, accepted, bytes);
+        Some(Pumped::Read(Box::new(read)))
+    };
+    if run.start == run.end {
+        // Nothing to fetch.
+        return read(None);
+    }
+    let at = sub.ahead.iter().position(|entry| {
+        entry.object.key == progress.object.key && entry.blocks == Some(run.start..run.end)
+    })?;
+    match &sub.ahead[at].got {
+        None => Some(Pumped::Done),
+        Some(AheadGot::Blocks(bytes)) => {
+            let taken = read(Some(bytes.clone()));
+            sub.ahead.remove(at);
+            taken
+        }
+        Some(_) => None,
+    }
+}
+
+/// One read ahead: a region's lookup or a run of its blocks, from the object store only.
+async fn read_ahead_task(
+    stores: Stores,
+    object: ObjectRef,
+    blocks: Option<(StreamExtent, Arc<BlockTable>, Range<usize>)>,
+    back: mpsc::UnboundedSender<ReadMsg>,
+    sub: SubRef,
+    seq: u64,
+) {
+    let path = object.key.path();
+    let got = async {
+        // An object the local tier has is read from there, the usual way (section 6.2).
+        if blocks.is_none()
+            && let Some(local) = &stores.local
+            && local.head(&path).await.is_ok()
+        {
+            return AheadGot::Not;
+        }
+        let Ok(_permit) = stores.reads.acquire().await else {
+            return AheadGot::Not;
+        };
+        let reader = SegmentReader::new(Arc::clone(&stores.object), path.clone());
+        match blocks {
+            None => find_region(&reader, &stores.pages, &path, object.stream)
+                .await
+                .map(|found| AheadGot::Region(found.map(|(e, t)| (e, Arc::new(t))))),
+            Some((extent, table, range)) => reader
+                .read_blocks(&extent, &table, range)
+                .await
+                .map(AheadGot::Blocks),
+        }
+        .unwrap_or(AheadGot::Not)
+    }
+    .await;
+    let _ = back.send(ReadMsg::Done {
+        sub,
+        done: Box::new(ReadDone::Ahead { seq, got }),
+    });
+}
+
+/// A read from the object store, within the node's reads in flight.
+async fn read_object_store(job: &ObjectJob) -> Result<ObjectRead, SegmentError> {
+    let _permit = job.stores.reads.acquire().await;
+    read_from(Arc::clone(&job.stores.object), job).await
 }
 
 async fn run_object_job(job: ObjectJob) {
@@ -2276,7 +2761,7 @@ async fn run_object_job(job: ObjectJob) {
             read.from_local = true;
             ReadDone::Read(read)
         }
-        None => match read_from(Arc::clone(&job.stores.object), &job).await {
+        None => match read_object_store(&job).await {
             Ok(read) => ReadDone::Read(read),
             Err(SegmentError::Store(object_store::Error::NotFound { .. })) => ReadDone::Gone,
             Err(SegmentError::Store(_)) => {

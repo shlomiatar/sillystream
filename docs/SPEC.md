@@ -115,6 +115,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 
 - Positions: `from = 0` is the start of retention, `u64::MAX` is live only, and anything else means "after this id".
 - Reads come from memory, then the local disk, then S3. A reader catching up becomes live when it reaches recent data in memory.
+- A reader catching up from S3 may have up to 4 reads in flight for consecutive ranges, into the stream's region in the next object too, delivered in id order. One node-wide limit bounds S3 reads in flight and one the bytes read ahead; falling behind or unsubscribing drops them.
 - A client-held cursor needs nothing on the server.
 - A named cursor is stored on the server as `(stream, name) → id`, with the stream and the name each kept as a key hash (section 1). It moves forward only, through `COMMIT`, which gives at-least-once delivery. Rewinding is an explicit reset.
 - Every change to a named cursor, a sink's included, is written at once to the node's local key-value store under a key of its own, so a process crash doesn't move it back. The core doesn't wait for it: one writer keeps the latest value of each cursor and saves them in batches. S3 gets cursors with the stream's metadata at each seal, for when the machine is lost.
