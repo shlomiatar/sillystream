@@ -124,8 +124,8 @@ All three clients do the following the same way. Rust's behaviour today is the r
 - **Item ids:** ids follow the sorted order, and the SDK knows each item's position in it, so an item's ack carries `id = first_id + position`. When the server answers `first_id = 0` (an older retry that already committed, SPEC section 3), the item's id is unknown and is `None`/`null`/`0` by language.
 - **Producer ids:** random and non-zero, with the top bit clear (forwards own it), unless the app sets one. An app that wants dedupe across its own restarts sets `producer_id` and `first_seq` and keeps them itself, together with what it hadn't seen acked.
 - **Window:** `max_inflight_bytes` (64 MiB by default) of unacked publishes. `send` and `publish` wait past it.
-- **Ack levels:** 0–3 per publisher, default 2. Level 0 resolves when the frame is written and is never resent. A publish with a conditional state change is raised to level 1, because it needs an answer.
-- **`expect_ver`:** a publish carrying a state change with `expect_ver ≠ 0` holds back that producer's later publishes until it is answered (SPEC section 3). Other producers aren't held.
+- **Ack levels:** 1–3 per publisher, default 2 (SPEC section 7.2). Level 0 is retired: the server refuses it as malformed, so the SDKs don't offer it.
+- **`expect_ver`:** 0 is unconditional, and `EXPECT_UNSET` (`u64::MAX`) succeeds only if the stream's state was never set (SPEC section 10). A publish carrying a state change with `expect_ver ≠ 0` holds back that producer's later publishes until it is answered (SPEC section 3). Other producers aren't held.
 - **State in a publish:** `send_with_state(change)` attaches one state change to the first publish of the batch.
 
 ### 3.4 Subscribing
@@ -150,7 +150,7 @@ All three clients do the following the same way. Rust's behaviour today is the r
 
 ### 3.6 State
 
-- `state(stream)` returns a handle with `get`, `set`, `merge` and `incr`, each with an optional `expect_ver`. Writes return the new version, and a mismatch is a `VersionConflict` error with the current version when the server gives it.
+- `state(stream)` returns a handle with `get`, `set`, `merge` and `incr`, each with an optional `expect_ver`, which can be `EXPECT_UNSET` for the first claim on a stream (`If-None-Match: *` over HTTP). Writes return the new version, and a mismatch is a `VersionConflict` error with the current version when the server gives it.
 - Docs are CBOR. Each SDK takes and returns its language's native values (Rust `serde`, Go `any` or a struct, JS plain objects) and also raw CBOR bytes.
 - `get` uses a `STATE_ONLY` subscription over WebSocket, or `GET .../state` over HTTP. Watching changes is a subscription with `with_state`, which delivers `state` events.
 - **Lease helper:** none. A lease is a `set` with `expect_ver`, and the version is the fencing token. The docs show the pattern.
