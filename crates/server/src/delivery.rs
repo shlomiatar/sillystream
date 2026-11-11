@@ -157,6 +157,8 @@ pub(crate) struct FilterTable {
     entries: Vec<FilterEntry>,
     index: HashMap<Filter, usize>,
     next_id: u32,
+    core_count: usize,
+    /// Empty until a first subscriber comes, since most streams never have one.
     subs_by_core: Vec<u32>,
     /// Those of `subs_by_core` whose filter can match a record: not `STATE_ONLY`.
     record_subs_by_core: Vec<u32>,
@@ -173,9 +175,14 @@ impl FilterTable {
             entries: Vec::new(),
             index: HashMap::new(),
             next_id: 0,
-            subs_by_core: vec![0; core_count],
-            record_subs_by_core: vec![0; core_count],
+            core_count,
+            subs_by_core: Vec::new(),
+            record_subs_by_core: Vec::new(),
         }
+    }
+
+    pub fn core_count(&self) -> usize {
+        self.core_count
     }
 
     /// Adds a subscriber, and returns its filter's id. An id isn't reused while the stream
@@ -183,6 +190,10 @@ impl FilterTable {
     /// after a delete starts again from 0, and a late detach from before is only taken for
     /// one of its filters if its home core has a subscriber there to lose.
     pub fn attach(&mut self, filter: Filter, home: usize) -> u32 {
+        if self.subs_by_core.is_empty() {
+            self.subs_by_core = vec![0; self.core_count];
+            self.record_subs_by_core = vec![0; self.core_count];
+        }
         let at = match self.index.get(&filter) {
             Some(at) => *at,
             None => {
@@ -190,7 +201,7 @@ impl FilterTable {
                 self.entries.push(FilterEntry {
                     id: self.next_id,
                     filter,
-                    subs_by_core: vec![0; self.subs_by_core.len()],
+                    subs_by_core: vec![0; self.core_count],
                 });
                 self.next_id += 1;
                 self.index.insert(filter, at);
@@ -226,6 +237,12 @@ impl FilterTable {
                 self.index.insert(moved.filter, at);
             }
         }
+        if self.entries.is_empty() {
+            self.entries = Vec::new();
+            self.index = HashMap::new();
+            self.subs_by_core = Vec::new();
+            self.record_subs_by_core = Vec::new();
+        }
         true
     }
 
@@ -237,11 +254,12 @@ impl FilterTable {
     /// Whether a batch goes to `home`: one with no state change only if a subscriber there
     /// reads records.
     pub fn wants(&self, home: usize, has_state: bool) -> bool {
-        if has_state {
-            self.subs_by_core[home] > 0
+        let counts = if has_state {
+            &self.subs_by_core
         } else {
-            self.record_subs_by_core[home] > 0
-        }
+            &self.record_subs_by_core
+        };
+        counts.get(home).is_some_and(|count| *count > 0)
     }
 
     /// Each filter's answer, one check per record per filter. Returns `(matches, checks)`.
@@ -332,7 +350,7 @@ pub(crate) struct StreamDelivery {
     pub visible_state: (u64, Bytes),
     pub table: FilterTable,
     /// The next message number for each home core. Continuous across moves, so that a home
-    /// core can put two owners' messages back in order (D85).
+    /// core can put two owners' messages back in order (D85). Empty until a first message.
     pub seq_by_home: Vec<u64>,
     /// `(stream, name) → id` of section 5.1.
     pub cursors: HashMap<KeyHash, u64>,
@@ -376,7 +394,7 @@ impl StreamDelivery {
             visible_through: 0,
             visible_state: (0, Bytes::new()),
             table: FilterTable::new(core_count),
-            seq_by_home: vec![0; core_count],
+            seq_by_home: Vec::new(),
             cursors: HashMap::new(),
             objects: Vec::new(),
             floor_id: 0,
@@ -394,6 +412,15 @@ impl StreamDelivery {
             saved_last_id: 0,
             last_used: 0,
         }
+    }
+
+    /// Gives back the room its queues and lists grew to. For a stream gone quiet.
+    pub fn shrink_to_fit(&mut self) {
+        self.pending.shrink_to_fit();
+        self.unsaved.shrink_to_fit();
+        self.held_elsewhere.shrink_to_fit();
+        self.objects.shrink_to_fit();
+        self.cursors.shrink_to_fit();
     }
 
     /// The head a reader may be told: the last id, except while some are stamped and not

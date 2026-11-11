@@ -977,8 +977,13 @@ async fn idle_streams(args: &Args, bin: &Path) -> Result<(), String> {
         let before = server.rss_bytes()?;
         let mut waits = Vec::with_capacity(count as usize);
         let mut publishers = Vec::with_capacity(count as usize);
+        // A connection holds at most 65,536 open handles, so more streams take more of them.
+        let mut clients = vec![client];
         for at in 0..count {
-            let mut publisher = client
+            if at > 0 && at % 50_000 == 0 {
+                clients.push(server.client().await?);
+            }
+            let mut publisher = clients[clients.len() - 1]
                 .publisher(&format!("idle.{at}"), publisher_config(AckLevel::WalFsync))
                 .map_err(|error| error.to_string())?;
             waits.push(

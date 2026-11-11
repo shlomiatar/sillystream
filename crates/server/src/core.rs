@@ -431,7 +431,8 @@ pub(crate) struct Core {
     /// owner, because each core that gives a shard away remembers where it went, and an
     /// entry is never overwritten by what another core says (D66).
     location: Vec<u16>,
-    streams: HashMap<KeyHash, Stream>,
+    /// Boxed, so that the room a map keeps free costs a pointer each, not a whole stream.
+    streams: HashMap<KeyHash, Box<Stream>>,
     shards: HashMap<u32, Shard>,
     /// Stream → its own shard. Kept for good, so that the chain above stays whole.
     overrides: HashMap<KeyHash, u32>,
@@ -965,7 +966,7 @@ impl Core {
             delivery.meta_dirty = delivery.track_meta;
             self.streams.insert(
                 *name,
-                Stream {
+                Box::new(Stream {
                     name: *name,
                     shard,
                     ids: IdAllocator::new(floor_id, self.config.last_valid_id),
@@ -974,7 +975,7 @@ impl Core {
                     config: StreamConfig::default(),
                     owners: Vec::new(),
                     delivery,
-                },
+                }),
             );
         }
         self.streams
@@ -2365,12 +2366,12 @@ impl Core {
         }
     }
 
+    /// An empty log is the same as none, here or moved away.
     fn drop_idle_log(&mut self, name: KeyHash) {
         if self
             .logs
             .get(&name)
             .is_some_and(|log| log.batches.is_empty() && log.unuploaded.is_empty())
-            && !self.streams.contains_key(&name)
         {
             self.logs.remove(&name);
         }
@@ -2721,7 +2722,10 @@ impl Core {
             ControlMsg::CheckpointGather { gather, reply } => {
                 let _ = reply.send(self.gather(gather));
             }
-            ControlMsg::CheckpointDone { gather } => self.evict_idle(gather),
+            ControlMsg::CheckpointDone { gather } => {
+                self.evict_idle(gather);
+                self.shrink_to_fit();
+            }
             ControlMsg::Loaded {
                 stream,
                 ticket,
@@ -3027,7 +3031,7 @@ impl Core {
         self.tombstones.remove(name);
         self.streams.insert(
             *name,
-            Stream {
+            Box::new(Stream {
                 name: *name,
                 shard,
                 ids: IdAllocator::new(meta.last_id.max(meta.floor_id), self.config.last_valid_id),
@@ -3042,7 +3046,7 @@ impl Core {
                 },
                 owners: Vec::new(),
                 delivery,
-            },
+            }),
         );
         self.tidy_list(*name);
     }
@@ -3118,6 +3122,9 @@ impl Core {
             let last_id = stream.ids.last_id();
             let moved = last_id != delivery.saved_last_id;
             if !delivery.meta_dirty && delivery.list_change.is_empty() && !moved {
+                // Quiet for a whole window: what its queues grew to isn't needed.
+                delivery.shrink_to_fit();
+                stream.dedupe.shrink_to_fit();
                 continue;
             }
             let meta_changed = std::mem::take(&mut delivery.meta_dirty);
@@ -3221,7 +3228,7 @@ impl Core {
             if let Some(shard) = self.shards.get_mut(&stream.shard) {
                 shard.streams.remove(&name);
             }
-            for home in 0..self.config.core_count {
+            for home in 0..stream.delivery.seq_by_home.len() {
                 if stream.delivery.seq_by_home[home] == 0 {
                     continue;
                 }
@@ -3237,6 +3244,30 @@ impl Core {
                 }
             }
             self.evicted_count += 1;
+        }
+    }
+
+    /// Maps and queues sized for a burst, or for streams since evicted, give the room back.
+    fn shrink_to_fit(&mut self) {
+        shrink_map(&mut self.streams);
+        shrink_map(&mut self.logs);
+        for shard in self.shards.values_mut() {
+            if shard.streams.capacity() > 4 * shard.streams.len() {
+                shard.streams.shrink_to(2 * shard.streams.len());
+            }
+        }
+        if self.dirty.capacity() > 4 * self.dirty.len() {
+            self.dirty.shrink_to(2 * self.dirty.len());
+        }
+        if self.wal_visible.capacity() > 4 * self.wal_visible.len() {
+            self.wal_visible.shrink_to(2 * self.wal_visible.len());
+        }
+        if self.durable_waiters.capacity() > 4 * self.durable_waiters.len() {
+            self.durable_waiters
+                .shrink_to(2 * self.durable_waiters.len());
+        }
+        if self.outbound.capacity() > 4 * self.outbound.len() {
+            self.outbound.shrink_to(2 * self.outbound.len());
         }
     }
 
@@ -3631,7 +3662,7 @@ impl Core {
             }
             self.streams.insert(
                 stream.name,
-                Stream {
+                Box::new(Stream {
                     name: stream.name,
                     shard: shard_id,
                     ids: stream.ids,
@@ -3640,7 +3671,7 @@ impl Core {
                     config: stream.config,
                     owners: stream.owners,
                     delivery: stream.delivery,
-                },
+                }),
             );
         }
         self.drain_foreign_visible();
@@ -3767,7 +3798,18 @@ fn first_id(batch: &SlabBytes) -> u64 {
     format::RecordHeader::read(batch).map_or(0, |header| header.id)
 }
 
+/// With a quarter or less of its room used, a map keeps twice what it holds, so a map that
+/// shrinks and grows back doesn't rehash at every checkpoint.
+fn shrink_map<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+    if map.capacity() > 4 * map.len() {
+        map.shrink_to(2 * map.len());
+    }
+}
+
 fn next_seq(delivery: &mut StreamDelivery, home: usize) -> u64 {
+    if delivery.seq_by_home.is_empty() {
+        delivery.seq_by_home = vec![0; delivery.table.core_count()];
+    }
     let seq = delivery.seq_by_home[home];
     delivery.seq_by_home[home] += 1;
     seq
@@ -3786,7 +3828,7 @@ struct FanOutParts<'a> {
 fn fan_out(stream: &mut Stream, entry: PendingVisible, parts: FanOutParts<'_>) {
     let has_state = entry.state.is_some();
     let table = &stream.delivery.table;
-    let core_count = stream.delivery.seq_by_home.len();
+    let core_count = table.core_count();
     if !(0..core_count).any(|home| table.wants(home, has_state)) {
         return;
     }

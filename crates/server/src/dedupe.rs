@@ -96,6 +96,11 @@ impl DedupeTable {
         self.entries.is_empty()
     }
 
+    /// Lets go of room a new producer's insert left, for a stream gone quiet.
+    pub fn shrink_to_fit(&mut self) {
+        self.entries.shrink_to_fit();
+    }
+
     fn position(&self, producer_id: u64) -> Result<usize, usize> {
         self.entries
             .binary_search_by_key(&producer_id, DedupeEntry::producer_id)

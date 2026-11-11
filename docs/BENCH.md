@@ -915,3 +915,54 @@ About 4% better at 64 KiB and noise at 200 KB and 1 KiB. Never clearly worse, so
 **`webhook.deliver` live:** 4 sinks from `now`, then 30 s of 64 KiB publishes at level 1 from 64 connections. 159,346 records arrived over 32 active seconds (311 MiB/s), and the sinks finished within about 2 s of publishing. On 2026-11-07 they fell behind after 3 s and finished 30 s late.
 
 **The pauses were the receiver:** `silly bench webhook-receiver` wrote its 200 without flushing, so a reply could stay in the TLS layer while the sink waited out its 30 s timeout and sent the batch again. Reproduced locally (1–3 stalls a run, 4 sinks, 6.9 GB) and gone after `28737f7`. None of the runs here paused.
+
+## Where idle-stream memory goes
+
+`silly bench idle-streams --cores 4`, release build, the working tree on `1bc6499` before and after the changes below (the "before" server is `1bc6499` itself, built from `git archive`). Apple M4 Max, 16 cores, macOS 27.0.1, cargo 1.98.1, a shared laptop with a load average of 4 to 10. One run per cell unless two are listed. The bench now opens a connection per 50,000 streams, since one connection holds at most 65,536 open handles and 200,000 failed with "too many open handles".
+
+**Method.** The bench's server child was read with macOS's own tools while the bench slept after publishing: `heap -s` for live heap bytes, `footprint` for physical footprint, and `malloc_history -allBySize` with `MallocStackLogging=1` for which call site holds each live allocation (stack logging adds its own memory, so its runs give the breakdown, not the totals). Live heap per stream is the heap after, less 9.9 MB, the heap of a started server after the warm-up publish. Snapshots at 200,000 with stack logging didn't finish before the bench stopped the server, so the breakdown is from 20,000.
+
+#### Bytes per stream
+
+| streams | active limit | RSS, before | RSS, after | live heap, before | live heap, after | footprint, before | footprint, after |
+|---|---|---|---|---|---|---|---|
+| 20000 | none | 9044, 9514 | 8970, 9201 | 3908 | 1927, 2027 | | |
+| 20000 | 1000 | 9232, 9762 | 8324, 9276 | 2598 | 1248 | | |
+| 200000 | none | 7739, 7896 | 7325, 7781 | 3493 | 1788 | 5157 | 4606 |
+| 200000 | 1000 | 6072, 7818 | 5713, 6187 | 2071 | 846 | 5099 | 1104 |
+
+#### What a resident idle stream held, before
+
+From `malloc_history` at 20,000 streams, no limit, all sealed:
+
+| what | bytes per stream |
+|---|---|
+| the core's `streams` map: a 688-byte `Stream` inline, in a table at 61% load | 1144 |
+| `delivery.pending`, empty, keeping room for 4 | 512 |
+| `logs`: the empty batch queue (448), the empty `unuploaded` queue (80), the map entry (160) | 688 |
+| `delivery.unsaved`, empty, keeping room for 4 | 320 |
+| the dedupe table: one 28-byte entry in room for 4 | 128 |
+| `StreamDelivery::new`'s three per-core vectors, for subscribers it never had | 112 |
+| the object list, and the shard's stream set | 81 |
+| the metadata store's memtable (Fjall, from `LocalMeta::apply`) | 570–650 |
+| the publishing connection's handle for the stream (`WsConn` handles, `Client` routes) | 196 |
+
+`heap -s` agrees at about 3.9 KB live. With a limit of 1,000, eviction took the `Stream` and its queues away, but the `streams` and `logs` tables kept their size, so 2.6 KB stayed.
+
+**RSS isn't the live heap.** After the burst, macOS's malloc keeps freed pages, so RSS stays at the burst's peak whatever is freed afterwards. At 20,000 the live heap after eviction was 35 MB in a zone of 141 MB resident. The peak is the streams all resident at once before the first eviction, plus the first checkpoint's transient copies, about 1.8 KB a stream (`Vec<StreamMeta>`, the gathered changes, `encode_meta` twice, the Fjall batch, `chunk_changes`). Footprint, which leaves out pages the kernel may take back, shows eviction working at 200,000: 1,104 bytes a stream against 5,099 before.
+
+#### Changes
+
+- **The core's maps shrink** after each checkpoint (`streams`, `logs`, each shard's set, and the `dirty`, `wal_visible`, `durable_waiters` and `outbound` queues), once a quarter or less of their room is used, to twice what they hold.
+- **An empty log goes,** whether or not its stream is still on the core. It was kept for a stream still here.
+- **A stream quiet for a whole window gives back its queues' room** at the next gather: `pending`, `unsaved`, `held_elsewhere`, the object list, cursors and the dedupe table.
+- **Per-core vectors are made when first needed:** the filter table's counts at the first subscriber, `seq_by_home` at the first message to a home core.
+- **`Stream` is boxed in the map,** so a free slot costs 40 bytes, not 720.
+
+#### What is left, at 846 bytes of live heap per evicted stream
+
+- **Fjall's memtable,** 570–650 bytes for each stream written since its last flush. It's capped by Fjall's 64 MiB memtable, so it doesn't grow with streams past that.
+- **The publishing connection's handles,** about 196 bytes per stream it opened. They stay until the connection closes or the handle is closed, and the SDK doesn't close a dropped publisher's handle.
+- **RSS stays at the peak.** Getting it back would take an allocator that returns freed pages (jemalloc or mimalloc with decay, or `malloc_trim` on Linux), and a lower peak would take checkpoints of many changed streams written in chunks rather than in whole copies. Both are new mechanisms and neither was built.
+- **A resident idle stream** still costs about 2 KB live (the boxed `Stream` and its slot, 794 bytes, plus the above).
+- This was macOS only. Linux's glibc malloc keeps freed memory differently, and wasn't measured.
