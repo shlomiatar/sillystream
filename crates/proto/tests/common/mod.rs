@@ -148,10 +148,6 @@ pub fn client_vectors(record: &[u8]) -> Vec<(String, ClientFrame<'_>)> {
             publish(AckLevel::WalFsync, state(StateOp::Merge), record),
         ),
         (
-            "publish_ack0".to_string(),
-            publish(AckLevel::None, None, record),
-        ),
-        (
             "publish_ack1".to_string(),
             publish(AckLevel::Memory, None, record),
         ),

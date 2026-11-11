@@ -576,11 +576,7 @@ impl Publisher {
         state: Option<StateChange>,
         permit: OwnedSemaphorePermit,
     ) -> Result<AckWait, SdkError> {
-        // A conditional change needs its answer, so level 0 can't apply to it.
-        let ack = match (&state, self.config.ack) {
-            (Some(change), AckLevel::None) if change.expect_ver != 0 => AckLevel::Memory,
-            (_, ack) => ack,
-        };
+        let ack = self.config.ack;
         let (reply, answer) = oneshot::channel();
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -1231,16 +1227,6 @@ impl Driver {
             };
             let _ = out.send(message);
             entry.sent = true;
-            if entry.ack == AckLevel::None {
-                // Level 0: nothing will answer, and nothing is resent.
-                let entry = producer.queue.remove(at).unwrap();
-                let _ = entry.reply.send(Ok(Ack {
-                    producer_seq: entry.seq,
-                    first_id: 0,
-                    count: 0,
-                }));
-                continue;
-            }
             if entry.blocks_later() {
                 break;
             }

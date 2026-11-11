@@ -31,7 +31,6 @@ pub const FLAG_HAS_STATE: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum AckLevel {
-    None = 0,
     Memory = 1,
     WalFsync = 2,
     SegmentInS3 = 3,
@@ -40,7 +39,6 @@ pub enum AckLevel {
 impl AckLevel {
     pub fn from_wire(level: u8) -> Result<AckLevel, ProtoError> {
         match level {
-            0 => Ok(AckLevel::None),
             1 => Ok(AckLevel::Memory),
             2 => Ok(AckLevel::WalFsync),
             3 => Ok(AckLevel::SegmentInS3),

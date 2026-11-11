@@ -125,7 +125,7 @@ A reader is a cursor plus a filter. Multiple readers can each read from any poin
 - **Records are the unit of delivery.** The server sends the original bytes of each matching record, with no copy and no re-encoding.
 - **Resuming inside a record:** the server sends the whole record, and the client skips ahead by id.
 - **Filter table:** each stream keeps a table of its distinct filters, with subscribers listed under each. A record is checked once per distinct filter, and all matching subscribers share the result.
-- **Visibility:** decided per publish. A publish at ack level 2 or 3 is delivered once it is in the WAL, and one at level 0 or 1 is delivered at once, accepting that a crash can erase a record someone already saw. Delivery never waits for S3. A stream's publishes become visible in order, so a level 0–1 publish behind a level 2 one waits for it.
+- **Visibility:** decided per publish. A publish at ack level 2 or 3 is delivered once it is in the WAL, and one at level 1 is delivered at once, accepting that a crash can erase a record someone already saw. Delivery never waits for S3. A stream's publishes become visible in order, so a level 1 publish behind a level 2 one waits for it.
 - **Ordering:** records arrive in id order.
 - **Linger:** each subscription has a `linger_ms`. Pending records go out when the timer fires or the queue reaches the maximum frame size.
 - **Progress:** after skipping records, the server sends `PROGRESS` at most every few seconds and when the subscriber catches up to the head, so a rare filter doesn't rescan from its old position after a reconnect. It means nothing matches up to that id, and a named cursor can commit it.
@@ -219,11 +219,10 @@ Sealed data is safe in S3. Surviving the loss of a region is out of scope.
 
 ### 7.2 Ack levels
 
-Each publish asks for an ack level, and the ack is sent only after that level is met. The default is level 2.
+Each publish asks for an ack level, and the ack is sent only after that level is met. The default is level 2. A producer that doesn't care can ignore a level 1 ack: it is one small frame.
 
 | level | ack after | typical | slow case | lost on |
 |---|---|---|---|---|
-| 0 | nothing | none | none | anything |
 | 1 | memory | under 0.1 ms | under 1 ms | process crash |
 | 2 | WAL fsync | 1–4 ms on EBS, 0.1–2 ms on NVMe | 10+ ms on EBS, about 5 ms on NVMe | see section 7.1 |
 | 3 | segment in S3 | half a window + 20–100 ms | one window + 200 ms | regional S3 failure |

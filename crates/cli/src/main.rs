@@ -30,7 +30,7 @@ silly tail STREAM [--from start|live|ID] [--to ID] [--filter F] [--limit N] [--n
 silly bench latency|throughput|idle|catch-up|many-streams|puts|idle-streams|ack-matrix|
                   fan-out|connect|recovery|all
                         [--server-bin FILE] [--count N] [--seconds N] [--idle-count N]
-                        [--levels 0,1,2,3] [--cores N] [--catch-up-mib N] [--idle-streams N]
+                        [--levels 1,2,3] [--cores N] [--catch-up-mib N] [--idle-streams N]
                         [--seal-windows MS,MS] [--subscribers N,N] [--wal-mib N,N] [--runs N]
                         [--timeout-seconds N] [--connect-count N] [--connect-concurrency N,N]
                         [--remote-url HOST:PORT --remote-ca PEM --remote-token-file FILE]
@@ -353,7 +353,6 @@ async fn sink_command(args: &Args, action: &str, stream: &str, id: &str) -> Resu
 
 pub(crate) fn parse_ack(level: u64) -> Result<AckLevel, String> {
     Ok(match level {
-        0 => AckLevel::None,
         1 => AckLevel::Memory,
         2 => AckLevel::WalFsync,
         3 => AckLevel::SegmentInS3,

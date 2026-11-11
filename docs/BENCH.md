@@ -307,6 +307,7 @@ target/release/silly bench all --count 5000 --seconds 10 --idle-count 10000 --co
 | 10000 | 10223616 | 225263616 | 21504 |
 
 - **Level 0** has no ack to time, so its row is publish to delivery on a subscriber of the stream, closed loop.
+- **Level 0 was retired later** (SPEC section 7.2). Runs after that time publish to delivery at level 1, and the ack matrix's subscriber rows publish at level 1 and wait for their acks, so those rows aren't comparable with the level 0 rows here.
 - **Levels 1 and 2** are closed loop: each ack before the next publish, so they include the SDK and TLS on both sides and one loopback round trip. Level 2 is on this laptop's SSD with `F_FULLFSYNC`. Section 7.2's NVMe and EBS figures are neither confirmed nor refuted by it.
 - **Level 3** goes out at 50 per second so that the spread of a 1 s seal window shows, and its target is `LocalFileSystem`, which doesn't fsync objects. It measures the wait for the window, not S3.
 - **Throughput** rows are one stream, so one owning core, whatever `--cores` says. The window is 8 MiB unanswered per connection, or 16 records if larger. Each row has its own server. Rows include the client's own cost on the same machine, so the server may not be the limit.

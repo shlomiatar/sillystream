@@ -86,31 +86,6 @@ async fn level_1_acks_with_the_fsync_and_the_upload_both_held() {
 }
 
 #[tokio::test]
-async fn level_0_sends_nothing_but_still_commits_and_a_rejection_still_nacks() {
-    let harness = Harness::new(manual_config(2));
-    let mut client = harness.node().client(0).await;
-    let records = record_with(1, b"hello");
-    client.publish(publish("s", &records, 1, 0)).await.unwrap();
-    expect_quiet(&mut client).await;
-    let snapshot = client.snapshot(key("s")).await.unwrap();
-    assert!(snapshot.head > 0);
-
-    let mut bad = record_with(1, b"hello");
-    bad[0] = 1; // A non-zero id.
-    client.publish(publish("s", &bad, 2, 0)).await.unwrap();
-    match expect_reply(&mut client).await {
-        Reply::Nack {
-            code, producer_seq, ..
-        } => {
-            assert_eq!(code, proto::ErrorCode::Malformed);
-            assert_eq!(producer_seq, 2);
-        }
-        other => panic!("expected a nack, got {other:?}"),
-    }
-    harness.finish();
-}
-
-#[tokio::test]
 async fn a_publish_below_the_streams_minimum_is_raised_to_it() {
     let harness = Harness::new(manual_config(2));
     let mut client = harness.node().client(0).await;
@@ -126,8 +101,8 @@ async fn a_publish_below_the_streams_minimum_is_raised_to_it() {
         .await;
     harness.wal.hold();
     let records = record_with(1, b"hello");
-    // Asks for 0 and for 1: both wait for the fsync, and level 0 gets an ack.
-    client.publish(publish("s", &records, 1, 0)).await.unwrap();
+    // Asks for level 1 twice: both wait for the fsync.
+    client.publish(publish("s", &records, 1, 1)).await.unwrap();
     client.publish(publish("s", &records, 2, 1)).await.unwrap();
     expect_quiet(&mut client).await;
     harness.wal.release();

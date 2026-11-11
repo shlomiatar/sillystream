@@ -360,15 +360,14 @@ while let Some(event) = sub.next().await {
 
 | level | what it survives | use it for |
 |---|---|---|
-| 0 | nothing; no reply comes back | metrics and debug logs you can lose |
-| 1 | everything but a process crash | high-volume logs, presence and heartbeats |
+| 1 | everything but a process crash | metrics, high-volume logs, presence and heartbeats |
 | 2 (default) | a process crash, and machine loss when `wal_dir` is on EBS | tasks, results, handoffs, business events |
 | 3 | segment in S3 | audit and billing events, anything that must survive losing the AZ |
 
-Measured over the simple HTTP form on a laptop (local disk, 2 s seal window, connection setup included): level 0 took 1.5 ms (`202 Accepted`), level 1 4 ms, level 2 16 ms, and level 3 170 ms. Section 7.2 of the spec has the expected ranges.
+Measured over the simple HTTP form on a laptop (local disk, 2 s seal window, connection setup included): level 1 took 4 ms, level 2 16 ms, and level 3 170 ms. Section 7.2 of the spec has the expected ranges.
 
-- **Set a floor per stream.** With `silly stream config audit.billing --min-ack 3`, a careless producer can't ask for less: a level 0 request then waits for the floor and gets a normal ack.
-- **Delivery doesn't wait for durability.** A record is delivered once it is in the WAL. On a stream that uses levels 0–1 only, a subscriber can see a record that a crash then erases. So consumers of a level 1 stream must not treat what they saw as committed.
+- **Set a floor per stream.** With `silly stream config audit.billing --min-ack 3`, a careless producer can't ask for less: a level 1 request then waits for the floor.
+- **Delivery doesn't wait for durability.** A record is delivered once it is in the WAL. On a stream that uses level 1 only, a subscriber can see a record that a crash then erases. So consumers of a level 1 stream must not treat what they saw as committed.
 - **For idempotent retries without the SDK**, use the simple HTTP form's producer headers. A retry of the latest publish gets the original ack, and an older one gets `first_id = 0`:
 
 ```bash

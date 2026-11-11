@@ -68,7 +68,7 @@ impl Default for StreamConfig {
     fn default() -> StreamConfig {
         StreamConfig {
             default_ack_level: 2,
-            min_ack_level: 0,
+            min_ack_level: 1,
             retention_ms: 24 * 60 * 60 * 1000,
         }
     }

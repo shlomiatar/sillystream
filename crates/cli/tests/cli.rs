@@ -305,8 +305,8 @@ fn build_server(bin_dir: &Path) -> PathBuf {
 /// numbers themselves are in docs/BENCH.md, from a release build.
 ///
 /// The parts run at once, each with its own servers, so the test takes as long as the slowest
-/// part, not all of them in turn. The ack matrix runs level 3 only: a flat-out level 0 row in a
-/// debug build spends most of a minute delivering what it published.
+/// part, not all of them in turn. The ack matrix runs level 3 only: a flat-out row with a
+/// subscriber in a debug build spends most of a minute delivering what it published.
 #[test]
 fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
     let fixture = start();
@@ -366,7 +366,7 @@ fn bench_prints_tables_for_each_level_and_throughput_and_memory() {
         output.push_str(&String::from_utf8(run.stdout).unwrap());
     }
     for row in [
-        "| 0 | publish to delivery",
+        "| 1 | publish to delivery",
         "| 1 | ack",
         "| 2 | ack",
         "| 3 | ack",

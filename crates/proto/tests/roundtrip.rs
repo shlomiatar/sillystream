@@ -42,7 +42,7 @@ fn arb_clauses() -> impl Strategy<Value = WireClauses> {
 }
 
 fn arb_ack() -> impl Strategy<Value = AckLevel> {
-    (0..=3u8).prop_map(|level| AckLevel::from_wire(level).unwrap())
+    (1..=3u8).prop_map(|level| AckLevel::from_wire(level).unwrap())
 }
 
 fn arb_op() -> impl Strategy<Value = StateOp> {

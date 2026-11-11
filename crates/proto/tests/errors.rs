@@ -99,6 +99,9 @@ fn unknown_ack_level_is_rejected() {
     let mut bytes = load("publish_00");
     bytes[22] = 4;
     assert_eq!(client_err(&bytes), ProtoError::UnknownAckLevel);
+    // Level 0 is retired (section 7.2).
+    bytes[22] = 0;
+    assert_eq!(client_err(&bytes), ProtoError::UnknownAckLevel);
 }
 
 #[test]
@@ -243,7 +246,7 @@ fn bytes_over_u32_are_refused_without_copying() {
         handle: 1,
         producer_id: 1,
         producer_seq: 1,
-        ack: AckLevel::None,
+        ack: AckLevel::Memory,
         state: None,
         records: &records,
     });

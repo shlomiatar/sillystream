@@ -1340,8 +1340,7 @@ impl Core {
             waiters: Vec::new(),
         };
         match level {
-            0 => {}
-            1 => waiter.fire(),
+            ..=1 => waiter.fire(),
             2 => self.durable_waiters.push_back((ticket, waiter)),
             _ => batch.waiters.push(waiter),
         }

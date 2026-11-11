@@ -440,12 +440,12 @@ async fn level_3_latencies(client: &Client, count: u64) -> Result<Vec<f64>, Stri
     Ok(samples)
 }
 
-/// Level 0 has no ack to time, so this is publish to delivery on a subscriber of the same stream.
+/// Publish to delivery on a subscriber of the same stream, publishing at level 1.
 async fn delivery_latencies(server: &ServerChild, count: u64) -> Result<Vec<f64>, String> {
     let reader = server.client().await?;
     let writer = server.client().await?;
     let mut publisher = writer
-        .publisher("latency.0", publisher_config(AckLevel::None))
+        .publisher("latency.0", publisher_config(AckLevel::Memory))
         .map_err(|error| error.to_string())?;
     let body = record(256)?;
     // A stream has to exist to subscribe to it.
@@ -498,7 +498,7 @@ fn latency_row(label: &str, measures: &str, samples: &mut [f64]) -> String {
 async fn latency(args: &Args, bin: &Path) -> Result<(), String> {
     let count = args.number("--count")?.unwrap_or(5_000);
     let cores = args.number("--cores")?.unwrap_or(4);
-    let levels = args.one("--levels").unwrap_or("0,1,2,3");
+    let levels = args.one("--levels").unwrap_or("1,2,3");
     let server = start_server(bin, cores)?;
     let client = server.client().await?;
     println!("### Latency, 256-byte record, one publisher, {cores} cores\n");
@@ -506,13 +506,14 @@ async fn latency(args: &Args, bin: &Path) -> Result<(), String> {
     println!("|---|---|---|---|---|---|");
     for level in levels.split(',') {
         let row = match level {
-            "0" => {
-                let mut samples = delivery_latencies(&server, count).await?;
-                latency_row("0", "publish to delivery", &mut samples)
-            }
             "1" => {
+                let mut delivered = delivery_latencies(&server, count).await?;
                 let mut samples = ack_latencies(&client, AckLevel::Memory, count).await?;
-                latency_row("1", "ack, closed loop", &mut samples)
+                format!(
+                    "{}\n{}",
+                    latency_row("1", "publish to delivery", &mut delivered),
+                    latency_row("1", "ack, closed loop", &mut samples)
+                )
             }
             "2" => {
                 let mut samples = ack_latencies(&client, AckLevel::WalFsync, count).await?;
@@ -1100,7 +1101,7 @@ struct LoadShape {
     rate_per_second: u64,
     data_bytes: usize,
     seconds: u64,
-    /// A subscriber on each stream, for level 0, which has nothing else to show what arrived.
+    /// A subscriber on each stream, to time publish to delivery.
     with_subscriber: bool,
 }
 
@@ -1136,8 +1137,7 @@ async fn load_run(server: &ServerChild, shape: LoadShape) -> Result<LoadRun, Str
                 },
             )
             .map_err(|error| error.to_string())?;
-        // The stream has to exist before a subscriber can be on it. Level 1 for this one, since
-        // level 0 wouldn't say when it does.
+        // The stream has to exist before a subscriber can be on it.
         let mut opener = client
             .publisher(&stream, publisher_config(AckLevel::Memory))
             .map_err(|error| error.to_string())?;
@@ -1181,7 +1181,6 @@ async fn load_run(server: &ServerChild, shape: LoadShape) -> Result<LoadRun, Str
         let slots = Arc::new(Semaphore::new(shape.outstanding_count));
         let seconds = shape.seconds;
         let rate = shape.rate_per_second;
-        let track_acks = shape.ack != AckLevel::None;
         let outstanding_count = shape.outstanding_count as u32;
         publishers.push(tokio::spawn(async move {
             let _client = client;
@@ -1212,9 +1211,7 @@ async fn load_run(server: &ServerChild, shape: LoadShape) -> Result<LoadRun, Str
                         failed.fetch_add(1, Ordering::Relaxed);
                     } else {
                         acked.fetch_add(1, Ordering::Relaxed);
-                        if track_acks {
-                            acks.add(begun.elapsed().as_secs_f64() * 1e6);
-                        }
+                        acks.add(begun.elapsed().as_secs_f64() * 1e6);
                     }
                 });
             }
@@ -1292,7 +1289,7 @@ fn number_list(args: &Args, flag: &str, default: &str) -> Result<Vec<u64>, Strin
 async fn ack_matrix(args: &Args, bin: &Path) -> Result<(), String> {
     let cores = args.number("--cores")?.unwrap_or(8);
     let at_least_seconds = args.number("--seconds")?.unwrap_or(15);
-    let levels = args.one("--levels").unwrap_or("0,1,2,3");
+    let levels = args.one("--levels").unwrap_or("1,2,3");
     const DATA_BYTES: usize = 256;
     const STREAM_COUNT: u64 = 4;
     println!(
@@ -1319,14 +1316,14 @@ async fn ack_matrix(args: &Args, bin: &Path) -> Result<(), String> {
             };
             [
                 (
-                    "0",
+                    "1",
                     "1 stream, 100/s, with a subscriber",
-                    one(AckLevel::None, 1, 1, 100, true),
+                    one(AckLevel::Memory, 1, 1, 100, true),
                 ),
                 (
-                    "0",
+                    "1",
                     "4 streams, flat out, with a subscriber each",
-                    one(AckLevel::None, STREAM_COUNT, 256, 0, true),
+                    one(AckLevel::Memory, STREAM_COUNT, 256, 0, true),
                 ),
                 (
                     "1",
@@ -1387,11 +1384,7 @@ async fn ack_matrix(args: &Args, bin: &Path) -> Result<(), String> {
             } else {
                 "not run | not run | not run".to_owned()
             };
-            let ack_cells = if shape.ack == AckLevel::None {
-                "no ack | no ack | no ack".to_owned()
-            } else {
-                run.acks.cells()
-            };
+            let ack_cells = run.acks.cells();
             println!(
                 "| {window_ms} | {level} | {load} | {:.1} | {:.0} | {ack_cells} | {} | {delivered} | {delivery_cells} | {} |",
                 run.seconds,

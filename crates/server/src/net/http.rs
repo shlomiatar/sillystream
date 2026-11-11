@@ -855,25 +855,7 @@ impl<'a> HttpConn<'a> {
             Ok(shape) => shape,
             Err(response) => return self.refuse(request, response).await,
         };
-        let ack_level = match shape.ack_level {
-            // The owner raises it if it has to, and this waits for whatever that brings.
-            Some(level @ 1..) => level,
-            // Level 0 sends nothing, so waiting needs to know before it starts. A minimum set
-            // after this look still raises the commit, but not this answer (D223).
-            asked => {
-                let config = self
-                    .client()
-                    .stream_info(stream)
-                    .await
-                    .map(|info| info.config)
-                    .unwrap_or_default();
-                asked.map_or_else(
-                    || effective_default(&config),
-                    |level| level.max(config.min_ack_level).min(3),
-                )
-            }
-        };
-        let mut records = if shape.simple {
+        let records = if shape.simple {
             let length = request.content_length as usize;
             let padded_bytes = length.next_multiple_of(8);
             let total_bytes = (HEADER_BYTES + padded_bytes) as u64;
@@ -897,20 +879,14 @@ impl<'a> HttpConn<'a> {
         } else {
             self.read_body_into_slab(request, 0, 0).await?
         };
-        // Nothing will come back to answer with, so what the owner would refuse is refused here,
-        // or the caller is told a publish was accepted that commits nothing (D133).
-        if ack_level == 0
-            && let Err(msg) = crate::core::check_publish(&mut records, None)
-        {
-            return Ok(error(ErrorCode::Malformed, &msg));
-        }
         let handle = self.number();
         let mut publish = RegionPublish {
             stream,
             handle,
             producer_id: shape.producer_id,
             producer_seq: shape.producer_seq,
-            ack_level: Some(ack_level),
+            // The owner applies the stream's default and minimum, and this waits for its answer.
+            ack_level: shape.ack_level,
             author,
             state: None,
             records,
@@ -927,9 +903,6 @@ impl<'a> HttpConn<'a> {
                     return Ok(error(ErrorCode::RateLimited, "the node has stopped"));
                 }
             }
-        }
-        if ack_level == 0 {
-            return Ok(Response::json(202, "{\"accepted\":true}".to_owned()));
         }
         loop {
             let Some(reply) = client.recv().await else {
@@ -961,7 +934,7 @@ impl<'a> HttpConn<'a> {
                     code,
                     msg,
                 } if reference == handle => return Ok(error(code, &msg)),
-                // What an earlier level 0 publish or request left behind.
+                // What an earlier request left behind.
                 _ => {}
             }
         }
@@ -1217,10 +1190,6 @@ async fn write_within_limit(write: impl Future<Output = io::Result<()>>) -> io::
     }
 }
 
-fn effective_default(config: &StreamConfig) -> u8 {
-    config.default_ack_level.max(config.min_ack_level).min(3)
-}
-
 struct PublishShape {
     simple: bool,
     options: u64,
@@ -1254,8 +1223,8 @@ fn publish_shape(request: &Request) -> Result<PublishShape, Response> {
     let ack_level = match request.query("ack") {
         None => None,
         Some(text) => match text.parse::<u8>() {
-            Ok(level) if level <= 3 => Some(level),
-            _ => return Err(malformed("ack is a level from 0 to 3")),
+            Ok(level @ 1..=3) => Some(level),
+            _ => return Err(malformed("ack is a level from 1 to 3")),
         },
     };
     Ok(PublishShape {
@@ -1437,8 +1406,8 @@ fn parse_config(body: &[u8]) -> Result<StreamConfigPatch, Response> {
     let mut patch = StreamConfigPatch::default();
     let level = |value: &Json, name: &str| -> Result<u8, Response> {
         match value.as_u64() {
-            Some(level) if level <= 3 => Ok(level as u8),
-            _ => Err(malformed(&format!("{name} is a level from 0 to 3"))),
+            Some(level @ 1..=3) => Ok(level as u8),
+            _ => Err(malformed(&format!("{name} is a level from 1 to 3"))),
         }
     };
     for (key, value) in object_fields(body)? {

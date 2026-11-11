@@ -81,7 +81,6 @@ def publish(name, flags, ack, records, op=2):
 
 publish("publish_00", 0, 2, RECORD)
 publish("publish_01", 1, 2, RECORD)
-publish("publish_ack0", 0, 0, RECORD)
 publish("publish_ack1", 0, 1, RECORD)
 publish("publish_ack3", 0, 3, RECORD)
 publish("publish_state_no_records", 1, 2, b"")

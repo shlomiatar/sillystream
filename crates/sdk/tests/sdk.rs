@@ -877,43 +877,6 @@ async fn after_a_reconnect_the_same_producer_resends_in_order_with_the_same_seqs
     assert_eq!(waits.next().unwrap().wait().await.unwrap().first_id, 30);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn level_0_publishes_need_no_answer_and_arrive() {
-    let fixture = start();
-    let client = fixture.client().await;
-    let mut publisher = client
-        .publisher(
-            "zero",
-            PublisherConfig {
-                ack: AckLevel::None,
-                ..PublisherConfig::default()
-            },
-        )
-        .unwrap();
-    publisher.add(0, b"fast".to_vec());
-    publisher.flush().await.unwrap();
-    // Nothing answers a level 0 publish, so the stream may not be there yet.
-    let got = 'subscribe: loop {
-        let mut subscription = client
-            .subscribe(Subscribe::new("zero", FROM_START))
-            .unwrap();
-        loop {
-            match next_event(&mut subscription).await {
-                Ok(Event::Items(items)) => break 'subscribe items,
-                Ok(_) => {}
-                Err(SdkError::Server {
-                    code: ErrorCode::NotFound,
-                    ..
-                }) => break,
-                Err(other) => panic!("{other:?}"),
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    assert_eq!(bytes_of(&got), [b"fast".to_vec()]);
-    fixture.server.shutdown();
-}
-
 fn raw_records(items: &[(u64, &[u8])]) -> Vec<u8> {
     let raw = BatchConfig {
         zstd_level: None,

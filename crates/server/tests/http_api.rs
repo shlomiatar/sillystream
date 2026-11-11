@@ -317,23 +317,22 @@ async fn publish_over_max_frame_is_error_6() {
     server.server.shutdown();
 }
 
+/// Ack level 0 is retired (section 7.2): asking for it, or making it a stream's default or
+/// minimum, is refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn level_0_is_answered_without_an_ack() {
+async fn level_0_is_refused() {
     let server = start();
     let text = token(ALL);
     let reply = server
         .http(&Http::new("POST", "/v1/stream/zero/publish?ack=0", &text).body(&b"x"[..]))
         .await;
-    assert_eq!(reply.status, 202);
-    // A stream whose default is 0 must not leave a publish waiting for an ack that never comes.
-    let config = server
-        .http(&Http::new("PUT", "/v1/stream/zero", &text).body(&br#"{"default_ack":0}"#[..]))
-        .await;
-    assert_eq!(config.status, 200, "{}", config.text());
-    let reply = server
-        .http(&Http::new("POST", "/v1/stream/zero/publish", &text).body(&b"y"[..]))
-        .await;
-    assert_eq!(reply.status, 202);
+    assert_code(&reply, 400, 8);
+    for body in [r#"{"default_ack":0}"#, r#"{"min_ack":0}"#] {
+        let config = server
+            .http(&Http::new("PUT", "/v1/stream/zero", &text).body(body.as_bytes().to_vec()))
+            .await;
+        assert_code(&config, 400, 8);
+    }
     server.server.shutdown();
 }
 
@@ -721,10 +720,10 @@ async fn stream_put_creates_and_changes_config() {
     assert_code(&put("not json").await, 400, 8);
     assert_code(&put("[1]").await, 400, 8);
 
-    // A minimum takes effect: a level 0 publish is raised, and it is acked through the WS.
+    // A minimum takes effect: a level 1 publish is raised, and it is acked through the WS.
     let mut ws = server.ws(&text).await;
     ws.open(1, "cfg").await;
-    ws.publish(1, 1, AckLevel::None, &record(0, b"raised"))
+    ws.publish(1, 1, AckLevel::Memory, &record(0, b"raised"))
         .await;
     assert!(matches!(ws.recv_owned().await, Owned::Ack { .. }));
     drop(ws);
@@ -1214,10 +1213,9 @@ async fn a_bad_certificate_is_refused_at_the_start() {
     assert!(result.is_err());
 }
 
-/// Level 0 has no ack to wait for, but it can't be told it was accepted when the owner is going
-/// to refuse it. Section 3 says a rejected publish commits nothing and gets a `NACK`.
+/// Section 3 says a rejected publish commits nothing and gets a `NACK`, at every level.
 #[tokio::test(flavor = "multi_thread")]
-async fn level_0_is_refused_what_any_other_level_is_refused() {
+async fn a_malformed_publish_is_refused_at_every_level() {
     let server = start();
     let all = token(ALL);
     let bad_length = vec![1u8, 2, 3];
@@ -1232,7 +1230,7 @@ async fn level_0_is_refused_what_any_other_level_is_refused() {
         ("empty", b""),
     ];
     for (name, body) in cases {
-        for ack in [0, 2] {
+        for ack in [1, 2] {
             let path = format!("/v1/stream/g.{ack}/publish?ack={ack}");
             let reply = server
                 .http(
@@ -1245,19 +1243,19 @@ async fn level_0_is_refused_what_any_other_level_is_refused() {
             assert_eq!(reply.code(), Some(8), "{name} at level {ack}");
         }
     }
-    // What is fine still goes, and answers as level 0 does, in both forms.
+    // What is fine still goes, in both forms.
     for (content_type, body) in [
         ("application/x-sillystream-records", record(0, b"abc")),
         ("application/octet-stream", b"abc".to_vec()),
     ] {
         let reply = server
             .http(
-                &Http::new("POST", "/v1/stream/g.0/publish?ack=0", &all)
+                &Http::new("POST", "/v1/stream/g.1/publish?ack=1", &all)
                     .header("content-type", content_type)
                     .body(body),
             )
             .await;
-        assert_eq!(reply.status, 202, "{}", reply.text());
+        assert_eq!(reply.status, 200, "{}", reply.text());
     }
     server.server.shutdown();
 }
@@ -1360,19 +1358,14 @@ async fn an_http_publish_below_the_minimum_waits_for_the_minimum() {
             .await
     };
 
-    // With no minimum, level 0 is what it always was.
-    make("none", 0).await;
-    assert_eq!(publish("none", 0).await.status, 202);
-    assert_eq!(publish("no.such.stream.yet", 0).await.status, 202);
-
-    make("one", 1).await;
-    let raised = publish("one", 0).await;
+    make("two", 2).await;
+    let raised = publish("two", 1).await;
     assert_eq!(raised.status, 200, "{}", raised.text());
     assert!(raised.field("first_id").is_some(), "{}", raised.text());
 
     // Level 3 needs an upload, and nothing seals until this test says so.
     make("three", 3).await;
-    let waiting = publish("three", 0);
+    let waiting = publish("three", 1);
     tokio::pin!(waiting);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
