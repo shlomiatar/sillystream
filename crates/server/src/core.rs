@@ -1242,7 +1242,13 @@ impl Core {
     ) -> Result<Bytes, (ErrorCode, String)> {
         let stream = self.streams.get(&name);
         let ver = stream.map_or(0, |stream| stream.state.ver());
-        if change.expect_ver != 0 && change.expect_ver != ver {
+        // 0 is unconditional, and `u64::MAX` means only if never set (section 10).
+        let expected = match change.expect_ver {
+            0 => true,
+            u64::MAX => ver == 0,
+            want => want == ver,
+        };
+        if !expected {
             return Err((
                 ErrorCode::VersionConflict,
                 format!("state is at version {ver}"),

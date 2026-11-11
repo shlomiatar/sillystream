@@ -7,7 +7,7 @@ mod common;
 
 use ciborium::{Value, cbor};
 use common::*;
-use sdk::{PublisherConfig, SdkError, StateChange, StateOp};
+use sdk::{EXPECT_UNSET, PublisherConfig, SdkError, StateChange, StateOp};
 use std::time::Duration;
 
 #[tokio::main]
@@ -21,8 +21,6 @@ async fn main() {
     // 1. Acquire: take the lease if it's free, expired or already ours, by CAS on its version.
     let mut fence = loop {
         let (doc, ver, _) = state_get(&http, stream).await;
-        // expect_ver 0 is unconditional, so the doc must exist before anyone competes for it.
-        assert!(ver != 0, "initialize {stream}'s state first");
         let holder = get(&doc, "holder").and_then(Value::as_text).unwrap_or("");
         let until = get(&doc, "until")
             .and_then(Value::as_integer)
@@ -30,7 +28,8 @@ async fn main() {
         if holder.is_empty() || holder == me || until < now_ms() {
             let lease = cbor!({ "holder" => me, "until" => now_ms() + ttl }).unwrap();
             let change = StateChange {
-                expect_ver: ver,
+                // A never-set state is version 0, which EXPECT_UNSET guards.
+                expect_ver: if ver == 0 { EXPECT_UNSET } else { ver },
                 op: StateOp::Set,
                 doc: to_cbor(&lease),
             };

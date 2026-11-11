@@ -103,10 +103,13 @@ impl AckWait {
     }
 }
 
+/// `expect_ver` for a change that succeeds only if the stream's state was never set (section 10).
+pub const EXPECT_UNSET: u64 = u64::MAX;
+
 /// A state change carried on a publish, or sent by itself.
 #[derive(Debug, Clone)]
 pub struct StateChange {
-    /// 0 is unconditional.
+    /// 0 is unconditional, and `EXPECT_UNSET` succeeds only if the state was never set.
     pub expect_ver: u64,
     pub op: StateOp,
     /// CBOR.

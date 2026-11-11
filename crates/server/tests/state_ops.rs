@@ -515,3 +515,47 @@ async fn a_state_op_waits_for_the_wal_whatever_the_streams_default_level() {
         harness.finish();
     }
 }
+
+#[tokio::test]
+async fn expect_unset_lets_only_the_first_create_win() {
+    let harness = Harness::new(manual_config(1));
+    let mut client = harness.node().client(0).await;
+    client
+        .state_op(op("s", 1, u64::MAX, StateOp::Set, &int(1)))
+        .await
+        .unwrap();
+    let (_, ok, ver) = expect_result(&mut client).await;
+    assert!(ok);
+    client
+        .state_op(op("s", 2, u64::MAX, StateOp::Set, &int(2)))
+        .await
+        .unwrap();
+    assert_eq!(expect_result(&mut client).await, (2, false, ver));
+    assert_eq!(
+        client.snapshot(key("s")).await.unwrap().state_ver,
+        ver,
+        "the second create changed nothing"
+    );
+    harness.finish();
+}
+
+#[tokio::test]
+async fn expect_unset_on_a_publish_fails_once_the_state_is_set() {
+    let harness = Harness::new(manual_config(1));
+    let mut client = harness.node().client(0).await;
+    let records = record_with(1, b"x");
+    client
+        .publish(atomic(&records, 1, u64::MAX, map(&[("n", int(1))])))
+        .await
+        .unwrap();
+    expect_ack(&mut client).await;
+    client
+        .publish(atomic(&records, 2, u64::MAX, map(&[("n", int(2))])))
+        .await
+        .unwrap();
+    match expect_reply(&mut client).await {
+        Reply::Nack { code, .. } => assert_eq!(code, ErrorCode::VersionConflict),
+        other => panic!("{other:?}"),
+    }
+    harness.finish();
+}

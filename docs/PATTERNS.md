@@ -328,7 +328,7 @@ echo '{"owner":"a1"}' | j2c | st -X PATCH -H "If-Match: \"$V\"" --data-binary @-
 echo '{"owner":"a2"}' | j2c | st -X PATCH -H "If-Match: \"$V\"" --data-binary @- $U   # 409, version conflict
 ```
 
-> **Initialize first.** `expect_ver = 0` means *unconditional*, and a stream whose state was never set has version 0. So the first "CAS" on a fresh stream isn't one: when three workers raced on a new queue, all three "won" the first claim. Set the doc once when you create the stream (`set` with no `If-Match`), and have competitors refuse to run while the version is still 0. See section 10.
+> **The first claim.** `expect_ver = 0` means *unconditional*, and a stream whose state was never set has version 0. To make the first change conditional too, send `expect_ver = EXPECT_UNSET` (`u64::MAX`), or `If-None-Match: *` over HTTP: it succeeds only while the state was never set, so of several workers racing on a new queue exactly one wins.
 
 ### 3.2 Atomic changes
 
@@ -493,7 +493,7 @@ The lease is `{"holder", "until"}` in a stream's state. To acquire it, CAS it wh
 // lease STREAM HOLDER TTL_MS STEPS STEP_MS
 use ciborium::{Value, cbor};
 use common::*;
-use sdk::{PublisherConfig, SdkError, StateChange, StateOp};
+use sdk::{EXPECT_UNSET, PublisherConfig, SdkError, StateChange, StateOp};
 use std::time::Duration;
 
 #[tokio::main]
@@ -507,8 +507,6 @@ async fn main() {
     // 1. Acquire: take the lease if it's free, expired or already ours, by CAS on its version.
     let mut fence = loop {
         let (doc, ver, _) = state_get(&http, stream).await;
-        // expect_ver 0 is unconditional, so the doc must exist before anyone competes for it.
-        assert!(ver != 0, "initialize {stream}'s state first");
         let holder = get(&doc, "holder").and_then(Value::as_text).unwrap_or("");
         let until = get(&doc, "until")
             .and_then(Value::as_integer)
@@ -516,7 +514,8 @@ async fn main() {
         if holder.is_empty() || holder == me || until < now_ms() {
             let lease = cbor!({ "holder" => me, "until" => now_ms() + ttl }).unwrap();
             let change = StateChange {
-                expect_ver: ver,
+                // A never-set state is version 0, which EXPECT_UNSET guards.
+                expect_ver: if ver == 0 { EXPECT_UNSET } else { ver },
                 op: StateOp::Set,
                 doc: to_cbor(&lease),
             };
@@ -611,7 +610,9 @@ Every worker reads every task. To claim one, a worker moves `next` to that task'
 // queue STREAM WORKER TTL_MS WORK_MS
 use ciborium::{Value, cbor};
 use common::*;
-use sdk::{Event, PublisherConfig, SdkError, StateChange, StateOp, Subscribe, WireClause};
+use sdk::{
+    EXPECT_UNSET, Event, PublisherConfig, SdkError, StateChange, StateOp, Subscribe, WireClause,
+};
 use std::time::Duration;
 
 const KIND: u64 = 0xff << 56;
@@ -653,8 +654,6 @@ async fn main() {
             // Claim: move "next" to this task and add its lease, if no one has moved it past.
             let claimed = loop {
                 let (doc, ver, _) = state_get(&http, stream).await;
-                // expect_ver 0 is unconditional, so the doc must exist before anyone claims.
-                assert!(ver != 0, "initialize {stream}'s state first");
                 if int(&doc, "next") >= task.id {
                     break false; // another worker claimed it
                 }
@@ -664,7 +663,8 @@ async fn main() {
                 })
                 .unwrap();
                 let change = StateChange {
-                    expect_ver: ver,
+                    // A never-set state is version 0, which EXPECT_UNSET guards.
+                    expect_ver: if ver == 0 { EXPECT_UNSET } else { ver },
                     op: StateOp::Merge,
                     doc: to_cbor(&claim),
                 };
@@ -944,7 +944,7 @@ None of these is changed here. Each needs a decision first.
 
 **Spec and server**
 
-1. **No conditional create.** `expect_ver = 0` is unconditional, and a never-set state has version 0, so the first CAS on a fresh stream can't be conditional. Every coordination pattern needs a separate setup step today. One option is a reserved value meaning "only if never set".
+1. **No conditional create.** Fixed: `expect_ver = u64::MAX` (`EXPECT_UNSET`, or `If-None-Match: *`) succeeds only if the state was never set (SPEC section 10).
 2. **`WITH_STATE` versus `STATE_ONLY` is undocumented.** SPEC 11.1 lists the flags without saying what they do. The server sends `STATE` frames only to `STATE_ONLY` subscriptions, and `WITH_STATE` is the snapshot in `SUBSCRIBED` only.
 3. **Atomic publish + state is per stream.** That's by design, but it means fencing (7.1) and claims (7.2) work only when the results go to the same stream as the state. Writes to another stream can only carry the version as a token.
 4. **There's no way to read a named cursor over HTTP.** `PUT /cursor/<name>` with `0` works as a read only because it never rewinds. A `GET` would say what it does.

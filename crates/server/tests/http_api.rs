@@ -468,6 +468,24 @@ async fn state_get_and_patch_with_if_match() {
         .await;
     assert_code(&conflict, 409, 3);
     assert_eq!(conflict.field("ok").unwrap(), "false");
+
+    // `If-None-Match: *` creates only while the state was never set (section 10).
+    let create = |stream: &'static str| {
+        Http::new("PATCH", stream, &text)
+            .header("X-State-Op", "set")
+            .header("If-None-Match", "*")
+            .body(cbor_map(&[("a", 1)]))
+    };
+    assert_eq!(
+        server.http(&create("/v1/stream/fresh/state")).await.status,
+        200
+    );
+    assert_code(
+        &server.http(&create("/v1/stream/fresh/state")).await,
+        409,
+        3,
+    );
+    assert_code(&server.http(&create(path)).await, 409, 3);
     let got = server.http(&Http::new("GET", path, &text)).await;
     assert_eq!(
         got.header("x-state-ver").unwrap(),

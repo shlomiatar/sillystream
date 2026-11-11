@@ -8,8 +8,8 @@ mod resolve;
 
 pub use batch::{BatchConfig, CODEC_RAW, CODEC_ZSTD, Item, build_records, decode_records};
 pub use client::{
-    Ack, AckWait, Client, ClientConfig, Event, Publisher, PublisherConfig, StateChange, Subscribe,
-    Subscription,
+    Ack, AckWait, Client, ClientConfig, EXPECT_UNSET, Event, Publisher, PublisherConfig,
+    StateChange, Subscribe, Subscription,
 };
 pub use proto::{AckLevel, ErrorCode, StateOp, WireClause};
 

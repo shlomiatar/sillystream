@@ -353,7 +353,7 @@ State is how things stand now, consistent with the log. It is the one part of a 
 | incr | 3 | add n to a numeric path |
 
 - **In the log:** each change is a system record (section 2.2) holding the operation, and `version` is that record's id. The current state is the result of applying the operations. Retention can delete old entries, so the snapshot is stored separately too.
-- **Conditional changes:** any op can carry `expect_ver` (0 = unconditional). A mismatch fails with a version conflict.
+- **Conditional changes:** any op can carry `expect_ver` (0 = unconditional). A mismatch fails with a version conflict. `expect_ver = u64::MAX` succeeds only if the state was never set (version 0), so the first claim on a new stream can be conditional too; on HTTP it is `If-None-Match: *`.
 - **Atomic changes:** a publish can include one state change. Its records and the state change commit together with consecutive ids, or neither does.
 - **Snapshot + read:** the owner returns the state and `head` as a single consistent step, and the client reads from `head + 1`.
 - **Storage:** active streams keep state in RAM. A change goes into the WAL, is applied in RAM, and is then acked. At each seal, changed states go to the local key-value store and the S3 checkpoint.

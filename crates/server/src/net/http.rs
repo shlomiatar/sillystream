@@ -998,6 +998,8 @@ impl<'a> HttpConn<'a> {
             _ => return malformed("X-State-Op is set, merge or incr"),
         };
         let expect_ver = match request.header("if-match") {
+            // `If-None-Match: *` is a create: only if the state was never set (section 10).
+            None if request.header("if-none-match") == Some("*") => u64::MAX,
             None | Some("*") => 0,
             Some(value) => match value.trim_matches('"').parse() {
                 Ok(version) => version,

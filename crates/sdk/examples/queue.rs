@@ -7,7 +7,9 @@ mod common;
 
 use ciborium::{Value, cbor};
 use common::*;
-use sdk::{Event, PublisherConfig, SdkError, StateChange, StateOp, Subscribe, WireClause};
+use sdk::{
+    EXPECT_UNSET, Event, PublisherConfig, SdkError, StateChange, StateOp, Subscribe, WireClause,
+};
 use std::time::Duration;
 
 const KIND: u64 = 0xff << 56;
@@ -49,8 +51,6 @@ async fn main() {
             // Claim: move "next" to this task and add its lease, if no one has moved it past.
             let claimed = loop {
                 let (doc, ver, _) = state_get(&http, stream).await;
-                // expect_ver 0 is unconditional, so the doc must exist before anyone claims.
-                assert!(ver != 0, "initialize {stream}'s state first");
                 if int(&doc, "next") >= task.id {
                     break false; // another worker claimed it
                 }
@@ -60,7 +60,8 @@ async fn main() {
                 })
                 .unwrap();
                 let change = StateChange {
-                    expect_ver: ver,
+                    // A never-set state is version 0, which EXPECT_UNSET guards.
+                    expect_ver: if ver == 0 { EXPECT_UNSET } else { ver },
                     op: StateOp::Merge,
                     doc: to_cbor(&claim),
                 };
