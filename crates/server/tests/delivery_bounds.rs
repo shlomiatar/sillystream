@@ -431,7 +431,7 @@ async fn subscribed_and_snapshot_show_no_state_the_wal_has_not_taken() {
         panic!("expected a state result");
     };
     hear_until(&mut connection, &mut heard, |heard| {
-        !heard.records(1).is_empty() && state_frame_count(heard) == 1
+        !heard.records(1).is_empty() && state_frame_count(heard) == 2
     })
     .await;
     assert_eq!(heard.records(1)[0].0, ver);

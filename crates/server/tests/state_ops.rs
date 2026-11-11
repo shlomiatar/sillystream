@@ -559,3 +559,304 @@ async fn expect_unset_on_a_publish_fails_once_the_state_is_set() {
     }
     harness.finish();
 }
+
+/// What `sub` heard, in order: each record's id, and each `STATE`'s version marked `true`.
+fn record_and_state_ids(heard: &Heard, sub: u32) -> Vec<(u64, bool)> {
+    let mut out = Vec::new();
+    for event in &heard.events {
+        match event {
+            server::Event::Data { sub: to, records } if *to == sub => out.extend(
+                parse_records(&records.to_vec())
+                    .into_iter()
+                    .map(|record| (record.0, false)),
+            ),
+            server::Event::State { sub: to, ver, .. } if *to == sub => out.push((*ver, true)),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn state_count(heard: &Heard, sub: u32) -> usize {
+    record_and_state_ids(heard, sub)
+        .iter()
+        .filter(|(_, is_state)| *is_state)
+        .count()
+}
+
+/// SPEC 11.1: a `STATE` goes after every record below its version and before any above it,
+/// whether the records went out at once or lingered in the queue.
+#[tokio::test]
+async fn a_with_state_subscriber_gets_each_change_in_id_order() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    let records = record_with(1, b"x");
+    client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut at_once = server::Subscription::new(1, key("s"), u64::MAX);
+    at_once.with_state = true;
+    connection.subscribe(at_once);
+    let mut lingering = server::Subscription::new(2, key("s"), u64::MAX);
+    lingering.with_state = true;
+    lingering.include_system = true;
+    lingering.linger_ms = 200;
+    connection.subscribe(lingering);
+    let mut state_only = server::Subscription::new(3, key("s"), u64::MAX);
+    state_only.state_only = true;
+    connection.subscribe(state_only);
+    for sub in 1..=3 {
+        subscribed(&mut connection, &mut heard, sub).await;
+    }
+
+    // A record, records and a change together, a record, a change alone, a record.
+    client.publish(publish("s", &records, 2, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    client
+        .publish(atomic(&records, 3, 0, map(&[("n", int(1))])))
+        .await
+        .unwrap();
+    let (_, first_id, count) = expect_ack(&mut client).await;
+    let ver_1 = first_id + u64::from(count) - 1;
+    client.publish(publish("s", &records, 4, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    client
+        .state_op(op("s", 5, 0, StateOp::Merge, &map(&[("n", int(2))])))
+        .await
+        .unwrap();
+    let (_, ok, ver_2) = expect_result(&mut client).await;
+    assert!(ok);
+    client.publish(publish("s", &records, 6, 2)).await.unwrap();
+    let (_, last_id, _) = expect_ack(&mut client).await;
+
+    hear_until(&mut connection, &mut heard, |heard| {
+        [1, 2].iter().all(|sub| {
+            record_and_state_ids(heard, *sub)
+                .last()
+                .is_some_and(|last| last.0 == last_id)
+        }) && state_count(heard, 3) == 2
+    })
+    .await;
+    for sub in [1, 2] {
+        let seen = record_and_state_ids(&heard, sub);
+        let states: Vec<u64> = seen.iter().filter(|s| s.1).map(|s| s.0).collect();
+        assert_eq!(states, [ver_1, ver_2], "sub {sub}: {seen:?}");
+        // In id order, the system record (sub 2 only) just ahead of its `STATE`.
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]), "{seen:?}");
+    }
+    assert_eq!(
+        record_and_state_ids(&heard, 2)
+            .iter()
+            .filter(|s| !s.1 && (s.0 == ver_1 || s.0 == ver_2))
+            .count(),
+        2,
+        "INCLUDE_SYSTEM gets the system records as well as the STATE frames"
+    );
+    // STATE_ONLY: the changes, no records, no PROGRESS.
+    let seen = record_and_state_ids(&heard, 3);
+    assert_eq!(seen, [(ver_1, true), (ver_2, true)]);
+    hear_for(&mut connection, &mut heard, QUIET_MS).await;
+    assert!(heard.progress(3).is_empty());
+    drop(connection);
+    harness.finish();
+}
+
+/// History brings records, not `STATE` frames: the snapshot came with `SUBSCRIBED`, and
+/// changes are pushed from the head on.
+#[tokio::test]
+async fn a_with_state_subscriber_catching_up_gets_states_only_from_the_head() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    let records = record_with(1, b"x");
+    client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    let (_, first_id, _) = expect_ack(&mut client).await;
+    client
+        .state_op(op("s", 2, 0, StateOp::Set, &map(&[("n", int(1))])))
+        .await
+        .unwrap();
+    expect_result(&mut client).await;
+    client.publish(publish("s", &records, 3, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    client
+        .state_op(op("s", 4, 0, StateOp::Set, &map(&[("n", int(2))])))
+        .await
+        .unwrap();
+    let (_, _, head_ver) = expect_result(&mut client).await;
+
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut subscription = server::Subscription::new(1, key("s"), first_id - 1);
+    subscription.with_state = true;
+    connection.subscribe(subscription);
+    subscribed(&mut connection, &mut heard, 1).await;
+    let snapshot_ver = heard.events.iter().find_map(|event| match event {
+        server::Event::Subscribed { state_ver, .. } => Some(*state_ver),
+        _ => None,
+    });
+    assert_eq!(snapshot_ver, Some(head_ver));
+    // `PROGRESS` at the head says it is live.
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard.progress(1).contains(&head_ver)
+    })
+    .await;
+    assert_eq!(heard.records(1).len(), 2);
+    assert_eq!(state_count(&heard, 1), 0, "no STATE for history");
+
+    client
+        .state_op(op("s", 5, 0, StateOp::Set, &map(&[("n", int(3))])))
+        .await
+        .unwrap();
+    let (_, _, live_ver) = expect_result(&mut client).await;
+    client.publish(publish("s", &records, 6, 2)).await.unwrap();
+    let (_, last_id, _) = expect_ack(&mut client).await;
+    hear_until(&mut connection, &mut heard, |heard| {
+        heard
+            .records(1)
+            .last()
+            .is_some_and(|last| last.0 == last_id)
+    })
+    .await;
+    let seen = record_and_state_ids(&heard, 1);
+    assert_eq!(seen.iter().filter(|s| s.1).count(), 1, "{seen:?}");
+    assert_eq!(
+        &seen[seen.len() - 2..],
+        [(live_ver, true), (last_id, false)]
+    );
+    drop(connection);
+    harness.finish();
+}
+
+/// A subscriber that fell behind lost the `STATE` frames queued for it, so on reaching the head
+/// again it gets the current state once, after the records below it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_with_state_subscriber_back_from_behind_gets_the_current_state_once() {
+    let mut config = manual_config(2);
+    config.subscriber_queue_bytes = 64 * 1024;
+    config.connection_window_bytes = 16 * 1024;
+    config.fair_share_bytes = 4 * 1024;
+    config.catch_up_read_bytes = 8 * 1024;
+    let harness = Harness::new(config);
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    let data = vec![7u8; 1024];
+    let records = record_with(1, &data);
+    client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    let mut slow = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut subscription = server::Subscription::new(1, key("s"), u64::MAX);
+    subscription.with_state = true;
+    slow.subscribe(subscription);
+    subscribed(&mut slow, &mut heard, 1).await;
+
+    // Not read from here on: records, and a change every so often, until it is behind.
+    let mut seq = 1;
+    let mut req = 0;
+    while total_stat(node, |stats| stats.behind_count).await == 0 {
+        seq += 1;
+        client
+            .publish(publish("s", &records, seq, 2))
+            .await
+            .unwrap();
+        expect_ack(&mut client).await;
+        if seq % 20 == 0 {
+            req += 1;
+            client
+                .state_op(op("s", req, 0, StateOp::Set, &int(seq as i64)))
+                .await
+                .unwrap();
+            assert!(expect_result(&mut client).await.1);
+        }
+        assert!(seq < 2_000, "it should have fallen behind");
+    }
+    // Changes while it is behind.
+    for value in [-1, -2] {
+        req += 1;
+        client
+            .state_op(op("s", req, 0, StateOp::Set, &int(value)))
+            .await
+            .unwrap();
+        assert!(expect_result(&mut client).await.1);
+    }
+    let current_ver = client.snapshot(key("s")).await.unwrap().state_ver;
+
+    hear_until(&mut slow, &mut heard, |heard| {
+        heard
+            .events
+            .iter()
+            .any(|event| matches!(event, server::Event::State { ver, .. } if *ver == current_ver))
+    })
+    .await;
+    hear_for(&mut slow, &mut heard, QUIET_MS).await;
+    let behind_at = heard
+        .events
+        .iter()
+        .position(|event| matches!(event, server::Event::Behind { .. }))
+        .unwrap();
+    let after = Heard {
+        events: heard.events[behind_at..].to_vec(),
+    };
+    let seen = record_and_state_ids(&after, 1);
+    let states: Vec<&(u64, bool)> = seen.iter().filter(|s| s.1).collect();
+    assert_eq!(states, [&(current_ver, true)], "{seen:?}");
+    let at = seen.iter().position(|s| s.1).unwrap();
+    assert!(seen[..at].iter().all(|s| s.0 < current_ver));
+    assert!(
+        seen[at + 1..].is_empty(),
+        "nothing above the head was published"
+    );
+    let doc = heard.events.iter().rev().find_map(|event| match event {
+        server::Event::State { doc, .. } => Some(doc.clone()),
+        _ => None,
+    });
+    assert_eq!(from_cbor(&doc.unwrap()), int(-2));
+    drop(slow);
+    harness.finish();
+}
+
+/// `STATE_ONLY` costs a busy stream nothing per batch: one of records only isn't checked
+/// against its filter, nor sent to its core. A change still reaches it.
+#[tokio::test]
+async fn a_state_only_subscriber_costs_record_only_batches_nothing() {
+    let harness = Harness::new(manual_config(2));
+    let node = harness.node();
+    let mut client = node.client(0).await;
+    let records = record_with(1, b"x");
+    client.publish(publish("s", &records, 1, 2)).await.unwrap();
+    expect_ack(&mut client).await;
+    let mut connection = node.connection(1).await.unwrap();
+    let mut heard = Heard::default();
+    let mut subscription = server::Subscription::new(1, key("s"), u64::MAX);
+    subscription.state_only = true;
+    connection.subscribe(subscription);
+    subscribed(&mut connection, &mut heard, 1).await;
+
+    for seq in 2..=50 {
+        client
+            .publish(publish("s", &records, seq, 2))
+            .await
+            .unwrap();
+        expect_ack(&mut client).await;
+    }
+    assert_eq!(
+        total_stat(node, |stats| stats.filter_check_count).await,
+        0,
+        "no batch was fanned out"
+    );
+    client
+        .state_op(op("s", 1, 0, StateOp::Set, &int(1)))
+        .await
+        .unwrap();
+    let (_, _, ver) = expect_result(&mut client).await;
+    hear_until(&mut connection, &mut heard, |heard| {
+        state_count(heard, 1) == 1
+    })
+    .await;
+    assert_eq!(record_and_state_ids(&heard, 1), [(ver, true)]);
+    drop(connection);
+    harness.finish();
+}

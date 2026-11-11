@@ -24,8 +24,8 @@ use crate::compaction::RetentionClass;
 use crate::connection::{CommandTicket, DeliverySettings, Home, Stores};
 use crate::dedupe::{DedupeCheck, DedupeTable};
 use crate::delivery::{
-    FanOut, Gathered, ObjectRef, PendingVisible, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes,
-    StreamDelivery, UnsavedStep, retention_start_id, walk_records,
+    FanOut, Gathered, ObjectRef, PendingVisible, RecordSpan, SharedBytes, StreamDelivery,
+    UnsavedStep, retention_start_id, walk_records,
 };
 use crate::keys::Keys;
 use crate::message::{
@@ -1741,18 +1741,8 @@ impl Core {
         } else {
             Bytes::new()
         };
-        if message.state_only {
-            stream.delivery.table.attach_state_only(sub.home);
-            self.send_attached(
-                &message.stream,
-                sub,
-                STATE_ONLY_FILTER_ID,
-                head,
-                cursor,
-                state_ver,
-                state,
-            );
-        } else if cursor >= stream.delivery.visible_through {
+        // `STATE_ONLY` reads no records, so it is live at once, under a filter that matches none.
+        if message.state_only || cursor >= stream.delivery.visible_through {
             self.attach_live(
                 &message.stream,
                 sub,
@@ -1919,7 +1909,8 @@ impl Core {
         }
         let limit = stream.delivery.visible_through;
         if message.after >= limit {
-            let state_ver = stream.delivery.visible_state.0;
+            // The state as of this point, for one that fell behind and is owed it.
+            let (state_ver, state) = stream.delivery.visible_state.clone();
             self.attach_live(
                 &message.stream,
                 message.sub,
@@ -1927,7 +1918,7 @@ impl Core {
                 head,
                 message.after,
                 state_ver,
-                Bytes::new(),
+                state,
             );
             return;
         }

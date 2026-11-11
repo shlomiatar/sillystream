@@ -19,9 +19,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::core::Links;
-use crate::delivery::{
-    FanOut, Matched, ObjectRef, RecordSpan, STATE_ONLY_FILTER_ID, SharedBytes, walk_records,
-};
+use crate::delivery::{FanOut, Matched, ObjectRef, RecordSpan, SharedBytes, walk_records};
 use crate::message::{
     AttachMsg, CatchReply, ConnCmd, ControlMsg, CursorOp, CursorReport, ReadDone, ReadMsg,
     ReadStepMsg, StreamBody, SubRef,
@@ -507,7 +505,6 @@ pub(crate) struct HomeStats {
 enum Mode {
     Attaching,
     Live { filter_id: u32 },
-    StateOnly,
     CatchUp,
 }
 
@@ -515,6 +512,9 @@ struct QueueItem {
     matched: Arc<Matched>,
     run: usize,
     offset: usize,
+    /// A `STATE` that goes right after this item's records: those below its version are all
+    /// here or before it, and none above.
+    state_after: Option<(u64, Bytes)>,
 }
 
 /// A catch-up partway through an object, so its region is found once.
@@ -573,8 +573,17 @@ struct Sub {
     past_last_id: u64,
     /// An object found missing, for the next step to tell the owner of.
     gone: Option<ObjectRef>,
+    /// The version of the last state given or queued for it.
     state_ver: u64,
+    /// A `STATE` to send before any more of the queue: the queue is all above its version.
     latest_state: Option<(u64, Bytes)>,
+    /// `WITH_STATE` or `STATE_ONLY`: each change is pushed while live.
+    wants_state: bool,
+    /// `STATE_ONLY`: its filter matches nothing, and it is never told `PROGRESS`.
+    state_only: bool,
+    /// It fell behind and lost what state was queued, so it is given the current state on
+    /// reaching the head again.
+    state_owed: bool,
 }
 
 impl Sub {
@@ -607,10 +616,9 @@ impl Sub {
         self.queue.push_back(item);
     }
 
-    fn pop_item(&mut self) {
-        let Some(item) = self.queue.pop_front() else {
-            return;
-        };
+    /// Returns the `STATE` that goes after it, if any.
+    fn pop_item(&mut self) -> Option<(u64, Bytes)> {
+        let item = self.queue.pop_front()?;
         let (held, size_bytes) = item.matched.bytes.held();
         if self
             .queue
@@ -619,6 +627,7 @@ impl Sub {
         {
             self.held_bytes -= size_bytes;
         }
+        item.state_after
     }
 
     fn clear_queue(&mut self) {
@@ -628,7 +637,8 @@ impl Sub {
     }
 
     /// Whole records up to `budget_bytes`. Only a record over the budget by itself goes past
-    /// it, and then it goes alone (D91). Bytes aren't copied.
+    /// it, and then it goes alone (D91). Bytes aren't copied. A frame ends where a `STATE` is
+    /// due, which is left in `latest_state` to go next.
     fn take_frame(
         &mut self,
         budget_bytes: u64,
@@ -690,8 +700,11 @@ impl Sub {
             if end == run.end {
                 item.run += 1;
                 item.offset = 0;
-                if item.run == item.matched.runs.len() {
-                    self.pop_item();
+                if item.run == item.matched.runs.len()
+                    && let Some(state) = self.pop_item()
+                {
+                    self.latest_state = Some(state);
+                    break;
                 }
             } else {
                 item.offset = end;
@@ -710,6 +723,7 @@ impl Sub {
                 matched: Arc::clone(matched),
                 run: 0,
                 offset: 0,
+                state_after: None,
             };
             return Some((item, matched.total_bytes));
         }
@@ -736,6 +750,7 @@ impl Sub {
             matched: Arc::clone(matched),
             run,
             offset,
+            state_after: None,
         };
         Some((item, bytes as u64))
     }
@@ -751,6 +766,20 @@ struct Conn {
     turns: VecDeque<usize>,
     subs: HashMap<u32, usize>,
     in_ready: bool,
+}
+
+impl Conn {
+    /// Sends the `STATE` waiting in `latest_state`, if any.
+    fn push_state(&mut self, sub: &mut Sub) {
+        if let Some((ver, doc)) = sub.latest_state.take() {
+            self.window_left_bytes -= doc.len() as i64;
+            self.out.push(Event::State {
+                sub: sub.id,
+                ver,
+                doc,
+            });
+        }
+    }
 }
 
 impl Drop for Conn {
@@ -1062,13 +1091,19 @@ impl Home {
         }
         let uid = self.next_uid;
         self.next_uid += 1;
+        let mut filter = filter.expect("checked above");
+        if state_only {
+            // An id range that holds nothing, so no record ever matches.
+            filter.id_first = u64::MAX;
+            filter.id_last = 0;
+        }
         let sub = Sub {
             uid,
             serial: uid,
             conn,
             id,
             stream,
-            filter: filter.expect("checked above"),
+            filter,
             linger_ms,
             name,
             tag,
@@ -1093,6 +1128,9 @@ impl Home {
             gone: None,
             state_ver: 0,
             latest_state: None,
+            wants_state: with_state || state_only,
+            state_only,
+            state_owed: false,
         };
         let filter = sub.filter;
         let key = match self.free_subs.pop() {
@@ -1135,15 +1173,12 @@ impl Home {
             return;
         };
         let stream = sub.stream;
-        let filter_id = match sub.mode {
-            Mode::Live { filter_id } => filter_id,
-            Mode::StateOnly => STATE_ONLY_FILTER_ID,
-            Mode::Attaching | Mode::CatchUp => return,
+        let Mode::Live { filter_id } = sub.mode else {
+            return;
         };
         if let Some(home_stream) = self.streams.get_mut(&stream) {
-            if filter_id == STATE_ONLY_FILTER_ID {
-                home_stream.state_subs.retain(|other| *other != key);
-            } else if let Some(group) = home_stream.groups.get_mut(&filter_id) {
+            home_stream.state_subs.retain(|other| *other != key);
+            if let Some(group) = home_stream.groups.get_mut(&filter_id) {
                 group.subs.retain(|other| *other != key);
                 if group.subs.is_empty() {
                     home_stream.groups.remove(&filter_id);
@@ -1255,6 +1290,8 @@ impl Home {
                     continue;
                 };
                 sub.in_turn = false;
+                // A `STATE` the window held back goes ahead of the records above it.
+                connection.push_state(sub);
                 let frame = sub.take_frame(share_bytes, held_charge_bytes, &mut spans);
                 if frame.len_bytes > 0 {
                     connection.window_left_bytes -= frame.window_cost_bytes as i64;
@@ -1263,6 +1300,7 @@ impl Home {
                         records: frame,
                     });
                 }
+                connection.push_state(sub);
                 if sub.queue.is_empty() {
                     sub.due = false;
                 } else if sub.due {
@@ -1304,7 +1342,7 @@ impl Home {
             return true;
         };
         let id = sub.position.max(floor_id);
-        if id <= sub.handed_through {
+        if id <= sub.handed_through || sub.state_only {
             return true;
         }
         // Everything matching at or below `id` has to be out ahead of it.
@@ -1579,14 +1617,12 @@ impl Home {
             return;
         }
         let key = sub_ref.key;
-        self.say_subscribed(key, head, cursor, state_ver, state, true);
+        self.say_subscribed(key, head, cursor, state_ver, state.clone(), true);
         let home_stream = self.streams.entry(*stream).or_default();
         let sub = self.subs[key].as_mut().expect("checked above");
         let was_catching_up = sub.mode == Mode::CatchUp;
-        if filter_id == STATE_ONLY_FILTER_ID {
-            sub.mode = Mode::StateOnly;
+        if sub.wants_state {
             home_stream.state_subs.push(key);
-            return;
         }
         sub.mode = Mode::Live { filter_id };
         sub.position = sub.position.max(cursor);
@@ -1599,7 +1635,15 @@ impl Home {
         if was_catching_up {
             // Reaching head: section 5.2's other reason to send it.
             sub.head_progress_owed = true;
-            if sub.queue.is_empty() {
+            // What it lost by falling behind is made up with how things stand now.
+            let state_owed = std::mem::take(&mut sub.state_owed);
+            if state_owed {
+                self.queue_state(key, state_ver, state);
+            }
+            if self.subs[key]
+                .as_ref()
+                .is_some_and(|sub| sub.queue.is_empty())
+            {
                 self.send_head_progress(key);
             }
         }
@@ -1658,12 +1702,33 @@ impl Home {
         }
         if let Some((ver, doc)) = &fan.state {
             for key in state_subs {
-                if let Some(Some(sub)) = self.subs.get_mut(key)
-                    && *ver > sub.state_ver
-                {
-                    sub.latest_state = Some((*ver, doc.clone()));
-                    self.send_latest_state(key);
+                let live = self
+                    .subs
+                    .get(key)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|sub| {
+                        matches!(sub.mode, Mode::Live { .. }) && *ver > sub.state_ver
+                    });
+                if live {
+                    self.queue_state(key, *ver, doc.clone());
                 }
+            }
+        }
+    }
+
+    /// A change's `STATE` goes after what is queued, which is all at or below its version,
+    /// and before anything queued later. Two changes with no record between them for this
+    /// subscriber need only the later one (D88).
+    fn queue_state(&mut self, key: usize, ver: u64, doc: Bytes) {
+        let Some(Some(sub)) = self.subs.get_mut(key) else {
+            return;
+        };
+        sub.state_ver = ver;
+        match sub.queue.back_mut() {
+            Some(last) => last.state_after = Some((ver, doc)),
+            None => {
+                sub.latest_state = Some((ver, doc));
+                self.send_latest_state(key);
             }
         }
     }
@@ -1679,15 +1744,7 @@ impl Home {
         if connection.window_left_bytes <= 0 {
             return;
         }
-        if let Some((ver, doc)) = sub.latest_state.take() {
-            sub.state_ver = ver;
-            connection.window_left_bytes -= doc.len() as i64;
-            connection.out.push(Event::State {
-                sub: sub.id,
-                ver,
-                doc,
-            });
-        }
+        connection.push_state(sub);
     }
 
     /// Section 5.2's overflow: what is queued goes, so the bound holds, and the subscription
@@ -1700,6 +1757,8 @@ impl Home {
             return;
         };
         sub.clear_queue();
+        sub.latest_state = None;
+        sub.state_owed = sub.wants_state;
         sub.due = false;
         sub.mode = Mode::CatchUp;
         sub.position = sub.handed_through;
@@ -1796,6 +1855,7 @@ impl Home {
                     matched,
                     run: 0,
                     offset: 0,
+                    state_after: None,
                 },
                 bytes,
             );

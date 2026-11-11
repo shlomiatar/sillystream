@@ -141,9 +141,6 @@ pub(crate) struct FanOut {
     pub state: Option<(u64, Bytes)>,
 }
 
-/// The filter id of a `STATE_ONLY` subscriber, which has no filter.
-pub(crate) const STATE_ONLY_FILTER_ID: u32 = u32::MAX;
-
 /// A filter id, what it picks, and who is under it on each core.
 #[derive(Debug)]
 struct FilterEntry {
@@ -161,7 +158,13 @@ pub(crate) struct FilterTable {
     index: HashMap<Filter, usize>,
     next_id: u32,
     subs_by_core: Vec<u32>,
-    state_subs_by_core: Vec<u32>,
+    /// Those of `subs_by_core` whose filter can match a record: not `STATE_ONLY`.
+    record_subs_by_core: Vec<u32>,
+}
+
+/// `STATE_ONLY`'s filter, whose id range holds nothing.
+fn reads_no_records(filter: &Filter) -> bool {
+    filter.id_first > filter.id_last
 }
 
 impl FilterTable {
@@ -171,7 +174,7 @@ impl FilterTable {
             index: HashMap::new(),
             next_id: 0,
             subs_by_core: vec![0; core_count],
-            state_subs_by_core: vec![0; core_count],
+            record_subs_by_core: vec![0; core_count],
         }
     }
 
@@ -196,19 +199,14 @@ impl FilterTable {
         };
         self.entries[at].subs_by_core[home] += 1;
         self.subs_by_core[home] += 1;
+        if !reads_no_records(&filter) {
+            self.record_subs_by_core[home] += 1;
+        }
         self.entries[at].id
-    }
-
-    pub fn attach_state_only(&mut self, home: usize) {
-        self.state_subs_by_core[home] += 1;
     }
 
     /// Whether it took a filter's subscriber away. A late detach finds nothing to take.
     pub fn detach(&mut self, filter_id: u32, home: usize) -> bool {
-        if filter_id == STATE_ONLY_FILTER_ID {
-            self.state_subs_by_core[home] = self.state_subs_by_core[home].saturating_sub(1);
-            return false;
-        }
         let Some(at) = self.entries.iter().position(|entry| entry.id == filter_id) else {
             return false;
         };
@@ -218,6 +216,9 @@ impl FilterTable {
         }
         entry.subs_by_core[home] -= 1;
         self.subs_by_core[home] -= 1;
+        if !reads_no_records(&entry.filter) {
+            self.record_subs_by_core[home] -= 1;
+        }
         if entry.subs_by_core.iter().all(|count| *count == 0) {
             self.index.remove(&entry.filter);
             self.entries.swap_remove(at);
@@ -231,11 +232,16 @@ impl FilterTable {
     /// Nobody is subscribed from any core, so the stream may leave RAM (section 7.6).
     pub fn is_unwatched(&self) -> bool {
         self.subs_by_core.iter().all(|count| *count == 0)
-            && self.state_subs_by_core.iter().all(|count| *count == 0)
     }
 
+    /// Whether a batch goes to `home`: one with no state change only if a subscriber there
+    /// reads records.
     pub fn wants(&self, home: usize, has_state: bool) -> bool {
-        self.subs_by_core[home] > 0 || (has_state && self.state_subs_by_core[home] > 0)
+        if has_state {
+            self.subs_by_core[home] > 0
+        } else {
+            self.record_subs_by_core[home] > 0
+        }
     }
 
     /// Each filter's answer, one check per record per filter. Returns `(matches, checks)`.
@@ -580,7 +586,6 @@ mod tests {
         assert!(table.detach(id, 0));
         assert!(!table.detach(id, 0));
         assert!(!table.detach(id + 1, 1));
-        assert!(!table.detach(STATE_ONLY_FILTER_ID, 1));
         assert!(!table.is_unwatched());
         assert!(table.detach(id, 1));
         assert!(table.is_unwatched());

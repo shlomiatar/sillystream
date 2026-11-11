@@ -337,7 +337,7 @@ A publish can carry one state change. Its records and the change commit together
 ### 3.3 Snapshot + read, and watching the doc
 
 - `GET /state` returns the doc, `X-State-Ver` and `X-Head` in one step, and `SUBSCRIBE` with `WITH_STATE` returns them in `SUBSCRIBED`. Read records from `head + 1` and you miss nothing and see nothing twice.
-- `WITH_STATE` sends the doc **once**. A subscriber that should see later changes either subscribes `STATE_ONLY`, which pushes the whole doc on each change, or adds `INCLUDE_SYSTEM`, which sends each change as a system record.
+- `WITH_STATE` then pushes the whole doc on each later change, as a `STATE` event in id order among the records: after the items below its version, before any above. One subscription gives the doc and the log, and a catch-up from history gets the changes as `STATE` only from the head on. `STATE_ONLY` is the same with no records, for watching just the doc. `INCLUDE_SYSTEM` also sends each change as a system record, if the operation itself matters.
 
 The core of it, from `crates/sdk/examples/watch_state.rs`:
 
@@ -944,7 +944,7 @@ None of these is changed here. Each needs a decision first.
 **Spec and server**
 
 1. **No conditional create.** Fixed: `expect_ver = u64::MAX` (`EXPECT_UNSET`, or `If-None-Match: *`) succeeds only if the state was never set (SPEC section 10).
-2. **`WITH_STATE` versus `STATE_ONLY` is undocumented.** SPEC 11.1 lists the flags without saying what they do. The server sends `STATE` frames only to `STATE_ONLY` subscriptions, and `WITH_STATE` is the snapshot in `SUBSCRIBED` only.
+2. **`WITH_STATE` versus `STATE_ONLY` is undocumented.** Fixed: both push a `STATE` frame for each change after the snapshot, `WITH_STATE` in id order among the records and `STATE_ONLY` with no records (SPEC 11.1).
 3. **Atomic publish + state is per stream.** That's by design, but it means fencing (7.1) and claims (7.2) work only when the results go to the same stream as the state. Writes to another stream can only carry the version as a token.
 4. **There's no way to read a named cursor over HTTP.** `PUT /cursor/<name>` with `0` works as a read only because it never rewinds. A `GET` would say what it does.
 5. **Archive objects can't be found by stream name.** The path holds the stream's keyed hash, and no route returns it, so finding a stream's archive needs the stream key and BLAKE3 outside the server.

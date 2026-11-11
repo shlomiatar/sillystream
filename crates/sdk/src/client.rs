@@ -168,6 +168,8 @@ pub enum Event {
     Items(Vec<Item>),
     /// Nothing matches up to this id.
     Progress(u64),
+    /// A change to the state, with `with_state` or `state_only`. It comes after the items below
+    /// `ver` and before any above it.
     State {
         ver: u64,
         doc: Vec<u8>,

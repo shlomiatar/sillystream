@@ -311,9 +311,17 @@ async fn state_ops_and_publishes_with_state_report_conflicts() {
     };
     assert_eq!(state, doc("a", 4));
     assert!(state_ver > second);
-    client.state_op("st", set(0, 6)).await.unwrap();
+    let changed = client.state_op("st", set(0, 6)).await.unwrap();
     publisher.add(0, b"after".to_vec());
     publisher.flush().await.unwrap();
+    // `WITH_STATE` pushes the change too, ahead of the item after it.
+    assert_eq!(
+        next_event(&mut subscription).await.unwrap(),
+        Event::State {
+            ver: changed,
+            doc: doc("a", 6)
+        }
+    );
     let got = items(&mut subscription, 1).await;
     assert_eq!(got[0].bytes, b"after");
     fixture.server.shutdown();

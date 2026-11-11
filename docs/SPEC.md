@@ -352,7 +352,7 @@ State is how things stand now, consistent with the log. It is the one part of a 
 - **In the log:** each change is a system record (section 2.2) holding the operation, and `version` is that record's id. The current state is the result of applying the operations. Retention can delete old entries, so the snapshot is stored separately too.
 - **Conditional changes:** any op can carry `expect_ver` (0 = unconditional). A mismatch fails with a version conflict. `expect_ver = u64::MAX` succeeds only if the state was never set (version 0), so the first claim on a new stream can be conditional too; on HTTP it is `If-None-Match: *`.
 - **Atomic changes:** a publish can include one state change. Its records and the state change commit together with consecutive ids, or neither does.
-- **Snapshot + read:** the owner returns the state and `head` as a single consistent step, and the client reads from `head + 1`.
+- **Snapshot + read:** the owner returns the state and `head` as a single consistent step, and the client reads from `head + 1`. A `WITH_STATE` subscription does this in one: the snapshot comes in `SUBSCRIBED`, and each later change as a `STATE` frame in its place among the records (section 11.1).
 - **Storage:** active streams keep state in RAM. A change goes into the WAL, is applied in RAM, and is then acked. At each seal, changed states go to the local key-value store and the S3 checkpoint.
 - **Recovery:** load the last snapshot and replay state operations from the WAL.
 
@@ -394,8 +394,9 @@ server → client
 0x8F PONG         nonce u32
 ```
 
-- `WITH_STATE`: `SUBSCRIBED` carries the state's version and doc at subscribe time. Nothing more is pushed.
-- `STATE_ONLY`: the same snapshot, then a `STATE` frame for each change as it becomes visible, and no `DATA`.
+- `WITH_STATE`: `SUBSCRIBED` carries the state's version and doc at subscribe time, and then a `STATE` frame brings the whole doc for each later change as it becomes visible. The `STATE` for version `v` comes after every `DATA` record below `v` and before any above it. A subscription catching up gets no `STATE` frames for the history it reads, only those of changes after it reaches the head. One that falls `BEHIND` gets the current state once when it reaches the head again. A slow client may get only the latest of changes with no matching record between them.
+- `STATE_ONLY`: the same as `WITH_STATE`, with no `DATA` and no `PROGRESS`. It starts at the head whatever `from` says.
+- With `INCLUDE_SYSTEM` as well, a change comes twice: as its system record in `DATA`, and as the `STATE` frame after it.
 
 Error codes: 1 unauthorized, 2 not found, 3 version conflict, 4 rate limited, 5 too many subscriptions, 6 frame too large, 7 retention expired, 8 malformed.
 
