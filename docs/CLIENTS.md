@@ -135,6 +135,7 @@ All three clients do the following the same way. Rust's behaviour today is the r
 - **Catch-up and live:** one subscription does both. It starts wherever `from` says, the server reads history and then switches to live. `Subscribed { head }` tells the app where the head was, so it can tell catch-up from live by comparing ids.
 - **`until`:** the client stops by itself once it has handed over or skipped past `until`, and the subscription ends cleanly.
 - **Events:** `subscribed`, `items`, `progress`, `state`, `behind`, and errors.
+- **State on a subscription (SPEC sections 10 and 11.1):** with `with_state`, `subscribed` carries the state as of `head`, and every later change comes as a `state` event holding the whole doc, after the items below its version and before any above it. So `state.ver` is never ahead of the items already handed over. Catching up gets no historic `state` events. After `behind`, reaching the head sends the current state once. With `state_only` there are no items and no `progress`, and it starts at the head. With `include_system` a change comes twice: as its system record, then as `state`. Clients must accept `state` events on any `with_state` subscription.
 - **Back-pressure:** `max_queue_bytes` (64 MiB by default) of undelivered frames. Past it the client unsubscribes, and resubscribes from its cursor once the app has read half of it.
 - **Decompression limit:** `max_decompressed_bytes` (256 MiB by default) per batch handed over. A frame over it comes in several batches, and one record over it is a bad record with the reason `too_large`.
 - **Bad records:** a record that can't be opened (section 2) is reported as `BadRecord { first_id, last_id, reason }` after the items before it. Those ids are skipped and the subscription goes on.
@@ -152,7 +153,7 @@ All three clients do the following the same way. Rust's behaviour today is the r
 
 - `state(stream)` returns a handle with `get`, `set`, `merge` and `incr`, each with an optional `expect_ver`, which can be `EXPECT_UNSET` for the first claim on a stream (`If-None-Match: *` over HTTP). Writes return the new version, and a mismatch is a `VersionConflict` error with the current version when the server gives it.
 - Docs are CBOR. Each SDK takes and returns its language's native values (Rust `serde`, Go `any` or a struct, JS plain objects) and also raw CBOR bytes.
-- `get` uses a `STATE_ONLY` subscription over WebSocket, or `GET .../state` over HTTP. Watching changes is a subscription with `with_state`, which delivers `state` events.
+- `get` uses a `STATE_ONLY` subscription over WebSocket, or `GET .../state` over HTTP. Watching changes is a `state_only` subscription, or `with_state` to get records and state in one order (section 3.4).
 - **Lease helper:** none. A lease is a `set` with `expect_ver`, and the version is the fencing token. The docs show the pattern.
 
 ### 3.7 Admin
