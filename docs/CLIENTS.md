@@ -14,7 +14,7 @@ Three clients share one behaviour and differ only in API shape:
 |---|---|
 | order | Rust gains every feature first and produces the test vectors, then JS/TS, then Go |
 | dictionaries | zstd's own frame header carries the dictionary id, so codec stays 1 and the SPEC doesn't change |
-| encryption | a new codec value, 2, for an encrypted envelope that holds the inner codec. **Needs a one-line SPEC change** (section 2's codec list) |
+| encryption | a new codec value, 2, for an encrypted envelope that holds the inner codec. In SPEC section 2 |
 | cipher | AES-256-GCM, random 96-bit nonce per record |
 | AAD | `options` and the envelope header, not the stream id, so forward sinks keep working |
 | dictionaries and keys | the app supplies both. The SDK takes a map of dictionary id to bytes and a keyring. Distribution is the app's job |
@@ -284,7 +284,7 @@ ver, err := c.State("session.42").Merge(ctx, doc, silly.ExpectVer(v))
 
 ## 6. Order of work
 
-0. **SPEC change** (needs the user's go-ahead): add `2 encrypted envelope` to section 2's codec list and point to this document for the envelope. The server ignores codec, so it doesn't change.
+0. **SPEC change:** done. Section 2 lists codec 2 and points here for the envelope.
 1. **Rust:** codecs (dictionaries, envelope, keyring), the `Producer`, the token provider and expiry reading, `run`, system roots (and `silly` needing `--ca` only for a private CA), the state handle, and the performance work. Then the test vectors.
 2. **JS/TS:** WebSocket client, then the HTTP mode.
 3. **Go:** WebSocket client and admin HTTP.

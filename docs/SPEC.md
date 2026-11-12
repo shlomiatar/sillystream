@@ -25,7 +25,7 @@ offset size field
 16     8    author    u64, 0 = system
 24     4    len       u32, data bytes
 28     2    count     u16, items in this record, 1–65,535
-30     2    codec     u16, set by the client, ignored by the server: 0 raw, 1 zstd
+30     2    codec     u16, set by the client, ignored by the server: 0 raw, 1 zstd, 2 encrypted
 32          data, padded to 8
 ```
 
@@ -36,6 +36,7 @@ All fields are little-endian and naturally aligned.
 - **Data:** opaque to the runtime, with one exception (section 2.2). Producers set it, and it can be compressed, encrypted or anything else. The runtime never parses or decompresses it, which lets it move data by copying bytes.
 - **Items:** with `count = 1`, data is the item's bytes. With `count > 1`, data is client-owned item offsets and item bytes, usually compressed together. Any per-item details, such as event time, also live inside the data.
 - **SDK packing:** the server never looks at it, but every SDK uses the same one. Before compression, data is the item's bytes when `count = 1`, and otherwise `count` little-endian u32 end offsets into the item bytes followed by the item bytes. With `codec = 1` that whole thing, offsets included, is one zstd frame; with `codec = 0` it is as is. The SDK leaves data raw when it is under 64 bytes or zstd wouldn't make it smaller.
+- **Encryption:** with `codec = 2`, data is an encrypted envelope whose plaintext is codec 0 or 1 data. The SDKs define the envelope in `docs/CLIENTS.md` section 2.4. The server treats it like any other data.
 
 ### 2.1 Options layout
 
